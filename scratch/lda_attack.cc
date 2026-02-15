@@ -99560,9 +99560,31 @@ dec_port_id = read_other_other_item_from_csv(
 		bool send = false;
 		if(routing_algorithm == 4)
 		{
-			bool cond1 = std::stoi(dec_node_id)==std::stoi(cnid);
-			bool cond2 = std::stoi(dec_port_id)==std::stoi(cpid);
+			bool cond1 = false;
+			bool cond2 = false;
 			bool cond3 = (verification.find("True") != std::string::npos);
+			
+			// Safe parsing: check for empty strings and handle exceptions
+			try {
+				if (!dec_node_id.empty() && !cnid.empty()) {
+					cond1 = std::stoi(dec_node_id) == std::stoi(cnid);
+				}
+			} catch (const std::invalid_argument& e) {
+				cout << "Warning: Invalid node id format. dec_node_id='" << dec_node_id << "', cnid='" << cnid << "'" << endl;
+			} catch (const std::out_of_range& e) {
+				cout << "Warning: Node id out of range. dec_node_id='" << dec_node_id << "', cnid='" << cnid << "'" << endl;
+			}
+			
+			try {
+				if (!dec_port_id.empty() && !cpid.empty()) {
+					cond2 = std::stoi(dec_port_id) == std::stoi(cpid);
+				}
+			} catch (const std::invalid_argument& e) {
+				cout << "Warning: Invalid port id format. dec_port_id='" << dec_port_id << "', cpid='" << cpid << "'" << endl;
+			} catch (const std::out_of_range& e) {
+				cout << "Warning: Port id out of range. dec_port_id='" << dec_port_id << "', cpid='" << cpid << "'" << endl;
+			}
+			
 			cout<<"cond1 is "<<cond1<<endl;
 			cout<<"cond2 is "<<cond2<<endl;
 			cout<<"cond3 is "<<cond3<<endl;
