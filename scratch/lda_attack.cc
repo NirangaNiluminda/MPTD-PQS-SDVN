@@ -150570,7 +150570,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 			
 			//Simulator::Schedule (Seconds (7.400), reset_packet_timestamps);
 			//Simulator::Schedule(Seconds(7.400),generate_F_and_E);
-			
+			/*
 			for(uint32_t i=0;i<2*flows;i++)
 			{
 				(demanding_flow_struct_controller_inst+i)->f_size = 2;
@@ -150750,7 +150750,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 				 //Simulator::Schedule(Seconds(t+0.0050), CallBWTRCBFromNS3, 0+2, "consortium1");
 				 //Simulator::Schedule(Seconds(t+0.0150), BCTES, 0+2, 0, "C1", "consortium1");
 				 
-			}	
+			}	///Methanata wenakam
 //*/	
 	}
 	

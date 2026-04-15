@@ -511,20 +511,13 @@ def update_csv_element(file_path, row_index, col_index, new_value):
     rows[row_index][col_index] = str(new_value)
     #print(f"After update: {rows[row_index]}")
 
+
     # Write back to the CSV
     with open(file_path, 'w', encoding='UTF8', newline='') as csvfile:
         writer = csv.writer(csvfile)
         writer.writerows(rows)
     
-    # Write the updated rows back to the CSV file
-    with open(file_path, 'w', encoding='UTF8', newline='') as csvfile:
-        writer = csv.writer(csvfile, delimiter=',', quotechar='"', quoting=csv.QUOTE_MINIMAL)
-        print("writing to csv")
-        for i in range(len(rows)):
-                 #print(i)
-                 #print(rows[i])
-                 writer.writerow(rows[i])
-    csvfile.close()
+
     
 
 
