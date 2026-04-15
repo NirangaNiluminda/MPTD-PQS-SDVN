@@ -1,0 +1,41 @@
+# Ignore everything
+*
+
+# ── Core NS-3 simulation code (C++ codebase) ──────────────────────────────────
+!analytics/
+!scratch/
+!analytics/**
+!scratch/**
+
+# ── FYP Python framework ──────────────────────────────────────────────────────
+!mptd_pqs/
+!mptd_pqs/**
+mptd_pqs/__pycache__/
+mptd_pqs/**/*.pyc
+!mptd_pqs_pipeline.py
+!attack_comparison.py
+!mptd_pqs_results.json
+
+# ── Mobility trace files ──────────────────────────────────────────────────────
+!mobility/
+!mobility/**
+
+# ── Root config / build files ─────────────────────────────────────────────────
+!.gitignore
+!wscript
+
+# ── Ignore large generated outputs even inside allowed folders ─────────────────
+scratch/*.log
+scratch/*.tr
+scratch/*.pcap
+scratch/*.txt
+scratch/lda_attack_output.txt
+analytics/data/*.csv
+analytics/data/optimization_data.csv
+
+# ── Keep these specific CSVs (manually maintained, not auto-generated) ─────────
+!analytics/data/security_nodepair_AES_data.csv
+
+# ── Ignore compiled objects inside scratch ────────────────────────────────────
+scratch/**/*.o
+scratch/**/*.a
