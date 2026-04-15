@@ -1,0 +1,6 @@
+def build(bld):
+    obj = bld.create_ns3_program('mrtpa_sim',
+        ['core', 'network', 'wifi', 'lte', 'csma', 'internet',
+         'mobility', 'wave', 'applications', 'point-to-point',
+         'flow-monitor', 'netanim'])
+    obj.source = ['simulation.cc']
