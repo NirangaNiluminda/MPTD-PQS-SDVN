@@ -578,6 +578,7 @@ int main(int argc, char *argv[])
   int con_base_posy;
   MobilityHelper RSU_mobility;
   RSU_mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
+  MobilityHelper vehicle_mobility;
   vehicle_mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
   if (mobility_scenario == 0)//urban mobility
   {

@@ -1,5 +1,5 @@
 def build(bld):
-    obj = bld.create_ns3_program('mrtpa_sim',
+    obj = bld.create_ns3_program('mptd_pqs_sdvn',
         ['core', 'network', 'wifi', 'lte', 'csma', 'internet',
          'mobility', 'wave', 'applications', 'point-to-point',
          'flow-monitor', 'netanim'])
