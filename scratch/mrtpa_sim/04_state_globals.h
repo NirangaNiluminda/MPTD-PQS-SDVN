@@ -1,214 +1,127 @@
 // ============================================================
-// SECTION 4: Runtime State Variables and Flow Structs
+// SECTION 4: Runtime State Variables
+// MPTD-PQS: Dual-Mode Detection for MP and TP Attacks in SDVN
 // ============================================================
 // Contents:
-//   - Timing/utilization variables: dsrc_utilization_time, packet_delay[]
-//   - Packet timestamp arrays: dsrc_packet_initial_timestamp[], etc.
-//   - Flow structs: Q_f, L_f, W_f, t_f, U_f, Y_f, delta_f, load_f
-//   - Flow state instances: Q_at_controller_inst, delta_at_nodes_inst, etc.
-//
-// These hold per-packet timing and per-flow optimization state
-// collected during the simulation run.
+//   - Network timing/utilization: dsrc, lte, packet delay
+//   - MPTD-PQS trajectory state: position/velocity history per vehicle
+//   - Drift score buffers for TP-S4/TP-S5 detection
+//   - Sybil identity tracker per RSU for MP-S1 detection
 // ============================================================
 
 #ifndef NS3_UDP_ARQ_APPLICATION_H
 #define NS3_UDP_ARQ_APPLICATION_H
 
+// ── Network Performance Timing (kept from original) ───────────────────────
+double dsrc_utilization_time        = 0.0;
+double lte_utilization_time         = 0.0;
+double dsrc_total_received_packets  = 0.0;
 
-double dsrc_utilization_time = 0.0;
-double lte_utilization_time = 0.0;
-double ethernet_utilization_time = 0.0;
-double packet_delay[total_size+2];
-double packet_delay_dsrc[total_size+2];
+double packet_delay[total_size + 2];
+double packet_delay_dsrc[total_size + 2];
 
-double dsrc_packet_initial_timestamp[total_size+2];
-double packet_initial_timestamp[total_size+2];
+double dsrc_packet_initial_timestamp[total_size + 2];
+double dsrc_packet_final_timestamp[total_size + 2];
 double dsrc_initial_timestamp;
-double dsrc_LLDP_initial_timestamp;
-double dsrc_LLDP_final_timestamp;
-double lte_initial_timestamp;
-double LLDP_initial_timestamp;
-double ethernet_initial_timestamp;
-double ethernet_LLDP_initial_timestamp;
-double aodv_initial_timestamp[total_size+2];
-
-double dsrc_packet_final_timestamp[total_size+2];
-double packet_final_timestamp[total_size+2];
 double dsrc_final_timestamp;
-double dsrc_total_received_packets = 0.0;
+
+double lte_initial_timestamp;
 double lte_final_timestamp;
-double LLDP_final_timestamp;
-double ethernet_final_timestamp;
-double aodv_final_timestamp[total_size+2];
 
-double max_distance[total_size+2];
+double aodv_initial_timestamp[total_size + 2];
+double aodv_final_timestamp[total_size + 2];
 
-struct Q_fi
-{
-	double Q_values[total_size];
+double max_distance[total_size + 2];
+
+// ── MPTD-PQS: Per-Vehicle Beacon State ────────────────────────────────────
+// Stores the last N beacons per vehicle for temporal detection algorithms.
+// Used by TP-DETECT (Algorithm 1) and SYB-DETECT (Algorithm 2).
+
+#define BEACON_HISTORY 20   // window size for drift score (k in paper)
+
+struct VehicleBeaconState {
+    double pos_x[BEACON_HISTORY];   // p_i(t) x-coordinate history
+    double pos_y[BEACON_HISTORY];   // p_i(t) y-coordinate history
+    double speed[BEACON_HISTORY];   // s_i(t) speed history (m/s)
+    double heading[BEACON_HISTORY]; // θ_i(t) heading history (rad)
+    double accel[BEACON_HISTORY];   // a_i(t) acceleration history (m/s²)
+    double timestamp[BEACON_HISTORY]; // beacon timestamp history
+    int    head;                    // circular buffer head index
+    int    count;                   // number of valid entries
+    double drift_score;             // D_i(k): cumulative drift (Eq. 3.15)
+    bool   is_malicious;            // ground truth for this vehicle
 };
 
-struct Q_f
-{
- 	struct Q_fi Q_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
+VehicleBeaconState vehicle_state[total_size];
+
+// Initialise all vehicle beacon state buffers
+void init_vehicle_states() {
+    for (int i = 0; i < total_size; i++) {
+        vehicle_state[i].head  = 0;
+        vehicle_state[i].count = 0;
+        vehicle_state[i].drift_score  = 0.0;
+        vehicle_state[i].is_malicious = false;
+        for (int j = 0; j < BEACON_HISTORY; j++) {
+            vehicle_state[i].pos_x[j]     = 0.0;
+            vehicle_state[i].pos_y[j]     = 0.0;
+            vehicle_state[i].speed[j]     = 0.0;
+            vehicle_state[i].heading[j]   = 0.0;
+            vehicle_state[i].accel[j]     = 0.0;
+            vehicle_state[i].timestamp[j] = 0.0;
+        }
+    }
+}
+
+// Push a new beacon reading into the circular buffer for vehicle vid
+void push_beacon(int vid, double px, double py, double sp,
+                 double hd, double ac, double ts) {
+    if (vid < 0 || vid >= total_size) return;
+    VehicleBeaconState &vs = vehicle_state[vid];
+    vs.pos_x[vs.head]     = px;
+    vs.pos_y[vs.head]     = py;
+    vs.speed[vs.head]     = sp;
+    vs.heading[vs.head]   = hd;
+    vs.accel[vs.head]     = ac;
+    vs.timestamp[vs.head] = ts;
+    vs.head = (vs.head + 1) % BEACON_HISTORY;
+    if (vs.count < BEACON_HISTORY) vs.count++;
+}
+
+// ── MPTD-PQS: Per-RSU Sybil Identity Tracker (MP-S1) ─────────────────────
+// Tracks distinct vehicle IDs seen per RSU for identity density check.
+#define MAX_IDS_PER_RSU 64
+
+struct RsuIdentitySet {
+    uint32_t ids[MAX_IDS_PER_RSU];
+    int      count;
+    double   window_start; // time window start for density check
 };
 
-struct Q_f Q_at_controller_inst[2*flows];
+RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 
+void init_rsu_id_sets() {
+    for (int i = 0; i < total_size; i++) {
+        rsu_id_set[i].count        = 0;
+        rsu_id_set[i].window_start = 0.0;
+        for (int j = 0; j < MAX_IDS_PER_RSU; j++)
+            rsu_id_set[i].ids[j] = 0;
+    }
+}
 
-struct L_fi
-{
-	double L_values[total_size];
-};
-
-struct L_f
-{
- 	struct L_fi L_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct L_f L_at_controller_inst[2*flows];
-
-
-struct W_fi
-{
-	double W_values[total_size];
-};
-
-struct W_f
-{
- 	struct W_fi W_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct W_f W_at_controller_inst[2*flows];
-
-
-
-struct Omega_fi
-{
-	double Omega_values[total_size];
-};
-
-struct Omega_f
-{
- 	struct Omega_fi Omega_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct Omega_f Omega_at_controller_inst[2*flows];
-
-
-
-struct Theta_fi
-{
-	double Theta_values[total_size];
-};
-
-struct Theta_f
-{
- 	struct Theta_fi Theta_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct Theta_f Theta_at_controller_inst[2*flows];
-
-
-struct T_fi
-{
-	double T_values[total_size];
-};
-
-struct T_f
-{
- 	struct T_fi T_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct T_f T_at_controller_inst[2*flows];
-
-
-struct t_fi
-{
-	double t_values[total_size];
-};
-
-struct t_f
-{
- 	struct t_fi t_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct t_f t_at_controller_inst[2*flows];
-
-struct U_fi
-{
-	double U_values[total_size];
-};
-
-struct U_f
-{
- 	struct U_fi U_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct U_f U_at_controller_inst[2*flows];
-
-
-struct Y_fi
-{
-	double Y_values[total_size];
-};
-
-struct Y_f
-{
- 	struct Y_fi Y_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct Y_f Y_at_controller_inst[2*flows];
-
-struct delta_fi
-{
-	double delta_values[total_size];
-};
-
-struct delta_f
-{
- 	struct delta_fi delta_fi_inst[total_size];
- 	uint32_t source_f;
- 	uint32_t destination_f;
- 	uint32_t flow_id;
-};
-
-struct delta_f delta_at_controller_inst[2*flows];
-struct delta_f delta_at_nodes_inst[2*flows];
-
-
-struct load_f
-{
-	double load_f[total_size];
-};
-
-struct load_f load_at_nodes[2*flows];
+// Register a vehicle ID seen at RSU; returns true if new in window
+bool register_vehicle_at_rsu(int rsu_id, uint32_t vehicle_id, double now) {
+    if (rsu_id < 0 || rsu_id >= total_size) return false;
+    RsuIdentitySet &rs = rsu_id_set[rsu_id];
+    // Reset window every second
+    if (now - rs.window_start > 1.0) {
+        rs.count = 0;
+        rs.window_start = now;
+    }
+    for (int i = 0; i < rs.count; i++)
+        if (rs.ids[i] == vehicle_id) return false;
+    if (rs.count < MAX_IDS_PER_RSU)
+        rs.ids[rs.count++] = vehicle_id;
+    return true;
+}
 
 #endif // NS3_UDP_ARQ_APPLICATION_H

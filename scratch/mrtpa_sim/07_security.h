@@ -3054,3 +3054,8 @@ void read_uplink_data_second_time(struct downlink_rest_data dlrd)
 }
 
 void decrypt_downlink_packet(struct downlink_packet_decrypt dlpd)
+{
+    // Legacy LLDP decrypt stub — body moved to 08_lldp_handlers.h in old codebase.
+    // Replaced with 08_beacon_handlers.h in Stage 4. No-op stub.
+    (void)dlpd;
+}

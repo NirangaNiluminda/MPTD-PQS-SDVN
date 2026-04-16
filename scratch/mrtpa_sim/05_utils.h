@@ -1,51 +1,58 @@
 // ============================================================
 // SECTION 5: Utility and Initialization Functions
+// MPTD-PQS: Dual-Mode Detection for MP and TP Attacks in SDVN
 // ============================================================
 // Contents:
-//   clear_delta_at_controller()    - zero out delta matrices
-//   clear_delta_at_nodes()         - zero out node-level deltas
-//   print_management_data()        - debug print management state
-//   clear_routing_data_at_nodes()  - reset per-node routing tables
-//   clear_data_at_nodes()          - clear received data buffers
-//   initialize_all_scores()        - reset all performance score arrays
 //   execCmd(cmd)                   - execute shell command, return stdout
 //   extractValue(json, key)        - extract value from JSON string
+//   calculate_acceleration()       - compute acceleration from velocities
+//   Structs: data_at_nodes, data_at_manager, routing_data_at_nodes, etc.
+//   (Structs kept until 08/11 headers are rewritten in Stages 4 & 6)
 // ============================================================
-void clear_delta_at_controller(struct delta_f * nd1)
-{
-	for(uint32_t i=0; i<2*flows;i++)
-	{
-		(nd1+i)->source_f = 0;
-		(nd1+i)->destination_f = 0;
-		(nd1+i)->flow_id = 0;
-		for(uint32_t j=0;j<total_size;j++)
-		{
-			for(uint32_t k=0;k<total_size;k++)
-			{
-				(nd1+i)->delta_fi_inst[j].delta_values[k] = 0.0;
-			}
-		}
-	}
-	cout<<"Solution at controller cleared"<<endl;
-}
+// Removed: clear_delta_at_controller(), clear_delta_at_nodes()
+//   — used delta_f struct which was legacy LDA flow optimization (Stage 3)
 
-void clear_delta_at_nodes(struct delta_f * nd1)
-{
-	for(uint32_t i=0; i<2*flows;i++)
-	{
-		(nd1+i)->source_f = 0;
-		(nd1+i)->destination_f = 0;
-		(nd1+i)->flow_id = 0;
-		for(uint32_t j=0;j<total_size;j++)
-		{
-			for(uint32_t k=0;k<total_size;k++)
-			{
-				(nd1+i)->delta_fi_inst[j].delta_values[k] = 0.0;
-			}
-		}
-	}
-	cout<<"Solution at nodes cleared at "<<Now().GetSeconds()<<endl;
-}
+// ── Legacy stub for 07_security.h functions (remove when 07 is cleaned) ───
+// downlink_rest_data was in old LDA codebase; kept as minimal stub so that
+// function signatures in 07_security.h compile without modification.
+// All DS/HMAC fields are uint8_t* as in the original LDA codebase.
+struct downlink_rest_data {
+    uint8_t  _stg = 0, _rsnid = 0, _rspid = 0;
+    uint32_t _snid = 0, _spid = 0, _dnid = 0, _dpid = 0;
+    uint8_t  _hmac[81]    = {};
+    uint8_t  _hmac_key[81]= {};
+    uint8_t  _hmac1[32]   = {};
+    uint8_t  _hmac2[32]   = {};
+    uint8_t  _dpk1[256]   = {};
+    uint8_t  _dpk2[1280]  = {};
+    uint8_t  _dpk3[1280]  = {};
+    uint8_t  _ds1[16]     = {};
+    uint8_t  _ds2[16]     = {};
+    uint8_t  _ds[64]      = {};
+    uint8_t  _dpk[64]     = {};
+    uint8_t*  stage              = &_stg;
+    uint8_t*  raw_source_nodeid  = &_rsnid;
+    uint8_t*  raw_source_portid  = &_rspid;
+    uint32_t* source_nodeid      = &_snid;
+    uint32_t* source_portid      = &_spid;
+    uint32_t* destination_nodeid = &_dnid;
+    uint32_t* destination_portid = &_dpid;
+    uint8_t*  HMAC           = _hmac;
+    uint8_t*  HMAC_key       = _hmac_key;
+    uint8_t*  HMAC1          = _hmac1;
+    uint8_t*  HMAC2          = _hmac2;
+    uint8_t*  DS_public_key1 = _dpk1;
+    uint8_t*  DS_public_key2 = _dpk2;
+    uint8_t*  DS_public_key3 = _dpk3;
+    uint8_t*  DS1            = _ds1;
+    uint8_t*  DS2            = _ds2;
+    uint8_t*  DS             = _ds;
+    uint8_t*  DS_public_key  = _dpk;
+    uint32_t  casted_raw_source_nodeid      = 0;
+    uint32_t  casted_raw_source_portid      = 0;
+    uint32_t  casted_destination_nodeid     = 0;
+    uint32_t  casted_raw_destination_portid = 0;
+};
 
 struct demanding_flow_struct_nodes
 {

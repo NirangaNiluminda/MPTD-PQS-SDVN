@@ -78,7 +78,7 @@ int main(int argc, char *argv[])
     //std::cout << a << "+" << b << "=" << apb.Func(a, b) << std::endl;
     //std::cout << a+2 << "+" << b+2 << "=" << apb.Func(a+2, b+2) << std::endl;
     
-    LogComponentEnable ("vanet", LOG_LEVEL_INFO);
+    //LogComponentEnable ("vanet", LOG_LEVEL_INFO); // removed: component not registered
     LogComponentEnable ("UdpClient", LOG_LEVEL_INFO);
     LogComponentEnable ("UdpEchoClientApplication", LOG_LEVEL_INFO);
     LogComponentEnable ("UdpEchoServerApplication", LOG_LEVEL_INFO);
