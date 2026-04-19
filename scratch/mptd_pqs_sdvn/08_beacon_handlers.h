@@ -292,6 +292,29 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
                       tp_flags | (mp_flags << 5), psi);
 
+    // 9. Forward to Python ML prediction server (Stage 5)
+    //    Non-blocking fire-and-forget; only in full mode (not routing_test)
+    if (!routing_test)
+    {
+        double px  = tag.GetPosX();
+        double py  = tag.GetPosY();
+        double sp  = tag.GetSpeed();
+        double hd  = tag.GetHeading();
+        double ac  = tag.GetAcceleration();
+        std::string ml_cmd =
+            "curl -s -X POST http://localhost:5001/predict"
+            " -H 'Content-Type: application/json'"
+            " -d '{\"vehicle_id\":" + std::to_string(vehicle_id) +
+            ",\"psi_score\":"       + std::to_string(psi) +
+            ",\"features\":["       + std::to_string(px) + ","
+                                    + std::to_string(py) + ","
+                                    + std::to_string(sp) + ","
+                                    + std::to_string(hd) + ","
+                                    + std::to_string(ac) + "]}'"
+            " > /dev/null 2>&1 &";
+        system(ml_cmd.c_str());
+    }
+
     (void)now;
 }
 
