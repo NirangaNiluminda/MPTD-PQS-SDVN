@@ -21,10 +21,6 @@
 #include <cmath>
 #include <sstream>
 
-// ── Forward declaration (defined in 11_blockchain_transmission.h) ────────────
-void send_dsrc_data_unicast(Ptr<Node> source_node, uint32_t node_index,
-                             uint32_t destination, uint32_t port_id);
-
 // ── Forward declarations (defined in 10_metrics_csv.h) ───────────────────────
 // 10_metrics_csv.h is included after this file in simulation.cc, so we
 // forward-declare here to allow HandleBeaconReceived() to call them.
