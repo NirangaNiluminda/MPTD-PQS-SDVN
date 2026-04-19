@@ -526,47 +526,7 @@ void update_previous_velocity(Ptr <NetDevice> nd, Ptr <Node> node)
 	//cout<<"updating velocity of node "<<nid<<"as "<<previous_velocity_dsrc[nid]<<"at time "<<Now().GetSeconds()<<endl;
 }
 
-void add_routing_data_at_nodes(struct routing_data_at_nodes * nd1, Ptr <NetDevice> nd, Ptr <Node> node)
-{	
-	//routing_time = false;
-	//uint32_t nid = node->GetId();
-	//Mac48Address dest = Mac48Address::GetBroadcast();
-  	//uint16_t protocolwave = 0x88dc;//ethertype for WAVE is set here.
-	Ptr <WifiNetDevice> wdi = DynamicCast <WifiNetDevice> (nd);
-	Ptr <Node> ni = DynamicCast <Node> (node);
-	//CustomDataTag tag;
-	uint32_t nid = uint32_t(ni->GetId()) - 2;
-	//packet_initial_timestamp[nid] = Simulator::Now().GetSeconds();
-	//cout<<"updating data from node "<<nid<<endl;
-	Ptr<ConstantVelocityMobilityModel> mdl = DynamicCast <ConstantVelocityMobilityModel> (node->GetObject<MobilityModel>());
-	Vector posi = mdl->GetPosition();
-	Vector current_velocity = mdl->GetVelocity();
-	double delta_t = 0.000200;
-	
-	Vector acceleration;
-	acceleration = calculate_acceleration(previous_velocity_dsrc[nid],current_velocity,delta_t);
-	//cout<<"calculating acceleration for nid "<<nid<<"with previous velocity "<<previous_velocity_dsrc[nid]<<"current velocity "<<current_velocity<<" is "<<acceleration<<endl;
-	
-	//Ptr <Packet> packet_i = Create<Packet> (0);
-	//tag.SetNodeId(nid);
-	/*
-	tag.SetPosition(posi);
-	tag.SetVelocity(current_velocity);
-	tag.SetAcceleration(acceleration);
-	tag.SetTimestamp(ti);
-	packet_i->AddPacketTag(tag);
-	dsrc_total_packet_size = dsrc_total_packet_size + packet_i->GetSerializedSize();
-	//Simulator::Schedule (Seconds(0) , &WifiNetDevice::Send, wdi, packet_i, dest, protocolwave);	
-	cout<<"dsrc total size is "<<dsrc_total_packet_size<<endl;
-	*/
-	//previous_velocity_dsrc[nid] = current_velocity;
-	
-	nd1->acceleration = acceleration;
-	nd1->velocity = current_velocity;
-	nd1->position = posi;
-	nd1->nodeid = nid;
-	//cout<<"updating data from node "<<nid<< "updated as acceleration"<<nd1->acceleration<<"velocity: "<<nd1->velocity<< "position"<<nd1->position<<endl;
-}
+// add_routing_data_at_nodes() removed in Stage 10 — LDA legacy, no references after Stage 2 cleanup
 
 
 void add_demanding_flow_struct_nodes(struct demanding_flow_struct_nodes * nd1, uint32_t source, uint32_t destination, uint32_t x, uint32_t z, uint32_t q)

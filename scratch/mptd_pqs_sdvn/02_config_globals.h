@@ -292,8 +292,7 @@ bool present_fabrication_attack_controllers = false;
 bool present_MIM_attack_nodes           = false;
 bool present_MIM_attack_controllers     = false;
 
-// ── Lagrangian / QoS multipliers ──────────────────────────────────────────
-double mu1 = 0.0, mu2 = 0.0, mu3 = 0.0;
+// mu1/mu2/mu3 removed in Stage 10 — LDA Lagrangian multipliers, no references found
 
 // ── Controller state matrices (Q, Y, Omega, W, T, t) ─────────────────────
 // All follow the same nested struct pattern as LLegacyFi / DeltaLegacyFi.
