@@ -39,3 +39,9 @@ analytics/data/optimization_data.csv
 # ── Ignore compiled objects inside scratch ────────────────────────────────────
 scratch/**/*.o
 scratch/**/*.a
+
+# ── ML pipeline: ignore generated/binary artefacts ───────────────────────────
+analytics/ml/__pycache__/
+analytics/ml/**/__pycache__/
+analytics/ml/**/*.pyc
+analytics/ml/models/
