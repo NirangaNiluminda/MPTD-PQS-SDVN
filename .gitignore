@@ -45,3 +45,8 @@ analytics/ml/__pycache__/
 analytics/ml/**/__pycache__/
 analytics/ml/**/*.pyc
 analytics/ml/models/
+
+# ── Stage 8: ignore auto-generated evaluation outputs ─────────────────────────
+analytics/results/figures/
+analytics/results/sweep/
+analytics/results/logs/
