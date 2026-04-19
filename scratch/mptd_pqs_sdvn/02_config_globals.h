@@ -204,33 +204,7 @@ LegacyLinkF Link_duplicates_SecondTime_downlink_at_controller_inst[2];
 #define max 40               // array size for neighbor tables in 05_utils.h
 const int flows = 1;         // flow count — only 05_utils struct arrays use this
 uint32_t large = 50000;      // sentinel value used in clear_data_at_nodes()
-// ── Temporary: max1..max25 still referenced by 03_packet_tags.h ───────────
-// Will be removed in Stage 2 when 03_packet_tags.h is replaced.
-#define max1  1
-#define max2  2
-#define max3  3
-#define max4  4
-#define max5  5
-#define max6  6
-#define max7  7
-#define max8  8
-#define max9  9
-#define max10 10
-#define max11 11
-#define max12 12
-#define max13 13
-#define max14 14
-#define max15 15
-#define max16 16
-#define max17 17
-#define max18 18
-#define max19 19
-#define max20 20
-#define max21 21
-#define max22 22
-#define max23 23
-#define max24 24
-#define max25 25
+// max1..max25 removed in Stage 9 — no references found after Stage 2 cleanup
 
 // ── Legacy controller delta / L structs (09_send_lte.h / 12_main.h) ───────
 struct DeltaLegacyVal { double delta_values[MAX_NODES]; };
