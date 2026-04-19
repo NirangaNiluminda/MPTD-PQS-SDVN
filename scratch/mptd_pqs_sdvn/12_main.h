@@ -1482,6 +1482,21 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 		       //unicast metadata from RSU nodes to management server - only in the first data cycle
 			declare_attack_states();
 			declare_attackers();
+
+			// ── Stage 7: PQ Crypto self-test (always runs) ────────────────────────────
+			if (use_pq_crypto) {
+			    TRSSignature pq_sig = generate_trs_aggregate(0, 100.0, 200.0, 15.0, 1.57, 0.0);
+			    verify_trs(pq_sig);
+			    std::cout << "[TRS] PQ-INIT: RSU ring self-test — "
+			              << "signers=" << pq_sig.signers.size()
+			              << " verified=" << (pq_sig.verified ? "YES" : "NO")
+			              << " hash=" << pq_sig.aggregate_hash << "\n";
+			    FHECiphertext pq_ct = fhe_encrypt_scalar(15.0);
+			    std::cout << "[FHE] PQ-INIT: CKKS self-test — "
+			              << "enc=" << pq_ct.noisy_value
+			              << " err=" << std::abs(fhe_decrypt_scalar(pq_ct) - 15.0) << "\n";
+			}
+
 			double t_assign = t0 + 0.001 * (time(NULL) % 1000);
 			Simulator::Schedule(Seconds(t_assign), assign_controllers);
 			test_boolean();			

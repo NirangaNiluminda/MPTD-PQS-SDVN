@@ -71,6 +71,11 @@ const char* attack_scenario_name[] = {
 
 bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 
+// ── Stage 7: Post-Quantum Crypto flag ──────────────────────────────────────
+// Set to false for ablation study A4 (disables TRS + FHE)
+// Paper §3.3.2-3.3.3; Eq. 3.58-3.65
+bool use_pq_crypto = true;
+
 // ── BSM Beacon Parameters (IEEE 802.11p, §3.4.4 Eq. 3.9) ──────────────────
 // b_i(t) = (p_i(t), s_i(t), θ_i(t), a_i(t), t, ID_i)
 double T_b = 0.1;           // Beacon broadcast interval: 100ms (IEEE 802.11p)

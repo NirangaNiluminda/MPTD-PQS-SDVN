@@ -2792,3 +2792,18 @@ void decrypt_downlink_packet(struct downlink_packet_decrypt dlpd)
     // Replaced with 08_beacon_handlers.h in Stage 4. No-op stub.
     (void)dlpd;
 }
+
+// ============================================================
+// STAGE 7: Post-Quantum Cryptography — TRS + Simulated CKKS FHE
+// Paper §3.3.2 (TRS, Eq. 3.58-3.60) and §3.3.3 (FHE, Eq. 3.61-3.65)
+//
+// Implementations (TRSSignature, FHECiphertext, generate_trs_aggregate,
+// verify_trs, fhe_encrypt_scalar, fhe_aggregate, fhe_decrypt_scalar)
+// are defined in 06_mrtpa_attack.h (included before this file) so that
+// StoreTrajectoryToBlockchain() can use them at the point of call.
+//
+// When OpenFHE is installed, replace FHECiphertext with Ciphertext<DCRTPoly>
+// and add to 01_includes.h:
+//   #include <openfhe.h>
+//   using namespace lbcrypto;
+// ============================================================

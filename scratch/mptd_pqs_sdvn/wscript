@@ -4,3 +4,13 @@ def build(bld):
          'mobility', 'wave', 'applications', 'point-to-point',
          'flow-monitor', 'netanim'])
     obj.source = ['simulation.cc']
+    # Stage 7: OpenFHE Post-Quantum Crypto (TRS + CKKS FHE)
+    # Uncomment when OpenFHE is installed:
+    #   sudo apt-get install -y libgmp-dev
+    #   git clone https://github.com/openfheorg/openfhe-development.git
+    #   cd openfhe-development && mkdir build && cd build
+    #   cmake .. && make -j4 && sudo make install
+    # Then replace FHECiphertext with Ciphertext<DCRTPoly> in 07_security.h
+    # and add the following lines:
+    # obj.uselib = 'OPENFHE'
+    # env.LIB_OPENFHE = ['OPENFHEbinfhe', 'OPENFHEcore', 'OPENFHEpke']
