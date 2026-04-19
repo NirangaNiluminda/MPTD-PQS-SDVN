@@ -147,6 +147,15 @@ vector<vector<vector<vector<double>>>> I_mat;
 
 // Z_nodes / X_nodes: declared in 07_security.h — do NOT redeclare here
 
+// ── Routing packet timestamp arrays ──────────────────────────────────────────
+double routing_packet_initial_timestampLLDP[2][2][total_size][total_size] = {};
+double routing_packet_final_timestampLLDP  [2][2][total_size][total_size] = {};
+double intercepted_packet_initial_timestampLLDP[2][2][total_size][total_size][total_size] = {};
+double intercepted_packet_final_timestampLLDP  [2][2][total_size][total_size][total_size] = {};
+// Per-flow packet timestamps (indexed by flow id and packet id)
+double routing_packet_final_timestamp        [2*flows][Flow_size+2] = {};
+double routing_packet_general_final_timestamp[2*flows][total_size][Flow_size+2] = {};
+
 double R_max = 278;
 
 // Forward declaration for vehicle_send_to_nearest_rsu

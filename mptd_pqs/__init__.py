@@ -1,5 +1,5 @@
 """
-MPTD-PQS: Mobility Pattern Trajectory Detection with Post-Quantum Security_
+MPTD-PQS: Mobility Pattern Trajectory Detection with Post-Quantum Security
 ==========================================================================
 Dual-mode detection framework for Software Defined Vehicular Networks (SDVN).
 

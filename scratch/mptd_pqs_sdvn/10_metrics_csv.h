@@ -1,1732 +1,235 @@
 // ============================================================
-// SECTION 10: Performance Metrics and CSV Output Functions
+// SECTION 10: MPTD-PQS Paper Metrics + CSV Output (Stage 4)
 // ============================================================
-// These functions compute and save all performance metrics
-// reported in the paper's evaluation section.
+// Implements the 7 evaluation metrics from §3.5 of the paper:
+//   MCC  - Matthews Correlation Coefficient
+//   FPR  - False Positive Rate
+//   PARR - Poisoning Attack Rejection Rate
+//   CDER - Correct Detection-to-Error Ratio
+//   TDEE - Trajectory Data Error Exposure
+//   TPE  - Trajectory Poisoning Exposure
+//   PBPO - Post-Blockchain Poisoning Offset
 //
-// CSV Write Functions:
-//   write_csv()                - write optimization convergence data
-//   write_csv_status_lifetime()- write link lifetime statistics
-//   write_csv_status()         - write current network status
-//   read_csv()                 - read previously saved metrics
-//   write_csv_results()        - MAIN RESULTS: PDR, latency, jitter, security
-//   write_csv_results_routing()- routing algorithm comparison results
-//   write_csv_results_LLDP()   - LLDP-specific results
-//   write_csv_delay_training() - training data for DNN delay prediction
+// Globals (updated by update_confusion_matrix() each beacon):
+//   cm_TP, cm_FP, cm_TN, cm_FN
 //
-// Global result variables (used in write_csv_results):
-//   current_cost, average_latency, average_packet_delivery_ratio
-//   current_packet_confusion_ratio, current_intercepted_ratio
-//   average_latency_routing, normalized_mobility, network_contention
+// Called from 08_beacon_handlers.h (via forward decls):
+//   update_confusion_matrix(bool is_poisoned, bool detected)
+//   log_beacon_to_csv(vid, rsu_id, tag, detected, sig_mask, psi)
 //
-// Routing timing arrays:
-//   routing_packet_initial_timestamp[flow][packet]
-//   routing_packet_final_timestamp[flow][packet]
-//   intercepted_packet_*timestamp arrays
+// Called from 12_main.h after Simulator::Run():
+//   write_mptd_results_csv()
+//
+// Output paths (NS3_ROOT = /home/niranga/ns-allinone-3.35/ns-3.35):
+//   analytics/results/beacon_log.csv          — per-beacon rows
+//   analytics/results/sweep/metrics_a{N}_p{P}.csv — per-run summary
 // ============================================================
-void write_csv()
+
+#ifndef MPTD_PQS_METRICS_CSV_H
+#define MPTD_PQS_METRICS_CSV_H
+
+#include <fstream>
+#include <cmath>
+#include <sstream>
+#include <sys/stat.h>
+#include <sys/types.h>
+
+// ── Confusion matrix counters ─────────────────────────────────────────────────
+// TN: not poisoned AND not detected
+// FP: not poisoned BUT detected (false alarm)
+// FN: poisoned BUT not detected (missed attack)
+// TP: poisoned AND detected correctly
+uint32_t cm_TP = 0;
+uint32_t cm_FP = 0;
+uint32_t cm_TN = 0;
+uint32_t cm_FN = 0;
+
+// ── Helper: create directory (no-op if exists) ────────────────────────────────
+static void ensure_analytics_dir(const char *path)
 {
-	fstream fout;
-	fout.open(NS3_ROOT "/analytics/data/optimization_data.csv",ios::out|ios::trunc);
-	for (uint32_t i=2; i<total_size+2 ;i++)
-	{
-		fout << total_size << ", "
-		     <<	con_data_inst[i].B << ", "
-		     << con_data_inst[i].neighborsize << ", ";
-		     //<< con_data_inst[i].frequency << ", "
-		     //<< con_data_inst[i].datasize << ", ";
-		     for(uint32_t j=0;j<max;j++)
-		     {
-		     	fout<< con_data_inst[i].neighborid[j] << ", ";
-		     }
-		     /*
-		     for(uint32_t j=0;j<max;j++)
-		     {
-		     	fout<< con_data_inst[i].combined_cost[j] << ", ";
-		     }
-		     */
-		     fout<< "\n";
-	}
-	fout.close();
+    mkdir(path, 0755);
 }
 
-void write_csv_status_lifetime()
+// ── Confusion matrix update ────────────────────────────────────────────────────
+// Called by HandleBeaconReceived() in 08_beacon_handlers.h after each beacon.
+void update_confusion_matrix(bool is_poisoned, bool detected)
 {
-	fstream fout;
-	switch(routing_algorithm)
-	{
-		case(0):
-			fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_ECMP.csv",ios::out|ios::trunc);
-			break;
-		case(1):
-			fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_RR.csv",ios::out|ios::trunc);
-			break;
-		case(2):
-			fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_QRSDN.csv",ios::out|ios::trunc);
-			break;
-		case(3):
-			fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_RLMR.csv",ios::out|ios::trunc);
-			break;
-		case(4):
-			fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data.csv",ios::out|ios::trunc);
-			break;
-		case(5):
-			/*
-			if(experiment_number == 0)
-			{
-				fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_QRSDN.csv",ios::out|ios::trunc);
-			}
-			if(experiment_number == 1)
-			{
-				fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_RR.csv",ios::out|ios::trunc);
-			}
-			if(experiment_number == 2)
-			{
-				fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_QRSDN.csv",ios::out|ios::trunc);
-			}
-			if(experiment_number == 3)
-			{
-				fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_RLMR.csv",ios::out|ios::trunc);
-			}
-			*/
-			fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data_RLMR.csv",ios::out|ios::trunc);
-			break;
-			
-		default:
-			fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data.csv",ios::out|ios::trunc);
-			break;
-	}
-	for (uint32_t i=0; i<total_size ;i++)
-	{
-		//cout<<"writing status "<<i<<endl;
-		fout << total_size << ", "
-		     << (routing_data_at_controller_inst+i)->nodeid << ", "
-		     << (routing_data_at_controller_inst+i)->position.x << ", "
-		     << (routing_data_at_controller_inst+i)->position.y << ", "
-		     << (routing_data_at_controller_inst+i)->velocity.x<< ", "
-		     << (routing_data_at_controller_inst+i)->velocity.y << ", "
-		     << (routing_data_at_controller_inst+i)->acceleration.x << ", "
-		     << (routing_data_at_controller_inst+i)->acceleration.y << ", "
-		     << mobility_scenario << ", "
-		     << N_Vehicles << ", "
-		     << N_RSUs << ", "
-		     << "\n";
-	}
-	fout.close();
-	cout<<"finished writing link lifetime status at"<<Now().GetSeconds()<<endl;
+    if  (is_poisoned &&  detected) cm_TP++;
+    else if (!is_poisoned &&  detected) cm_FP++;
+    else if (!is_poisoned && !detected) cm_TN++;
+    else                                cm_FN++; // poisoned, not detected
 }
 
-void write_csv_status()
+// ── Per-beacon CSV log ─────────────────────────────────────────────────────────
+// Appends one row per beacon for downstream ML pipeline training/evaluation.
+// Columns: sim_time, vehicle_id, rsu_id, pos_x, pos_y, speed, heading, accel,
+//          is_poisoned, detected, sig_mask, psi_score, attack_number, attack_pct
+void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
+                       bool detected, uint32_t sig_mask, double psi)
 {
-	fstream fout;
-	fout.open(NS3_ROOT "/analytics/data/optimization_link_lifetime_data.csv",ios::out|ios::trunc);
-	for (uint32_t i=2; i<total_size+2 ;i++)
-	{
-		Ptr <Node> node;
-		if ((i-2) < N_Vehicles)
-		{	
-			node = DynamicCast <Node> (Vehicle_Nodes.Get(i-2));
-		}
-		else
-		{
-			node = DynamicCast <Node> (RSU_Nodes.Get(i-N_Vehicles-2));
-		}
-		
-		Ptr<ConstantVelocityMobilityModel> mdl = DynamicCast <ConstantVelocityMobilityModel> (node->GetObject<MobilityModel>());
-        	Vector position = mdl->GetPosition();
-        	Vector velocity = mdl->GetVelocity();
-		//cout<<"writing status "<<i<<endl;
-		fout << total_size << ", "
-		     << position.x << ", "
-		     <<	position.y << ", "
-		     << velocity.x<< ", "
-		     << velocity.y << ", "
-		     << data_at_manager_inst[i].acceleration.x << ", "
-		     << data_at_manager_inst[i].acceleration.y << ", "
-		     << mobility_scenario << ", "
-		     << N_Vehicles << ", "
-		     << N_RSUs << ", "
-		     << "\n";
-	}
-	fout.close();
-	cout<<"finished writing status"<<endl;
-}
+    ensure_analytics_dir(NS3_ROOT "/analytics");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
+    static bool header_written = false;
+    std::ofstream fout;
 
-void read_csv()
-{
-    fstream fin;
-    fin.open(NS3_ROOT "/analytics/data/optimization_results.csv", ios::in);
-    vector<string> row;
-    string line;
-    string temp;
-    int j=0;
-    while (fin >> temp) 
-    {
-        row.clear();
-        getline(fin, line);
-        int n = line.length();
-        char line_char[n+1];
-        strcpy(line_char,line.c_str());
-        //cout<<line<<endl;
-        int int_val;
-        char * ptr;
-        ptr = strtok(line_char,",");
-        int i =0;
-        while(ptr != NULL)
-        {
-        	stringstream ss;
-		ss << ptr;
-		ss >> int_val;
-		if (i==0)
-		{
-			X_gurobi[j+2] = int_val;
-			//cout<<"x"<<j<<" value "<<int_val<<endl;
-		}
-		if (i==1)
-		{
-			Z_gurobi[j+2] = int_val;
-			//cout<<"z"<<j<<"value "<<int_val<<endl;
-		}
-        	
-        	ptr = strtok(NULL,",");   
-        	i++;	
-        }
-        j++;
+    if (!header_written) {
+        fout.open(NS3_ROOT "/analytics/results/beacon_log.csv",
+                  std::ios::out | std::ios::trunc);
+        fout << "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
+             << "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct\n";
+        header_written = true;
+    } else {
+        fout.open(NS3_ROOT "/analytics/results/beacon_log.csv",
+                  std::ios::out | std::ios::app);
     }
-    if (j == 0)
-        cout << "Solution not found\n";
+
+    fout << tag.GetTimestamp()      << ","
+         << vid                     << ","
+         << rsu_id                  << ","
+         << tag.GetPosX()           << ","
+         << tag.GetPosY()           << ","
+         << tag.GetSpeed()          << ","
+         << tag.GetHeading()        << ","
+         << tag.GetAcceleration()   << ","
+         << (tag.GetIsPoisoned() ? 1 : 0) << ","
+         << (detected            ? 1 : 0) << ","
+         << sig_mask                << ","
+         << psi                     << ","
+         << attack_number           << ","
+         << attack_percentage       << "\n";
+    fout.close();
 }
 
-double current_cost = 0.0;
-double current_lte_utilization = 0.0;
-double current_ethernet_utilization = 0.0;
-double current_dsrc_utilization=0.0;
-double current_computational_complexity=0.0;
-double current_routing_latency=0.0;
-double current_latency=0.0;
-double current_latency_dsrc = 0.0;
-double optimization_percentage = 0.0;
-double average_packet_delivery_ratio = 0.0;
-double current_packet_delivery_ratio = 0.0;
-double current_packet_confusion_ratio = 0.0;
-double current_intercepted_ratio = 0.0;
-double average_packet_delivery_ratio_dsrc = 0.0;
-double average_packet_confusion = 0.0;
-double average_intercepted_ratio = 0.0;
-double current_packet_delivery_ratio_dsrc = 0.0;
-double normalized_mobility = 0.0;
-double network_contention = 0.0;
+// ── 7 Paper Metric Computations (§3.5) ───────────────────────────────────────
 
-void write_csv_results()
+// MCC: Matthews Correlation Coefficient
+// (TP·TN − FP·FN) / sqrt((TP+FP)(TP+FN)(TN+FP)(TN+FN))
+double compute_MCC()
 {
-	fstream fout;
-	string filename;
-	if (architecture == 0)
-	{
-		switch (experiment_number)
-		{
-			case (0)://entropy experiment
-				filename = NS3_ROOT "/analytics/results/centralized_entropy.csv";
-	
-				break;
-			case (1)://optimization frequency
-				if (data_transmission_frequency == 0.02)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_0.02.csv";
-				}
-				if (data_transmission_frequency ==0.05)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_0.05.csv";
-				}
-				if (data_transmission_frequency ==0.10)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_0.10.csv";
-				}
-				if (data_transmission_frequency ==0.25)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_0.25.csv";
-				}
-				if (data_transmission_frequency ==0.50)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_0.50.csv";
-				}
-
-				if (data_transmission_frequency == 1.00)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_1.00.csv";
-				}
-
-				if (data_transmission_frequency ==2.00)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_2.csv";
-				}
-
-				if (data_transmission_frequency ==4.00)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_4.csv";
-				}
-
-				if (data_transmission_frequency ==6.00)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_6.csv";
-				}
-
-				if (data_transmission_frequency ==8.00)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_8.csv";
-				}
-
-				if (data_transmission_frequency ==10.00)
-				{
-					filename = NS3_ROOT "/analytics/results/centralized_frequency_10.csv";
-				}
-
-				break;
-			case (2): //number of nodes
-				switch(total_size)
-				{
-					case (4):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_4.csv";
-						break;
-					case (8):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_8.csv";
-						break;
-					case (16):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_16.csv";
-						break;
-					case (32):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_32.csv";
-						break;
-					case (64):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_64.csv";
-						break;
-					case (96):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_96.csv";
-						break;
-					case (128):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_128.csv";
-						break;
-					case (160):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_160.csv";
-						break;						
-					case (192):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_192.csv";
-						break;
-					case (224):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_224.csv";
-						break;
-					case (256):
-						filename = NS3_ROOT "/analytics/results/centralized_nodes_256.csv";
-						break;
-				}
-				break;
-			case (3)://mobility scenario
-				if (mobility_scenario == 0) //urban mobility
-				  {
-				  	switch(maxspeed)
-				  	{
-				  		case (0):
-				  			filename = NS3_ROOT "/analytics/results/centralized_mobility_urban_0.csv";
-					  		break;
-				  		case (10):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_urban_10.csv";
-					  		break;
-					  	case (20):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_urban_20.csv";
-					  		break;
-					  	case (30):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_urban_30.csv";
-					  		break;
-					  	case (40):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_urban_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_urban_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_urban_60.csv";
-					  		break;
-					  	default:
-					  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 1) //non-urban mobility
-				   {
-				   	switch(maxspeed)
-				   	{
-				   		case (0):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_0.csv";
-				   	  		break;
-				   		case (10):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_10.csv";
-				   	  		break;
-				   	  	case (20):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_20.csv";
-					  		break;
-					  	case (30):
-					   		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_30.csv";
-					   		break;
-					   	case (40):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_60.csv";
-					  		break;
-				   	  	case (70):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_70.csv";
-				   	  		break;
-				   	  	case (80):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_80.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_90.csv";
-				   	  		break;
-				   	  	case (100):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_rural_100.csv";
-				   	  		break;
-				   	  	default:
-				   	  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 2)//highway
-				   {
-				   	  switch(maxspeed)
-				   	  {
-				   	  	case (0):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_0.csv";
-				   	  		break;
-				   	  	case (10):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_10.csv";
-				   	  		break;
-				   	  	case (30):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_30.csv";
-				   	  		break;
-				   	  	case (50):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_50.csv";
-				   	  		break;
-				   	  	case (70):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_70.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_90.csv";
-				   	  		break;
-				   	  	case (110):
-				   	  		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_110.csv";
-				   	  		break;
-					 	case (130):
-					 		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_130.csv";
-					 		break;
-					 	case (150):
-					 		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_150.csv";
-					 		break;
-					 	case (170):
-					 		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_170.csv";
-					 		break;
-					 	case (190):
-					 		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_190.csv";
-					 		break;
-					 	case (210):
-					 		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_210.csv";
-					 		break;
-					 	case (230):
-					 		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_230.csv";
-					 		break;
-					 	case (250):
-					 		filename = NS3_ROOT "/analytics/results/centralized_mobility_autobahn_250.csv";
-					 		break;
-					 	default:
-					 		break;
-					  }
-				   }
-				break;
-			case (4): //RSU ratios
-				uint32_t ratio;
-				if (N_RSUs != 0)
-				{
-					ratio = N_Vehicles/N_RSUs;
-				}
-				else
-				{
-					ratio = 200;
-				}
-				switch (ratio)
-				{
-					case(200)://200 veh, 0 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_inf.csv";
-						break;
-					case(199)://199 veh, 1 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_199.csv";
-						break;
-					case(99)://198 veh, 2 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_99.csv";
-						break;
-					case(49)://196 veh, 4 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_49.csv";
-						break;
-					case(24)://192 veh, 8 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_24.csv";
-						break;
-					case(9)://180 veh, 20 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_9.csv";
-						break;
-					case(4)://160 veh, 40 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_4.csv";
-						break;
-					case(3):// 150 veh, 50 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_3.csv";
-						break;
-					case(2): //134 veh, 66 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_2.csv";
-						break;
-					case(1): //100 veh, 100 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_1.csv";
-						break;
-					case(0): //0 veh, 200 RSU
-						filename = NS3_ROOT "/analytics/results/centralized_heterogeneity_0.csv";
-						break;
-				}
-				break;
-			case (7)://threshold experiment
-				filename = NS3_ROOT "/analytics/results_routing/centralized_threshold.csv";
-				break;	
-			case (8)://threshold experiment
-				filename = NS3_ROOT "/analytics/results_routing/centralized_threshold.csv";
-				break;
-			case (9)://routing frequency
-				if (routing_frequency == 0.02)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_0.02.csv";
-				}
-				if (routing_frequency ==0.05)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_0.05.csv";
-				}
-				if (routing_frequency ==0.10)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_0.10.csv";
-				}
-				if (routing_frequency ==0.25)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_0.25.csv";
-				}
-				if (routing_frequency ==0.50)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_0.50.csv";
-				}
-				if (routing_frequency == 1.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_1.00.csv";
-				}
-				if (routing_frequency ==2.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_2.csv";
-				}
-
-				if (routing_frequency ==3.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_3.csv";
-				}
-		
-				if (routing_frequency == 4.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_4.csv";
-				}
-
-				if (routing_frequency ==5.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/centralized_routing_frequency_5.csv";
-				}
-				break;
-			case (10): //number of nodes for routing
-				switch(total_size)
-				{
-					case (4):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_4.csv";
-						break;
-					case (8):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_8.csv";
-						break;
-					case (16):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_16.csv";
-						break;
-					case (32):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_32.csv";
-						break;
-					case (64):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_64.csv";
-						break;
-					case (96):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_96.csv";
-						break;
-					case (128):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_128.csv";
-						break;
-					case (160):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_160.csv";
-						break;						
-					case (192):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_192.csv";
-						break;
-					case (224):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_224.csv";
-						break;
-					case (256):
-						filename = NS3_ROOT "/analytics/results_routing/centralized_routing_nodes_256.csv";
-						break;
-				}
-				break;
-			case (11)://mobility scenario routing
-				if (mobility_scenario == 0) //urban mobility
-				  {
-				  	switch(maxspeed)
-				  	{
-				  		case (0):
-				  			filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_urban_0.csv";
-					  		break;
-				  		case (10):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_urban_10.csv";
-					  		break;
-					  	case (20):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_urban_20.csv";
-					  		break;
-					  	case (30):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_urban_30.csv";
-					  		break;
-					  	case (40):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_urban_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_urban_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_urban_60.csv";
-					  		break;
-					  	default:
-					  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 1) //non-urban mobility
-				   {
-				   	switch(maxspeed)
-				   	{
-				   		case (0):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_rural_0.csv";
-				  	  		break;
-				   	  	case (20):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_rural_20.csv";
-					  		break;
-					   	case (40):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_rural_40.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_rural_60.csv";
-					  		break;
-				   	  	case (80):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_rural_80.csv";
-				   	  		break;
-				   	  	case (100):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_rural_100.csv";
-				   	  		break;
-				   	  	default:
-				   	  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 2)//highway
-				   {
-				   	  switch(maxspeed)
-				   	  {
-				   	  	case (0):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_autobahn_0.csv";
-				   	  		break;
-				   	  	case (30):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/centralized__routing_mobility_autobahn_30.csv";
-				   	  		break;
-				   	  	case (50):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/centralized__routing_mobility_autobahn_50.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/centralized__routing_mobility_autobahn_90.csv";
-				   	  		break;
-					 	case (130):
-					 		filename = NS3_ROOT "/analytics/results_routing/centralized__routing_mobility_autobahn_130.csv";
-					 		break;
-					 	case (170):
-					 		filename = NS3_ROOT "/analytics/results_routing/centralized__routing_mobility_autobahn_170.csv";
-					 		break;
-					 	case (210):
-					 		filename = NS3_ROOT "/analytics/results_routing/centralized__routing_mobility_autobahn_210.csv";
-					 		break;
-					 	case (250):
-					 		filename = NS3_ROOT "/analytics/results_routing/centralized_routing_mobility_autobahn_250.csv";
-					 		break;
-					 	default:
-					 		break;
-					  }
-				   }
-				break;
-		}
-	}
-	
-	if (architecture == 1)
-	{
-		switch (experiment_number)
-		{
-			case (0)://entropy experiment
-				filename = NS3_ROOT "/analytics/results/distributed_entropy.csv";
-	
-				break;
-			case (1)://optimization frequency
-				if (data_transmission_frequency == 0.02)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_0.02.csv";
-				}
-				if (data_transmission_frequency ==0.05)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_0.05.csv";
-				}
-				if (data_transmission_frequency ==0.10)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_0.10.csv";
-				}
-				if (data_transmission_frequency ==0.25)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_0.25.csv";
-				}
-				if (data_transmission_frequency ==0.50)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_0.50.csv";
-				}
-
-				if (data_transmission_frequency == 1.00)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_1.00.csv";
-				}
-
-				if (data_transmission_frequency ==2.00)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_2.csv";
-				}
-
-				if (data_transmission_frequency ==4.00)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_4.csv";
-				}
-
-				if (data_transmission_frequency ==6.00)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_6.csv";
-				}
-
-				if (data_transmission_frequency ==8.00)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_8.csv";
-				}
-
-				if (data_transmission_frequency ==10.00)
-				{
-					filename = NS3_ROOT "/analytics/results/distributed_frequency_10.csv";
-				}
-
-				break;
-			case (2): //number of nodes
-				switch(total_size)
-				{
-					case (4):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_4.csv";
-						break;
-					case (8):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_8.csv";
-						break;
-					case (16):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_16.csv";
-						break;
-					case (32):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_32.csv";
-						break;
-					case (64):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_64.csv";
-						break;
-					case (96):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_96.csv";
-						break;
-					case (128):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_128.csv";
-						break;
-					case (160):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_160.csv";
-						break;						
-					case (192):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_192.csv";
-						break;
-					case (224):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_224.csv";
-						break;
-					case (256):
-						filename = NS3_ROOT "/analytics/results/distributed_nodes_256.csv";
-						break;
-				}
-				break;
-			case (3)://mobility scenario
-				if (mobility_scenario == 0) //urban mobility
-				  {
-				  	switch(maxspeed)
-				  	{
-				  		case (0):
-				  			filename = NS3_ROOT "/analytics/results/distributed_mobility_urban_0.csv";
-					  		break;
-				  		case (10):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_urban_10.csv";
-					  		break;
-					  	case (20):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_urban_20.csv";
-					  		break;
-					  	case (30):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_urban_30.csv";
-					  		break;
-					  	case (40):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_urban_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_urban_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_urban_60.csv";
-					  		break;
-					  	default:
-					  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 1) //non-urban mobility
-				   {
-				   	switch(maxspeed)
-				   	{
-				   		case (0):
-				   	  		filename = NS3_ROOT "/analytics/results/distributed_mobility_rural_0.csv";
-				   	  		break;
-				   	  	case (20):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_rural_20.csv";
-					  		break;
-					   	case (40):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_rural_40.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results/distributed_mobility_rural_60.csv";
-					  		break;
-				   	  	case (80):
-				   	  		filename = NS3_ROOT "/analytics/results/distributed_mobility_rural_80.csv";
-				   	  		break;
-				   	  	case (100):
-				   	  		filename = NS3_ROOT "/analytics/results/distributed_mobility_rural_100.csv";
-				   	  		break;
-				   	  	default:
-				   	  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 2)//highway
-				   {
-				   	  switch(maxspeed)
-				   	  {
-				   	  	case (0):
-				   	  		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_0.csv";
-				   	  		break;
-				   	  	case (30):
-				   	  		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_30.csv";
-				   	  		break;
-				   	  	case (50):
-				   	  		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_50.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_90.csv";
-					 	case (130):
-					 		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_130.csv";
-					 		break;
-					 	case (170):
-					 		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_170.csv";
-					 		break;
-					 	case (210):
-					 		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_210.csv";
-					 		break;
-					 	case (250):
-					 		filename = NS3_ROOT "/analytics/results/distributed_mobility_autobahn_250.csv";
-					 		break;
-					 	default:
-					 		break;
-					  }
-				   }
-				break;
-			case (4): //RSU ratios
-				uint32_t ratio;
-				if (N_RSUs != 0)
-				{
-					ratio = N_Vehicles/N_RSUs;
-				}
-				else
-				{
-					ratio = 200;
-				}
-				switch (ratio)
-				{
-					case(200)://200 veh, 0 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_inf.csv";
-						break;
-					case(199)://199 veh, 1 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_199.csv";
-						break;
-					case(99)://198 veh, 2 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_99.csv";
-						break;
-					case(49)://196 veh, 4 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_49.csv";
-						break;
-					case(24)://192 veh, 8 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_24.csv";
-						break;
-					case(9)://180 veh, 20 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_9.csv";
-						break;
-					case(4)://160 veh, 40 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_4.csv";
-						break;
-					case(3):// 150 veh, 50 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_3.csv";
-						break;
-					case(2): //134 veh, 66 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_2.csv";
-						break;
-					case(1): //100 veh, 100 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_1.csv";
-						break;
-					case(0): //0 veh, 200 RSU
-						filename = NS3_ROOT "/analytics/results/distributed_heterogeneity_0.csv";
-						break;
-				}
-				break;
-			case (7)://link lifetime threshold experiment
-				filename = NS3_ROOT "/analytics/results_routing/distributed_threshold.csv";
-				break;	
-			case (8)://contention threshold experiment
-				filename = NS3_ROOT "/analytics/results_routing/distributed_threshold.csv";
-				break;
-			case (9)://routing frequency
-				if (routing_frequency == 0.02)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_0.02.csv";
-				}
-				if (routing_frequency ==0.05)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_0.05.csv";
-				}
-				if (routing_frequency ==0.10)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_0.10.csv";
-				}
-				if (routing_frequency ==0.25)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_0.25.csv";
-				}
-				if (routing_frequency ==0.50)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_0.50.csv";
-				}
-				if (routing_frequency == 1.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_1.00.csv";
-				}
-				if (routing_frequency ==2.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_2.csv";
-				}
-
-				if (routing_frequency ==3.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_3.csv";
-				}
-		
-				if (routing_frequency == 4.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_4.csv";
-				}
-
-				if (routing_frequency ==5.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/distributed_routing_frequency_5.csv";
-				}
-
-				break;
-			case (10): //number of nodes for routing
-				switch(total_size)
-				{
-					case (4):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_4.csv";
-						break;
-					case (8):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_8.csv";
-						break;
-					case (16):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_16.csv";
-						break;
-					case (32):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_32.csv";
-						break;
-					case (64):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_64.csv";
-						break;
-					case (96):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_96.csv";
-						break;
-					case (128):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_128.csv";
-						break;
-					case (160):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_160.csv";
-						break;						
-					case (192):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_192.csv";
-						break;
-					case (224):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_224.csv";
-						break;
-					case (256):
-						filename = NS3_ROOT "/analytics/results_routing/distributed_routing_nodes_256.csv";
-						break;
-				}
-				break;
-			case (11)://mobility scenario - routing
-				if (mobility_scenario == 0) //urban mobility
-				  {
-				  	switch(maxspeed)
-				  	{
-				  		case (0):
-				  			filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_urban_0.csv";
-					  		break;
-				  		case (10):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_urban_10.csv";
-					  		break;
-					  	case (20):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_urban_20.csv";
-					  		break;
-					  	case (30):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_urban_30.csv";
-					  		break;
-					  	case (40):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_urban_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_urban_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_urban_60.csv";
-					  		break;
-					  	default:
-					  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 1) //non-urban mobility
-				   {
-				   	switch(maxspeed)
-				   	{
-				   		case (0):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_rural_0.csv";
-				   	  		break;
-				   	  	case (20):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_rural_20.csv";
-					  		break;
-					   	case (40):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_rural_40.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_rural_60.csv";
-					  		break;
-				   	  	case (80):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_rural_80.csv";
-				   	  		break;
-				   	  	case (100):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_rural_100.csv";
-				   	  		break;
-				   	  	default:
-				   	  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 2)//highway
-				   {
-				   	  switch(maxspeed)
-				   	  {
-				   	  	case (0):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_0.csv";
-				   	  		break;
-				   	  	case (30):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_30.csv";
-				   	  		break;
-				   	  	case (50):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_50.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_90.csv";
-				   	  		break;
-					 	case (130):
-					 		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_130.csv";
-					 		break;
-					 	case (170):
-					 		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_170.csv";
-					 		break;
-					 	case (210):
-					 		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_210.csv";
-					 		break;
-					 	case (250):
-					 		filename = NS3_ROOT "/analytics/results_routing/distributed_routing_mobility_autobahn_250.csv";
-					 		break;
-					 	default:
-					 		break;
-					  }
-				   }
-				break;
-		}
-	}
-	
-	if (architecture == 2)
-	{
-		switch (experiment_number)
-		{
-			case (0)://entropy experiment
-				if (entropy_threshold == 0.000)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.000.csv";
-				}
-				if(entropy_threshold == 0.001)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.001.csv";
-				}
-				if(entropy_threshold == 0.002)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.002.csv";
-				}
-				if(entropy_threshold == 0.005)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.005.csv";
-				}
-				if(entropy_threshold == 0.010)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.010.csv";
-				}
-				if(entropy_threshold == 0.020)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.020.csv";
-				}
-				if(entropy_threshold == 0.050)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.050.csv";
-				}
-				if(entropy_threshold == 0.100)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.100.csv";
-				}
-				if(entropy_threshold == 0.200)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.200.csv";
-				}
-				if(entropy_threshold == 0.500)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_entropy_0.500.csv";
-				}
-				break;
-			case (1)://optimization frequency
-				if (optimization_frequency == 0.02)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_0.02.csv";
-				}
-				if (optimization_frequency ==0.05)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_0.05.csv";
-				}
-				if (optimization_frequency ==0.10)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_0.10.csv";
-				}
-				if (optimization_frequency ==0.25)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_0.25.csv";
-				}
-				if (optimization_frequency ==0.50)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_0.50.csv";
-				}
-				if (optimization_frequency == 1.0)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_1.00.csv";
-				}
-				if (optimization_frequency ==2.0)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_2.csv";
-				}
-
-				if (optimization_frequency ==4.0)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_4.csv";
-				}
-		
-				if (optimization_frequency == 6.0)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_6.csv";
-				}
-
-				if (optimization_frequency ==8.0)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_8.csv";
-				}
-
-				if (optimization_frequency ==10.0)
-				{
-					filename = NS3_ROOT "/analytics/results/hybrid_frequency_10.csv";
-				}
-
-				break;
-			case (2): //number of nodes
-				switch(total_size)
-				{
-					case (4):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_4.csv";
-						break;
-					case (8):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_8.csv";
-						break;
-					case (16):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_16.csv";
-						break;
-					case (32):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_32.csv";
-						break;
-					case (64):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_64.csv";
-						break;
-					case (96):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_96.csv";
-						break;
-					case (128):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_128.csv";
-						break;
-					case (160):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_160.csv";
-						break;
-					case (192):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_192.csv";
-						break;						
-					case (224):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_224.csv";
-						break;
-					case (256):
-						filename = NS3_ROOT "/analytics/results/hybrid_nodes_256.csv";
-						break;
-				}
-				break;
-			case (3)://mobility scenario
-				if (mobility_scenario == 0) //urban mobility
-				  {
-				  	switch(maxspeed)
-				  	{
-				  		case (0):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_urban_0.csv";
-					  		break;
-				  		case (10):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_urban_10.csv";
-					  		break;
-					  	case (20):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_urban_20.csv";
-					  		break;
-					  	case (30):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_urban_30.csv";
-					  		break;
-					  	case (40):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_urban_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_urban_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_urban_60.csv";
-					  		break;
-					  	default:
-					  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 1) //non-urban mobility
-				   {
-				   	switch(maxspeed)
-				   	{
-				   		case (0):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_0.csv";
-				   	  		break;
-				   		case (10):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_10.csv";
-				   	  		break;
-				   	  	case (20):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_20.csv";
-					  		break;
-					  	case (30):
-					   		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_30.csv";
-					   		break;
-					   	case (40):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_60.csv";
-					  		break;
-				   	  	case (70):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_70.csv";
-				   	  		break;
-				   	  	case (80):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_80.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_90.csv";
-				   	  		break;
-				   	  	case (100):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_rural_100.csv";
-				   	  		break;
-				   	  	default:
-				   	  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 2)//highway
-				   {
-				   	  switch(maxspeed)
-				   	  {
-				   	  	case (0):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_0.csv";
-				   	  		break;
-				   	  	case (10):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_10.csv";
-				   	  		break;
-				   	  	case (30):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_30.csv";
-				   	  		break;
-				   	  	case (50):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_50.csv";
-				   	  		break;
-				   	  	case (70):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_70.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_90.csv";
-				   	  		break;
-				   	  	case (110):
-				   	  		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_110.csv";
-				   	  		break;
-					 	case (130):
-					 		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_130.csv";
-					 		break;
-					 	case (150):
-					 		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_150.csv";
-					 		break;
-					 	case (170):
-					 		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_170.csv";
-					 		break;
-					 	case (190):
-					 		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_190.csv";
-					 		break;
-					 	case (210):
-					 		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_210.csv";
-					 		break;
-					 	case (230):
-					 		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_230.csv";
-					 		break;
-					 	case (250):
-					 		filename = NS3_ROOT "/analytics/results/hybrid_mobility_autobahn_250.csv";
-					 		break;
-					 	default:
-					 		break;
-					  }
-				   }
-				break;
-			case (4): //RSU ratios
-				uint32_t ratio;
-				if (N_RSUs != 0)
-				{
-					ratio = N_Vehicles/N_RSUs;
-				}
-				else
-				{
-					ratio = 200;
-				}
-				switch (ratio)
-				{
-					case(200)://200 veh, 0 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_inf.csv";
-						break;
-					case(199)://199 veh, 1 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_199.csv";
-						break;
-					case(99)://198 veh, 2 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_99.csv";
-						break;
-					case(49)://196 veh, 4 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_49.csv";
-						break;
-					case(24)://192 veh, 8 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_24.csv";
-						break;
-					case(9)://180 veh, 20 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_9.csv";
-						break;
-					case(4)://160 veh, 40 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_4.csv";
-						break;
-					case(3):// 150 veh, 50 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_3.csv";
-						break;
-					case(2): //134 veh, 66 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_2.csv";
-						break;
-					case(1): //100 veh, 100 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_1.csv";
-						break;
-					case(0): //0 veh, 200 RSU
-						filename = NS3_ROOT "/analytics/results/hybrid_heterogeneity_0.csv";
-						break;
-				}
-				break;
-			case (7)://link lifetime experiment
-				if (link_lifetime_threshold == 0.000)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_0.000.csv";
-				}
-				if(link_lifetime_threshold == 0.100)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_0.100.csv";
-				}
-				if(link_lifetime_threshold == 0.200)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_0.200.csv";
-				}
-				if(link_lifetime_threshold == 0.500)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_0.500.csv";
-				}
-				if(link_lifetime_threshold == 1.00)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_1.00.csv";
-				}
-				if(link_lifetime_threshold == 2.00)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_2.000.csv";
-				}
-				if(link_lifetime_threshold == 4.00)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_4.000.csv";
-				}
-				if(link_lifetime_threshold == 6.000)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_6.000.csv";
-				}
-				if(link_lifetime_threshold == 8.000)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_8.000.csv";
-				}
-				if(link_lifetime_threshold == 12.000)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_link_lifetime_10.000.csv";
-				}
-				break;	
-			case (8)://contention experiment
-				if (contention_threshold == 0.000)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.000.csv";
-				}
-				if(contention_threshold == 0.001)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.001.csv";
-				}
-				if(contention_threshold == 0.002)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.002.csv";
-				}
-				if(contention_threshold == 0.005)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.005.csv";
-				}
-				if(contention_threshold == 0.010)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.010.csv";
-				}
-				if(contention_threshold == 0.020)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.020.csv";
-				}
-				if(contention_threshold == 0.050)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.050.csv";
-				}
-				if(contention_threshold == 0.100)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.100.csv";
-				}
-				if(contention_threshold == 0.200)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.200.csv";
-				}
-				if(contention_threshold == 0.500)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_contention_0.500.csv";
-				}
-				break;	
-			case (9)://routing frequency
-				if (routing_frequency == 0.02)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_0.02.csv";
-				}
-				if (routing_frequency ==0.05)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_0.05.csv";
-				}
-				if (routing_frequency ==0.10)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_0.10.csv";
-				}
-				if (routing_frequency ==0.25)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_0.25.csv";
-				}
-				if (routing_frequency ==0.50)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_0.50.csv";
-				}
-				if (routing_frequency == 1.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_1.00.csv";
-				}
-				if (routing_frequency ==2.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_2.csv";
-				}
-
-				if (routing_frequency ==3.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_3.csv";
-				}
-		
-				if (routing_frequency == 4.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_4.csv";
-				}
-
-				if (routing_frequency ==5.0)
-				{
-					filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_frequency_5.csv";
-				}
-
-				break;
-			case (10): //number of nodes-routing
-				switch(total_size)
-				{
-					case (4):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_4.csv";
-						break;
-					case (8):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_8.csv";
-						break;
-					case (16):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_16.csv";
-						break;
-					case (32):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_32.csv";
-						break;
-					case (64):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_64.csv";
-						break;
-					case (96):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_96.csv";
-						break;
-					case (128):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_128.csv";
-						break;
-					case (160):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_160.csv";
-						break;
-					case (192):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_192.csv";
-						break;						
-					case (224):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_224.csv";
-						break;
-					case (256):
-						filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_nodes_256.csv";
-						break;
-				}
-				break;
-			case (11)://mobility scenario
-				if (mobility_scenario == 0) //urban mobility
-				  {
-				  	switch(maxspeed)
-				  	{
-				  		case (0):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_urban_0.csv";
-					  		break;
-				  		case (10):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_urban_10.csv";
-					  		break;
-					  	case (20):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_urban_20.csv";
-					  		break;
-					  	case (30):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_urban_30.csv";
-					  		break;
-					  	case (40):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_urban_40.csv";
-					  		break;
-					  	case (50):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_urban_50.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_urban_60.csv";
-					  		break;
-					  	default:
-					  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 1) //non-urban mobility
-				   {
-				   	switch(maxspeed)
-				   	{
-				   		case (0):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_rural_0.csv";
-				   	  		break;
-				   	  	case (20):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_rural_20.csv";
-					  		break;
-					   	case (40):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_rural_40.csv";
-					  		break;
-					  	case (60):
-					  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_rural_60.csv";
-					  		break;
-				   	  	case (80):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_rural_80.csv";
-				   	  		break;
-				   	  	case (100):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_rural_100.csv";
-				   	  		break;
-				   	  	default:
-				   	  		break;
-					 }
-				   }
-				   
-				   if (mobility_scenario == 2)//highway
-				   {
-				   	  switch(maxspeed)
-				   	  {
-				   	  	case (0):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_0.csv";
-				   	  		break;
-				   	  	case (30):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_30.csv";
-				   	  		break;
-				   	  	case (50):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_50.csv";
-				   	  		break;
-				   	  	case (90):
-				   	  		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_90.csv";
-				   	  		break;
-					 	case (130):
-					 		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_130.csv";
-					 		break;
-					 	case (170):
-					 		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_170.csv";
-					 		break;
-					 	case (210):
-					 		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_210.csv";
-					 		break;
-					 	case (250):
-					 		filename = NS3_ROOT "/analytics/results_routing/hybrid_routing_mobility_autobahn_250.csv";
-					 		break;
-					 	default:
-					 		break;
-					  }
-				   }
-				break;
-		}
-
-	}
-	
-	fout.open(filename,ios::out|ios::app);
-	if (architecture == 0)
-	{
-		fout << data_gathering_cycle_number << ", ";
-	}
-	if (architecture == 2)
-	{
-		fout << (data_gathering_cycle_number - 1) << ", ";
-	}
-	if (paper == 0)
-	{
-	fout << current_cost << ", "
-	     << average_cost << ", "
-	     << current_lte_utilization << ", "
-	     << average_lte_utilization << ", "
-	     << current_ethernet_utilization << ", "
-	     << average_ethernet_utilization << ", "
-	     << current_dsrc_utilization << ", "
-	     << average_dsrc_utilization << ", "
-	     << 1000*current_latency << ", "
-	     << 1000*average_latency << ", "
-	     << optimization_percentage << ", "
-	     << 100*current_packet_delivery_ratio << ", "
-	     << 100*average_packet_delivery_ratio << ", "
-	     << "\n";
-	}
-	
-	if (paper == 1)
-	{
-	fout << current_cost << ", "
-	     << average_cost << ", "
-	     << current_lte_utilization << ", "
-	     << average_lte_utilization << ", "
-	     << current_ethernet_utilization << ", "
-	     << average_ethernet_utilization << ", "
-	     << current_dsrc_utilization << ", "
-	     << average_dsrc_utilization << ", "
-	     << 1000*current_latency_dsrc << ", "
-	     << 1000*average_latency_dsrc << ", "
-	     << 100*current_packet_delivery_ratio_dsrc << ", "
-	     << 100*average_packet_delivery_ratio_dsrc << ", "
-	     << "\n";
-	}
-	fout.close();
+    double tp = cm_TP, fp = cm_FP, tn = cm_TN, fn = cm_FN;
+    double denom = std::sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn));
+    if (denom < 1e-9) return 0.0;
+    return (tp*tn - fp*fn) / denom;
 }
 
-double utilization_time = 0.0;
+// FPR: False Positive Rate  —  FP / (FP + TN)
+double compute_FPR()
+{
+    double fp = cm_FP, tn = cm_TN;
+    if (fp + tn < 1e-9) return 0.0;
+    return fp / (fp + tn);
+}
 
-double packet_delay_routing [2*flows][Flow_size+1];
-double packet_jitter_routing [2*flows][Flow_size+1];
-double routing_packet_initial_timestamp [2*flows][Flow_size+1];
-double routing_packet_final_timestamp [2*flows][Flow_size+1];
-double routing_packet_general_final_timestamp [2*flows][total_size][Flow_size+1];
-double routing_packet_general_initial_timestamp [2*flows][total_size][Flow_size+1];
+// PARR: Poisoning Attack Rejection Rate  —  TP / (TP + FN)  [= Recall]
+double compute_PARR()
+{
+    double tp = cm_TP, fn = cm_FN;
+    if (tp + fn < 1e-9) return 0.0;
+    return tp / (tp + fn);
+}
 
+// CDER: Correct Detection-to-Error Ratio  —  TP / (TP + FP + FN)
+double compute_CDER()
+{
+    double tp = cm_TP, fp = cm_FP, fn = cm_FN;
+    if (tp + fp + fn < 1e-9) return 0.0;
+    return tp / (tp + fp + fn);
+}
 
-double routing_packet_initial_timestampLLDP [2*flows][2*flows][total_size][total_size];
-double routing_packet_final_timestampLLDP [2*flows][2*flows][total_size][total_size];
-double intercepted_packet_initial_timestampLLDP [2*flows][2*flows][total_size][total_size][total_size];
-double intercepted_packet_final_timestampLLDP [2*flows][2*flows][total_size][total_size][total_size];
+// TDEE: Trajectory Data Error Exposure  —  FN / total_received
+double compute_TDEE()
+{
+    double fn = (double)cm_FN;
+    double total = (double)total_trajectories_received;
+    if (total < 1.0) return 0.0;
+    return fn / total;
+}
 
-double average_latency_routing = 0.0;
-double current_latency_routing = 0.0;
-double previous_cumulative_ratio = 0.0;
-double previous_cumulative_confusion_ratio = 0.0;
-double previous_cumulative_intercepted_ratio = 0.0;
+// TPE: Trajectory Poisoning Exposure  —  total_poisoned / total_received
+double compute_TPE()
+{
+    double poisoned = (double)total_trajectories_poisoned;
+    double total    = (double)total_trajectories_received;
+    if (total < 1.0) return 0.0;
+    return poisoned / total;
+}
+
+// PBPO: Post-Blockchain Poisoning Offset
+// (poisoned_stored − flagged_stored) / total_stored
+// Interpreted as: FN / total_stored_blockchain
+// (undetected poisoned entries remaining on ledger without a flag)
+double compute_PBPO()
+{
+    double fn    = (double)cm_FN;
+    double total = (double)total_trajectories_stored_blockchain;
+    if (total < 1.0) return 0.0;
+    return fn / total;
+}
+
+// ── Print all 7 metrics to stdout ─────────────────────────────────────────────
+void print_mptd_metrics()
+{
+    std::cout << "\n── MPTD-PQS Detection Metrics ────────────────────────" << std::endl;
+    std::cout << "  Confusion matrix:"
+              << "  TP=" << cm_TP
+              << "  FP=" << cm_FP
+              << "  TN=" << cm_TN
+              << "  FN=" << cm_FN << std::endl;
+    std::cout << "  MCC  = " << compute_MCC()  << std::endl;
+    std::cout << "  FPR  = " << compute_FPR()  << std::endl;
+    std::cout << "  PARR = " << compute_PARR() << std::endl;
+    std::cout << "  CDER = " << compute_CDER() << std::endl;
+    std::cout << "  TDEE = " << compute_TDEE() << std::endl;
+    std::cout << "  TPE  = " << compute_TPE()  << std::endl;
+    std::cout << "  PBPO = " << compute_PBPO() << std::endl;
+    std::cout << "──────────────────────────────────────────────────────" << std::endl;
+}
+
+// ── Master results CSV — one row per simulation run ───────────────────────────
+// Output: analytics/results/sweep/metrics_a{attack_number}_p{attack_percentage}.csv
+// Scheduled from 12_main.h after Simulator::Run().
+void write_mptd_results_csv()
+{
+    ensure_analytics_dir(NS3_ROOT "/analytics");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results/sweep");
+
+    std::ostringstream fname;
+    fname << NS3_ROOT "/analytics/results/sweep/metrics_a"
+          << attack_number << "_p" << attack_percentage << ".csv";
+
+    std::ofstream fout(fname.str(), std::ios::out | std::ios::trunc);
+
+    // Header
+    fout << "attack_number,attack_pct,"
+         << "cm_TP,cm_FP,cm_TN,cm_FN,"
+         << "MCC,FPR,PARR,CDER,TDEE,TPE,PBPO,"
+         << "total_received,total_poisoned,total_stored\n";
+
+    // Values
+    fout << attack_number        << ","
+         << attack_percentage    << ","
+         << cm_TP                << ","
+         << cm_FP                << ","
+         << cm_TN                << ","
+         << cm_FN                << ","
+         << compute_MCC()        << ","
+         << compute_FPR()        << ","
+         << compute_PARR()       << ","
+         << compute_CDER()       << ","
+         << compute_TDEE()       << ","
+         << compute_TPE()        << ","
+         << compute_PBPO()       << ","
+         << total_trajectories_received         << ","
+         << total_trajectories_poisoned         << ","
+         << total_trajectories_stored_blockchain << "\n";
+    fout.close();
+
+    // Also print to stdout and note the file written
+    print_mptd_metrics();
+    std::cout << "  Results CSV: " << fname.str() << std::endl;
+    std::cout << "  Beacon log : " NS3_ROOT "/analytics/results/beacon_log.csv" << std::endl;
+}
+
+#endif // MPTD_PQS_METRICS_CSV_H

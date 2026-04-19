@@ -1811,6 +1811,9 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   Simulator::Run();
   Simulator::Destroy();
 
+  // ── Write MPTD-PQS metrics CSV (Stage 4) ─────────────────────────────────
+  write_mptd_results_csv();
+
   // ── MRTPA Attack Summary ──────────────────────────────────────────────────
   std::cout << "\n========================================" << std::endl;
   std::cout << " MRTPA ATTACK SUMMARY" << std::endl;

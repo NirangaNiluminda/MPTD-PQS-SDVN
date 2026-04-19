@@ -21,9 +21,16 @@
 #include <cmath>
 #include <sstream>
 
-// ── Forward declaration (defined in 11_routing_blockchain_transmission.h) ──
+// ── Forward declaration (defined in 11_blockchain_transmission.h) ────────────
 void send_dsrc_data_unicast(Ptr<Node> source_node, uint32_t node_index,
                              uint32_t destination, uint32_t port_id);
+
+// ── Forward declarations (defined in 10_metrics_csv.h) ───────────────────────
+// 10_metrics_csv.h is included after this file in simulation.cc, so we
+// forward-declare here to allow HandleBeaconReceived() to call them.
+void update_confusion_matrix(bool is_poisoned, bool detected);
+void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
+                       bool detected, uint32_t sig_mask, double psi);
 
 // ============================================================
 // TP-DETECT — Algorithm 1 (§3.4.4)
@@ -278,7 +285,13 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     //    (Actual blockchain call is in 11_routing_blockchain_transmission.h)
     total_trajectories_stored_blockchain++;
 
-    (void)anomalous; // full mode would invoke GAT+temporal AE via Python pipeline
+    // 8. Update confusion matrix + beacon CSV log (Stage 4)
+    bool detected = anomalous || (tp_flags != 0) || (mp_flags != 0);
+    update_confusion_matrix(tag.GetIsPoisoned(), detected);
+    double psi = double(__builtin_popcount(tp_flags) + __builtin_popcount(mp_flags)) / 9.0;
+    log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
+                      tp_flags | (mp_flags << 5), psi);
+
     (void)now;
 }
 
