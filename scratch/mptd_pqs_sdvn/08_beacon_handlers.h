@@ -32,6 +32,16 @@ void update_confusion_matrix(bool is_poisoned, bool detected);
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi);
 
+// ── Forward declarations (Stage 6: defined in 06_mrtpa_attack.h) ─────────────
+void CallSCTrust(uint32_t vehicleID, double phiScore, uint32_t sigMask,
+                 bool isAnomaly, double timestamp);
+void CallSCRevoke(uint32_t vehicleID, const std::string &reason,
+                  uint32_t rsuID, double timestamp);
+
+// ── Stage 6: consecutive anomaly counter per vehicle (revoke after 3) ─────────
+static int consecutive_anomaly_count[total_size + 2] = {};
+static const int REVOKE_THRESHOLD = 3;
+
 // ============================================================
 // TP-DETECT — Algorithm 1 (§3.4.4)
 // Returns bitmask of violated signatures (bit 0 = TP-S1 ... bit 4 = TP-S5)
@@ -313,6 +323,32 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                     + std::to_string(ac) + "]}'"
             " > /dev/null 2>&1 &";
         system(ml_cmd.c_str());
+    }
+
+    // 10. SC-Trust + SC-Revoke (Stage 6)
+    //     Only in full mode; uses psi as phi approximation until ML server responds
+    if (!routing_test && vehicle_id < (uint32_t)(total_size + 2))
+    {
+        double ts       = Simulator::Now().GetSeconds();
+        uint32_t sigmask = tp_flags | (mp_flags << 5);
+
+        // Update trust score on ledger for every beacon
+        CallSCTrust(vehicle_id, psi, sigmask, detected, ts);
+
+        // Track consecutive anomalies per vehicle
+        if (detected)
+        {
+            consecutive_anomaly_count[vehicle_id]++;
+            if (consecutive_anomaly_count[vehicle_id] >= REVOKE_THRESHOLD)
+            {
+                CallSCRevoke(vehicle_id, "3_consecutive_anomalies", rsu_id, ts);
+                consecutive_anomaly_count[vehicle_id] = 0; // reset after revoke
+            }
+        }
+        else
+        {
+            consecutive_anomaly_count[vehicle_id] = 0;
+        }
     }
 
     (void)now;

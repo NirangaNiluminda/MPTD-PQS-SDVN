@@ -229,6 +229,57 @@ void FlagMaliciousOnBlockchain(std::string entityID, std::string reason)
 }
 
 // ============================================================
+// Stage 6: SC-Trust + SC-Revoke Blockchain Calls
+// Called by 08_beacon_handlers.h after each detection round
+// ============================================================
+
+// CallSCTrust: update per-vehicle trust score on Fabric ledger
+// τ_i(t) = 0.3·τ_i(t-1) + 0.7·(1-Φ)  computed inside chaincode SCTrustUpdate
+void CallSCTrust(uint32_t vehicleID, double phiScore, uint32_t sigMask,
+                 bool isAnomaly, double timestamp)
+{
+    std::string body =
+        "{\"vehicleID\":\""  + std::to_string(vehicleID)          + "\","
+        "\"phiScore\":\""    + std::to_string(phiScore)            + "\","
+        "\"sigMask\":\""     + std::to_string(sigMask)             + "\","
+        "\"isAnomaly\":\""   + (isAnomaly ? "true" : "false")      + "\","
+        "\"timestamp\":\""   + std::to_string(timestamp)           + "\"}";
+
+    std::string cmd =
+        "curl -s -X POST http://localhost:3000/api/sctrust"
+        " -H 'Content-Type: application/json'"
+        " -d '" + body + "' > /dev/null 2>&1 &";
+    system(cmd.c_str());
+
+    if (isAnomaly)
+        std::cout << "[SC-TRUST] Vehicle " << vehicleID
+                  << "  Φ=" << phiScore << "  isAnomaly=1" << std::endl;
+}
+
+// CallSCRevoke: write an immutable revocation record for a vehicle
+// Triggered by 08_beacon_handlers.h when consecutive_anomaly reaches threshold
+void CallSCRevoke(uint32_t vehicleID, const std::string &reason,
+                  uint32_t rsuID, double timestamp)
+{
+    std::string body =
+        "{\"vehicleID\":\""  + std::to_string(vehicleID)  + "\","
+        "\"reason\":\""      + reason                      + "\","
+        "\"rsuID\":\""       + std::to_string(rsuID)       + "\","
+        "\"timestamp\":\""   + std::to_string(timestamp)   + "\"}";
+
+    std::string cmd =
+        "curl -s -X POST http://localhost:3000/api/screvoke"
+        " -H 'Content-Type: application/json'"
+        " -d '" + body + "' > /dev/null 2>&1 &";
+    system(cmd.c_str());
+
+    std::cout << "[SC-REVOKE] Vehicle " << vehicleID
+              << " REVOKED by RSU " << rsuID
+              << " reason=" << reason
+              << " t=" << timestamp << "s" << std::endl;
+}
+
+// ============================================================
 // End of MRTPA Functions
 // ============================================================
 
