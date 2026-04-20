@@ -85,12 +85,29 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     if (residual > delta_th)
         violated |= (1 << 3);
 
-    // TP-S5: cumulative drift D_i(k) > delta_th (Eq. 3.15)
-    vs.drift_score += residual;
-    if (vs.count >= drift_window_k)
-        vs.drift_score -= 0; // simplified: don't remove old entries in this stub
-    if (vs.drift_score > delta_th * drift_window_k)
-        violated |= (1 << 4);
+    // TP-S5: cumulative drift D_i(k) = (1/k) · Σ r_i(t−j·T_b) > delta_th  (Eq. 3.15)
+    // Recompute rolling average over the last drift_window_k beacon pairs
+    // using the circular position history already stored in vs.
+    {
+        int avail = (vs.count >= 2) ? (vs.count - 1) : 0;  // pairs available
+        int k     = (avail < drift_window_k) ? avail : drift_window_k;
+        double drift_sum = 0.0;
+        for (int step = 0; step < k; step++) {
+            // pair: (head-2-step) → (head-1-step)  in circular buffer
+            int b_cur  = ((vs.head - 1 - step) + BEACON_HISTORY) % BEACON_HISTORY;
+            int b_prev = ((vs.head - 2 - step) + BEACON_HISTORY) % BEACON_HISTORY;
+            double dt_s = vs.timestamp[b_cur] - vs.timestamp[b_prev];
+            if (dt_s <= 0) dt_s = T_b;
+            double px_hat = vs.pos_x[b_prev] + vs.speed[b_prev] * std::cos(vs.heading[b_prev]) * dt_s;
+            double py_hat = vs.pos_y[b_prev] + vs.speed[b_prev] * std::sin(vs.heading[b_prev]) * dt_s;
+            double r = std::sqrt((vs.pos_x[b_cur]-px_hat)*(vs.pos_x[b_cur]-px_hat) +
+                                 (vs.pos_y[b_cur]-py_hat)*(vs.pos_y[b_cur]-py_hat));
+            drift_sum += r;
+        }
+        vs.drift_score = (k > 0) ? (drift_sum / k) : 0.0;
+        if (vs.drift_score > delta_th)
+            violated |= (1 << 4);
+    }
 
     return violated;
 }

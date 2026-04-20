@@ -212,6 +212,32 @@ def train_lstm_ae(df: pd.DataFrame):
     model   = LSTMAEDetector().to(DEVICE)
     opt     = torch.optim.Adam(model.parameters(), lr=LR)
     loss_fn = nn.MSELoss()
+    BETA    = 0.1  # kinematic penalty weight β (Eq. 3.51)
+    DT      = 0.1  # beacon interval T_b = 100 ms
+
+    def kinematic_loss(recon: torch.Tensor) -> torch.Tensor:
+        """
+        Mobility-Constrained Reconstruction Loss — Eq. 3.31 / 3.51
+        L_kinematic = (1/L) Σ max(0, r_i(t_l) − δ_th)²
+        where r_i(t_l) = ‖ p_i(t) − p̂_i(t) ‖  (dead-reckoning residual, Eq. 3.13)
+        and δ_th is the tolerance threshold (default 10.0 m, from §3.3.2).
+        Only residuals EXCEEDING δ_th are penalised (hinge form).
+        recon: (B, k, 5)  cols: [pos_x, pos_y, speed, heading, accel]
+        """
+        DELTA_TH = 10.0   # δ_th — dead-reckoning tolerance (metres), Eq. 3.13
+        pos_x   = recon[:, :, 0]   # (B, k)
+        pos_y   = recon[:, :, 1]
+        speed   = recon[:, :, 2]
+        heading = recon[:, :, 3]
+        # Predicted positions using prev step kinematics (cols 1..k-1 depend on 0..k-2)
+        pred_x = pos_x[:, :-1] + speed[:, :-1] * torch.cos(heading[:, :-1]) * DT
+        pred_y = pos_y[:, :-1] + speed[:, :-1] * torch.sin(heading[:, :-1]) * DT
+        # r_i(t) = Euclidean dead-reckoning residual  (Eq. 3.13/3.14)
+        r = torch.sqrt((pos_x[:, 1:] - pred_x) ** 2 +
+                       (pos_y[:, 1:] - pred_y) ** 2 + 1e-8)  # (B, k-1)
+        # Hinge: only penalise residuals beyond δ_th  (Eq. 3.31/3.51)
+        hinge = torch.clamp(r - DELTA_TH, min=0.0) ** 2
+        return hinge.mean()
 
     for epoch in range(EPOCHS_AE):
         model.train()
@@ -220,7 +246,9 @@ def train_lstm_ae(df: pd.DataFrame):
             batch = train_t[i:i+BATCH_SIZE].to(DEVICE)
             opt.zero_grad()
             recon = model(batch)
-            loss  = loss_fn(recon, batch)
+            l_recon    = loss_fn(recon, batch)
+            l_kinematic = kinematic_loss(recon)
+            loss = l_recon + BETA * l_kinematic   # Eq. 3.51: L_total = L_recon + β·L_kinematic
             loss.backward()
             opt.step()
             total_loss += loss.item()

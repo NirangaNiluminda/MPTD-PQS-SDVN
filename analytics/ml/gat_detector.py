@@ -20,9 +20,11 @@ FEATURE_DIM = 5 # [pos_x, pos_y, speed, heading, accel]
 
 class GATDetector(nn.Module):
     """
-    Two-layer GAT followed by a per-node linear classifier.
+    Two-layer GAT.  Output: S_i(t) = ‖(x'_i − x̄') / σ'‖₂  (Eq. 3.42)
+    where x'_i is the 16-dim GAT embedding of node i, and x̄'/σ' are the
+    snapshot-level mean and std across all nodes.
     Input shape : (N, 5)   where N = number of vehicles in snapshot
-    Output shape: (N, 1)   spatial anomaly score S_i ∈ [0,1]
+    Output shape: (N, 1)   spatial anomaly score S_i ∈ [0, ∞)  (clamped to [0,1] for fusion)
     """
 
     def __init__(self, in_dim: int = FEATURE_DIM, hidden: int = 32, heads: int = 4):
@@ -30,13 +32,23 @@ class GATDetector(nn.Module):
         self.conv1 = GATConv(in_dim, hidden, heads=heads, dropout=0.1)
         # concat=True → output dim = hidden * heads = 128
         self.conv2 = GATConv(hidden * heads, 16, heads=1, concat=False, dropout=0.1)
-        self.out   = nn.Linear(16, 1)
         self.act   = nn.ELU()
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
-        x = self.act(self.conv1(x, edge_index))
-        x = self.act(self.conv2(x, edge_index))
-        return torch.sigmoid(self.out(x))   # (N, 1)
+        """
+        Returns S_i ∈ [0,1] per node: L2-norm of z-score of GAT embedding (Eq. 3.42).
+        """
+        emb = self.act(self.conv1(x, edge_index))   # (N, hidden*heads)
+        emb = self.act(self.conv2(emb, edge_index)) # (N, 16) — x'_i
+
+        # Snapshot-level mean and std across nodes  (Eq. 3.42)
+        mu  = emb.mean(dim=0, keepdim=True)         # (1, 16)
+        sig = emb.std(dim=0, keepdim=True) + 1e-6   # (1, 16)
+        z   = (emb - mu) / sig                      # (N, 16)
+        s_i = z.norm(dim=1, keepdim=True)           # (N, 1) — L2 z-score norm
+
+        # Sigmoid to map [0,∞) → [0,1] for downstream score fusion
+        return torch.sigmoid(s_i)                   # (N, 1)
 
 
 # ---------------------------------------------------------------------------

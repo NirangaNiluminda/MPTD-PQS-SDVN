@@ -247,7 +247,7 @@ void print_time()
 {
     cout << "[SIM] t=" << Simulator::Now().GetSeconds() << "s" << endl;
 }
-void Rx(Ptr<const Packet>, uint16_t, WifiTxVector, MpduInfo, SignalNoiseDbm, uint16_t) {}
-void MacRx(Ptr<const Packet>)             {}
-void MacTx(Ptr<const Packet>)             {}
-void Enqueue(Ptr<const WifiMacQueueItem>) {}
+void Rx(std::string, Ptr<const Packet>, uint16_t, WifiTxVector, MpduInfo, SignalNoiseDbm, uint16_t) {}
+void MacRx(std::string, Ptr<const Packet>)             {}
+void MacTx(std::string, Ptr<const Packet>)             {}
+void Enqueue(std::string, Ptr<const WifiMacQueueItem>) {}
