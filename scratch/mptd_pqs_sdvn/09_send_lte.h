@@ -53,20 +53,83 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 		lte_initial_timestamp = Simulator::Now().GetSeconds();
 	}
 
-	// Build BsmBeaconTag from latest vehicle_state entry
+	// ── Read NS-3 MobilityModel → compute beacon payload ───────────────────
+	// NOTE: we do NOT push to vehicle_state[] at send time.
+	// vehicle_state[nid] is populated ONLY by HandleBeaconReceived() on the
+	// RSU receive side. This avoids the send-vs-receive index collision
+	// (send side would use vid=nid-2, receive side uses nid directly).
+	double tx_px = 0.0, tx_py = 0.0, tx_spd = 0.0, tx_hdg = 0.0, tx_acc = 0.0;
+	double real_px = 0.0, real_py = 0.0;
+	bool   is_mal  = false;
+	{
+		Ptr<MobilityModel> mob = node_source->GetObject<MobilityModel>();
+		double real_spd = 0.0, real_hdg = 0.0, real_acc = 0.0;
+		if (mob) {
+			Vector pos = mob->GetPosition();
+			Vector vel = mob->GetVelocity();
+			real_px  = pos.x;
+			real_py  = pos.y;
+			real_spd = std::sqrt(vel.x * vel.x + vel.y * vel.y);
+			real_hdg = (real_spd > 1e-6) ? std::atan2(vel.y, vel.x) : 0.0;
+			// Accel: approximate from separate send-side speed history (not vehicle_state)
+			double prev_spd = send_prev_speed[vid];
+			double prev_ts  = send_prev_time [vid];
+			double dt = Simulator::Now().GetSeconds() - prev_ts;
+			real_acc = (dt > 1e-9 && send_prev_time[vid] > 0.0) ?
+			           (real_spd - prev_spd) / dt : 0.0;
+			// Update send-side history
+			send_prev_speed[vid] = real_spd;
+			send_prev_time [vid] = Simulator::Now().GetSeconds();
+		}
+
+		// Determine if this vehicle is malicious (any active attack flag)
+		is_mal = location_malicious_nodes[vid]
+		      || flooding_malicious_nodes[vid]
+		      || fabrication_malicious_nodes[vid]
+		      || MIM_malicious_nodes[vid]
+		      || vanishing_malicious_nodes[vid];
+
+		tx_px = real_px;  tx_py = real_py;
+		tx_spd = real_spd; tx_hdg = real_hdg; tx_acc = real_acc;
+
+		if (is_mal) {
+			// Apply trajectory poisoning (Algorithm 1, §3.3.1)
+			Vector fpos(real_px, real_py, 0.0);
+			double vx = real_spd * std::cos(real_hdg);
+			double vy = real_spd * std::sin(real_hdg);
+			Vector fvel(vx, vy, 0.0);
+			Vector facc(0.0, 0.0, 0.0);
+			PoisonTrajectory(fpos, fvel, facc, poisoning_intensity_theta);
+			EnforceRealism(fpos, fvel, facc);
+			tx_px  = fpos.x;
+			tx_py  = fpos.y;
+			tx_spd = std::sqrt(fvel.x * fvel.x + fvel.y * fvel.y);
+			tx_hdg = (tx_spd > 1e-6) ? std::atan2(fvel.y, fvel.x) : 0.0;
+			tx_acc = std::sqrt(facc.x * facc.x + facc.y * facc.y);
+		}
+
+		// Accumulate displacement error for TDEE / TPE metrics (§4.1.2)
+		double dx = tx_px - real_px, dy = tx_py - real_py;
+		double disp_err = std::sqrt(dx * dx + dy * dy);
+		tdee_error_sum += disp_err;
+		tdee_error_cnt++;
+		if (is_mal) {
+			tpe_sq_sum += disp_err * disp_err;
+			tpe_cnt++;
+		}
+	}
+
+	// Build BsmBeaconTag directly from computed tx values
 	BsmBeaconTag tag;
-	VehicleBeaconState &vs = vehicle_state[vid];
-	uint32_t h = vs.head; // index of most-recent entry
 	tag.SetVehicleId(nid);
-	tag.SetPosition(vs.pos_x[h], vs.pos_y[h]);
-	tag.SetSpeed(vs.speed[h]);
-	tag.SetHeading(vs.heading[h]);
-	tag.SetAcceleration(vs.accel[h]);
+	tag.SetPosition(tx_px, tx_py);
+	tag.SetSpeed(tx_spd);
+	tag.SetHeading(tx_hdg);
+	tag.SetAcceleration(tx_acc);
 	tag.SetTimestamp(Simulator::Now().GetSeconds());
-	// is_malicious flag comes from vehicle_state (set by 06_mrtpa_attack.h)
-	tag.SetIsPoisoned(vs.is_malicious);
-	tag.SetAttackType(static_cast<uint32_t>(attack_number)); // global from 02_config_globals.h
-	tag.SetSigViolated(0); // sig_violated is set by the detector (08_beacon_handlers.h)
+	tag.SetIsPoisoned(is_mal);
+	tag.SetAttackType(static_cast<uint32_t>(attack_number));
+	tag.SetSigViolated(0); // sig_violated set by detector (08_beacon_handlers.h)
 
 	Ptr<Packet> packet1 = Create<Packet>(0);
 	packet1->AddPacketTag(tag);

@@ -102,11 +102,17 @@ double d_min   = 10.0;      // Minimum inter-vehicle spacing (m)
 double rho_v   = 0.01;      // Vehicle density (vehicles/m²)
 
 // MP-S2: Synchronized beacon timing (Eq. 3.17)
-double tau_sync  = 0.001;   // Sub-millisecond timing resolution (s)
+// Beacons are staggered T_b/N apart in 12_main.h (≈6.25ms for 16 vehicles).
+// tau_sync=1ms < 6.25ms stagger → honest vehicles are NOT flagged.
+// Attacker colluders who send within 1ms of each other ARE flagged.
+double tau_sync  = 0.001;   // 1ms synchronization detection window (s)
 double rho_sync  = 0.8;     // Co-occurrence rate threshold
 
 // MP-S3: Regional speed distribution shift (Eq. 3.18)
-double kappa_th  = 0.5;     // KL divergence threshold
+// kappa_th = 1.5: speed must deviate > 150% of regional mean to be flagged.
+// Lower value (e.g., 0.5) caused stationary honest vehicles near fast malicious
+// vehicles to be falsely flagged (legitimate zero-speed near 8 m/s mean gives kl=1.0).
+double kappa_th  = 1.5;     // KL divergence threshold
 
 // Composite rule-based anomaly threshold (Eq. 3.20)
 double psi_th    = 0.3;     // Lightweight mode isolation threshold
@@ -133,6 +139,23 @@ bool mitm_malicious_nodes[total_size];                 // MP-S3
 uint32_t total_trajectories_received         = 0;
 uint32_t total_trajectories_poisoned         = 0;
 uint32_t total_trajectories_stored_blockchain = 0;
+
+// ── TDEE / TPE displacement error accumulators (populated in 09_send_lte.h) ──
+// TDEE: mean |reported_pos - real_pos| over all beacons (m)
+double   tdee_error_sum   = 0.0;
+uint32_t tdee_error_cnt   = 0;
+// TPE: RMSE of |reported_pos - real_pos| for malicious-vehicle beacons only (m)
+double   tpe_sq_sum       = 0.0;
+uint32_t tpe_cnt          = 0;
+// PBPO: mean beacon processing time per receive-side call (ms)
+double   pbpo_time_sum_ms = 0.0;
+uint32_t pbpo_cnt         = 0;
+
+// ── Send-side speed/time history — separate from receive-side vehicle_state ──
+// Used only in send_LTE_metadata_uplink_alone() to compute accel at send time.
+// Indexed by vid = nid - 2 (0..N_Vehicles-1), never written by receive side.
+double send_prev_speed[MAX_NODES] = {};
+double send_prev_time [MAX_NODES] = {};
 
 // ── Node/consortium assignment ─────────────────────────────────────────────
 uint32_t node_controller_ID[total_size];

@@ -149,6 +149,19 @@ void declare_attack_states()
         present_fabrication_attack_controllers = false;
         present_MIM_attack_controllers         = false;
         if (controller_malicious_assumption) present_vanishing_attack_controllers = true;
+    } else if (attack_number == 7) {
+        // MP-S4: Coordinated multi-source — all attack types simultaneously (§3.2.4)
+        present_location_attack_nodes      = true;
+        present_flooding_attack_nodes      = true;
+        present_fabrication_attack_nodes   = true;
+        present_MIM_attack_nodes           = true;
+        present_vanishing_attack_nodes     = true;
+        if (controller_malicious_assumption) {
+            present_flooding_attack_controllers    = true;
+            present_fabrication_attack_controllers = true;
+            present_MIM_attack_controllers         = true;
+            present_vanishing_attack_controllers   = true;
+        }
     }
 
     if (routing_algorithm == 4) {

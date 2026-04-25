@@ -1531,13 +1531,15 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 			  		  Simulator::Schedule(Seconds(t),clear_delta_at_nodes, delta_at_nodes_inst);
 			  		  
 //*/			  		  
-			  		  /*
+			  		  // ── Vehicle beacon transmission (MPTD-PQS §3.4) ──────────────────────
 					  for (uint32_t u=0; u<Vehicle_Nodes.GetN(); u++)
 					  {
 					  	Ptr <SimpleUdpApplication> udp_app = DynamicCast <SimpleUdpApplication> (apps.Get(u+2));
-						Simulator::Schedule(Seconds(t+0.000025*u),send_LTE_metadata_uplink_alone,udp_app,Vehicle_Nodes.Get(u),management_Node.Get(0), u);
+						// Stagger = T_b/N per vehicle (≈6.25ms for 16 vehicles), so MP-S2 tau_sync=1ms
+							// does not fire on normal beacons (honest vehicles 6.25ms apart >> 1ms threshold).
+							double stagger = T_b / (double)Vehicle_Nodes.GetN();
+							Simulator::Schedule(Seconds(t + stagger * u),send_LTE_metadata_uplink_alone,udp_app,Vehicle_Nodes.Get(u),management_Node.Get(0), u);
 					  }
-					  */
 					  //calculate the routing solution
 					  //unicast the solution back to nodes
 					  

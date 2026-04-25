@@ -20,6 +20,7 @@
 
 #include <cmath>
 #include <sstream>
+#include <time.h>   // clock_gettime for PBPO timing
 
 // ── Forward declarations (defined in 10_metrics_csv.h) ───────────────────────
 // 10_metrics_csv.h is included after this file in simulation.cc, so we
@@ -27,6 +28,8 @@
 void update_confusion_matrix(bool is_poisoned, bool detected);
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi);
+// PBPO timing accumulator (defined in 02_config_globals.h)
+// pbpo_time_sum_ms and pbpo_cnt are global — updated directly here.
 
 // ── Forward declarations (Stage 6: defined in 06_mrtpa_attack.h) ─────────────
 void CallSCTrust(uint32_t vehicleID, double phiScore, uint32_t sigMask,
@@ -162,8 +165,11 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     }
     if (count_near > 0) {
         double mean_sp = sum_speed / count_near;
-        // KL divergence estimate: deviation from regional mean
-        double kl_approx = std::fabs(tag.GetSpeed() - mean_sp) / (mean_sp + 1e-6);
+        // KL divergence estimate: deviation from regional mean.
+        // Denominator uses mean_sp + s_max*0.1 to avoid near-zero division
+        // when all nearby vehicles are stationary (mean_sp≈0).
+        double kl_approx = std::fabs(tag.GetSpeed() - mean_sp)
+                         / (mean_sp + s_max * 0.1);   // s_max*0.1 ≈ 3.33 m/s floor
         if (kl_approx > kappa_th)
             violated |= (1 << 2);
     }
@@ -278,6 +284,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 {
     double now = Simulator::Now().GetSeconds();
 
+    // PBPO: start wall-clock timer (§4.1.2 Eq 4.7)
+    struct timespec t_start, t_end;
+    clock_gettime(CLOCK_MONOTONIC, &t_start);
+
     // 1. Push new beacon into circular state buffer
     push_beacon(vehicle_id,
                 tag.GetPosX(), tag.GetPosY(),
@@ -337,6 +347,13 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             " > /dev/null 2>&1 &";
         system(ml_cmd.c_str());
     }
+
+    // PBPO: stop timer and accumulate (§4.1.2 Eq 4.7)
+    clock_gettime(CLOCK_MONOTONIC, &t_end);
+    double elapsed_ms = (t_end.tv_sec  - t_start.tv_sec)  * 1000.0
+                      + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+    pbpo_time_sum_ms += elapsed_ms;
+    pbpo_cnt++;
 
     // 10. SC-Trust + SC-Revoke (Stage 6)
     //     Only in full mode; uses psi as phi approximation until ML server responds

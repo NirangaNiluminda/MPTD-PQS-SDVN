@@ -129,42 +129,42 @@ double compute_PARR()
     return tp / (tp + fn);
 }
 
-// CDER: Correct Detection-to-Error Ratio  —  TP / (TP + FP + FN)
+// CDER: Control Decision Error Rate  —  (FP + FN) / (TP + FP + TN + FN)
+// Fraction of all beacons where the detection decision was wrong.
+// (1 − Accuracy). High CDER = many wrong control decisions.
 double compute_CDER()
 {
-    double tp = cm_TP, fp = cm_FP, fn = cm_FN;
-    if (tp + fp + fn < 1e-9) return 0.0;
-    return tp / (tp + fp + fn);
+    double tp = cm_TP, fp = cm_FP, tn = cm_TN, fn = cm_FN;
+    double total = tp + fp + tn + fn;
+    if (total < 1e-9) return 0.0;
+    return (fp + fn) / total;
 }
 
-// TDEE: Trajectory Data Error Exposure  —  FN / total_received
+// TDEE: Traffic Density Estimation Error  —  mean |reported_pos − real_pos| (m)
+// Measures how far received beacon positions deviate from NS-3 ground truth.
+// Accumulated in 09_send_lte.h at send time; zero for honest vehicles.
 double compute_TDEE()
 {
-    double fn = (double)cm_FN;
-    double total = (double)total_trajectories_received;
-    if (total < 1.0) return 0.0;
-    return fn / total;
+    if (tdee_error_cnt == 0) return 0.0;
+    return tdee_error_sum / (double)tdee_error_cnt;
 }
 
-// TPE: Trajectory Poisoning Exposure  —  total_poisoned / total_received
+// TPE: Trajectory Prediction Error  —  RMSE of position error for malicious beacons (m)
+// Captures the magnitude of trajectory manipulation for attacker vehicles.
+// sqrt(mean(|poisoned_pos − real_pos|²)) over malicious-vehicle beacons.
 double compute_TPE()
 {
-    double poisoned = (double)total_trajectories_poisoned;
-    double total    = (double)total_trajectories_received;
-    if (total < 1.0) return 0.0;
-    return poisoned / total;
+    if (tpe_cnt == 0) return 0.0;
+    return std::sqrt(tpe_sq_sum / (double)tpe_cnt);
 }
 
-// PBPO: Post-Blockchain Poisoning Offset
-// (poisoned_stored − flagged_stored) / total_stored
-// Interpreted as: FN / total_stored_blockchain
-// (undetected poisoned entries remaining on ledger without a flag)
+// PBPO: Per-Beacon Processing Overhead  —  mean detection time per beacon (ms)
+// Measures real-time feasibility: mean wall-clock time from beacon arrival
+// to detection decision, measured with clock_gettime() in 08_beacon_handlers.h.
 double compute_PBPO()
 {
-    double fn    = (double)cm_FN;
-    double total = (double)total_trajectories_stored_blockchain;
-    if (total < 1.0) return 0.0;
-    return fn / total;
+    if (pbpo_cnt == 0) return 0.0;
+    return pbpo_time_sum_ms / (double)pbpo_cnt;
 }
 
 // ── Print all 7 metrics to stdout ─────────────────────────────────────────────
@@ -176,13 +176,13 @@ void print_mptd_metrics()
               << "  FP=" << cm_FP
               << "  TN=" << cm_TN
               << "  FN=" << cm_FN << std::endl;
-    std::cout << "  MCC  = " << compute_MCC()  << std::endl;
-    std::cout << "  FPR  = " << compute_FPR()  << std::endl;
-    std::cout << "  PARR = " << compute_PARR() << std::endl;
-    std::cout << "  CDER = " << compute_CDER() << std::endl;
-    std::cout << "  TDEE = " << compute_TDEE() << std::endl;
-    std::cout << "  TPE  = " << compute_TPE()  << std::endl;
-    std::cout << "  PBPO = " << compute_PBPO() << std::endl;
+    std::cout << "  MCC  = " << compute_MCC()  << "  (Matthews Correlation Coefficient)" << std::endl;
+    std::cout << "  FPR  = " << compute_FPR()  << "  (False Positive Rate)" << std::endl;
+    std::cout << "  PARR = " << compute_PARR() << "  (Poisoning Attack Rejection Rate = Recall)" << std::endl;
+    std::cout << "  CDER = " << compute_CDER() << "  (Control Decision Error Rate = 1 - Accuracy)" << std::endl;
+    std::cout << "  TDEE = " << compute_TDEE() << " m  (mean beacon position error, all vehicles)" << std::endl;
+    std::cout << "  TPE  = " << compute_TPE()  << " m  (RMSE position error, malicious vehicles only)" << std::endl;
+    std::cout << "  PBPO = " << compute_PBPO() << " ms (mean per-beacon detection overhead)" << std::endl;
     std::cout << "──────────────────────────────────────────────────────" << std::endl;
 }
 
