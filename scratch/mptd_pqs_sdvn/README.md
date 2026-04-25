@@ -91,11 +91,47 @@ python3 waf --run "mptd_pqs_sdvn \
 
 ---
 
+## 🔍 Fabric Explorer (Blockchain UI)
+
+View transactions, blocks, and chaincode activity in a web browser.
+
+**Fabric network must be running first**, then run the single start script:
+
+```bash
+bash /home/niranga/fabric-samples/explorer/start-explorer.sh
+```
+
+Wait ~30 seconds, then open: **http://localhost:8080**
+
+| Field | Value |
+|-------|-------|
+| Username | `exploreradmin` |
+| Password | `exploreradminpw` |
+
+**Stop Explorer:**
+```bash
+cd /home/niranga/fabric-samples/explorer
+docker compose down -v
+```
+
+> **Why a script?** Fabric CA generates a new private key filename every time
+> `network.sh up` runs. Explorer expects a file named `priv_sk` in each keystore
+> directory. The script automatically creates that symlink before starting the
+> containers so no manual steps are needed.
+
+> **Explorer location:** `fabric-samples/explorer/` (NOT `blockchain-explorer/` —
+> that older setup does not work with Fabric 2.5.x).
+
+---
+
 ## 🛑 Shutting Down (Free RAM)
 
 When you are done working, shut everything down to free RAM (~2 GB):
 
 ```bash
+# Stop Explorer (if running)
+cd /home/niranga/fabric-samples/explorer && docker compose down -v
+
 # Stop Fabric containers (all 6 containers removed)
 cd /home/niranga/fabric-samples/test-network
 ./network.sh down
@@ -113,19 +149,23 @@ pkill -f docker-api-proxy.py
 ## 🔁 Starting Up Again After Shutdown
 
 ```bash
-# Terminal 1
+# Terminal 1 — Blockchain stack
 cd /home/niranga/fabric-samples/test-network
 python3 docker-api-proxy.py &
 ./network.sh up createChannel -ca
 ./network.sh deployCC -ccn trajectory -ccp ../trajectory-chaincode/chaincode -ccl go
 cd /home/niranga/fabric-samples/trajectory-rest-api && python3 server.py
 
-# Terminal 2
+# Terminal 2 — ML server
 cd /home/niranga/ns-allinone-3.35/ns-3.35/analytics/ml && python3 prediction_server.py
 
-# Terminal 3 (run your simulation)
+# Terminal 3 — NS-3 simulation
 cd /home/niranga/ns-allinone-3.35/ns-3.35
 python3 waf --run "mptd_pqs_sdvn --attack_number=1 --routing_test=false --attack_percentage=20 --simTime=13"
+
+# Optional Terminal 4 — Blockchain Explorer UI (after network is up)
+bash /home/niranga/fabric-samples/explorer/start-explorer.sh
+# → open http://localhost:8080  (exploreradmin / exploreradminpw)
 ```
 
 > **One-time setup:** After a reboot, ensure Docker context is set correctly:
@@ -313,6 +353,7 @@ fabric-samples/
 | Service | RAM | Safe to stop when idle? |
 |---|---|---|
 | Fabric containers (6 total) | ~1.5 GB | ✅ `./network.sh down` |
+| Fabric Explorer + DB | ~400 MB | ✅ `docker-compose down` in `blockchain-explorer/` |
 | Docker API proxy | ~10 MB | ✅ `pkill -f docker-api-proxy.py` |
 | ML prediction server | ~500 MB | ✅ Ctrl+C |
 | REST API server | ~100 MB | ✅ Ctrl+C |
