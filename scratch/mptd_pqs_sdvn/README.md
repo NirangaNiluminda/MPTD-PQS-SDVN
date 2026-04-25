@@ -50,18 +50,27 @@ NS-3 Simulation  ──(curl)──►  localhost:5001  ◄──  analytics/ml/
 
 Open **3 terminals** and run in order:
 
+### Before anything — set Docker context (every session)
+
+```bash
+# Run this FIRST every session, especially after a reboot or Docker Desktop restart.
+# Without it, containers won't appear in Docker Desktop and network.sh will fail.
+docker context use desktop-linux
+```
+
 ### Terminal 1 — Blockchain + REST API
 
 ```bash
-# STEP 1: Start the Docker API version proxy (required — fixes Fabric/Docker compatibility)
+# STEP 1: Kill any stale proxy from a previous session, then start fresh
 cd /home/niranga/fabric-samples/test-network
+pkill -f docker-api-proxy.py 2>/dev/null || true
 python3 docker-api-proxy.py &
 
 # STEP 2: Start the Fabric network (first time or after shutdown)
 ./network.sh up createChannel -ca
 ./network.sh deployCC -ccn trajectory -ccp ../trajectory-chaincode/chaincode -ccl go
 
-# STEP 3: Start the REST API
+# STEP 3: Start the REST API (this occupies the terminal — leave it running)
 cd /home/niranga/fabric-samples/trajectory-rest-api
 python3 server.py
 ```
@@ -129,49 +138,85 @@ docker compose down -v
 When you are done working, shut everything down to free RAM (~2 GB):
 
 ```bash
-# Stop Explorer (if running)
+# 1 — Stop Explorer (if running)
 cd /home/niranga/fabric-samples/explorer && docker compose down -v
 
-# Stop Fabric containers (all 6 containers removed)
+# 2 — Fix file ownership BEFORE stopping Fabric (prevents "Permission denied")
+sudo chown -R $USER:$USER /home/niranga/fabric-samples/test-network/organizations/
+
+# 3 — Stop Fabric containers (all 6 containers + blockchain data removed)
 cd /home/niranga/fabric-samples/test-network
 ./network.sh down
 
-# Stop the Docker API proxy
-pkill -f docker-api-proxy.py
+# 4 — Stop the Docker API proxy
+pkill -f docker-api-proxy.py 2>/dev/null || true
 
-# Stop ML server and REST API: press Ctrl+C in their terminals
+# 5 — Stop ML server and REST API
+#     Option A (if running in foreground terminals): press Ctrl+C in each terminal
+#     Option B (if started in background with &):
+pkill -f prediction_server.py 2>/dev/null || true
+pkill -f "trajectory-rest-api/server.py" 2>/dev/null || true
 ```
 
 > **Note:** `network.sh down` wipes all blockchain data. You must run `deployCC` again next time you start up. This is normal — each simulation run generates fresh data.
+>
+> **If `network.sh down` fails with "Permission denied":** run step 2 (`sudo chown`) first, then retry step 3.
 
 ---
 
 ## 🔁 Starting Up Again After Shutdown
 
+### Step 0 — Every session (mandatory)
+
 ```bash
-# Terminal 1 — Blockchain stack
+# Set Docker context FIRST — needed after every reboot or Docker Desktop restart.
+# Skipping this = containers not visible in Docker Desktop + network.sh failures.
+docker context use desktop-linux
+```
+
+### Terminal 1 — Blockchain + REST API
+
+```bash
 cd /home/niranga/fabric-samples/test-network
+
+# Kill any leftover proxy from a previous session (safe even if none is running)
+pkill -f docker-api-proxy.py 2>/dev/null || true
+
+# Start the API proxy BEFORE network.sh (required for chaincode install)
 python3 docker-api-proxy.py &
+
 ./network.sh up createChannel -ca
 ./network.sh deployCC -ccn trajectory -ccp ../trajectory-chaincode/chaincode -ccl go
+
+# Start REST API — this occupies Terminal 1, leave it running
 cd /home/niranga/fabric-samples/trajectory-rest-api && python3 server.py
+```
 
-# Terminal 2 — ML server
-cd /home/niranga/ns-allinone-3.35/ns-3.35/analytics/ml && python3 prediction_server.py
+✅ Wait for: `Listening on http://0.0.0.0:3000`
 
-# Terminal 3 — NS-3 simulation
+### Terminal 2 — ML Prediction Server
+
+```bash
+cd /home/niranga/ns-allinone-3.35/ns-3.35/analytics/ml
+python3 prediction_server.py
+```
+
+✅ Wait for: `Running on http://127.0.0.1:5001`
+
+### Terminal 3 — NS-3 Simulation
+
+```bash
 cd /home/niranga/ns-allinone-3.35/ns-3.35
 python3 waf --run "mptd_pqs_sdvn --attack_number=1 --routing_test=false --attack_percentage=20 --simTime=13"
+```
 
-# Optional Terminal 4 — Blockchain Explorer UI (after network is up)
+### Optional Terminal 4 — Blockchain Explorer UI
+
+```bash
+# Run only after Terminal 1 is fully up (Fabric network + chaincode deployed)
 bash /home/niranga/fabric-samples/explorer/start-explorer.sh
 # → open http://localhost:8080  (exploreradmin / exploreradminpw)
 ```
-
-> **One-time setup:** After a reboot, ensure Docker context is set correctly:
-> ```bash
-> docker context use desktop-linux
-> ```
 
 ---
 
