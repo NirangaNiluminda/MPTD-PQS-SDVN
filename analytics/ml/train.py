@@ -129,14 +129,24 @@ def build_gat_dataset(df: pd.DataFrame):
     """
     One PyG Data object per time-step snapshot (all vehicles at that timestamp).
     Label y_i = is_poisoned for each node.
+
+    Node features (paper Eq. 3.21, 6-dim):
+      [pos_x, pos_y, speed, heading, accel, tau_i]
+    tau_i (SC-Trust score) defaults to 1.0 for training data because
+    beacon_log.csv does not include blockchain trust queries.
+    When real tau_i values are available (from /api/sctrust calls),
+    they should be merged into the DataFrame before calling this function.
     """
     feat_cols = ["pos_x", "pos_y", "speed", "heading", "accel"]
     graphs = []
     for t, grp in df.groupby("sim_time"):
-        feats  = grp[feat_cols].values.astype(np.float32)
-        labels = grp["is_poisoned"].values.astype(np.float32)
-        data   = snapshot_to_graph(feats)
-        data.y = torch.tensor(labels, dtype=torch.float)
+        feats_5  = grp[feat_cols].values.astype(np.float32)
+        # Append tau_i column: default 1.0 (fully trusted) — Eq. 3.21
+        tau_col  = np.ones((len(feats_5), 1), dtype=np.float32)
+        feats_6  = np.hstack([feats_5, tau_col])   # (N, 6)
+        labels   = grp["is_poisoned"].values.astype(np.float32)
+        data     = snapshot_to_graph(feats_6)
+        data.y   = torch.tensor(labels, dtype=torch.float)
         graphs.append(data)
     return graphs
 
