@@ -113,29 +113,113 @@ void StoreControllerAssignmentToBlockchain(
 // ============================================================
 
 // PoisonTrajectory: Apply poisoning with intensity θ (Algorithm 1, Line 22)
-// Adds controlled noise to position, velocity, and acceleration
+// Generic: modifies position + velocity + acceleration simultaneously.
+// Called directly only as fallback; prefer PoisonTrajectoryByType() below.
 void PoisonTrajectory(Vector &position, Vector &velocity, Vector &acceleration, double theta)
 {
-    // Seed with time-varying component for different poisoning each call
-    double time_factor = Simulator::Now().GetSeconds();
+    double t = Simulator::Now().GetSeconds();
+    position.x    += theta * max_position_deviation     * sin(t * 0.7);
+    position.y    += theta * max_position_deviation     * cos(t * 0.5);
+    velocity.x    += theta * max_velocity_deviation     * sin(t * 1.3);
+    velocity.y    += theta * max_velocity_deviation     * cos(t * 0.9);
+    acceleration.x += theta * max_acceleration_deviation * cos(t * 1.7);
+    acceleration.y += theta * max_acceleration_deviation * sin(t * 1.1);
+}
 
-    // Position poisoning: gradual drift proportional to θ and time
-    double pos_noise_x = theta * max_position_deviation * sin(time_factor * 0.7);
-    double pos_noise_y = theta * max_position_deviation * cos(time_factor * 0.5);
-    position.x += pos_noise_x;
-    position.y += pos_noise_y;
+// ============================================================
+// PoisonTrajectoryByType — per-attack differentiated injection
+// Paper §3.4.1–3.4.2 — each attack manipulates a DIFFERENT field
+// so that distinct detection signatures fire per attack type.
+//
+//  attack 1 TP-S1 Location Spoofing  → position drift only
+//                                       fires: TP-S1 (kinematic), TP-S4/S5 (drift)
+//  attack 2 TP-S2 Flooding            → velocity/heading exaggeration
+//                                       fires: TP-S2 (heading rate)
+//  attack 3 TP-S3 Fabrication         → extreme acceleration injection
+//                                       fires: TP-S3 (|a|>a_max)
+//  attack 4 MP-S1 Sybil RSU           → position drift (density inflation handled by RSU)
+//                                       fires: MP-S1 (identity density)
+//  attack 5 MP-S2 Vanishing           → suppressed at send level (no poison here)
+//                                       effect: FN — vehicle sends nothing
+//  attack 6 MP-S4 Combined            → position + heading + acceleration together
+//                                       fires: TP-S1, TP-S2, TP-S3, TP-S4/S5
+//  attack 7 Coordinated Multi-Source  → phase-locked position drift across attackers
+//                                       fires: TP-S1 + MP-S2 (sync timing)
+// ============================================================
+void PoisonTrajectoryByType(Vector &position, Vector &velocity, Vector &acceleration,
+                             double theta, int atk_num)
+{
+    double t = Simulator::Now().GetSeconds();
 
-    // Velocity poisoning: scale deviation by θ
-    double vel_noise_x = theta * max_velocity_deviation * sin(time_factor * 1.3);
-    double vel_noise_y = theta * max_velocity_deviation * cos(time_factor * 0.9);
-    velocity.x += vel_noise_x;
-    velocity.y += vel_noise_y;
+    switch (atk_num)
+    {
+        case 1:
+            // TP-S1: Location Spoofing — position drift only (Eq. 3.10)
+            // Triggers: TP-S1 (kinematic), TP-S4 (dead-reckoning), TP-S5 (drift)
+            position.x += theta * max_position_deviation * sin(t * 0.7);
+            position.y += theta * max_position_deviation * cos(t * 0.5);
+            break;
 
-    // Acceleration poisoning: subtle changes
-    double acc_noise_x = theta * max_acceleration_deviation * cos(time_factor * 1.7);
-    double acc_noise_y = theta * max_acceleration_deviation * sin(time_factor * 1.1);
-    acceleration.x += acc_noise_x;
-    acceleration.y += acc_noise_y;
+        case 2:
+            // TP-S2: Flooding — abrupt heading + speed exaggeration (Eq. 3.11)
+            // Triggers: TP-S2 (|Δθ| > ω_max·T_b), also TP-S4 via large velocity jump
+            velocity.x += theta * max_velocity_deviation * 2.0 * sin(t * 3.1);
+            velocity.y += theta * max_velocity_deviation * 2.0 * cos(t * 2.7);
+            // Large Δv → large implied Δθ → TP-S2 fires
+            break;
+
+        case 3:
+            // TP-S3: Fabrication — extreme acceleration injection (Eq. 3.12)
+            // Triggers: TP-S3 (|a_i| > a_max = 4 m/s²) — inject 2.5× the limit
+            acceleration.x = theta * a_max * 2.5 * cos(t * 1.7);
+            acceleration.y = theta * a_max * 2.5 * sin(t * 1.1);
+            // Also slightly offset position so dead-reckoning diverges
+            position.x += theta * max_position_deviation * 0.3 * sin(t * 0.4);
+            break;
+
+        case 4:
+            // MP-S1: Sybil via RSU — position drift to inflate RSU density count
+            // The RSU identity density check (Eq. 3.16) fires when too many
+            // IDs appear in the coverage area. Position drift moves attacker
+            // beacons across RSU boundaries, appearing as multiple identities.
+            position.x += theta * max_position_deviation * 1.5 * sin(t * 0.3);
+            position.y += theta * max_position_deviation * 1.5 * cos(t * 0.4);
+            break;
+
+        case 5:
+            // MP-S2: Vanishing — NO trajectory modification here.
+            // Beacon suppression is handled at the send level in 09_send_lte.h:
+            // vanishing attackers skip sending every alternate beacon (50% drop).
+            // Effect on metrics: FN increase (poisoned beacons not sent → not detected)
+            break;
+
+        case 6:
+            // MP-S4: Combined / All-type attack (Eq. 3.19)
+            // Simultaneously triggers TP-S1, TP-S2, TP-S3, TP-S4/S5
+            position.x    += theta * max_position_deviation     * sin(t * 0.7);
+            position.y    += theta * max_position_deviation     * cos(t * 0.5);
+            velocity.x    += theta * max_velocity_deviation     * 1.5 * sin(t * 2.9);
+            velocity.y    += theta * max_velocity_deviation     * 1.5 * cos(t * 2.3);
+            acceleration.x = theta * a_max * 2.0               * cos(t * 1.7);
+            acceleration.y = theta * a_max * 2.0               * sin(t * 1.1);
+            break;
+
+        case 7:
+            // Coordinated Multi-Source — phase-locked drift across all attackers
+            // All attacker vehicles use the SAME sinusoidal phase → identical
+            // fake positions → triggers MP-S2 (sync timing) + TP-S1 (drift)
+            // Phase offset = π/2 to distinguish from attack 1
+            position.x += theta * max_position_deviation * sin(t * 0.7 + 1.5708);
+            position.y += theta * max_position_deviation * cos(t * 0.5 + 1.5708);
+            velocity.x += theta * max_velocity_deviation * 0.5 * sin(t * 0.7 + 1.5708);
+            velocity.y += theta * max_velocity_deviation * 0.5 * cos(t * 0.5 + 1.5708);
+            break;
+
+        default:
+            // Fallback: generic full-field poisoning
+            PoisonTrajectory(position, velocity, acceleration, theta);
+            break;
+    }
 }
 
 // EnforceRealism: Clamp poisoned values to physically plausible ranges (Algorithm 1, Line 23)

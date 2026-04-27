@@ -93,14 +93,39 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 		tx_spd = real_spd; tx_hdg = real_hdg; tx_acc = real_acc;
 
 		if (is_mal) {
-			// Apply trajectory poisoning (Algorithm 1, §3.3.1)
+			// ── MP-S2 Vanishing: suppress beacon on alternate calls (50% drop) ──
+			// Vehicle appears to "vanish" from the network intermittently.
+			// Effect: poisoned beacons are never received → FN rate increases.
+			if (vanishing_malicious_nodes[vid]) {
+				static uint32_t vanish_counter[MAX_NODES] = {};
+				vanish_counter[vid]++;
+				if (vanish_counter[vid] % 2 == 0) {
+					// Skip this beacon — do NOT send, do NOT accumulate errors
+					// (TDEE/TPE only count beacons that ARE sent)
+					cout << "[VANISH] node " << nid
+					     << " suppressed beacon at "
+					     << Simulator::Now().GetSeconds() << endl;
+					return;
+				}
+			}
+
+			// Apply attack-type-specific trajectory poisoning (§3.4.1–3.4.2)
+			// Each attack_number manipulates different BSM beacon fields so
+			// distinct detection signatures (TP-S1..MP-S4) fire per type.
 			Vector fpos(real_px, real_py, 0.0);
 			double vx = real_spd * std::cos(real_hdg);
 			double vy = real_spd * std::sin(real_hdg);
 			Vector fvel(vx, vy, 0.0);
 			Vector facc(0.0, 0.0, 0.0);
-			PoisonTrajectory(fpos, fvel, facc, poisoning_intensity_theta);
-			EnforceRealism(fpos, fvel, facc);
+			PoisonTrajectoryByType(fpos, fvel, facc, poisoning_intensity_theta,
+			                       attack_number);
+			// Attack 3 (TP-S3 Fabrication) deliberately injects values ABOVE
+			// physical limits — the attacker fabricates impossible acceleration.
+			// Applying EnforceRealism would clamp it back, defeating TP-S3 detection.
+			// All other attacks maintain plausible-looking trajectories.
+			if (attack_number != 3) {
+				EnforceRealism(fpos, fvel, facc);
+			}
 			tx_px  = fpos.x;
 			tx_py  = fpos.y;
 			tx_spd = std::sqrt(fvel.x * fvel.x + fvel.y * fvel.y);
