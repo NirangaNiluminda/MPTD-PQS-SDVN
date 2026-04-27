@@ -43,7 +43,7 @@ double simTime              = 13.7;
 int    mobility_scenario    = 0;   // 0=urban, 1=non-urban, 2=highway
 int    maxspeed             = 60;  // km/h max vehicle speed
 
-double data_transmission_frequency = 0.33;
+double data_transmission_frequency = 2.0;    // 2 Hz → 0.5s per beacon round (was 0.33 Hz)
 double data_transmission_period    = 1.0 / data_transmission_frequency;
 double link_lifetime_threshold     = 0.400;
 
@@ -189,9 +189,13 @@ void UeTxEndCallback(uint32_t ueId, Ptr<const Packet> p)
 }
 
 // ── Helper: probabilistic malicious assignment ─────────────────────────────
+// Seed depends ONLY on nodeID so that increasing probabilityPercent
+// monotonically includes more nodes (superset property preserved across sweeps).
 bool GetBooleanWithProbability(double probabilityPercent, int nodeID) {
-    srand(Simulator::Now().GetSeconds() + 1.0*(rand()%50) + 5.0*nodeID);
-    double randomValue = 1.0*(rand()%100);
+    // Hash nodeID with a prime to spread values uniformly across [0,100).
+    uint32_t seed = 7919u * (uint32_t)nodeID + 3571u;
+    srand(seed);
+    double randomValue = 1.0 * (rand() % 100);
     return randomValue < probabilityPercent;
 }
 

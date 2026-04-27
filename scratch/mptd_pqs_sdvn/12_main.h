@@ -58,10 +58,9 @@ int main(int argc, char *argv[])
     
     if (routing_test == true)
     {
-     	//N_Vehicles = 22;
-     	N_Vehicles = 5;
-     	N_RSUs = 4;
-     	//flows = 1;
+        // Use N_Vehicles from cmd-line or config default (16); clamp to ≥16 for eval
+        if (N_Vehicles < 16) N_Vehicles = 16;
+        N_RSUs = 4;
     }
     
     ueBusy.resize(total_size, false);
@@ -115,11 +114,24 @@ int main(int argc, char *argv[])
 	    MobilityHelper custom_mobility;
 	    Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
 	    // Vehicles spread near 4 RSUs at (750,1200),(1150,1200),(1550,1200),(1950,1200)
-	    positionAlloc->Add(Vector(750.0,  1150.0, 0.0)); // Vehicle 0 near RSU 0
-	    positionAlloc->Add(Vector(1150.0, 1150.0, 0.0)); // Vehicle 1 near RSU 1
-	    positionAlloc->Add(Vector(1550.0, 1150.0, 0.0)); // Vehicle 2 near RSU 2
-	    positionAlloc->Add(Vector(1950.0, 1150.0, 0.0)); // Vehicle 3 near RSU 3
-	    positionAlloc->Add(Vector(1150.0, 1050.0, 0.0)); // Vehicle 4 near RSU 1
+	    // 16 vehicles — 4 per RSU at (750,1200),(1150,1200),(1550,1200),(1950,1200)
+	    // Each cluster slightly spread to avoid Sybil false-positives
+	    positionAlloc->Add(Vector(730.0,  1150.0, 0.0)); // V0  near RSU0
+	    positionAlloc->Add(Vector(760.0,  1150.0, 0.0)); // V1  near RSU0
+	    positionAlloc->Add(Vector(750.0,  1170.0, 0.0)); // V2  near RSU0
+	    positionAlloc->Add(Vector(750.0,  1130.0, 0.0)); // V3  near RSU0
+	    positionAlloc->Add(Vector(1130.0, 1150.0, 0.0)); // V4  near RSU1
+	    positionAlloc->Add(Vector(1160.0, 1150.0, 0.0)); // V5  near RSU1
+	    positionAlloc->Add(Vector(1150.0, 1170.0, 0.0)); // V6  near RSU1
+	    positionAlloc->Add(Vector(1150.0, 1130.0, 0.0)); // V7  near RSU1
+	    positionAlloc->Add(Vector(1530.0, 1150.0, 0.0)); // V8  near RSU2
+	    positionAlloc->Add(Vector(1560.0, 1150.0, 0.0)); // V9  near RSU2
+	    positionAlloc->Add(Vector(1550.0, 1170.0, 0.0)); // V10 near RSU2
+	    positionAlloc->Add(Vector(1550.0, 1130.0, 0.0)); // V11 near RSU2
+	    positionAlloc->Add(Vector(1930.0, 1150.0, 0.0)); // V12 near RSU3
+	    positionAlloc->Add(Vector(1960.0, 1150.0, 0.0)); // V13 near RSU3
+	    positionAlloc->Add(Vector(1950.0, 1170.0, 0.0)); // V14 near RSU3
+	    positionAlloc->Add(Vector(1950.0, 1130.0, 0.0)); // V15 near RSU3
 	    /*
 	    positionAlloc->Add(Vector(0.0, -x*3, 0.0)); // Custom position for Node 3
 	    positionAlloc->Add(Vector(0.0, -x*4, 0.0)); // Custom position for Node 4
