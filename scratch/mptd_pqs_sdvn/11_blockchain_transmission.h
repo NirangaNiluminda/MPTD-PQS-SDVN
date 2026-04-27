@@ -100,45 +100,55 @@ void declare_attack_states()
             present_vanishing_attack_controllers   = true;
         }
     } else if (attack_number == 1) {
+        // TP-S1: Compromised RSU trajectory poisoning (§3.4.1, Figure 3.1)
+        // Attacker = RSU (trajectory_poisoning_malicious_nodes set in assign_controllers)
+        // NO malicious vehicles — all vehicles are honest in this scenario
+        present_location_attack_nodes    = false;
+        present_flooding_attack_nodes    = false;
+        present_fabrication_attack_nodes = false;
+        present_MIM_attack_nodes         = false;
+        present_vanishing_attack_nodes   = false;
+        present_flooding_attack_controllers    = false;
+        present_fabrication_attack_controllers = false;
+        present_MIM_attack_controllers         = false;
+        present_vanishing_attack_controllers   = false;
+    } else if (attack_number == 2) {
+        // TP-S2: Malicious vehicle trajectory poisoning (§3.4.1, Figure 3.2)
+        // Attacker = vehicle; sends fake but realistic trajectory data
         present_location_attack_nodes    = true;
         present_flooding_attack_nodes    = false;
         present_fabrication_attack_nodes = false;
         present_MIM_attack_nodes         = false;
         present_vanishing_attack_nodes   = false;
-        if (controller_malicious_assumption) present_flooding_attack_controllers = true;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
-    } else if (attack_number == 2) {
-        present_location_attack_nodes    = false;
-        present_flooding_attack_nodes    = true;
-        present_fabrication_attack_nodes = false;
-        present_MIM_attack_nodes         = false;
-        present_vanishing_attack_nodes   = false;
-        if (controller_malicious_assumption) present_flooding_attack_controllers = true;
+        present_flooding_attack_controllers    = false;
         present_fabrication_attack_controllers = false;
         present_MIM_attack_controllers         = false;
         present_vanishing_attack_controllers   = false;
     } else if (attack_number == 3) {
+        // MP-S1: Sybil via compromised RSU — ghost vehicle ID injection (§3.4.2, Figure 3.4)
+        // Attacker = RSU; generates additional fake vehicle identities
+        // NO malicious vehicles — all vehicles are honest
         present_location_attack_nodes      = false;
         present_flooding_attack_nodes      = false;
-        present_fabrication_attack_nodes   = true;
+        present_fabrication_attack_nodes   = false;
         present_MIM_attack_nodes           = false;
         present_vanishing_attack_nodes     = false;
-        present_flooding_attack_controllers = false;
-        if (controller_malicious_assumption) present_fabrication_attack_controllers = true;
-        present_MIM_attack_controllers       = false;
-        present_vanishing_attack_controllers = false;
+        present_flooding_attack_controllers    = false;
+        present_fabrication_attack_controllers = false;
+        present_MIM_attack_controllers         = false;
+        present_vanishing_attack_controllers   = false;
     } else if (attack_number == 4) {
+        // MP-S2: Sybil via malicious vehicle impersonation (§3.4.2, Figure 3.5)
+        // Attacker = vehicle; sends extra beacons with stolen vehicle IDs
         present_location_attack_nodes    = false;
         present_flooding_attack_nodes    = false;
         present_fabrication_attack_nodes = false;
-        present_MIM_attack_nodes         = true;
+        present_MIM_attack_nodes         = true;   // reuse MIM flag for identity theft
         present_vanishing_attack_nodes   = false;
         present_flooding_attack_controllers    = false;
         present_fabrication_attack_controllers = false;
-        if (controller_malicious_assumption) present_MIM_attack_controllers = true;
-        present_vanishing_attack_controllers = false;
+        present_MIM_attack_controllers         = false;
+        present_vanishing_attack_controllers   = false;
     } else if (attack_number == 5) {
         present_location_attack_nodes    = false;
         present_flooding_attack_nodes    = false;
@@ -218,6 +228,30 @@ void declare_attackers()
     set_ctrl(fabrication_malicious_controllers, present_fabrication_attack_controllers);
     set_ctrl(MIM_malicious_controllers,         present_MIM_attack_controllers);
     set_ctrl(vanishing_malicious_controllers,   present_vanishing_attack_controllers);
+}
+
+// ── declare_compromised_rsus() — set which RSUs are compromised ───────────────
+// Called for attack_number 1 (TP-S1) and 3 (MP-S1) where the RSU is attacker.
+// Uses attack_percentage to determine how many of the 4 RSUs are compromised:
+//   10–33%  → 1 RSU (RSU 0)
+//   34–66%  → 2 RSUs (RSU 0, 1)
+//   67–100% → 3 RSUs (RSU 0, 1, 2)
+void declare_compromised_rsus()
+{
+    compromised_rsu[0] = compromised_rsu[1] = compromised_rsu[2] = compromised_rsu[3] = false;
+
+    if (attack_number != 1 && attack_number != 3) return; // only RSU-level attacks
+
+    if (attack_percentage >= 10)  compromised_rsu[0] = true;
+    if (attack_percentage >= 34)  compromised_rsu[1] = true;
+    if (attack_percentage >= 67)  compromised_rsu[2] = true;
+
+    for (int r = 0; r < 4; r++) {
+        if (compromised_rsu[r])
+            cout << "[RSU-COMPROMISE] RSU " << r << " is COMPROMISED"
+                 << " (attack=" << attack_number
+                 << " pct=" << attack_percentage << "%)" << endl;
+    }
 }
 
 // ── assign_controllers() — assign node→controller + RSU malicious flags ──────

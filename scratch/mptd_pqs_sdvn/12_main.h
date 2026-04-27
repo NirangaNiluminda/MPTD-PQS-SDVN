@@ -1494,6 +1494,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 		       //unicast metadata from RSU nodes to management server - only in the first data cycle
 			declare_attack_states();
 			declare_attackers();
+			declare_compromised_rsus(); // TP-S1, MP-S1: set which RSUs are compromised
 
 			// ── Stage 7: PQ Crypto self-test (always runs) ────────────────────────────
 			if (use_pq_crypto) {

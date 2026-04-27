@@ -99,6 +99,11 @@ struct RsuIdentitySet {
 
 RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 
+// ── RSU compromise flags (TP-S1, MP-S1) ──────────────────────────────────────
+// compromised_rsu[i] = true means RSU i intercepts+modifies vehicle data.
+// Set by declare_compromised_rsus() in 11_blockchain_transmission.h.
+bool compromised_rsu[4] = {false, false, false, false};
+
 void init_rsu_id_sets() {
     for (int i = 0; i < total_size; i++) {
         rsu_id_set[i].count        = 0;

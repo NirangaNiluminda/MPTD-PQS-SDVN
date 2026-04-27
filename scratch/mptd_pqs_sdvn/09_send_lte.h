@@ -164,6 +164,52 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 
 	cout << "[LTE-UP] node " << nid << " BsmBeacon sent at "
 	     << Simulator::Now().GetSeconds() << endl;
+
+	// ── MP-S2: Vehicle identity theft — send extra beacons with stolen IDs ───────
+	// Paper §3.4.2 (Figure 3.5): Malicious vehicle impersonates other vehicles by
+	// transmitting additional beacons claiming to be different vehicle IDs.
+	// The stolen beacons carry THIS vehicle's current position but a different ID,
+	// making the RSU think other vehicles are at an impossible location.
+	if (attack_number == 4 && is_mal)
+	{
+		static const int N_stolen = 2; // number of identities to steal per beacon interval
+		int stolen_count = 0;
+
+		for (uint32_t other_nid = 2;
+		     other_nid < (uint32_t)(N_Vehicles + 2) && stolen_count < N_stolen;
+		     other_nid++)
+		{
+			if (other_nid == nid) continue; // don't steal own ID
+			uint32_t other_vid = other_nid - 2;
+			// Only steal from honest vehicles (realistic attacker behaviour)
+			if (MIM_malicious_nodes[other_vid]) continue;
+
+			// Build impersonation beacon: stolen ID, attacker's real position
+			BsmBeaconTag fake_tag;
+			fake_tag.SetVehicleId(other_nid);          // stolen identity
+			fake_tag.SetPosition(tx_px, tx_py);        // attacker's position
+			fake_tag.SetSpeed(tx_spd);
+			fake_tag.SetHeading(tx_hdg);
+			fake_tag.SetAcceleration(tx_acc);
+			fake_tag.SetTimestamp(Simulator::Now().GetSeconds());
+			fake_tag.SetIsPoisoned(true);              // impersonation = poisoned
+			fake_tag.SetAttackType(4);
+			fake_tag.SetSigViolated(0);
+
+			Ptr<Packet> fake_pkt = Create<Packet>(0);
+			fake_pkt->AddPacketTag(fake_tag);
+			lte_total_packet_size += fake_pkt->GetSerializedSize();
+
+			// Slight delay so RSU receives real + stolen beacons as separate events
+			Simulator::Schedule(Seconds(0.005 * (stolen_count + 1)),
+			                    &SimpleUdpApplication::SendPacket,
+			                    udp_app, fake_pkt, dest_ip, 7777);
+
+			cout << "[MP-S2-SYB] V" << nid << " impersonating V" << other_nid
+			     << " at pos(" << tx_px << "," << tx_py << ")" << endl;
+			stolen_count++;
+		}
+	}
 }
 
 

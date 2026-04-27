@@ -165,7 +165,15 @@ void PoisonTrajectoryByType(Vector &position, Vector &velocity, Vector &accelera
             // Triggers: TP-S2 (|Δθ| > ω_max·T_b), also TP-S4 via large velocity jump
             velocity.x += theta * max_velocity_deviation * 2.0 * sin(t * 3.1);
             velocity.y += theta * max_velocity_deviation * 2.0 * cos(t * 2.7);
-            // Large Δv → large implied Δθ → TP-S2 fires
+            // Position also drifts in velocity direction (vehicle claims to be ahead)
+            {
+                double spd = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+                if (spd > 1e-6) {
+                    position.x += theta * max_position_deviation * (velocity.x / spd);
+                    position.y += theta * max_position_deviation * (velocity.y / spd);
+                }
+            }
+            // Large Δv + Δpos → TP-S2 fires
             break;
 
         case 3:
