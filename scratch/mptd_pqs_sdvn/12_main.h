@@ -1845,7 +1845,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 
   // ── MRTPA Attack Summary ──────────────────────────────────────────────────
   std::cout << "\n========================================" << std::endl;
-  std::cout << " MRTPA ATTACK SUMMARY" << std::endl;
+  std::cout << " ATTACK SUMMARY" << std::endl;
   std::cout << "========================================" << std::endl;
   std::cout << "  Attack number        : " << attack_number << std::endl;
   std::cout << "  Attack percentage    : " << attack_percentage << "%" << std::endl;
