@@ -146,33 +146,9 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
         }
     }
 
-    // MP-S3: regional speed KL divergence (Eq. 3.18)
-    // D_KL(P_t || P_hist) > κ_th
-    // Simplified: flag if all nearby vehicles report identical speed
-    // (full KL divergence would need histogram computation)
-    double sum_speed = 0;
-    int count_near = 0;
-    for (int other = 0; other < total_size; other++) {
-        if (vehicle_state[other].count == 0) continue;
-        int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
-        double dx = vehicle_state[other].pos_x[h] - tag.GetPosX();
-        double dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
-        double d = std::sqrt(dx*dx + dy*dy);
-        if (d < R_max_comm) {
-            sum_speed += vehicle_state[other].speed[h];
-            count_near++;
-        }
-    }
-    if (count_near > 0) {
-        double mean_sp = sum_speed / count_near;
-        // KL divergence estimate: deviation from regional mean.
-        // Denominator uses mean_sp + s_max*0.1 to avoid near-zero division
-        // when all nearby vehicles are stationary (mean_sp≈0).
-        double kl_approx = std::fabs(tag.GetSpeed() - mean_sp)
-                         / (mean_sp + s_max * 0.1);   // s_max*0.1 ≈ 3.33 m/s floor
-        if (kl_approx > kappa_th)
-            violated |= (1 << 2);
-    }
+    // MP-S3: KL-divergence check MOVED to run_mitm_detect() per paper Algorithm 3.
+    // Alg 2 (SYB-DETECT) covers Sybil/density/timing/ghost; Alg 3 (MITM-DETECT)
+    // covers distribution manipulation.  Bit 2 is now set by run_mitm_detect().
 
     // MP-S4: ghost transit impossibility
     // d(r_j, r_k) / |t_j - t_k| > s_max
@@ -196,11 +172,46 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 // ============================================================
 // MITM-DETECT / CP-DETECT — Algorithms 3 & 4 (stubs)
 // ============================================================
+// ============================================================
+// MITM-DETECT — Algorithm 3 (§3.4.4)
+// Detects Man-in-the-Middle manipulation of beacon distributions.
+// Returns bitmask: bit 2 = MP-S3 (KL divergence speed anomaly)
+//
+// Paper Algorithm 3, Step 4 (Eq. 3.18):
+//   D_KL(P_t || P_hist) > κ_th
+// Approximation: flag if vehicle speed deviates > κ_th from
+// regional mean, normalised by (mean + floor) to avoid zero-division.
+// ============================================================
 uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 {
-    // MP-S3 (MitM): detected by speed distribution anomaly in SYB-DETECT
-    // Full implementation uses flow-level analysis (Stage 5 expansion)
-    return 0;
+    uint32_t violated = 0;
+
+    // MP-S3: regional speed KL divergence (Eq. 3.18)
+    // D_KL(P_t || P_hist) > κ_th
+    // Collect speed samples from all vehicles in RSU communication range.
+    double sum_speed = 0.0;
+    int    count_near = 0;
+    for (int other = 0; other < total_size; other++) {
+        if (vehicle_state[other].count == 0) continue;
+        int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+        double dx = vehicle_state[other].pos_x[h] - tag.GetPosX();
+        double dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
+        if (std::sqrt(dx*dx + dy*dy) < R_max_comm) {
+            sum_speed += vehicle_state[other].speed[h];
+            count_near++;
+        }
+    }
+    if (count_near > 0) {
+        double mean_sp  = sum_speed / count_near;
+        // Denominator floor = s_max * 0.1 ≈ 3.33 m/s to prevent near-zero
+        // division when all nearby vehicles are stationary (mean_sp ≈ 0).
+        double kl_approx = std::fabs(tag.GetSpeed() - mean_sp)
+                         / (mean_sp + s_max * 0.1);
+        if (kl_approx > kappa_th)
+            violated |= (1 << 2);   // bit 2 = MP-S3 position in mp_flags
+    }
+
+    return violated;
 }
 
 uint32_t run_cp_detect(BsmBeaconTag &tag)
@@ -294,10 +305,12 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                 tag.GetSpeed(), tag.GetHeading(),
                 tag.GetAcceleration(), tag.GetTimestamp());
 
-    // 2. Run detection algorithms
-    uint32_t tp_flags = run_tp_detect(vehicle_id, tag);
-    uint32_t mp_flags = run_syb_detect(vehicle_id, rsu_id, tag);
-    uint32_t cp_flags = run_cp_detect(tag);
+    // 2. Run detection algorithms (paper Algorithms 1–4)
+    uint32_t tp_flags   = run_tp_detect(vehicle_id, tag);          // Alg 1: TP-S1..S5
+    uint32_t mp_flags   = run_syb_detect(vehicle_id, rsu_id, tag); // Alg 2: MP-S1,S2,S4
+    uint32_t mitm_flags = run_mitm_detect(vehicle_id, rsu_id, tag);// Alg 3: MP-S3 (KL)
+    mp_flags           |= mitm_flags; // merge: bit 2 (MP-S3) now comes from MITM-DETECT
+    uint32_t cp_flags   = run_cp_detect(tag);                      // Alg 4: CP
 
     // Combine: sig_violated bitmask (bits 0-4 = TP-S1..S5, bits 5-8 = MP-S1..S4)
     uint32_t sig_violated = tp_flags | (mp_flags << 5) | (cp_flags << 9);
