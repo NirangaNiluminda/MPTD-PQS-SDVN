@@ -8,6 +8,11 @@
 // when routing_test=true).
 // ============================================================
 
+// Forward declaration — inject_mp_s2_stolen_beacons() is defined later in this file
+// (after send_LTE_metadata_uplink_alone which calls it).
+void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication>, uint32_t,
+                                  double, double, double, double, double, Ipv4Address);
+
 bool routing_time = false;
 double average_cost = 0.0;
 double average_lte_utilization = 0.0;
@@ -93,14 +98,39 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 		tx_spd = real_spd; tx_hdg = real_hdg; tx_acc = real_acc;
 
 		if (is_mal) {
-			// Apply trajectory poisoning (Algorithm 1, §3.3.1)
+			// ── MP-S2 Vanishing: suppress beacon on alternate calls (50% drop) ──
+			// Vehicle appears to "vanish" from the network intermittently.
+			// Effect: poisoned beacons are never received → FN rate increases.
+			if (vanishing_malicious_nodes[vid]) {
+				static uint32_t vanish_counter[MAX_NODES] = {};
+				vanish_counter[vid]++;
+				if (vanish_counter[vid] % 2 == 0) {
+					// Skip this beacon — do NOT send, do NOT accumulate errors
+					// (TDEE/TPE only count beacons that ARE sent)
+					cout << "[VANISH] node " << nid
+					     << " suppressed beacon at "
+					     << Simulator::Now().GetSeconds() << endl;
+					return;
+				}
+			}
+
+			// Apply attack-type-specific trajectory poisoning (§3.4.1–3.4.2)
+			// Each attack_number manipulates different BSM beacon fields so
+			// distinct detection signatures (TP-S1..MP-S4) fire per type.
 			Vector fpos(real_px, real_py, 0.0);
 			double vx = real_spd * std::cos(real_hdg);
 			double vy = real_spd * std::sin(real_hdg);
 			Vector fvel(vx, vy, 0.0);
 			Vector facc(0.0, 0.0, 0.0);
-			PoisonTrajectory(fpos, fvel, facc, poisoning_intensity_theta);
-			EnforceRealism(fpos, fvel, facc);
+			PoisonTrajectoryByType(fpos, fvel, facc, poisoning_intensity_theta,
+			                       attack_number);
+			// Attack 3 (TP-S3 Fabrication) deliberately injects values ABOVE
+			// physical limits — the attacker fabricates impossible acceleration.
+			// Applying EnforceRealism would clamp it back, defeating TP-S3 detection.
+			// All other attacks maintain plausible-looking trajectories.
+			if (attack_number != 3) {
+				EnforceRealism(fpos, fvel, facc);
+			}
 			tx_px  = fpos.x;
 			tx_py  = fpos.y;
 			tx_spd = std::sqrt(fvel.x * fvel.x + fvel.y * fvel.y);
@@ -139,6 +169,66 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 
 	cout << "[LTE-UP] node " << nid << " BsmBeacon sent at "
 	     << Simulator::Now().GetSeconds() << endl;
+
+	// ── MP-S2 Attack Injection (§3.4.2, Figure 3.5) ─────────────────────────────
+	// Attack model defined in 06_mrtpa_attack.h (declare_attack_states, attack_number==4).
+	// Execution: malicious vehicle calls inject_mp_s2_stolen_beacons() to send
+	// extra beacon packets claiming stolen vehicle identities at this vehicle's position.
+	if (attack_number == 4 && is_mal)
+		inject_mp_s2_stolen_beacons(udp_app, nid, tx_px, tx_py,
+		                             tx_spd, tx_hdg, tx_acc, dest_ip);
+}
+
+// ── inject_mp_s2_stolen_beacons() — MP-S2 identity theft beacon injection ────
+// Paper §3.4.2 (Figure 3.5): Malicious vehicle transmits N_stolen additional
+// beacons per interval, each claiming to be a different honest vehicle's ID
+// but carrying the attacker's own current position. This causes the RSU to
+// record the same honest vehicle ID appearing simultaneously at two impossible
+// locations → triggers MP-S4 ghost-transit-impossibility check (§3.4.4).
+//
+// Attack model definition: 06_mrtpa_attack.h → declare_attack_states() case 4
+// Detection logic:         08_beacon_handlers.h → run_syb_detect() bit 3 (MP-S4)
+void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
+                                  uint32_t attacker_nid,
+                                  double tx_px, double tx_py,
+                                  double tx_spd, double tx_hdg, double tx_acc,
+                                  Ipv4Address dest_ip)
+{
+	static const int N_stolen = 2; // identities stolen per beacon interval (paper §3.4.2)
+	int stolen_count = 0;
+
+	for (uint32_t other_nid = 2;
+	     other_nid < (uint32_t)(N_Vehicles + 2) && stolen_count < N_stolen;
+	     other_nid++)
+	{
+		if (other_nid == attacker_nid) continue; // don't steal own ID
+		uint32_t other_vid = other_nid - 2;
+		if (MIM_malicious_nodes[other_vid]) continue; // only steal from honest vehicles
+
+		BsmBeaconTag fake_tag;
+		fake_tag.SetVehicleId(other_nid);           // stolen identity
+		fake_tag.SetPosition(tx_px, tx_py);         // attacker's real position
+		fake_tag.SetSpeed(tx_spd);
+		fake_tag.SetHeading(tx_hdg);
+		fake_tag.SetAcceleration(tx_acc);
+		fake_tag.SetTimestamp(Simulator::Now().GetSeconds());
+		fake_tag.SetIsPoisoned(true);               // impersonation beacon = poisoned
+		fake_tag.SetAttackType(4);
+		fake_tag.SetSigViolated(0);
+
+		Ptr<Packet> fake_pkt = Create<Packet>(0);
+		fake_pkt->AddPacketTag(fake_tag);
+		lte_total_packet_size += fake_pkt->GetSerializedSize();
+
+		// Stagger 5ms per stolen beacon so RSU sees distinct receive events
+		Simulator::Schedule(Seconds(0.005 * (stolen_count + 1)),
+		                    &SimpleUdpApplication::SendPacket,
+		                    udp_app, fake_pkt, dest_ip, 7777);
+
+		cout << "[MP-S2-SYB] V" << attacker_nid << " impersonating V" << other_nid
+		     << " at pos(" << tx_px << "," << tx_py << ")" << endl;
+		stolen_count++;
+	}
 }
 
 

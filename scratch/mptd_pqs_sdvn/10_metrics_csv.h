@@ -70,18 +70,20 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    static bool header_written = false;
+    // APPEND mode: keep all runs in the same file so ML pipeline has a rich dataset.
+    // Header is written only if the file doesn't exist yet (checked via file size).
     std::ofstream fout;
+    std::string path = NS3_ROOT "/analytics/results/beacon_log.csv";
+    std::ifstream check(path);
+    bool file_exists = check.good() && check.peek() != std::ifstream::traits_type::eof();
+    check.close();
 
-    if (!header_written) {
-        fout.open(NS3_ROOT "/analytics/results/beacon_log.csv",
-                  std::ios::out | std::ios::trunc);
+    if (!file_exists) {
+        fout.open(path, std::ios::out | std::ios::trunc);
         fout << "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
              << "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct\n";
-        header_written = true;
     } else {
-        fout.open(NS3_ROOT "/analytics/results/beacon_log.csv",
-                  std::ios::out | std::ios::app);
+        fout.open(path, std::ios::out | std::ios::app);
     }
 
     fout << tag.GetTimestamp()      << ","

@@ -41,7 +41,7 @@ public:
     void SetVehicleId(uint32_t id)         { m_vehicle_id = id; }
     void SetIsPoisoned(bool p)             { m_is_poisoned = p; }
     void SetAttackType(uint32_t at)        { m_attack_type = at; }
-    void SetSigViolated(uint32_t sv)       { m_sig_violated = sv; }
+    void SetSigViolated(uint32_t sv)       { m_sig_violated = sv; }  // bitmask: bit0=TP-S1 .. bit8=MP-S4
 
     // Getters
     double   GetPosX()         const { return m_pos_x; }

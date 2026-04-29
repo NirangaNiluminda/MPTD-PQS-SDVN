@@ -52,7 +52,18 @@ def _safe(num, den):
 
 def compute_metrics(tp, fp, tn, fn, attack_pct=20, speed_kmh=50,
                     use_pq=True, n_rsus=4, trs_threshold=3):
-    """Compute all 7 paper metrics (Eqs. 4.1-4.7)."""
+    """Compute all 7 paper metrics (Eqs. 4.1-4.7).
+
+    Metric definitions (§4.1.2):
+      MCC   — Matthews Correlation Coefficient
+      FPR   — False Positive Rate  = FP / (FP+TN)
+      PARR  — Poisoning Attack Recognition Rate = TP / (TP+FN)   (recall)
+              When use_pq=False (A4/baselines without PQ crypto), PARR=0
+      CDER  — Coordinate Detection Error Rate  = (FP+FN) / N
+      TDEE  — Trajectory Displacement Estimation Error (proxy: fn_rate × speed×dt)
+      TPE   — Trajectory Poisoning Effect RMSE  (proxy: fn_rate × noise_m)
+      PBPO  — Processing/Blockchain overhead (not applicable in ML-only baselines)
+    """
     total          = tp + fp + tn + fn
     total_poisoned = tp + fn
     denom_mcc      = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
@@ -63,28 +74,25 @@ def compute_metrics(tp, fp, tn, fn, attack_pct=20, speed_kmh=50,
     # Eq. 4.2 — FPR
     fpr = _safe(fp, fp + tn)
 
-    # Eq. 4.3 — PARR (TRS mitigation; 0 when use_pq=False i.e. A4)
-    if not use_pq or total_poisoned == 0:
-        parr = 0.0 if not use_pq else 1.0
+    # Eq. 4.3 — PARR = TP/(TP+FN)  (poisoning recognition recall)
+    # For ablations without PQ crypto (use_pq=False), PARR is reported as 0
+    # because the TRS revocation path is inactive.
+    if not use_pq:
+        parr = 0.0
     else:
-        rho          = attack_pct / 100.0
-        n_compromised = rho * n_rsus
-        if n_compromised < trs_threshold:
-            parr = 1.0
-        elif n_compromised >= n_rsus:
-            parr = 0.0
-        else:
-            parr = 1.0 - (n_compromised - trs_threshold) / (n_rsus - trs_threshold)
+        parr = _safe(tp, total_poisoned)   # TP / (TP+FN)
 
-    # Eq. 4.4 — CDER
-    cder = _safe(fn, total)
+    # Eq. 4.4 — CDER = (FP+FN) / N  (combined misclassification error rate)
+    cder = _safe(fp + fn, total)
 
-    # Eq. 4.5 — TDEE proxy
-    fn_rate = _safe(fn, max(total_poisoned, 1))
-    tdee    = fn_rate * (attack_pct / 100.0)
+    # Eq. 4.5 — TDEE proxy (mean displacement error in metres)
+    # True TDEE requires position data; approximate as fn_rate × avg_speed × beacon_interval
+    fn_rate  = _safe(fn, max(total_poisoned, 1))
+    beacon_s = 0.5                          # T_b = 0.5 s
+    tdee     = fn_rate * speed_kmh * (1000.0 / 3600.0) * beacon_s
 
-    # Eq. 4.6 — TPE proxy
-    noise_m = speed_kmh * (1000.0 / 3600.0) * 2.0
+    # Eq. 4.6 — TPE RMSE proxy (metres of undetected trajectory deviation)
+    noise_m = speed_kmh * (1000.0 / 3600.0) * 2.0   # 2-beacon-interval drift
     tpe     = fn_rate * noise_m
 
     return dict(MCC=mcc, FPR=fpr, PARR=parr, CDER=cder, TDEE=tdee, TPE=tpe)
@@ -209,7 +217,13 @@ def main():
     # Compute metrics per mode
     # External baselines B1-B3 and internal ablations A1-A5
     # det_col maps to detection columns in det_df; use_pq controls PARR
-    attack_pct = int(df["attack_percentage"].iloc[0]) if "attack_percentage" in df.columns else 20
+    # beacon_log.csv uses "attack_pct"; synthetic data may use "attack_percentage"
+    if "attack_pct" in df.columns:
+        attack_pct = int(df["attack_pct"].iloc[0])
+    elif "attack_percentage" in df.columns:
+        attack_pct = int(df["attack_percentage"].iloc[0])
+    else:
+        attack_pct = 20
 
     modes = [
         # (display_name,   det_col,   use_pq_for_PARR)

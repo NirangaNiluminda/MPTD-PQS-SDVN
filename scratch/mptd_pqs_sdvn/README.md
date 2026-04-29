@@ -102,43 +102,101 @@ python3 waf --run "mptd_pqs_sdvn \
 
 ## 🔍 Fabric Explorer (Blockchain UI)
 
-View transactions, blocks, and chaincode activity in a web browser.
+View all blocks, transactions, and chaincode calls in a web browser.
 
-**Fabric network must be running first**, then run the single start script:
+**Requirement:** Fabric network must already be running (Terminal 1 from Quick Start).
+
+### Start Explorer
 
 ```bash
 bash /home/niranga/fabric-samples/explorer/start-explorer.sh
 ```
 
-Wait ~30 seconds, then open: **http://localhost:8080**
+Wait ~30 seconds for the database to initialise, then open: **http://localhost:8080**
 
 | Field | Value |
 |-------|-------|
+| URL | http://localhost:8080 |
 | Username | `exploreradmin` |
 | Password | `exploreradminpw` |
 
-**Stop Explorer:**
+You will see live blocks and transactions. After running an NS-3 simulation, refresh the
+Explorer to see all the trajectory data written to the blockchain by the REST API.
+
+### Stop Explorer
+
 ```bash
 cd /home/niranga/fabric-samples/explorer
 docker compose down -v
 ```
 
-> **Why a script?** Fabric CA generates a new private key filename every time
-> `network.sh up` runs. Explorer expects a file named `priv_sk` in each keystore
-> directory. The script automatically creates that symlink before starting the
-> containers so no manual steps are needed.
+The `-v` flag removes the PostgreSQL volume so Explorer starts cleanly next time.
+Without it the database retains stale block data from a previous Fabric network run.
 
-> **Explorer location:** `fabric-samples/explorer/` (NOT `blockchain-explorer/` —
-> that older setup does not work with Fabric 2.5.x).
+### Running Docker containers (Explorer)
+
+```
+explorerdb.mynetwork.com   PostgreSQL database for Explorer (port 5432 internal)
+explorer.mynetwork.com     Explorer web app (port 8080 → http://localhost:8080)
+```
+
+Check status at any time:
+```bash
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "explor|peer|orderer"
+```
+
+### Why a start script instead of plain `docker compose up`?
+
+Fabric CA generates a new private key filename every time `network.sh up` runs
+(e.g. `3d4331_sk`). Explorer expects a fixed filename `priv_sk` in each keystore
+directory. The script creates that symlink automatically before launching the
+containers. It also skips root-owned `fabric-ca/` keystores (which Explorer does
+not need) to avoid permission errors.
+
+> **Note:** Explorer is in `fabric-samples/explorer/` — do NOT use
+> `blockchain-explorer/` (older setup, incompatible with Fabric 2.5.x).
+
+---
+
+## 📦 IPFS (Off-Chain Storage)
+
+IPFS stores large trajectory data off-chain; only the CID hash goes to Fabric.
+
+**Current status:** IPFS daemon is not installed on this machine.
+The simulation REST API writes full trajectory JSON directly to Fabric (suitable
+for demo). To enable full IPFS integration:
+
+```bash
+# Install IPFS
+wget https://dist.ipfs.tech/kubo/v0.27.0/kubo_v0.27.0_linux-amd64.tar.gz
+tar -xzf kubo_v0.27.0_linux-amd64.tar.gz
+sudo bash kubo/install.sh
+
+# Initialise and start daemon
+ipfs init
+ipfs daemon &
+
+# Verify (should return {"Version":"0.27.0",...})
+curl -s http://localhost:5001/api/v0/version
+
+# IPFS Web UI (browser)
+# open http://localhost:5001/webui
+```
+
+Stop IPFS:
+```bash
+pkill ipfs
+```
 
 ---
 
 ## 🛑 Shutting Down (Free RAM)
 
-When you are done working, shut everything down to free RAM (~2 GB):
+When you are done working, shut everything down to free RAM (~2 GB).
+**Always stop Explorer before Fabric** — Explorer holds open DB connections to the peers.
 
 ```bash
-# 1 — Stop Explorer (if running)
+# 1 — Stop Explorer (if running) — must be before network.sh down
 cd /home/niranga/fabric-samples/explorer && docker compose down -v
 
 # 2 — Fix file ownership BEFORE stopping Fabric (prevents "Permission denied")
@@ -222,15 +280,18 @@ bash /home/niranga/fabric-samples/explorer/start-explorer.sh
 
 ## Attack Scenarios
 
-| `attack_number` | Paper ID | Type | Description |
-|---|---|---|---|
-| 1 | TP-S1 | Trajectory poisoning | Gradual position drift |
-| 2 | TP-S2 | Trajectory poisoning | Speed spoofing |
-| 3 | TP-S3 | Trajectory poisoning | Malicious controller |
-| 4 | MP-S1 | Mobility pattern | Traffic density manipulation |
-| 5 | MP-S2 | Mobility pattern | Sybil RSU injection |
-| 6 | MP-S3 | Mobility pattern | Man-in-the-Middle |
-| 7 | MP-S4 | Mobility pattern | Coordinated multi-source |
+| `attack_number` | Paper ID | Level | Attacker | Description |
+|---|---|---|---|---|
+| 1 | TP-S1 | RSU | Compromised RSU | RSU intercepts honest vehicle beacons and shifts GPS coordinates before forwarding |
+| 2 | TP-S2 | Vehicle | Malicious vehicle | Vehicle sends fake-but-realistic trajectory (exaggerated speed + shifted position) |
+| 3 | MP-S1 | RSU | Compromised RSU | RSU injects ghost vehicle IDs, inflating apparent traffic density (Sybil via RSU) |
+| 4 | MP-S2 | Vehicle | Malicious vehicle | Vehicle steals other vehicles' IDs and sends extra beacons at its own position (Sybil impersonation) |
+| 5 | Vanishing | Vehicle | Malicious vehicle | Vehicle randomly suppresses every other beacon (intermittent disappearance) |
+| 6 | All-vehicle | Vehicle | Malicious vehicles | All vehicle-level attack flags active simultaneously |
+| 7 | MP-S4 | Vehicle + Controller | Coordinated | All attack types active simultaneously across vehicles and controllers |
+
+> **Implemented & validated:** attack_number 1, 2, 3, 4 (see threat_model branch).
+> attack_number 5, 6, 7 are partially implemented (flags set; full detection tuning pending).
 
 ### Simulation Parameters
 

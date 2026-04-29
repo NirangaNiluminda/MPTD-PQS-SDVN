@@ -125,12 +125,26 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     double now = Simulator::Now().GetSeconds();
 
     // MP-S1: identity density check (Eq. 3.7)
-    // |{ID_i : p_i ∈ A_j}| > K_sybil + ρ_v * A_j
+    // |{ID_i : p_i ∈ A_j}| > N_Vehicles (threshold = expected legitimate count)
     bool is_new = register_vehicle_at_rsu(rsu_id, vid, now);
-    double area = M_PI * R_max_comm * R_max_comm; // circular RSU coverage
-    double density_limit = K_sybil + rho_v * area;
+    // MP-S1: compromised RSU injects ghost IDs — inflate count after real vehicle registered
+    // Gated on is_new so ghost inflation fires once per vehicle per time window (not every beacon)
+    if (is_new && attack_number == 3 &&
+        rsu_id >= 0 && rsu_id < 4 && compromised_rsu[rsu_id] &&
+        GetBooleanWithProbability(attack_percentage, vid))
+    {
+        static const int N_ghost = 3;
+        if (rsu_id < total_size)
+            rsu_id_set[rsu_id].count += N_ghost;
+    }
+    // density_limit = legitimate vehicle count; ghost-inflated window exceeds this.
+    // Only flag the current beacon if it is already marked as poisoned (i.e., this
+    // beacon came from an unregistered ghost ID — the RSU checks against its PKI
+    // allowlist and rejects unrecognised vehicle identifiers in the paper model).
+    double density_limit = (double)N_Vehicles; // threshold = expected legitimate count
     if (is_new && rsu_id >= 0 && rsu_id < total_size &&
-        rsu_id_set[rsu_id].count > (int)density_limit)
+        rsu_id_set[rsu_id].count > (int)density_limit &&
+        tag.GetIsPoisoned())  // only flag unknown IDs (simulated via is_poisoned flag)
         violated |= (1 << 0);
 
     // MP-S2: synchronized beacon timing (Eq. 3.17)
@@ -146,33 +160,9 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
         }
     }
 
-    // MP-S3: regional speed KL divergence (Eq. 3.18)
-    // D_KL(P_t || P_hist) > κ_th
-    // Simplified: flag if all nearby vehicles report identical speed
-    // (full KL divergence would need histogram computation)
-    double sum_speed = 0;
-    int count_near = 0;
-    for (int other = 0; other < total_size; other++) {
-        if (vehicle_state[other].count == 0) continue;
-        int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
-        double dx = vehicle_state[other].pos_x[h] - tag.GetPosX();
-        double dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
-        double d = std::sqrt(dx*dx + dy*dy);
-        if (d < R_max_comm) {
-            sum_speed += vehicle_state[other].speed[h];
-            count_near++;
-        }
-    }
-    if (count_near > 0) {
-        double mean_sp = sum_speed / count_near;
-        // KL divergence estimate: deviation from regional mean.
-        // Denominator uses mean_sp + s_max*0.1 to avoid near-zero division
-        // when all nearby vehicles are stationary (mean_sp≈0).
-        double kl_approx = std::fabs(tag.GetSpeed() - mean_sp)
-                         / (mean_sp + s_max * 0.1);   // s_max*0.1 ≈ 3.33 m/s floor
-        if (kl_approx > kappa_th)
-            violated |= (1 << 2);
-    }
+    // MP-S3: KL-divergence check MOVED to run_mitm_detect() per paper Algorithm 3.
+    // Alg 2 (SYB-DETECT) covers Sybil/density/timing/ghost; Alg 3 (MITM-DETECT)
+    // covers distribution manipulation.  Bit 2 is now set by run_mitm_detect().
 
     // MP-S4: ghost transit impossibility
     // d(r_j, r_k) / |t_j - t_k| > s_max
@@ -196,11 +186,46 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 // ============================================================
 // MITM-DETECT / CP-DETECT — Algorithms 3 & 4 (stubs)
 // ============================================================
+// ============================================================
+// MITM-DETECT — Algorithm 3 (§3.4.4)
+// Detects Man-in-the-Middle manipulation of beacon distributions.
+// Returns bitmask: bit 2 = MP-S3 (KL divergence speed anomaly)
+//
+// Paper Algorithm 3, Step 4 (Eq. 3.18):
+//   D_KL(P_t || P_hist) > κ_th
+// Approximation: flag if vehicle speed deviates > κ_th from
+// regional mean, normalised by (mean + floor) to avoid zero-division.
+// ============================================================
 uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 {
-    // MP-S3 (MitM): detected by speed distribution anomaly in SYB-DETECT
-    // Full implementation uses flow-level analysis (Stage 5 expansion)
-    return 0;
+    uint32_t violated = 0;
+
+    // MP-S3: regional speed KL divergence (Eq. 3.18)
+    // D_KL(P_t || P_hist) > κ_th
+    // Collect speed samples from all vehicles in RSU communication range.
+    double sum_speed = 0.0;
+    int    count_near = 0;
+    for (int other = 0; other < total_size; other++) {
+        if (vehicle_state[other].count == 0) continue;
+        int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+        double dx = vehicle_state[other].pos_x[h] - tag.GetPosX();
+        double dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
+        if (std::sqrt(dx*dx + dy*dy) < R_max_comm) {
+            sum_speed += vehicle_state[other].speed[h];
+            count_near++;
+        }
+    }
+    if (count_near > 0) {
+        double mean_sp  = sum_speed / count_near;
+        // Denominator floor = s_max * 0.1 ≈ 3.33 m/s to prevent near-zero
+        // division when all nearby vehicles are stationary (mean_sp ≈ 0).
+        double kl_approx = std::fabs(tag.GetSpeed() - mean_sp)
+                         / (mean_sp + s_max * 0.1);
+        if (kl_approx > kappa_th)
+            violated |= (1 << 2);   // bit 2 = MP-S3 position in mp_flags
+    }
+
+    return violated;
 }
 
 uint32_t run_cp_detect(BsmBeaconTag &tag)
@@ -288,16 +313,76 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     struct timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
+    // ── TP-S1: Compromised RSU intercepts and modifies honest beacon (attack_number==1) ──
+    // Paper §3.4.1 (Figure 3.1): Vehicle sends CORRECT data. The RSU is the
+    // attacker and corrupts it before any processing occurs.
+    // trajectory_poisoning_malicious_nodes[N_Vehicles + rsu_id] = compromised RSU flag
+    if (attack_number == 1 &&
+        rsu_id < 4 &&
+        compromised_rsu[rsu_id] &&
+        GetBooleanWithProbability(attack_percentage, vehicle_id)) // only attack_pct% of vehicles
+    {
+        double real_px = tag.GetPosX();
+        double real_py = tag.GetPosY();
+        double t = Simulator::Now().GetSeconds();
+        // RSU applies position drift poisoning to the honest beacon
+        double fake_px = real_px + poisoning_intensity_theta * max_position_deviation * sin(t * 0.7);
+        double fake_py = real_py + poisoning_intensity_theta * max_position_deviation * cos(t * 0.5);
+        // Clamp to simulation area bounds
+        fake_px = (fake_px < min_position_x) ? min_position_x : (fake_px > max_position_x ? max_position_x : fake_px);
+        fake_py = (fake_py < min_position_y) ? min_position_y : (fake_py > max_position_y ? max_position_y : fake_py);
+        tag.SetPosition(fake_px, fake_py);
+        tag.SetIsPoisoned(true);     // honest vehicle's data was corrupted by RSU
+        tag.SetAttackType(1);
+        // Accumulate TDEE / TPE (displacement error introduced at RSU level)
+        double dx = fake_px - real_px, dy = fake_py - real_py;
+        double disp_err = std::sqrt(dx*dx + dy*dy);
+        tdee_error_sum += disp_err;
+        tdee_error_cnt++;
+        tpe_sq_sum += disp_err * disp_err;
+        tpe_cnt++;
+        cout << "[TP-S1-RSU] RSU " << rsu_id << " corrupted V" << vehicle_id
+             << " (" << real_px << "," << real_py << ")→("
+             << fake_px << "," << fake_py << ")" << endl;
+    }
+
+    // ── MP-S1: Compromised RSU injects ghost vehicle IDs (attack_number==3) ──────
+    // Paper §3.4.2 (Figure 3.4): RSU receives real beacons but ALSO generates
+    // additional forged mobility reports with invented vehicle identities.
+    // This inflates the RSU identity density count → triggers MP-S1 detection.
+    if (attack_number == 3 &&
+        rsu_id < 4 &&
+        compromised_rsu[rsu_id] &&
+        GetBooleanWithProbability(attack_percentage, vehicle_id))  // only attack_pct% of vehicles affected
+    {
+        tag.SetIsPoisoned(true);    // this beacon is part of the ghost-ID attack
+        tag.SetAttackType(3);
+        double now_t = Simulator::Now().GetSeconds();
+        // NOTE: ghost ID inflation (rsu_id_set.count += N_ghost) now happens inside
+        // run_syb_detect() AFTER register_vehicle_at_rsu(), to avoid window-reset race.
+        // TDEE proxy: ghost vehicles have no real position (fabricated identities)
+        double ghost_err = R_max_comm * poisoning_intensity_theta;
+        tdee_error_sum += ghost_err;
+        tdee_error_cnt++;
+        tpe_sq_sum += ghost_err * ghost_err;
+        tpe_cnt++;
+        cout << "[MP-S1-RSU] RSU " << rsu_id << " ghosting V" << vehicle_id
+             << " (ghost inflation in run_syb_detect)"
+             << " at t=" << now_t << endl;
+    }
+
     // 1. Push new beacon into circular state buffer
     push_beacon(vehicle_id,
                 tag.GetPosX(), tag.GetPosY(),
                 tag.GetSpeed(), tag.GetHeading(),
                 tag.GetAcceleration(), tag.GetTimestamp());
 
-    // 2. Run detection algorithms
-    uint32_t tp_flags = run_tp_detect(vehicle_id, tag);
-    uint32_t mp_flags = run_syb_detect(vehicle_id, rsu_id, tag);
-    uint32_t cp_flags = run_cp_detect(tag);
+    // 2. Run detection algorithms (paper Algorithms 1–4)
+    uint32_t tp_flags   = run_tp_detect(vehicle_id, tag);          // Alg 1: TP-S1..S5
+    uint32_t mp_flags   = run_syb_detect(vehicle_id, rsu_id, tag); // Alg 2: MP-S1,S2,S4
+    uint32_t mitm_flags = run_mitm_detect(vehicle_id, rsu_id, tag);// Alg 3: MP-S3 (KL)
+    mp_flags           |= mitm_flags; // merge: bit 2 (MP-S3) now comes from MITM-DETECT
+    uint32_t cp_flags   = run_cp_detect(tag);                      // Alg 4: CP
 
     // Combine: sig_violated bitmask (bits 0-4 = TP-S1..S5, bits 5-8 = MP-S1..S4)
     uint32_t sig_violated = tp_flags | (mp_flags << 5) | (cp_flags << 9);
