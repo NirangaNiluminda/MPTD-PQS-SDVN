@@ -231,11 +231,12 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 
 uint32_t run_cp_detect(BsmBeaconTag &tag)
 {
-    // TP-S3 / MP-S4: controller-level detection
-    // When controller_malicious_assumption = true, flag all control-plane traffic
+    // TP-S3 (attack_number=5): controller-level trajectory poisoning.
+    // CP-DETECT fires whenever controller_malicious_assumption=true for attack 5.
+    // MP-S4 (attack_number=7): coordinated — controller is also assumed compromised.
     if (controller_malicious_assumption &&
-        (attack_number == 3 || attack_number == 7))
-        return 1; // controller is assumed compromised
+        (attack_number == 5 || attack_number == 7))
+        return 1;
     return 0;
 }
 
@@ -370,6 +371,45 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         cout << "[MP-S1-RSU] RSU " << rsu_id << " ghosting V" << vehicle_id
              << " (ghost inflation in run_syb_detect)"
              << " at t=" << now_t << endl;
+    }
+
+    // ── TP-S3: Controller-level trajectory poisoning (attack_number==5) ──────────
+    // Paper §3.4.1 (Figure 3.3): SDN controller (management node) intercepts honest
+    // vehicle beacons and modifies position + speed before forwarding to other planes.
+    // HandleBeaconReceived() runs at the management node → this IS the control plane.
+    if (attack_number == 5 &&
+        controller_malicious_assumption &&
+        GetBooleanWithProbability(attack_percentage, vehicle_id))
+    {
+        double real_px  = tag.GetPosX();
+        double real_py  = tag.GetPosY();
+        double real_spd = tag.GetSpeed();
+        double t_cp     = Simulator::Now().GetSeconds();
+        // Controller applies sinusoidal position drift + speed perturbation
+        double fake_px  = real_px  + poisoning_intensity_theta * max_position_deviation
+                                   * std::sin(t_cp * 1.1);
+        double fake_py  = real_py  + poisoning_intensity_theta * max_position_deviation
+                                   * std::cos(t_cp * 0.9);
+        double fake_spd = real_spd * (1.0 + poisoning_intensity_theta * std::sin(t_cp * 2.3));
+        // Clamp to simulation area (avoid std::max/std::min — #define max 40 conflicts)
+        fake_px  = (fake_px  < min_position_x) ? min_position_x : (fake_px  > max_position_x ? max_position_x : fake_px);
+        fake_py  = (fake_py  < min_position_y) ? min_position_y : (fake_py  > max_position_y ? max_position_y : fake_py);
+        fake_spd = (fake_spd < 0.0)            ? 0.0            : (fake_spd > s_max * 1.5     ? s_max * 1.5    : fake_spd);
+        tag.SetPosition(fake_px, fake_py);
+        tag.SetSpeed(fake_spd);
+        tag.SetIsPoisoned(true);
+        tag.SetAttackType(5);
+        // Accumulate TDEE / TPE (controller-introduced displacement error)
+        double dx = fake_px - real_px, dy = fake_py - real_py;
+        double disp_err = std::sqrt(dx*dx + dy*dy);
+        tdee_error_sum += disp_err;
+        tdee_error_cnt++;
+        tpe_sq_sum += disp_err * disp_err;
+        tpe_cnt++;
+        cout << "[TP-S3-CTRL] controller corrupted V" << vehicle_id
+             << " pos(" << real_px << "," << real_py
+             << ")→(" << fake_px << "," << fake_py
+             << ") spd " << real_spd << "→" << fake_spd << endl;
     }
 
     // 1. Push new beacon into circular state buffer

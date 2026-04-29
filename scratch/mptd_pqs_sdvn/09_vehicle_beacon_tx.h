@@ -109,11 +109,12 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 			Vector facc(0.0, 0.0, 0.0);
 			PoisonTrajectoryByType(fpos, fvel, facc, poisoning_intensity_theta,
 			                       attack_number);
-			// Attack 3 (TP-S3 Fabrication) deliberately injects values ABOVE
-			// physical limits — the attacker fabricates impossible acceleration.
-			// Applying EnforceRealism would clamp it back, defeating TP-S3 detection.
-			// All other attacks maintain plausible-looking trajectories.
-			if (attack_number != 3) {
+			// attack 3 (MP-S1 Sybil): no vehicle-level modification (is_mal=false), skip.
+			// attack 5 (TP-S3 Control-plane): vehicles are honest, case not reached.
+			// attack 6 (MP-S3 MitM): extreme speed must reach detector unclamped.
+			// attack 7 (MP-S4 Coordinated): speed amplification must reach detector unclamped.
+			// All other attacks maintain plausible-looking trajectories via EnforceRealism.
+			if (attack_number != 6 && attack_number != 7) {
 				EnforceRealism(fpos, fvel, facc);
 			}
 			tx_px  = fpos.x;
@@ -160,6 +161,14 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 	// Execution: malicious vehicle calls inject_mp_s2_stolen_beacons() to send
 	// extra beacon packets claiming stolen vehicle identities at this vehicle's position.
 	if (attack_number == 4 && is_mal)
+		inject_mp_s2_stolen_beacons(udp_app, nid, tx_px, tx_py,
+		                             tx_spd, tx_hdg, tx_acc, dest_ip);
+
+	// ── MP-S4 Coordinated: also injects stolen identity beacons (§3.2.4, Figure 3.7) ──
+	// Attack 7 combines TP-S2 trajectory poisoning (already applied above via
+	// PoisonTrajectoryByType case 7) with MP-S2 identity theft injection so that
+	// both the MP-S3 (KL divergence) and MP-S4 (ghost transit) signatures fire.
+	if (attack_number == 7 && is_mal)
 		inject_mp_s2_stolen_beacons(udp_app, nid, tx_px, tx_py,
 		                             tx_spd, tx_hdg, tx_acc, dest_ip);
 }

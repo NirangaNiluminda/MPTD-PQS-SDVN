@@ -50,11 +50,11 @@ double link_lifetime_threshold     = 0.400;
 // ── Attack Scenario Selection (maps to paper §3.4) ─────────────────────────
 //   1 = TP-S1 : Malicious RSU trajectory poisoning          (Fig 3.1)
 //   2 = TP-S2 : Malicious vehicle trajectory poisoning      (Fig 3.2)
-//   3 = TP-S3 : Control-plane trajectory poisoning          (Fig 3.3)
-//   4 = MP-S1 : Sybil-based via compromised RSU             (Fig 3.4)
-//   5 = MP-S2 : Sybil-based via vehicle impersonation       (Fig 3.5)
+//   3 = MP-S1 : Sybil via compromised RSU                   (Fig 3.4)
+//   4 = MP-S2 : Sybil via vehicle impersonation             (Fig 3.5)
+//   5 = TP-S3 : Control-plane trajectory poisoning          (Fig 3.3)
 //   6 = MP-S3 : MitM data-plane mobility pattern poisoning  (Fig 3.6)
-//   7 = MP-S4 : Control-plane mobility pattern poisoning    (Fig 3.7)
+//   7 = MP-S4 : Coordinated multi-vector attack             (Fig 3.7)
 int attack_number    = 1;
 int attack_percentage = 40;  // % of nodes that are malicious (0-100, avoid 100)
 
@@ -62,11 +62,11 @@ const char* attack_scenario_name[] = {
     "",                                                    // 0 unused
     "TP-S1:MaliciousRSU-TrajectoryPoisoning",             // 1
     "TP-S2:MaliciousVehicle-TrajectoryPoisoning",         // 2
-    "TP-S3:ControlPlane-TrajectoryPoisoning",             // 3
-    "MP-S1:Sybil-CompromisedRSU",                        // 4
-    "MP-S2:Sybil-VehicleImpersonation",                  // 5
+    "MP-S1:Sybil-CompromisedRSU",                        // 3
+    "MP-S2:Sybil-VehicleImpersonation",                  // 4
+    "TP-S3:ControlPlane-TrajectoryPoisoning",             // 5
     "MP-S3:MitM-DataPlane-MobilityPattern",              // 6
-    "MP-S4:ControlPlane-MobilityPattern"                 // 7
+    "MP-S4:Coordinated-MultiVector"                      // 7
 };
 
 bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
