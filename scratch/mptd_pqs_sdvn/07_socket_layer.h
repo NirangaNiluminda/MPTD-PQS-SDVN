@@ -27,10 +27,6 @@ NetDeviceContainer wifidevices_184;
 
 NodeContainer dsrc_Nodes;
 
-// ── LTE uplink/downlink state tracking ───────────────────────────────────────
-bool uplink_state[total_size];
-bool downlink_state[total_size];
-
 // ── SimpleUdpApplication — beacon socket I/O (§3.4.4) ────────────────────────
 class SimpleUdpApplication : public Application
 {
@@ -174,11 +170,9 @@ void SimpleUdpApplication::UplinkSendPacket(Ptr<Packet> packet, Ipv4Address dest
 {
     int x = m_uplink_send_socket->Send(packet);
     if (x == -1) {
-        cout << "An Error occured in sending packet uplink" << endl;
-        uplink_state[node_id] = false;
+        cout << "An Error occured in sending packet uplink (node " << node_id << ")" << endl;
     } else {
         cout << "Uplink packet transmitted" << endl;
-        uplink_state[node_id] = true;
     }
 }
 
@@ -194,19 +188,17 @@ void SimpleUdpApplication::DownlinkSendPacket(Ptr<Packet> packet, Ipv4Address de
 {
     int x = m_downlink_send_socket->Send(packet);
     if (x == -1) {
-        cout << "An Error occured in sending packet downlink" << endl;
-        downlink_state[node_id] = false;
+        cout << "An Error occured in sending packet downlink (node " << node_id << ")" << endl;
     } else {
         cout << "Downlink packet transmitted" << endl;
-        downlink_state[node_id] = true;
     }
 }
 // HandleReadOne is implemented in 08_detection_engine.h (out-of-class definition)
 
-// ── WiFi MAC / timing parameters (legacy — may be used by 12_main.h) ─────────
+// ── WiFi MAC timing parameters (used by 12_main.h WiFi MAC config) ───────────
 uint32_t CW_min  = 15;
-uint32_t SIFS    = 12;
-double   T_slot  = 20.0;
+double   SIFS    = 12;    // Short Inter-Frame Space (µs), 802.11p
+double   T_slot  = 20.0; // Slot time (µs), 802.11p
 
 // ── Legacy LDA routing stubs — dead code when routing_test=true ──────────────
 // Kept here to satisfy 12_main.h scheduler calls without modification.

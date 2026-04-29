@@ -203,27 +203,11 @@ bool GetBooleanWithProbability(double probabilityPercent, int nodeID) {
 // These old names are used in 06/07 — will be cleaned in Stage 5.
 #define max_realistic_speed         s_max
 #define max_realistic_acceleration  a_max
-bool training_delay = false;  // legacy flag used in 07_security.h
-
-// ── Legacy variable stubs (07_security.h, 08_lldp_handlers.h) ─────────────
-// Removed from original config; stubs keep 07_security.h compiling.
-// Remove when 07_security.h and 08_lldp_handlers.h are cleaned in Stages 4+.
+// ── Attack flag variables (active — used by 06a_attack_models.h) ─────────────
 int routing_algorithm = 0;
 bool vanishing_malicious_nodes[total_size]    = {};
 bool flooding_malicious_nodes[total_size]     = {};
 bool fabrication_malicious_nodes[total_size]  = {};
-bool blocked_port_state[total_size][total_size][2] = {};
-
-// Minimal Link struct hierarchy used by TrySendUplink/Downlink in 07_security.h
-struct LegacyLinkVal { double Link_values[MAX_NODES]; };
-struct LegacyLinkFi  { LegacyLinkVal Link_fi_inst[MAX_NODES]; };
-struct LegacyLinkF   { LegacyLinkFi  Link_f_inst[2]; };
-LegacyLinkF Link_at_controller_inst[2];
-LegacyLinkF LLDP_timestamp_at_controller_inst[2];
-LegacyLinkF Link_duplicates_at_controller_inst[2];
-LegacyLinkF Link_duplicates_SecondTime_uplink_at_controller_inst[2];
-LegacyLinkF Link_duplicates_downlink_at_controller_inst[2];
-LegacyLinkF Link_duplicates_SecondTime_downlink_at_controller_inst[2];
 
 // ── Temporary: legacy constants needed by 05_utils.h/08/11 ───────────────
 // These will be removed progressively in Stages 4 and 6 when 08_lldp_handlers.h
@@ -267,8 +251,6 @@ int    qf                  = 0;   // QoS flag
 double routing_frequency      = 1.0;
 double optimization_frequency = 1.0;
 double optimization_period    = 1.0;   // recomputed in main as 1/optimization_frequency
-double entropy_threshold      = 0.0;
-double contention_threshold   = 0.0;
 int    lambda                 = 10;    // flow size selector (used in switch statements)
 
 // ── Flow size constant (10_metrics_csv.h array dimensions) ─────────────────
@@ -321,38 +303,7 @@ bool present_MIM_attack_controllers     = false;
 
 // mu1/mu2/mu3 removed in Stage 10 — LDA Lagrangian multipliers, no references found
 
-// ── Controller state matrices (Q, Y, Omega, W, T, t) ─────────────────────
-// All follow the same nested struct pattern as LLegacyFi / DeltaLegacyFi.
-struct QVal   { double Q_values[MAX_NODES]; };
-struct QFi    { QVal   Q_fi_inst[MAX_NODES]; };
-QFi Q_at_controller_inst[2];
-
-struct YVal   { double Y_values[MAX_NODES]; };
-struct YFi    { YVal   Y_fi_inst[MAX_NODES]; };
-YFi Y_at_controller_inst[2];
-
-struct OmegaVal { double Omega_values[MAX_NODES]; };
-struct OmegaFi  { OmegaVal Omega_fi_inst[MAX_NODES]; };
-OmegaFi Omega_at_controller_inst[2];
-
-struct WVal   { double W_values[MAX_NODES]; };
-struct WFi    { WVal   W_fi_inst[MAX_NODES]; };
-WFi W_at_controller_inst[2];
-
-struct TVal   { double T_values[MAX_NODES]; };
-struct TFi    { TVal   T_fi_inst[MAX_NODES]; };
-TFi T_at_controller_inst[2];
-
-struct tVal   { double t_values[MAX_NODES]; };
-struct tFi    { tVal   t_fi_inst[MAX_NODES]; };
-tFi t_at_controller_inst[2];
-
-// ── Routing matrices E (3D) and F (2D) ──────────────────────────────────
-// int (not bool) because code does E_mat[c][n][f] < 2 and += 1 comparisons
-int E_mat[MAX_NODES][MAX_NODES][2] = {};
-int F_mat[MAX_NODES][2]            = {};
-
-// ── Per-node delta / load structs (11_routing) ────────────────────────────
+// ── Per-node delta struct (cleared in 12_main.h beacon scheduling) ───────────
 struct DeltaNodeVal {
     double   delta_values[MAX_NODES];
 };
@@ -364,20 +315,15 @@ struct DeltaNodeFi {
 };
 DeltaNodeFi delta_at_nodes_inst[2];
 
-struct LoadNode { double load_f[MAX_NODES]; };
-LoadNode load_at_nodes[2];
-
-// ── Stub functions referenced by 12_main.h ────────────────────────────────
-void generate_F_and_E() {
-    // Stub: full F/E matrix generation is part of Stage 6 cleanup
-}
+// ── Stub functions referenced by 12_main.h ────────────────────────────────────
+void generate_F_and_E() {}   // called inside !routing_test guard only
 
 void clear_delta_at_nodes(DeltaNodeFi* df) {
     for (int i = 0; i < 2; i++)
         for (int j = 0; j < MAX_NODES; j++) {
             df[i].delta_fi_inst[j] = DeltaNodeVal{};
-            df[i].source_f = 0;
+            df[i].source_f      = 0;
             df[i].destination_f = 0;
-            df[i].flow_id = 0;
+            df[i].flow_id       = 0;
         }
 }

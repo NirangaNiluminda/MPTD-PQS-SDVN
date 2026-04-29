@@ -12,17 +12,14 @@
 //
 // Removed vs 09_send_lte.h:
 //   routing_time, average_* metric globals (LDA routing artifacts)
-//   clear_solution() — Gurobi reset stub (called by 12_main.h; emptied below)
-//   send_LTE_metadata_downlink_alone() and other empty downlink stubs
+//   clear_solution() — Gurobi reset stub
+//   7 empty downlink stubs (send_LTE_metadata_downlink_alone, etc.)
 //   sent_IDS[][][] array (LDA IDS state, never used in MPTD-PQS path)
 // ============================================================
 
 // Forward declaration — inject_mp_s2_stolen_beacons() is defined later in this file
 void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication>, uint32_t,
                                   double, double, double, double, double, Ipv4Address);
-
-// ── clear_solution() stub — called by 12_main.h (Gurobi removed) ─────────────
-void clear_solution() {}
 
 // ── Vehicle → Management Node: beacon state via LTE uplink ──────────────────
 // Replaces legacy 25-variant switch(size){case 0:..case 25:}.
@@ -219,14 +216,3 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 	}
 }
 
-// ── Routing-mode stubs (never called when routing_test=true) ─────────────────
-void send_LTE_metadata_downlink_alone(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>, uint32_t) {}
-void send_LTE_deltavalues_downlink_alone(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>, uint32_t) {}
-void compute_controller_packet_out_cryptography(uint32_t, uint32_t, uint32_t)                   {}
-void send_LTE_LLDP_packetout_downlink_alone(Ptr<SimpleUdpApplication>, Ptr<Node>, uint32_t, uint32_t, uint32_t) {}
-void RSU_deltavalues_downlink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>)           {}
-void RSU_metadata_uplink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>)               {}
-void RSU_metadata_downlink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>)             {}
-
-// ── IDS send-flag array (used in MacRx routing path) ─────────────────────────
-bool sent_IDS[2*flows][total_size][Flow_size+2];

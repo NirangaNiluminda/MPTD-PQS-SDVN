@@ -34,10 +34,7 @@
 //     --routing_test=true --attack_percentage=80 --simTime=15"
 // ============================================================
 int main(int argc, char *argv[])
-{        
-    initialize_empty();
-    nodeid_sum();   
-    
+{
     CommandLine cmd;
     cmd.AddValue ("N_RSUs", "N_RSUs", N_RSUs);
     cmd.AddValue ("N_Vehicles", "N_Vehicles", N_Vehicles);
@@ -84,18 +81,13 @@ int main(int argc, char *argv[])
     LogComponentEnable ("PacketSink", LOG_LEVEL_INFO);
     
     clear_RQY();
-    
-    for (int i = 0; i<total_size+2; i++)
+
+    for (int i = 0; i < total_size+2; i++)
     {
-    	clear_neighbordata(neighbordata_inst+i);
-    	clear_controllerdata(con_data_inst+i);
-    	clear_data_at_nodes(data_at_nodes_inst+i);
-    	clear_routing_data_at_nodes(routing_data_at_nodes_inst+i-2);
-    	clear_data_at_manager(data_at_manager_inst+i);
+        clear_data_at_nodes(data_at_nodes_inst+i);
+        clear_routing_data_at_nodes(routing_data_at_nodes_inst+i-2);
     }
     clear_delta_at_controller(delta_at_controller_inst);
-    clear_solution();
-    initialize_all_routing_tables();
   
   controller_Node.Create(1);
   management_Node.Create(1); 
@@ -1526,11 +1518,6 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 			
 			//Simulator::Schedule (Seconds (7.400), reset_packet_timestamps);
 			//Simulator::Schedule(Seconds(7.400),generate_F_and_E);
-			
-			for(uint32_t i=0;i<2*flows;i++)
-			{
-				(demanding_flow_struct_controller_inst+i)->f_size = 2;
-			}
 			
 			Simulator::Schedule(Seconds(0.0010),generate_B_matrix);
 			Simulator::Schedule(Seconds(0.0010),generate_F_and_E);
