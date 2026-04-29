@@ -1,6 +1,6 @@
 # MPTD-PQS SDVN Simulation
 
-**Mobility Pattern & Trajectory Poisoning Detection with Post-Quantum Security**
+**Mobility Pattern & Trajectory Poisoning Detection with Post-Quantum Security**  
 in Software-Defined Vehicular Networks (SDVNs)
 
 Final Year Project — University of Ruhuna, Sri Lanka 2024/2025
@@ -54,23 +54,19 @@ Open **3 terminals** and run in order:
 
 ```bash
 # Run this FIRST every session, especially after a reboot or Docker Desktop restart.
-# Without it, containers won't appear in Docker Desktop and network.sh will fail.
 docker context use desktop-linux
 ```
 
 ### Terminal 1 — Blockchain + REST API
 
 ```bash
-# STEP 1: Kill any stale proxy from a previous session, then start fresh
 cd /home/niranga/fabric-samples/test-network
 pkill -f docker-api-proxy.py 2>/dev/null || true
 python3 docker-api-proxy.py &
 
-# STEP 2: Start the Fabric network (first time or after shutdown)
 ./network.sh up createChannel -ca
 ./network.sh deployCC -ccn trajectory -ccp ../trajectory-chaincode/chaincode -ccl go
 
-# STEP 3: Start the REST API (this occupies the terminal — leave it running)
 cd /home/niranga/fabric-samples/trajectory-rest-api
 python3 server.py
 ```
@@ -91,11 +87,162 @@ python3 prediction_server.py
 ```bash
 cd /home/niranga/ns-allinone-3.35/ns-3.35
 python3 waf --run "mptd_pqs_sdvn \
-    --attack_number=1 \
-    --attack_percentage=20 \
-    --maxspeed=50 \
+    --attack_number=2 \
+    --attack_percentage=30 \
     --simTime=13 \
     --routing_test=false"
+```
+
+---
+
+## 🚀 How to Run
+
+### Build
+
+```bash
+cd /home/niranga/ns-allinone-3.35/ns-3.35
+
+# Incremental build (after C++ changes):
+python3 waf build
+
+# Full clean build (first time or after configure errors):
+python3 waf distclean
+python3 waf configure --enable-examples
+python3 waf build
+```
+
+Build time: ~3 min full, ~30 s incremental.
+
+### Run a single attack
+
+```bash
+cd /home/niranga/ns-allinone-3.35/ns-3.35
+
+python3 waf --run "mptd_pqs_sdvn \
+    --attack_number=<1-7> \
+    --attack_percentage=30 \
+    --simTime=13 \
+    --routing_test=false"
+```
+
+### Run all 7 attacks in sequence
+
+```bash
+cd /home/niranga/ns-allinone-3.35/ns-3.35
+
+for atk in 1 2 3 4 5 6 7; do
+    echo "============================================"
+    echo " Attack $atk"
+    echo "============================================"
+    python3 waf --run \
+        "mptd_pqs_sdvn --attack_number=$atk \
+         --routing_test=false \
+         --attack_percentage=30 \
+         --simTime=13" \
+        2>&1 | grep -E "MCC|FPR|PARR|CDER|TDEE|TPE|PBPO|Confusion"
+done
+```
+
+### Quick smoke test (no external services needed)
+
+```bash
+# routing_test=true skips blockchain + ML calls — fastest way to check the sim runs
+python3 waf --run "mptd_pqs_sdvn --attack_number=2 --routing_test=true --simTime=5"
+```
+
+### Simulation Parameters
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `attack_number` | int | `1` | Attack scenario (1–7, see table below) |
+| `attack_percentage` | int | `40` | % of nodes that are malicious (0–99) |
+| `simTime` | double | `13.7` | Simulation duration in seconds |
+| `routing_test` | bool | `true` | `false` = full mode (blockchain + ML); `true` = offline/fast |
+| `maxspeed` | int | `60` | Vehicle speed cap in km/h |
+
+---
+
+## Attack Scenarios
+
+All 7 attacks from the paper taxonomy (§3.4) are fully implemented and verified.
+
+| `attack_number` | Paper ID | Attacker | Detection Algorithms | Description |
+|---|---|---|---|---|
+| **1** | **TP-S1** | Compromised RSU | TP-S1, TP-S4, TP-S5 | RSU intercepts honest vehicle beacons and shifts GPS coordinates before forwarding (Fig 3.1) |
+| **2** | **TP-S2** | Malicious vehicle | TP-S2, TP-S4 | Vehicle sends beacons with exaggerated speed + heading drift (Fig 3.2) |
+| **3** | **MP-S1** | Compromised RSU | MP-S1 (identity density) | RSU injects ghost vehicle IDs, inflating apparent traffic density — Sybil via RSU (Fig 3.4) |
+| **4** | **MP-S2** | Malicious vehicle | MP-S4 (ghost transit) | Vehicle steals other vehicles' IDs and re-broadcasts extra beacons at its own position (Fig 3.5) |
+| **5** | **TP-S3** | SDN controller | CP-DETECT, TP-S1, TP-S4, TP-S5 | Compromised controller intercepts honest beacons and modifies position + speed in the control plane (Fig 3.3) |
+| **6** | **MP-S3** | Malicious vehicle | MP-S3 (KL divergence) | Malicious vehicle amplifies its reported speed past the KL-divergence threshold κ_th=1.5 — MitM relay attack (Fig 3.6) |
+| **7** | **MP-S4** | Vehicles + controller | TP-S1/S2/S4 + MP-S3 + MP-S4 + CP | Coordinated multi-vector: combines TP-S2 trajectory drift, MP-S2 identity theft, and MP-S3 speed amplification simultaneously (Fig 3.7) |
+
+### Verified Metrics (attack_percentage=30, simTime=13)
+
+| `attack_number` | Paper ID | MCC | FPR | PARR | CDER |
+|---|---|---|---|---|---|
+| 1 | TP-S1 | 0.340 | 0.000 | 0.16 | 0.263 |
+| 2 | TP-S2 | 0.933 | 0.000 | 0.90 | 0.025 |
+| 3 | MP-S1 | 0.362 | 0.000 | 0.18 | 0.256 |
+| 4 | MP-S2 | 0.220 | 0.108 | 0.28 | 0.413 |
+| 5 | TP-S3 | 0.742 | 0.000 | 0.64 | 0.113 |
+| 6 | MP-S3 | 0.911 | 0.000 | 0.85 | 0.021 |
+| 7 | MP-S4 | 0.800 | 0.108 | 0.91 | 0.100 |
+
+> FPR=0.108 for attacks 4 and 7 is expected — stolen-beacon injection causes the detection
+> engine to flag some honest vehicles whose IDs were impersonated.
+
+---
+
+## Detection Signatures
+
+The detection engine (`08_detection_engine.h`) runs 4 algorithms on every received beacon:
+
+| Algorithm | Signatures | Equation |
+|---|---|---|
+| **TP-DETECT** (Alg 1) | TP-S1 kinematic, TP-S2 heading rate, TP-S3 acceleration, TP-S4 dead-reckoning, TP-S5 drift | §3.4.4, Eq 3.10–3.15 |
+| **SYB-DETECT** (Alg 2) | MP-S1 identity density, MP-S2 sync timing, MP-S4 ghost transit | §3.4.4, Eq 3.7, 3.16, 3.17 |
+| **MITM-DETECT** (Alg 3) | MP-S3 KL divergence | §3.4.4, Eq 3.18 |
+| **CP-DETECT** (Alg 4) | Control-plane flag | §3.4.4 |
+
+Composite score: ψ_i(t) = (|TP_violated| + |MP_violated|) / 9 > ψ_th = 0.3 → anomalous
+
+---
+
+## Evaluation Metrics (Paper §4.1.2)
+
+| Metric | Description |
+|---|---|
+| **MCC** | Matthews Correlation Coefficient — primary detection quality |
+| **FPR** | False Positive Rate — safety-critical for ITS |
+| **PARR** | Poisoned Aggregate Rejection Rate — TRS mitigation recall |
+| **CDER** | Control Decision Error Rate — end-to-end impact (1 − Accuracy) |
+| **TDEE** | Traffic Density Estimation Error (m) — mean position error all beacons |
+| **TPE** | Trajectory Prediction Error (m) — RMSE position error malicious only |
+| **PBPO** | Per-Beacon Processing Overhead (ms) — real-time feasibility |
+
+---
+
+## ML Pipeline
+
+```bash
+cd /home/niranga/ns-allinone-3.35/ns-3.35/analytics/ml
+
+# Install dependencies (first time only):
+pip3 install -r requirements.txt
+
+# Train models (run after simulation produces beacon_log.csv):
+python3 train.py
+# → saves models/gat_model.pt, lstm_ae_model.pt, scaler.pkl, theta_ae.txt
+
+# Run baseline comparison:
+python3 baseline_eval.py
+# → analytics/results/baseline_comparison.csv
+
+# Full evaluation sweep (84 runs, takes ~hours):
+cd ../..
+bash analytics/run_evaluation.sh             # all attacks
+bash analytics/run_evaluation.sh --attack 2  # single attack only
+bash analytics/run_evaluation.sh --resume    # skip completed runs
 ```
 
 ---
@@ -106,55 +253,23 @@ View all blocks, transactions, and chaincode calls in a web browser.
 
 **Requirement:** Fabric network must already be running (Terminal 1 from Quick Start).
 
-### Start Explorer
-
 ```bash
 bash /home/niranga/fabric-samples/explorer/start-explorer.sh
 ```
 
-Wait ~30 seconds for the database to initialise, then open: **http://localhost:8080**
+Wait ~30 seconds, then open: **http://localhost:8080**
 
 | Field | Value |
-|-------|-------|
+|---|---|
 | URL | http://localhost:8080 |
 | Username | `exploreradmin` |
 | Password | `exploreradminpw` |
 
-You will see live blocks and transactions. After running an NS-3 simulation, refresh the
-Explorer to see all the trajectory data written to the blockchain by the REST API.
-
-### Stop Explorer
-
+Stop Explorer:
 ```bash
 cd /home/niranga/fabric-samples/explorer
 docker compose down -v
 ```
-
-The `-v` flag removes the PostgreSQL volume so Explorer starts cleanly next time.
-Without it the database retains stale block data from a previous Fabric network run.
-
-### Running Docker containers (Explorer)
-
-```
-explorerdb.mynetwork.com   PostgreSQL database for Explorer (port 5432 internal)
-explorer.mynetwork.com     Explorer web app (port 8080 → http://localhost:8080)
-```
-
-Check status at any time:
-```bash
-docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "explor|peer|orderer"
-```
-
-### Why a start script instead of plain `docker compose up`?
-
-Fabric CA generates a new private key filename every time `network.sh up` runs
-(e.g. `3d4331_sk`). Explorer expects a fixed filename `priv_sk` in each keystore
-directory. The script creates that symlink automatically before launching the
-containers. It also skips root-owned `fabric-ca/` keystores (which Explorer does
-not need) to avoid permission errors.
-
-> **Note:** Explorer is in `fabric-samples/explorer/` — do NOT use
-> `blockchain-explorer/` (older setup, incompatible with Fabric 2.5.x).
 
 ---
 
@@ -178,196 +293,93 @@ ipfs daemon &
 
 # Verify (should return {"Version":"0.27.0",...})
 curl -s http://localhost:5001/api/v0/version
-
-# IPFS Web UI (browser)
-# open http://localhost:5001/webui
-```
-
-Stop IPFS:
-```bash
-pkill ipfs
 ```
 
 ---
 
-## 🛑 Shutting Down (Free RAM)
+## 🛑 Shutting Down
 
-When you are done working, shut everything down to free RAM (~2 GB).
-**Always stop Explorer before Fabric** — Explorer holds open DB connections to the peers.
+Always stop Explorer before Fabric — Explorer holds open DB connections to peers.
 
 ```bash
-# 1 — Stop Explorer (if running) — must be before network.sh down
+# 1 — Stop Explorer (if running)
 cd /home/niranga/fabric-samples/explorer && docker compose down -v
 
 # 2 — Fix file ownership BEFORE stopping Fabric (prevents "Permission denied")
 sudo chown -R $USER:$USER /home/niranga/fabric-samples/test-network/organizations/
 
-# 3 — Stop Fabric containers (all 6 containers + blockchain data removed)
+# 3 — Stop Fabric
 cd /home/niranga/fabric-samples/test-network
 ./network.sh down
 
-# 4 — Stop the Docker API proxy
+# 4 — Stop background processes
 pkill -f docker-api-proxy.py 2>/dev/null || true
-
-# 5 — Stop ML server and REST API
-#     Option A (if running in foreground terminals): press Ctrl+C in each terminal
-#     Option B (if started in background with &):
 pkill -f prediction_server.py 2>/dev/null || true
 pkill -f "trajectory-rest-api/server.py" 2>/dev/null || true
 ```
 
-> **Note:** `network.sh down` wipes all blockchain data. You must run `deployCC` again next time you start up. This is normal — each simulation run generates fresh data.
->
-> **If `network.sh down` fails with "Permission denied":** run step 2 (`sudo chown`) first, then retry step 3.
+> `network.sh down` wipes all blockchain data. Run `deployCC` again next startup.
 
 ---
 
-## 🔁 Starting Up Again After Shutdown
+## Repository Layout
 
-### Step 0 — Every session (mandatory)
-
-```bash
-# Set Docker context FIRST — needed after every reboot or Docker Desktop restart.
-# Skipping this = containers not visible in Docker Desktop + network.sh failures.
-docker context use desktop-linux
 ```
+scratch/mptd_pqs_sdvn/            NS-3 C++ simulation
+  simulation.cc                   Entry point (includes all headers in order)
+  wscript                         NS-3 build config
 
-### Terminal 1 — Blockchain + REST API
+  01_includes.h                   Library includes (NS-3, std, crypto)
+  02_config_globals.h             All simulation parameters and global constants
+  03_packet_tags.h                BsmBeaconTag — BSM beacon packet tag
+  04_state_globals.h              Per-vehicle/RSU runtime state (VehicleBeaconState)
+  05_utils.h                      execCmd(), extractValue(), data_at_nodes structs
 
-```bash
-cd /home/niranga/fabric-samples/test-network
+  06b_pq_crypto.h                 Post-Quantum crypto (TRS + FHE) — §3.3.2–3.3.3
+  06c_blockchain_api.h            Fabric REST API calls (Store*/Flag*/CallSC*)
+  06a_attack_models.h             All 7 attack models + PoisonTrajectoryByType()
 
-# Kill any leftover proxy from a previous session (safe even if none is running)
-pkill -f docker-api-proxy.py 2>/dev/null || true
+  07_socket_layer.h               SimpleUdpApplication class + WiFi MAC params
+  08_detection_engine.h           Detection engine: TP-DETECT, SYB-DETECT,
+                                    MITM-DETECT, CP-DETECT (Algorithms 1–4)
+  09_vehicle_beacon_tx.h          Vehicle beacon uplink + MP-S2 injection
+  10_metrics_csv.h                7 paper metrics + beacon_log.csv writer
+  11_blockchain_setup.h           Blockchain init, server config, controller assign
+  12_main.h                       NS-3 topology, mobility model, scheduler
 
-# Start the API proxy BEFORE network.sh (required for chaincode install)
-python3 docker-api-proxy.py &
+analytics/
+  run_evaluation.sh               Master sweep (7 attacks × 4 percentages × 3 speeds)
+  ml/
+    gat_detector.py               GAT spatial anomaly detector (Eq. 3.38–3.42)
+    lstm_ae.py                    LSTM autoencoder temporal detector (Eq. 3.43–3.53)
+    score_fusion.py               Score fusion Φ = λ1ψ + λ2S + λ3(ε/θ) (Eq. 3.54)
+    prediction_server.py          Flask server port 5001 — NS-3 → ML bridge
+    train.py                      Train GAT + LSTM-AE from beacon_log.csv
+    baseline_eval.py              B1–B3 + A1–A5 ablation comparison
+    requirements.txt              Python dependencies
+  results/
+    beacon_log.csv                Per-beacon log produced by NS-3
+    sweep/                        Per-run metric CSVs + sweep_summary.csv
+    figures/                      Generated PDF/PNG plots
 
-./network.sh up createChannel -ca
-./network.sh deployCC -ccn trajectory -ccp ../trajectory-chaincode/chaincode -ccl go
-
-# Start REST API — this occupies Terminal 1, leave it running
-cd /home/niranga/fabric-samples/trajectory-rest-api && python3 server.py
+fabric-samples/
+  test-network/
+    network.sh                    Fabric network lifecycle script
+    docker-api-proxy.py           TCP proxy: rewrites Docker API v1.25→v1.41
+  trajectory-chaincode/
+    chaincode/smartcontract.go    SC-Trust (Eq. 3.66) + SC-Revoke (Eq. 3.67)
+  trajectory-rest-api/
+    server.py                     REST API bridge (port 3000)
+  explorer/
+    start-explorer.sh             Starts Hyperledger Explorer (port 8080)
 ```
-
-✅ Wait for: `Listening on http://0.0.0.0:3000`
-
-### Terminal 2 — ML Prediction Server
-
-```bash
-cd /home/niranga/ns-allinone-3.35/ns-3.35/analytics/ml
-python3 prediction_server.py
-```
-
-✅ Wait for: `Running on http://127.0.0.1:5001`
-
-### Terminal 3 — NS-3 Simulation
-
-```bash
-cd /home/niranga/ns-allinone-3.35/ns-3.35
-python3 waf --run "mptd_pqs_sdvn --attack_number=1 --routing_test=false --attack_percentage=20 --simTime=13"
-```
-
-### Optional Terminal 4 — Blockchain Explorer UI
-
-```bash
-# Run only after Terminal 1 is fully up (Fabric network + chaincode deployed)
-bash /home/niranga/fabric-samples/explorer/start-explorer.sh
-# → open http://localhost:8080  (exploreradmin / exploreradminpw)
-```
-
----
-
-## Attack Scenarios
-
-| `attack_number` | Paper ID | Level | Attacker | Description |
-|---|---|---|---|---|
-| 1 | TP-S1 | RSU | Compromised RSU | RSU intercepts honest vehicle beacons and shifts GPS coordinates before forwarding |
-| 2 | TP-S2 | Vehicle | Malicious vehicle | Vehicle sends fake-but-realistic trajectory (exaggerated speed + shifted position) |
-| 3 | MP-S1 | RSU | Compromised RSU | RSU injects ghost vehicle IDs, inflating apparent traffic density (Sybil via RSU) |
-| 4 | MP-S2 | Vehicle | Malicious vehicle | Vehicle steals other vehicles' IDs and sends extra beacons at its own position (Sybil impersonation) |
-| 5 | Vanishing | Vehicle | Malicious vehicle | Vehicle randomly suppresses every other beacon (intermittent disappearance) |
-| 6 | All-vehicle | Vehicle | Malicious vehicles | All vehicle-level attack flags active simultaneously |
-| 7 | MP-S4 | Vehicle + Controller | Coordinated | All attack types active simultaneously across vehicles and controllers |
-
-> **Implemented & validated:** attack_number 1, 2, 3, 4 (see threat_model branch).
-> attack_number 5, 6, 7 are partially implemented (flags set; full detection tuning pending).
-
-### Simulation Parameters
-
-| Parameter | Values | Description |
-|---|---|---|
-| `attack_number` | 1–7 | Attack scenario |
-| `attack_percentage` | 0–99 | % of malicious vehicles |
-| `maxspeed` | km/h | Vehicle speed (20=low, 50=medium, 100=high) |
-| `simTime` | seconds | Simulation duration (default 13) |
-| `routing_test` | true/false | false = detection mode (use this) |
-
----
-
-## Build NS-3
-
-```bash
-cd /home/niranga/ns-allinone-3.35/ns-3.35
-
-# Incremental build (after C++ changes):
-python3 waf build
-
-# Full clean build (first time or if errors):
-python3 waf distclean
-python3 waf configure --enable-examples
-python3 waf build
-```
-
-Build time: ~3 min full, ~30 s incremental.
-
----
-
-## ML Pipeline
-
-```bash
-cd /home/niranga/ns-allinone-3.35/ns-3.35/analytics/ml
-
-# Install dependencies (first time only):
-pip3 install -r requirements.txt
-
-# Train models (run after simulation produces beacon_log.csv):
-python3 train.py
-# → saves models/gat_model.pt, lstm_ae_model.pt, scaler.pkl, theta_ae.txt
-
-# Run baseline comparison:
-python3 baseline_eval.py
-# → analytics/results/baseline_comparison.csv
-
-# Full evaluation sweep (84 runs, takes ~hours):
-cd ../..
-bash analytics/run_evaluation.sh            # all attacks
-bash analytics/run_evaluation.sh --attack 1 # single attack only
-bash analytics/run_evaluation.sh --resume   # skip completed runs
-```
-
----
-
-## Evaluation Metrics (Paper §4.1.2)
-
-| Metric | Description |
-|---|---|
-| MCC | Matthews Correlation Coefficient — primary detection quality |
-| FPR | False Positive Rate — safety-critical for ITS |
-| PARR | Poisoned Aggregate Rejection Rate — TRS mitigation |
-| CDER | Control Decision Error Rate — end-to-end impact |
-| TDEE | Traffic Density Estimation Error — MP attack impact |
-| TPE | Trajectory Prediction Error — TP attack impact |
-| PBPO | Per-Beacon Processing Overhead (ms) — real-time feasibility |
 
 ---
 
 ## Troubleshooting
 
-### Simulation crashes with callback type mismatch (SIGIOT)
-Already fixed in `07_security.h` — all four callbacks (`Rx`, `MacRx`, `MacTx`, `Enqueue`) include `std::string` context parameter.
+### Port already in use (18054, 7051, etc.)
 
-### Port already in use (18054, 7051 etc.)
 Old containers from a different Docker context are still running:
 ```bash
 docker context use default
@@ -376,103 +388,61 @@ docker context use desktop-linux
 ```
 
 ### Permission denied when running `network.sh down`
-Files owned by root (created inside containers):
+
+Files were created inside containers and are owned by root:
 ```bash
 sudo chown -R $USER:$USER /home/niranga/fabric-samples/test-network/organizations/
 ./network.sh down
 ```
 
 ### Chaincode install fails: `client version 1.25 is too old`
-The Docker API proxy is not running. Start it first:
+
+The Docker API proxy is not running:
 ```bash
 cd /home/niranga/fabric-samples/test-network
 python3 docker-api-proxy.py &
 ```
 
 ### Containers not visible in Docker Desktop
-You are on the wrong Docker context:
+
+Wrong Docker context:
 ```bash
 docker context use desktop-linux
 ```
 
 ### Peer fails to join channel (connection refused on port 7051)
-The peer container failed to start. Check:
+
+Proxy was not running when `network.sh up` was called — restart from scratch:
 ```bash
-docker ps -a | grep peer   # look for "Created" status (not "Up")
-docker logs peer0.org1.example.com
-```
-Usually caused by proxy not running — see above.
-
----
-
-## Repository Layout
-
-```
-scratch/mptd_pqs_sdvn/         NS-3 C++ simulation
-  01_includes.h                 Library includes
-  02_config_globals.h           Simulation parameters and global constants
-  03_packet_tags.h              BSM beacon tag (BsmBeaconTag)
-  04_state_globals.h            Per-vehicle/RSU runtime state
-  05_utils.h                    Utility structs and helpers
-  06_mrtpa_attack.h             Attack injectors + TRS/FHE (§3.3)
-  07_security.h                 Security helpers + trace callbacks
-  08_beacon_handlers.h          RSU beacon receive: rule-based detection + ML call
-  09_send_lte.h                 LTE uplink beacon transmission
-  10_metrics_csv.h              7 paper metrics + CSV logging
-  11_blockchain_transmission.h  Hyperledger Fabric REST API calls
-  12_main.h                     NS-3 topology, mobility, attack setup
-  simulation.cc                 Entry point
-  wscript                       NS-3 build config
-
-analytics/
-  run_evaluation.sh             Master sweep (7×4×3 = 84 NS-3 runs)
-  ml/
-    gat_detector.py             GAT spatial anomaly detector (Eq. 3.38–3.42)
-    lstm_ae.py                  LSTM autoencoder temporal detector (Eq. 3.43–3.53)
-    score_fusion.py             Score fusion Φ = λ1ψ + λ2S + λ3(ε/θ) (Eq. 3.54)
-    prediction_server.py        Flask server port 5001 — NS-3→ML bridge
-    train.py                    Train GAT + LSTM-AE from beacon_log.csv
-    baseline_eval.py            B1-B3 + A1-A5 ablation comparison
-    plot_results.py             7 publication figures (Fig 1–7)
-    requirements.txt            Python dependencies
-  results/
-    beacon_log.csv              Per-beacon log (produced by NS-3)
-    sweep/                      Per-run metric CSVs + sweep_summary.csv
-    figures/                    Generated PDF/PNG plots
-
-fabric-samples/
-  test-network/
-    network.sh                  Fabric network lifecycle script
-    docker-api-proxy.py         TCP proxy: rewrites Docker API v1.25→v1.41
-    compose/docker/
-      docker-compose-test-net.yaml  Peer overlay (CORE_VM_ENDPOINT → proxy)
-  trajectory-chaincode/
-    chaincode/smartcontract.go  SC-Trust (Eq. 3.66) + SC-Revoke (Eq. 3.67)
-  trajectory-rest-api/
-    server.py                   REST API bridge (port 3000)
+pkill -f docker-api-proxy.py 2>/dev/null || true
+cd /home/niranga/fabric-samples/test-network
+python3 docker-api-proxy.py &
+./network.sh down 2>/dev/null; ./network.sh up createChannel -ca
 ```
 
 ---
 
 ## RAM Usage Reference
 
-| Service | RAM | Safe to stop when idle? |
+| Service | RAM | How to stop |
 |---|---|---|
-| Fabric containers (6 total) | ~1.5 GB | ✅ `./network.sh down` |
-| Fabric Explorer + DB | ~400 MB | ✅ `docker-compose down` in `blockchain-explorer/` |
-| Docker API proxy | ~10 MB | ✅ `pkill -f docker-api-proxy.py` |
-| ML prediction server | ~500 MB | ✅ Ctrl+C |
-| REST API server | ~100 MB | ✅ Ctrl+C |
-| Docker Desktop engine | ~500 MB | ⚠️ Only if not needed |
+| Fabric containers (6 total) | ~1.5 GB | `./network.sh down` |
+| Fabric Explorer + DB | ~400 MB | `docker compose down -v` in `explorer/` |
+| Docker API proxy | ~10 MB | `pkill -f docker-api-proxy.py` |
+| ML prediction server | ~500 MB | Ctrl+C |
+| REST API server | ~100 MB | Ctrl+C |
+| Docker Desktop engine | ~500 MB | Only if not needed |
 
 ---
 
 ## Key Implementation Notes
 
-- **Simulated PQ crypto**: TRS uses FNV-1a hash + Fisher-Yates shuffle (no real Dilithium); FHE uses Box-Muller Gaussian noise σ=1e-6 to model CKKS error. Replace with OpenFHE library when available (see `wscript` comments).
-- **Blockchain**: Simulation continues if Fabric is offline — all curl calls are fire-and-forget (non-blocking).
+- **Simulated PQ crypto**: TRS uses FNV-1a hash + Fisher-Yates shuffle (no real Dilithium); FHE uses Box-Muller Gaussian noise σ=1e-6 to model CKKS error. Replace with OpenFHE library when available.
+- **Blockchain non-blocking**: Simulation continues if Fabric is offline — all curl calls are fire-and-forget.
 - **Score fusion**: Φ_i(t) = 0.3·ψ + 0.4·S + 0.3·(ε/θ_ae) > 0.5 (Eq. 3.54).
-- **Docker API proxy**: Required because Fabric peer's embedded Docker client (fsouza/go-dockerclient) hardcodes API v1.25, but Docker Engine 29.x requires minimum v1.40. The TCP proxy at port 12375 rewrites the version in all request paths.
+- **Docker API proxy**: Required because Fabric's embedded Docker client hardcodes API v1.25, but Docker Engine 29.x requires v1.40+. The TCP proxy at port 12375 rewrites the version in all request paths.
+- **Attack 5 (TP-S3)**: Vehicles are honest; poisoning happens at `HandleBeaconReceived()` (the control plane). No vehicle-level malicious flag is set.
+- **Attacks 6 & 7 bypass EnforceRealism**: MP-S3 requires the extreme speed value to reach the detector unclamped so KL-divergence (Eq. 3.18) fires.
 
 ---
 
@@ -481,12 +451,13 @@ fabric-samples/
 | Stage | Commit | Description |
 |---|---|---|
 | 1–2 | `25f75ac` | Rename to mptd_pqs_sdvn, strip legacy routing |
-| 3 | `e9d9f00` | Rewrite 09_send_lte.h, strip 07_security.h |
+| 3 | `e9d9f00` | Rewrite beacon uplink, strip legacy socket helpers |
 | 4 | `607e170` | 7 paper metrics + beacon CSV logging |
 | 5 | `e0a3272` | Python ML pipeline (GAT + LSTM-AE + Flask) |
 | 6 | `4725416` | SC-Trust + SC-Revoke blockchain integration |
 | 7 | `41ba65d` | TRS + simulated CKKS FHE |
 | 8 | `cc85182` | Full evaluation sweep + 7 figures + ablations |
-| 9 | — | Final cleanup |
-| 10 | `a76bb35` | Legacy LDA code removal (Option B) |
-| 11 | `0bbc898` | Paper equation audit + 5 code fixes + callback fixes |
+| 9 | `95a2c60` | Final Stage 8 cleanup |
+| 10A | `7a7a3b0` | File restructure: split 06→06a/06b/06c, rename 07/08/09/11 |
+| 10B | `a070210` | Full legacy LDA cleanup — remove 65 dead code items |
+| 10C | `4a67112` | Implement TP-S3, MP-S3, MP-S4 (attacks 5, 6, 7) |
