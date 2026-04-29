@@ -1,15 +1,23 @@
 // ============================================================
-// 07_security.h — MPTD-PQS Security Layer (Stage 10B cleanup)
+// 07_socket_layer.h — UDP Socket Layer (MPTD-PQS)
+// Renamed from 07_security.h (Stage 10B cleanup)
 // ============================================================
-// Retained: SimpleUdpApplication class + socket I/O + essential globals
-// Removed:  2600+ lines of LLDP discovery, HMAC verify, routing retry,
-//           flooding guards, location verification (LDA routing code)
+// Contents:
+//   SimpleUdpApplication class — beacon socket I/O (§3.4.4)
+//   Colour macros for NS-3 log output
+//   Trace callbacks (print_time, Rx, MacRx, MacTx, Enqueue)
+//   Legacy LDA stubs — dead code, kept to satisfy 12_main.h scheduler calls
+//
+// Removed vs 07_security.h:
+//   wifidevices_172/174/176/180/182/184 (unused secondary containers)
+//   Z_gurobi[], X_gurobi[], Z_nodes[], X_nodes[] (Gurobi arrays — clear_solution() emptied)
 // ============================================================
 
 bool routing_test = true;
 
 // ── DSRC device containers (installed in 12_main.h) ──────────────────────────
 NetDeviceContainer wifidevices;
+// Legacy DSRC channel device containers (used by 12_main.h channel setup)
 NetDeviceContainer wifidevices_172;
 NetDeviceContainer wifidevices_174;
 NetDeviceContainer wifidevices_176;
@@ -33,7 +41,7 @@ public:
     static TypeId GetTypeId();
     virtual TypeId GetInstanceTypeId() const;
 
-    void HandleReadOne(Ptr<Socket> socket);   // implemented in 08_beacon_handlers.h
+    void HandleReadOne(Ptr<Socket> socket);   // implemented in 08_detection_engine.h
     void HandleReadTwo(Ptr<Socket> socket);
 
     void SendPacket(Ptr<Packet> packet, Ipv4Address destination, uint16_t port);
@@ -193,20 +201,15 @@ void SimpleUdpApplication::DownlinkSendPacket(Ptr<Packet> packet, Ipv4Address de
         downlink_state[node_id] = true;
     }
 }
-// HandleReadOne is implemented in 08_beacon_handlers.h (out-of-class definition)
+// HandleReadOne is implemented in 08_detection_engine.h (out-of-class definition)
 
-// ── LDA/WiFi MAC globals (legacy — required by 12_main.h switch + 09_send_lte.h) ─────────────
-uint32_t CW_min  = 15;      // Minimum contention window (overwritten in 12_main.h switch)
-uint32_t SIFS    = 12;      // Short Inter-Frame Space (μs)
-double   T_slot  = 20.0;    // Slot time (μs)
+// ── WiFi MAC / timing parameters (legacy — may be used by 12_main.h) ─────────
+uint32_t CW_min  = 15;
+uint32_t SIFS    = 12;
+double   T_slot  = 20.0;
 
-// ── Gurobi optimization arrays (legacy — used by clear_solution() in 09_send_lte.h) ──────────
-double Z_gurobi[total_size+2];
-double X_gurobi[total_size+2];
-double Z_nodes  [total_size+2];
-double X_nodes  [total_size+2];
-
-// ── LDA routing stubs — all dead code when routing_test=true ──────────────────────────────────
+// ── Legacy LDA routing stubs — dead code when routing_test=true ──────────────
+// Kept here to satisfy 12_main.h scheduler calls without modification.
 void clear_RQY()                                                                               {}
 void reset_LLDP_counters()                                                                     {}
 void connect_to_uplink()                                                                       {}
@@ -242,7 +245,7 @@ void calculate_performance_evaluation_metricsLLDP()                             
 void reset_packet_timestamps()                                                                 {}
 void reset_confusion_matrix()                                                                  {}
 
-// ── Trace callbacks (wired via Config::ConnectFailSafe in 12_main.h) ──────────────────────────
+// ── Trace callbacks (wired via Config::ConnectFailSafe in 12_main.h) ──────────
 void print_time()
 {
     cout << "[SIM] t=" << Simulator::Now().GetSeconds() << "s" << endl;

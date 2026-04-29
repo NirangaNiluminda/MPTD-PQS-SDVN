@@ -1,24 +1,24 @@
 // ============================================================
-// 11_blockchain_transmission.h — MPTD-PQS Blockchain & Attack Setup
-//                                (Stage 10B cleanup)
+// 11_blockchain_setup.h — MPTD-PQS Blockchain & Controller Setup
+// Renamed + cleaned from 11_blockchain_transmission.h (Stage 10B cleanup)
 // ============================================================
 // Retained:
-//   initialize_blockchain()   — start Hyperledger Fabric test-network (§3.3.4)
-//   initialize_server()       — start Python REST API on port 3000
-//   declare_attack_states()   — set per-attack-number flags + StoreAttackConfigToBlockchain
-//   declare_attackers()       — assign malicious node status from attack_percentage
-//   assign_controllers()      — assign controller/consortium IDs + trajectory_poisoning_malicious_nodes
-//   assign_basic_keys()       — key distribution stub (only under routing_algorithm==4)
-//   test_boolean()            — debug: print attack state of all nodes
+//   initialize_blockchain()  — start Hyperledger Fabric test-network (§3.3.4)
+//   initialize_server()      — start Python REST API on port 3000
+//   assign_controllers()     — assign controller/consortium IDs + RSU malicious flags
+//   escapeQuotes()           — helper for JSON REST calls
+//   assign_basic_keys()      — key distribution stub (routing_algorithm==4 only)
+//   test_boolean()           — debug: print attack state of all nodes
 //
-// Removed: ~2700 lines of LDA routing (dijkstra, ECMP, DCMR, QRSDN, RLMR,
-//          LLDP, B-matrix, adjacency matrix, centralized DSRC TX/RX, HMAC,
-//          CallBWTRCBFromNS3, BCTES, and all routing stubs)
+// Removed vs 11_blockchain_transmission.h:
+//   generate_adjacency_matrix(), generate_B_matrix()      — LDA routing stubs
+//   centralized_dsrc_data_broadcast/unicast()             — LDA routing stubs
+//   vehicle_send_to_nearest_rsu()                         — LDA routing stub
+//   send_dsrc_data_unicast()                              — LDA routing stub
+//   initialize_bmatrix(), CallBWTRCBFromNS3(), BCTES()    — Blockchain LDA stubs
+//   Forward declarations for removed stubs
+//   timestamp_stored loop in assign_controllers()         — LDA HMAC legacy
 // ============================================================
-
-// ── Forward declarations for stubs below (used by 12_main.h scheduler) ───────
-void centralized_dsrc_data_unicast(Ptr<Node>, uint32_t, uint32_t, uint32_t);
-void centralized_dsrc_data_broadcast(Ptr<NetDevice>, Ptr<Node>, uint32_t, uint32_t);
 
 // ── initialize_blockchain() — start Hyperledger Fabric (§3.3.4) ──────────────
 void initialize_blockchain()
@@ -84,12 +84,6 @@ void initialize_server()
     std::cout << "Server started" << endl;
 }
 
-// ── declare_attack_states() / declare_attackers() / declare_compromised_rsus() ──
-// MOVED TO: 06_mrtpa_attack.h (Attack Model section, §3.4)
-// All attack model logic is centralised in 06_mrtpa_attack.h.
-// These functions are still called from 12_main.h — definitions live in
-// 06_mrtpa_attack.h which is included before this file.
-
 // ── assign_controllers() — assign node→controller + RSU malicious flags ──────
 void assign_controllers()
 {
@@ -110,11 +104,6 @@ void assign_controllers()
             trajectory_poisoning_malicious_nodes[i] = false;
         }
 
-        for (uint32_t j = 0; j < total_size; j++) {
-            timestamp_stored[i][j][0] = Simulator::Now().GetSeconds();
-            timestamp_stored[i][j][1] = Simulator::Now().GetSeconds();
-        }
-
         if (routing_algorithm == 4) {
             StoreControllerAssignmentToBlockchain(
                 i, node_controller_ID[i], assigned_consortium_ID[i],
@@ -125,12 +114,23 @@ void assign_controllers()
     }
 }
 
-// ── assign_basic_keys() — LDA RSA/ECC key distribution (routing_algorithm==4 only) ──
+// ── Legacy routing stubs — still called by 12_main.h scheduler ───────────────
+// These were in 11_blockchain_transmission.h. Kept as empty stubs since
+// 12_main.h is UNCHANGED. All are dead code when routing_test=true.
+void centralized_dsrc_data_broadcast(Ptr<NetDevice>, Ptr<Node>, uint32_t, uint32_t) {}
+void centralized_dsrc_data_unicast(Ptr<Node>, uint32_t, uint32_t, uint32_t)         {}
+void vehicle_send_to_nearest_rsu(uint32_t, double)                                  {}
+void send_dsrc_data_unicast(Ptr<Node>, uint32_t, uint32_t, uint32_t)                {}
+void generate_adjacency_matrix()                                                     {}
+void generate_B_matrix()                                                             {}
+void initialize_bmatrix()                                                            {}
+void CallBWTRCBFromNS3(uint32_t, std::string)                                        {}
+void BCTES(uint32_t, uint32_t, std::string, std::string)                             {}
+
+// ── assign_basic_keys() — LDA RSA/ECC key distribution stub ──────────────────
+// Only active when routing_algorithm==4. All crypto functions removed in Stage 10B.
 void assign_basic_keys()
 {
-    // All Simulator::Schedule calls for LDA_security/LDA_PQ_security are
-    // commented out — those functions no longer exist in MPTD-PQS mode.
-    // This stub satisfies the call in 12_main.h under routing_algorithm==4.
     cout << "[assign_basic_keys] stub — LDA crypto removed in Stage 10B" << endl;
 }
 
@@ -153,19 +153,3 @@ void test_boolean()
         cout << "Node " << j << " controller ID " << node_controller_ID[j] << endl;
     }
 }
-
-// ── Routing stubs (satisfy 12_main.h scheduler calls in routing_test paths) ──
-void generate_adjacency_matrix() {}
-void generate_B_matrix()         {}
-
-void centralized_dsrc_data_broadcast(Ptr<NetDevice>, Ptr<Node>, uint32_t, uint32_t) {}
-void centralized_dsrc_data_unicast(Ptr<Node>, uint32_t, uint32_t, uint32_t) {}
-void vehicle_send_to_nearest_rsu(uint32_t, double) {}
-
-// ── send_dsrc_data_unicast stub — satisfies forward decl in 08_beacon_handlers.h
-void send_dsrc_data_unicast(Ptr<Node>, uint32_t, uint32_t, uint32_t) {}
-
-// ── Blockchain routing stubs (called from 12_main.h under routing_algorithm==4) ──────────────
-void initialize_bmatrix()                              {}
-void CallBWTRCBFromNS3(uint32_t, std::string)          {}
-void BCTES(uint32_t, uint32_t, std::string, std::string) {}

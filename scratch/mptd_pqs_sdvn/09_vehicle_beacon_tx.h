@@ -1,40 +1,28 @@
 // ============================================================
-// SECTION 9: LTE Uplink/Downlink Send Functions (MPTD-PQS)
+// 09_vehicle_beacon_tx.h — Vehicle Beacon Transmit Functions (MPTD-PQS)
+// Renamed + cleaned from 09_send_lte.h (Stage 10B cleanup)
 // ============================================================
-// send_LTE_metadata_uplink_alone() — Vehicle sends BsmBeaconTag
-//   payload to management node via LTE uplink (replaces legacy
-//   25-variant CustomMetaDataUnicastTag switch).
-// All other routing-mode LTE functions are stubbed (never called
-// when routing_test=true).
+// Despite the "LTE" name in the original file, this module handles
+// 802.11p / WAVE DSRC beacon uplink from vehicle to management node.
+// The LTE name is a fossil from the old LDA routing code.
+//
+// Contents:
+//   send_LTE_metadata_uplink_alone()  — vehicle BSM beacon uplink (§3.4.3)
+//   inject_mp_s2_stolen_beacons()     — MP-S2 identity theft injection (§3.4.2)
+//
+// Removed vs 09_send_lte.h:
+//   routing_time, average_* metric globals (LDA routing artifacts)
+//   clear_solution() — Gurobi reset stub (called by 12_main.h; emptied below)
+//   send_LTE_metadata_downlink_alone() and other empty downlink stubs
+//   sent_IDS[][][] array (LDA IDS state, never used in MPTD-PQS path)
 // ============================================================
 
 // Forward declaration — inject_mp_s2_stolen_beacons() is defined later in this file
-// (after send_LTE_metadata_uplink_alone which calls it).
 void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication>, uint32_t,
                                   double, double, double, double, double, Ipv4Address);
 
-bool routing_time = false;
-double average_cost = 0.0;
-double average_lte_utilization = 0.0;
-double average_ethernet_utilization = 0.0;
-double average_dsrc_utilization = 0.0;
-double average_computational_complexity = 0.0;
-double average_routing_latency = 0.0;
-double average_latency = 0.0;
-double average_latency_dsrc = 0.0;
-
-
-void clear_solution()
-{
-	for (int i = 0; i < (total_size+2); i++)
-	{
-		Z_gurobi[i] = 1;
-		X_gurobi[i] = 1;
-		Z_nodes[i] = 1;
-		X_nodes[i] = 1;
-	}
-}
-
+// ── clear_solution() stub — called by 12_main.h (Gurobi removed) ─────────────
+void clear_solution() {}
 
 // ── Vehicle → Management Node: beacon state via LTE uplink ──────────────────
 // Replaces legacy 25-variant switch(size){case 0:..case 25:}.
@@ -159,7 +147,7 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 	tag.SetTimestamp(Simulator::Now().GetSeconds());
 	tag.SetIsPoisoned(is_mal);
 	tag.SetAttackType(static_cast<uint32_t>(attack_number));
-	tag.SetSigViolated(0); // sig_violated set by detector (08_beacon_handlers.h)
+	tag.SetSigViolated(0); // sig_violated set by detector (08_detection_engine.h)
 
 	Ptr<Packet> packet1 = Create<Packet>(0);
 	packet1->AddPacketTag(tag);
@@ -171,7 +159,7 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 	     << Simulator::Now().GetSeconds() << endl;
 
 	// ── MP-S2 Attack Injection (§3.4.2, Figure 3.5) ─────────────────────────────
-	// Attack model defined in 06_mrtpa_attack.h (declare_attack_states, attack_number==4).
+	// Attack model defined in 06a_attack_models.h (declare_attack_states, attack_number==4).
 	// Execution: malicious vehicle calls inject_mp_s2_stolen_beacons() to send
 	// extra beacon packets claiming stolen vehicle identities at this vehicle's position.
 	if (attack_number == 4 && is_mal)
@@ -186,8 +174,8 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 // record the same honest vehicle ID appearing simultaneously at two impossible
 // locations → triggers MP-S4 ghost-transit-impossibility check (§3.4.4).
 //
-// Attack model definition: 06_mrtpa_attack.h → declare_attack_states() case 4
-// Detection logic:         08_beacon_handlers.h → run_syb_detect() bit 3 (MP-S4)
+// Attack model definition: 06a_attack_models.h → declare_attack_states() case 4
+// Detection logic:         08_detection_engine.h → run_syb_detect() bit 3 (MP-S4)
 void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
                                   uint32_t attacker_nid,
                                   double tx_px, double tx_py,
@@ -231,22 +219,14 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 	}
 }
 
-
-// ── Routing-mode stubs (never called when routing_test=true) ────────────────
-
+// ── Routing-mode stubs (never called when routing_test=true) ─────────────────
 void send_LTE_metadata_downlink_alone(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>, uint32_t) {}
-
 void send_LTE_deltavalues_downlink_alone(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>, uint32_t) {}
-
-void compute_controller_packet_out_cryptography(uint32_t, uint32_t, uint32_t) {}
-
+void compute_controller_packet_out_cryptography(uint32_t, uint32_t, uint32_t)                   {}
 void send_LTE_LLDP_packetout_downlink_alone(Ptr<SimpleUdpApplication>, Ptr<Node>, uint32_t, uint32_t, uint32_t) {}
+void RSU_deltavalues_downlink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>)           {}
+void RSU_metadata_uplink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>)               {}
+void RSU_metadata_downlink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>)             {}
 
-void RSU_deltavalues_downlink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>) {}
-
-void RSU_metadata_uplink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>) {}
-
-// ── IDS send-flag array (used in MacRx routing path) ────────────────────────
+// ── IDS send-flag array (used in MacRx routing path) ─────────────────────────
 bool sent_IDS[2*flows][total_size][Flow_size+2];
-
-void RSU_metadata_downlink_unicast(Ptr<SimpleUdpApplication>, Ptr<Node>, Ptr<Node>) {}

@@ -1,5 +1,6 @@
 // ============================================================
-// SECTION 8: DSRC Beacon Receive Handler (Stage 4 replacement)
+// 08_detection_engine.h — MPTD-PQS Detection Engine
+// Renamed from 08_beacon_handlers.h (Stage 10B cleanup)
 // MPTD-PQS: Dual-Mode Detection for MP and TP Attacks in SDVN
 // ============================================================
 // Replaces 08_lldp_handlers.h (17K lines of legacy LLDP code).
