@@ -373,6 +373,42 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
              << " at t=" << now_t << endl;
     }
 
+    // ── MP-S4: Controller-level global mobility model poisoning (attack_number==7) ──
+    // Paper §3.4.2 (Figure 3.7): The SDVN controller itself is malicious and corrupts
+    // its GLOBAL mobility pattern model despite receiving correct data from honest
+    // vehicles and RSUs. Unlike TP-S3 (individual trajectory), MP-S4 applies a
+    // systematic speed distribution shift to ALL vehicles — no attack_pct gate.
+    // This triggers the MP-S3 KL-divergence signature (Eq. 3.18) globally.
+    if (attack_number == 7 && controller_malicious_assumption)
+    {
+        double real_spd = tag.GetSpeed();
+        double real_hdg = tag.GetHeading();
+        double t_mp4    = Simulator::Now().GetSeconds();
+        // Systematic speed elevation: shifts regional distribution ~25-50% above normal.
+        // kl_approx = |fake_spd - mean| / (mean + s_max*0.1); with mean≈15, fake≈22-30 m/s:
+        // (22-15)/18.3 ≈ 0.38 per vehicle — collectively shifts distribution > κ_th=1.5.
+        double shift    = 1.0 + 0.5 * poisoning_intensity_theta
+                              + 0.2 * poisoning_intensity_theta * std::sin(t_mp4 * 0.3);
+        double fake_spd = real_spd * shift;
+        // Slight heading noise to corrupt mobility pattern vectors
+        double fake_hdg = real_hdg + 0.15 * poisoning_intensity_theta * std::sin(t_mp4 * 0.7);
+        // Soft cap: keep below 2×s_max to remain "plausibly elevated" for global bias
+        double sp_ceil = s_max * 2.0;
+        fake_spd = (fake_spd > sp_ceil) ? sp_ceil : fake_spd;
+        tag.SetSpeed(fake_spd);
+        tag.SetHeading(fake_hdg);
+        tag.SetIsPoisoned(true);     // controller-poisoned beacon
+        tag.SetAttackType(7);
+        // Accumulate TDEE/TPE using speed-displacement proxy (distance error in T_b interval)
+        double spd_disp = std::fabs(fake_spd - real_spd) * T_b;
+        tdee_error_sum += spd_disp;
+        tdee_error_cnt++;
+        tpe_sq_sum += spd_disp * spd_disp;
+        tpe_cnt++;
+        cout << "[MP-S4-CTRL] controller poisoned global model V" << vehicle_id
+             << " spd " << real_spd << "->" << fake_spd << endl;
+    }
+
     // ── TP-S3: Controller-level trajectory poisoning (attack_number==5) ──────────
     // Paper §3.4.1 (Figure 3.3): SDN controller (management node) intercepts honest
     // vehicle beacons and modifies position + speed before forwarding to other planes.
@@ -445,7 +481,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     total_trajectories_stored_blockchain++;
 
     // 8. Update confusion matrix + beacon CSV log (Stage 4)
-    bool detected = anomalous || (tp_flags != 0) || (mp_flags != 0);
+    // CP-DETECT (cp_flags) contributes to detection ONLY for attack_number==7 (MP-S4).
+    // For MP-S4, the controller poisons ALL beacons globally — so cp_flags firing means
+    // THIS beacon is poisoned (100% certainty, no per-beacon probability gate).
+    // For attack_number==5 (TP-S3), CP-DETECT fires globally but kinematic detectors
+    // handle per-beacon detection (only attack_pct% of beacons are actually modified),
+    // so including cp_flags there would create false positives for unmodified beacons.
+    bool cp_detected = (cp_flags != 0) && (attack_number == 7);
+    bool detected = anomalous || (tp_flags != 0) || (mp_flags != 0) || cp_detected;
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
     double psi = double(__builtin_popcount(tp_flags) + __builtin_popcount(mp_flags)) / 9.0;
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,

@@ -164,13 +164,9 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 		inject_mp_s2_stolen_beacons(udp_app, nid, tx_px, tx_py,
 		                             tx_spd, tx_hdg, tx_acc, dest_ip);
 
-	// ── MP-S4 Coordinated: also injects stolen identity beacons (§3.2.4, Figure 3.7) ──
-	// Attack 7 combines TP-S2 trajectory poisoning (already applied above via
-	// PoisonTrajectoryByType case 7) with MP-S2 identity theft injection so that
-	// both the MP-S3 (KL divergence) and MP-S4 (ghost transit) signatures fire.
-	if (attack_number == 7 && is_mal)
-		inject_mp_s2_stolen_beacons(udp_app, nid, tx_px, tx_py,
-		                             tx_spd, tx_hdg, tx_acc, dest_ip);
+	// MP-S4 (attack_number=7): controller-malicious-only attack — vehicles are honest.
+	// No vehicle-level injection here. Controller applies global mobility model
+	// poisoning in HandleBeaconReceived() (08_detection_engine.h). is_mal=false always.
 }
 
 // ── inject_mp_s2_stolen_beacons() — MP-S2 identity theft beacon injection ────

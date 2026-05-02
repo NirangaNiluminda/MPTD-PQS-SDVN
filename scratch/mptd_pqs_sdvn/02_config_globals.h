@@ -54,7 +54,7 @@ double link_lifetime_threshold     = 0.400;
 //   4 = MP-S2 : Sybil via vehicle impersonation             (Fig 3.5)
 //   5 = TP-S3 : Control-plane trajectory poisoning          (Fig 3.3)
 //   6 = MP-S3 : MitM data-plane mobility pattern poisoning  (Fig 3.6)
-//   7 = MP-S4 : Coordinated multi-vector attack             (Fig 3.7)
+//   7 = MP-S4 : Control-plane global mobility model poisoning (Fig 3.7)
 int attack_number    = 1;
 int attack_percentage = 40;  // % of nodes that are malicious (0-100, avoid 100)
 
@@ -66,7 +66,7 @@ const char* attack_scenario_name[] = {
     "MP-S2:Sybil-VehicleImpersonation",                  // 4
     "TP-S3:ControlPlane-TrajectoryPoisoning",             // 5
     "MP-S3:MitM-DataPlane-MobilityPattern",              // 6
-    "MP-S4:Coordinated-MultiVector"                      // 7
+    "MP-S4:ControlPlane-MobilityPatternPoisoning"         // 7
 };
 
 bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
@@ -205,9 +205,9 @@ bool GetBooleanWithProbability(double probabilityPercent, int nodeID) {
 #define max_realistic_acceleration  a_max
 // ── Attack flag variables (active — used by 06a_attack_models.h) ─────────────
 int routing_algorithm = 0;
-bool vanishing_malicious_nodes[total_size]    = {};
-bool flooding_malicious_nodes[total_size]     = {};
-bool fabrication_malicious_nodes[total_size]  = {};
+bool beacon_suppression_nodes[total_size]     = {};  // reserved: beacon vanishing/drop attack
+bool heading_spoof_nodes[total_size]          = {};  // TP-S2: heading/velocity exaggeration
+bool rsu_fabrication_nodes[total_size]        = {};  // reserved: RSU fabrication
 
 // ── Temporary: legacy constants needed by 05_utils.h/08/11 ───────────────
 // These will be removed progressively in Stages 4 and 6 when 08_lldp_handlers.h
@@ -266,7 +266,7 @@ double   loss_max    = 0.1;
 double   AIFS        = 0.0;
 
 // ── Malicious node flags for location-based attacks (11_routing) ──────────
-bool location_malicious_nodes[total_size] = {};
+bool tp_vehicle_nodes[total_size]         = {};  // TP-S2: malicious vehicle trajectory poisoning
 
 NS_LOG_COMPONENT_DEFINE ("mptd_pqs_sdvn");
 
@@ -288,18 +288,23 @@ bool flooding_malicious_controllers[total_size]    = {};
 bool vanishing_malicious_controllers[total_size]   = {};
 bool fabrication_malicious_controllers[total_size] = {};
 bool MIM_malicious_controllers[total_size]         = {};
-bool MIM_malicious_nodes[total_size]               = {}; // mitm alias
+bool sybil_mitm_nodes[total_size]                  = {}; // MP-S2: identity theft / MP-S3: MitM relay
 
-// ── Present-attack status flags (11_routing) ──────────────────────────────
-bool present_location_attack_nodes      = false;
-bool present_flooding_attack_nodes      = false;
-bool present_flooding_attack_controllers = false;
-bool present_vanishing_attack_nodes     = false;
-bool present_vanishing_attack_controllers = false;
-bool present_fabrication_attack_nodes   = false;
+// ── Present-attack gateway flags — one per vehicle attack role (paper §3.4) ──
+// These control which per-node arrays are populated in declare_attackers().
+// RSU-level attacks (TP-S1, MP-S1) and controller attacks (TP-S3, MP-S4)
+// leave ALL flags false — their poisoning is applied directly in
+// HandleBeaconReceived() without going through the vehicle send path.
+bool present_tp_vehicle_attack          = false;  // TP-S2: vehicle sends poisoned trajectory
+bool present_heading_spoof_attack       = false;  // TP-S2: heading/velocity exaggeration component
+bool present_sybil_mitm_attack          = false;  // MP-S2: identity theft / MP-S3: MitM relay
+bool present_rsu_fabrication_attack     = false;  // reserved — RSU fabrication (unused currently)
+bool present_beacon_suppression_attack  = false;  // reserved — beacon vanishing (unused currently)
+// Controller-level gateway flags (set when controller_malicious_assumption=true)
+bool present_flooding_attack_controllers    = false;
+bool present_vanishing_attack_controllers   = false;
 bool present_fabrication_attack_controllers = false;
-bool present_MIM_attack_nodes           = false;
-bool present_MIM_attack_controllers     = false;
+bool present_MIM_attack_controllers         = false;
 
 // mu1/mu2/mu3 removed in Stage 10 — LDA Lagrangian multipliers, no references found
 

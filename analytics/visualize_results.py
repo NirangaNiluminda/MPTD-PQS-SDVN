@@ -26,13 +26,13 @@ OUT_DIR     = os.path.join(SCRIPT_DIR, "results")
 
 # ── Attack labels ────────────────────────────────────────────────────────────
 ATTACK_NAMES = {
-    1: "TP-S1\nLoc. Spoof",
-    2: "TP-S2\nVel. Exag.",
-    3: "TP-S3\nFabrication",
-    4: "MP-S1\nSybil",
-    5: "MP-S2\nVanishing",
-    6: "MP-S4\nCombined",
-    7: "Coordinated",
+    1: "TP-S1\nLoc. Spoof",      # Malicious RSU trajectory poisoning   (Fig 3.1)
+    2: "TP-S2\nVel. Exag.",       # Malicious vehicle trajectory         (Fig 3.2)
+    3: "MP-S1\nSybil RSU",        # Sybil via compromised RSU            (Fig 3.4)
+    4: "MP-S2\nVehicle Imp.",     # Sybil via vehicle impersonation      (Fig 3.5)
+    5: "TP-S3\nCtrl-Plane",       # Controller trajectory poisoning      (Fig 3.3)
+    6: "MP-S3\nMitM",             # MitM data-plane mobility pattern     (Fig 3.6)
+    7: "MP-S4\nCtrl-Mobility",    # Controller global mobility poisoning (Fig 3.7)
 }
 
 # ── Load data (one row per attack, fixed 30% attacker percentage) ────────────
