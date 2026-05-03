@@ -73,11 +73,11 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 		}
 
 		// Determine if this vehicle is malicious (any active attack flag)
-		is_mal = location_malicious_nodes[vid]
-		      || flooding_malicious_nodes[vid]
-		      || fabrication_malicious_nodes[vid]
-		      || MIM_malicious_nodes[vid]
-		      || vanishing_malicious_nodes[vid];
+		is_mal = tp_vehicle_nodes[vid]
+		      || heading_spoof_nodes[vid]
+		      || rsu_fabrication_nodes[vid]
+		      || sybil_mitm_nodes[vid]
+		      || beacon_suppression_nodes[vid];
 
 		tx_px = real_px;  tx_py = real_py;
 		tx_spd = real_spd; tx_hdg = real_hdg; tx_acc = real_acc;
@@ -86,7 +86,7 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 			// ── MP-S2 Vanishing: suppress beacon on alternate calls (50% drop) ──
 			// Vehicle appears to "vanish" from the network intermittently.
 			// Effect: poisoned beacons are never received → FN rate increases.
-			if (vanishing_malicious_nodes[vid]) {
+			if (beacon_suppression_nodes[vid]) {
 				static uint32_t vanish_counter[MAX_NODES] = {};
 				vanish_counter[vid]++;
 				if (vanish_counter[vid] % 2 == 0) {
@@ -193,7 +193,7 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 	{
 		if (other_nid == attacker_nid) continue; // don't steal own ID
 		uint32_t other_vid = other_nid - 2;
-		if (MIM_malicious_nodes[other_vid]) continue; // only steal from honest vehicles
+		if (sybil_mitm_nodes[other_vid]) continue; // only steal from honest vehicles
 
 		BsmBeaconTag fake_tag;
 		fake_tag.SetVehicleId(other_nid);           // stolen identity

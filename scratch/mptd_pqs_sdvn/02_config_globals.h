@@ -283,11 +283,6 @@ double LLDP_final_timestamp         = 0.0;
 double packet_final_timestamp[total_size + 2];
 double flow_initiation_time         = 0.0;
 
-// ── Malicious controller/node flags (11_routing) ──────────────────────────
-bool flooding_malicious_controllers[total_size]    = {};
-bool vanishing_malicious_controllers[total_size]   = {};
-bool fabrication_malicious_controllers[total_size] = {};
-bool MIM_malicious_controllers[total_size]         = {};
 bool sybil_mitm_nodes[total_size]                  = {}; // MP-S2: identity theft / MP-S3: MitM relay
 
 // ── Present-attack gateway flags — one per vehicle attack role (paper §3.4) ──
@@ -300,11 +295,6 @@ bool present_heading_spoof_attack       = false;  // TP-S2: heading/velocity exa
 bool present_sybil_mitm_attack          = false;  // MP-S2: identity theft / MP-S3: MitM relay
 bool present_rsu_fabrication_attack     = false;  // reserved — RSU fabrication (unused currently)
 bool present_beacon_suppression_attack  = false;  // reserved — beacon vanishing (unused currently)
-// Controller-level gateway flags (set when controller_malicious_assumption=true)
-bool present_flooding_attack_controllers    = false;
-bool present_vanishing_attack_controllers   = false;
-bool present_fabrication_attack_controllers = false;
-bool present_MIM_attack_controllers         = false;
 
 // mu1/mu2/mu3 removed in Stage 10 — LDA Lagrangian multipliers, no references found
 

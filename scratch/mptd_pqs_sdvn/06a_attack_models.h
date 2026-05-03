@@ -229,79 +229,55 @@ void declare_attack_states()
     if (attack_number == 1) {
         // TP-S1: Compromised RSU trajectory poisoning (§3.4.1, Figure 3.1)
         // Attacker = RSU; all vehicles are honest
-        present_tp_vehicle_attack    = false;
-        present_heading_spoof_attack    = false;
-        present_rsu_fabrication_attack = false;
+        present_tp_vehicle_attack         = false;
+        present_heading_spoof_attack      = false;
+        present_rsu_fabrication_attack    = false;
         present_sybil_mitm_attack         = false;
-        present_beacon_suppression_attack   = false;
-        present_flooding_attack_controllers    = false;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
+        present_beacon_suppression_attack = false;
     } else if (attack_number == 2) {
         // TP-S2: Malicious vehicle sends fake but realistic trajectory (§3.4.1, Figure 3.2)
-        present_tp_vehicle_attack    = true;
-        present_heading_spoof_attack    = false;
-        present_rsu_fabrication_attack = false;
+        present_tp_vehicle_attack         = true;
+        present_heading_spoof_attack      = false;
+        present_rsu_fabrication_attack    = false;
         present_sybil_mitm_attack         = false;
-        present_beacon_suppression_attack   = false;
-        present_flooding_attack_controllers    = false;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
+        present_beacon_suppression_attack = false;
     } else if (attack_number == 3) {
         // MP-S1: Sybil via compromised RSU — ghost vehicle ID injection (§3.4.2, Figure 3.4)
         // Attacker = RSU; all vehicles are honest
-        present_tp_vehicle_attack      = false;
+        present_tp_vehicle_attack         = false;
         present_heading_spoof_attack      = false;
-        present_rsu_fabrication_attack   = false;
-        present_sybil_mitm_attack           = false;
-        present_beacon_suppression_attack     = false;
-        present_flooding_attack_controllers    = false;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
+        present_rsu_fabrication_attack    = false;
+        present_sybil_mitm_attack         = false;
+        present_beacon_suppression_attack = false;
     } else if (attack_number == 4) {
         // MP-S2: Sybil via malicious vehicle impersonation (§3.4.2, Figure 3.5)
         // Attacker = vehicle; sends extra beacons with stolen vehicle IDs
-        present_tp_vehicle_attack    = false;
-        present_heading_spoof_attack    = false;
-        present_rsu_fabrication_attack = false;
-        present_sybil_mitm_attack         = true;   // MIM flag used for identity theft
-        present_beacon_suppression_attack   = false;
-        present_flooding_attack_controllers    = false;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
+        present_tp_vehicle_attack         = false;
+        present_heading_spoof_attack      = false;
+        present_rsu_fabrication_attack    = false;
+        present_sybil_mitm_attack         = true;   // identity theft
+        present_beacon_suppression_attack = false;
     } else if (attack_number == 5) {
         // TP-S3: Control-plane trajectory poisoning (§3.4.1, Figure 3.3)
         // Vehicles are honest; the SDN controller (management node) is compromised.
         // Poisoning applied at HandleBeaconReceived() in 08_detection_engine.h.
         // CP-DETECT fires via run_cp_detect() when controller_malicious_assumption=true.
-        present_tp_vehicle_attack      = false;
+        present_tp_vehicle_attack         = false;
         present_heading_spoof_attack      = false;
-        present_rsu_fabrication_attack   = false;
-        present_sybil_mitm_attack           = false;
-        present_beacon_suppression_attack     = false;
-        present_flooding_attack_controllers    = false;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
+        present_rsu_fabrication_attack    = false;
+        present_sybil_mitm_attack         = false;
+        present_beacon_suppression_attack = false;
         // controller_malicious_assumption remains true (set globally in 02_config_globals.h)
     } else if (attack_number == 6) {
         // MP-S3: MitM data-plane mobility pattern poisoning (§3.4.2, Figure 3.6)
         // Malicious vehicles act as relay nodes: intercept and re-broadcast with
         // amplified speed to exceed KL-divergence threshold (kappa_th=1.5, Eq. 3.18).
-        // MIM_malicious_nodes = true → is_mal=true → PoisonTrajectoryByType(case 6) fires.
-        present_tp_vehicle_attack      = false;
+        // sybil_mitm_nodes = true → is_mal=true → PoisonTrajectoryByType(case 6) fires.
+        present_tp_vehicle_attack         = false;
         present_heading_spoof_attack      = false;
-        present_rsu_fabrication_attack   = false;
-        present_sybil_mitm_attack           = true;   // MitM relay attackers
-        present_beacon_suppression_attack     = false;
-        present_flooding_attack_controllers    = false;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
+        present_rsu_fabrication_attack    = false;
+        present_sybil_mitm_attack         = true;   // MitM relay attackers
+        present_beacon_suppression_attack = false;
     } else if (attack_number == 7) {
         // MP-S4: Control-plane mobility pattern poisoning (§3.4.2, Figure 3.7)
         // The SDVN controller itself is malicious and corrupts the global mobility model
@@ -309,15 +285,11 @@ void declare_attack_states()
         // Vehicles and RSU operate correctly — NO vehicle-level attack flags set.
         // Controller-side poisoning (global speed distribution shift) is applied in
         // HandleBeaconReceived() in 08_detection_engine.h for ALL vehicle beacons.
-        present_tp_vehicle_attack      = false;  // vehicles are honest
+        present_tp_vehicle_attack         = false;  // vehicles are honest
         present_heading_spoof_attack      = false;
-        present_rsu_fabrication_attack   = false;
-        present_sybil_mitm_attack           = false;  // no identity theft
-        present_beacon_suppression_attack     = false;
-        present_flooding_attack_controllers    = false;
-        present_fabrication_attack_controllers = false;
-        present_MIM_attack_controllers         = false;
-        present_vanishing_attack_controllers   = false;
+        present_rsu_fabrication_attack    = false;
+        present_sybil_mitm_attack         = false;  // no identity theft
+        present_beacon_suppression_attack = false;
         // controller_malicious_assumption=true (set in 02_config_globals.h) handles the attack
     }
 
@@ -329,10 +301,6 @@ void declare_attack_states()
             present_rsu_fabrication_attack,
             present_sybil_mitm_attack,
             present_beacon_suppression_attack,
-            present_flooding_attack_controllers,
-            present_fabrication_attack_controllers,
-            present_MIM_attack_controllers,
-            present_vanishing_attack_controllers,
             controller_malicious_assumption);
     }
 }
@@ -361,20 +329,6 @@ void declare_attackers()
         }
     }
 
-    // Controller malicious assignment (by attack_percentage threshold)
-    auto set_ctrl = [&](bool* arr, bool flag) {
-        bool v0 = false, v1 = false, v2 = false;
-        if (flag) {
-            if      (attack_percentage >= 10)  v0 = true;
-            if      (attack_percentage >= 35)  v1 = true;
-            if      (attack_percentage >= 67)  v2 = true;
-        }
-        arr[0] = v0; arr[1] = v1; arr[2] = v2; arr[3] = false;
-    };
-    set_ctrl(flooding_malicious_controllers,    present_flooding_attack_controllers);
-    set_ctrl(fabrication_malicious_controllers, present_fabrication_attack_controllers);
-    set_ctrl(MIM_malicious_controllers,         present_MIM_attack_controllers);
-    set_ctrl(vanishing_malicious_controllers,   present_vanishing_attack_controllers);
 }
 
 // ── declare_compromised_rsus() — set which RSUs are compromised ───────────────

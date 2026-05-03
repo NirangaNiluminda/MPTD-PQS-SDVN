@@ -145,11 +145,11 @@ void test_boolean()
         }
     }
     for (uint32_t j = 0; j < total_size; j++) {
-        cout << "For " << j << "th node, location attack state is "      << location_malicious_nodes[j]    << endl;
-        cout << "For " << j << "th node, flooding attack state is "      << flooding_malicious_nodes[j]    << endl;
-        cout << "For " << j << "th node, fabrication attack state is "   << fabrication_malicious_nodes[j] << endl;
-        cout << "For " << j << "th node, MIM attack state is "           << MIM_malicious_nodes[j]         << endl;
-        cout << "For " << j << "th node, vanishing attack state is "     << vanishing_malicious_nodes[j]   << endl;
+        cout << "For " << j << "th node, tp_vehicle attack state is "         << tp_vehicle_nodes[j]        << endl;
+        cout << "For " << j << "th node, heading_spoof attack state is "     << heading_spoof_nodes[j]     << endl;
+        cout << "For " << j << "th node, rsu_fabrication attack state is "   << rsu_fabrication_nodes[j]   << endl;
+        cout << "For " << j << "th node, sybil_mitm attack state is "        << sybil_mitm_nodes[j]        << endl;
+        cout << "For " << j << "th node, beacon_suppression attack state is " << beacon_suppression_nodes[j] << endl;
         cout << "Node " << j << " controller ID " << node_controller_ID[j] << endl;
     }
 }

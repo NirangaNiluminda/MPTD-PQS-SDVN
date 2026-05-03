@@ -22,21 +22,16 @@
 // Called by declare_attack_states() to record the active attack type.
 void StoreAttackConfigToBlockchain(
     uint32_t attackNum,
-    bool locNodes, bool floodNodes, bool fabNodes, bool mimNodes, bool vanNodes,
-    bool floodCtrl, bool fabCtrl, bool mimCtrl, bool vanCtrl,
+    bool tpVehicle, bool headingSpoof, bool rsuFab, bool sybilMitm, bool beaconSup,
     bool ctrlMalAssumption)
 {
     std::string body =
-        "{\"attackNumber\":\"" + std::to_string(attackNum) + "\","
-        "\"locNodes\":\""    + (locNodes   ? "true" : "false") + "\","
-        "\"floodNodes\":\""  + (floodNodes ? "true" : "false") + "\","
-        "\"fabNodes\":\""    + (fabNodes   ? "true" : "false") + "\","
-        "\"mimNodes\":\""    + (mimNodes   ? "true" : "false") + "\","
-        "\"vanNodes\":\""    + (vanNodes   ? "true" : "false") + "\","
-        "\"floodCtrl\":\""   + (floodCtrl  ? "true" : "false") + "\","
-        "\"fabCtrl\":\""     + (fabCtrl    ? "true" : "false") + "\","
-        "\"mimCtrl\":\""     + (mimCtrl    ? "true" : "false") + "\","
-        "\"vanCtrl\":\""     + (vanCtrl    ? "true" : "false") + "\","
+        "{\"attackNumber\":\""    + std::to_string(attackNum) + "\","
+        "\"tpVehicle\":\""        + (tpVehicle      ? "true" : "false") + "\","
+        "\"headingSpoof\":\""     + (headingSpoof   ? "true" : "false") + "\","
+        "\"rsuFabrication\":\""   + (rsuFab         ? "true" : "false") + "\","
+        "\"sybilMitm\":\""        + (sybilMitm      ? "true" : "false") + "\","
+        "\"beaconSuppression\":\"" + (beaconSup     ? "true" : "false") + "\","
         "\"ctrlMaliciousAssumption\":\"" + (ctrlMalAssumption ? "true" : "false") + "\"}";
 
     std::string curlCmd =
