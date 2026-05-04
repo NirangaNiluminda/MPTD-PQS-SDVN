@@ -104,6 +104,17 @@ RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 // Set by declare_compromised_rsus() in 11_blockchain_transmission.h.
 bool compromised_rsu[4] = {false, false, false, false};
 
+// ── Option B: DSRC-RSU relay globals ──────────────────────────────────────────
+// Set by 12_main.h after node creation + IP assignment, before Simulator::Run().
+// When g_option_b_active=true, vehicle beacons flow:
+//   Vehicle → DSRC unicast → RSU (HandleBeaconAtRSU) → CSMA → management_node
+// When false: legacy LTE path (Vehicle → LTE → management_node directly).
+Ipv4Address g_management_csma_ip;            // management_node CSMA IP (10.1.1.6)
+Ipv4Address g_rsu_dsrc_ip[4];                // RSU DSRC IPs from dsrc_interfaces
+uint32_t    g_first_rsu_node_id = 0;         // NS-3 NodeID of RSU_Nodes.Get(0)
+uint32_t    g_num_active_rsus   = 0;         // = N_RSUs when routing_test=true
+bool        g_option_b_active   = false;     // set true by 12_main.h when relay is ready
+
 void init_rsu_id_sets() {
     for (int i = 0; i < total_size; i++) {
         rsu_id_set[i].count        = 0;

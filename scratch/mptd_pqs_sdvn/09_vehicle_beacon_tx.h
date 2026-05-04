@@ -30,9 +30,13 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
                                     Ptr<Node> destination_node,
                                     uint32_t node_index)
 {
-	Ptr<Ipv4> ipv4 = destination_node->GetObject<Ipv4>();
-	Ipv4InterfaceAddress iaddr = ipv4->GetAddress(2, 0); // LTE uplink interface
-	Ipv4Address dest_ip = iaddr.GetLocal();
+	// ── Option B: send to nearest RSU's DSRC IP (port 6666) ─────────────────────
+	// When g_option_b_active=true, the beacon travels via 802.11p DSRC through
+	// an actual NS-3 RSU node (HandleBeaconAtRSU) before reaching management_node.
+	// Fallback: legacy LTE path to management_node when Option B is not active.
+	Ipv4Address dest_ip;
+	uint16_t    dest_port;
+	uint32_t    nearest_rsu_idx = 0; // used for log output below
 
 	uint32_t nid = node_source->GetId();
 	uint32_t vid = (nid >= 2) ? (nid - 2) : 0; // vehicle_state[] index
@@ -81,6 +85,18 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 
 		tx_px = real_px;  tx_py = real_py;
 		tx_spd = real_spd; tx_hdg = real_hdg; tx_acc = real_acc;
+
+		// Now that real_px/real_py are known, resolve destination
+		if (g_option_b_active && g_num_active_rsus > 0) {
+			nearest_rsu_idx = nearest_rsu_for_position(real_px, real_py);
+			dest_ip   = g_rsu_dsrc_ip[nearest_rsu_idx];
+			dest_port = 6666;
+		} else {
+			// Fallback: direct LTE to management_node interface 2
+			Ptr<Ipv4> ipv4 = destination_node->GetObject<Ipv4>();
+			dest_ip   = ipv4->GetAddress(2, 0).GetLocal();
+			dest_port = 7777;
+		}
 
 		if (is_mal) {
 			// ── MP-S2 Vanishing: suppress beacon on alternate calls (50% drop) ──
@@ -151,10 +167,16 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 	packet1->AddPacketTag(tag);
 	lte_total_packet_size += packet1->GetSerializedSize();
 	Simulator::Schedule(Seconds(0), &SimpleUdpApplication::SendPacket,
-	                    udp_app, packet1, dest_ip, 7777);
+	                    udp_app, packet1, dest_ip, dest_port);
 
-	cout << "[LTE-UP] node " << nid << " BsmBeacon sent at "
-	     << Simulator::Now().GetSeconds() << endl;
+	if (g_option_b_active) {
+		cout << "[DSRC-TX] V" << nid << " → RSU" << nearest_rsu_idx
+		     << " (" << dest_ip << ":" << dest_port << ") at "
+		     << Simulator::Now().GetSeconds() << endl;
+	} else {
+		cout << "[LTE-UP] V" << nid << " → MGT (" << dest_ip << ") at "
+		     << Simulator::Now().GetSeconds() << endl;
+	}
 
 	// ── MP-S2 Attack Injection (§3.4.2, Figure 3.5) ─────────────────────────────
 	// Attack model defined in 06a_attack_models.h (declare_attack_states, attack_number==4).
@@ -211,9 +233,10 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 		lte_total_packet_size += fake_pkt->GetSerializedSize();
 
 		// Stagger 5ms per stolen beacon so RSU sees distinct receive events
+		uint16_t stolen_port = g_option_b_active ? 6666 : 7777;
 		Simulator::Schedule(Seconds(0.005 * (stolen_count + 1)),
 		                    &SimpleUdpApplication::SendPacket,
-		                    udp_app, fake_pkt, dest_ip, 7777);
+		                    udp_app, fake_pkt, dest_ip, stolen_port);
 
 		cout << "[MP-S2-SYB] V" << attacker_nid << " impersonating V" << other_nid
 		     << " at pos(" << tx_px << "," << tx_py << ")" << endl;

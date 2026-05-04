@@ -55,6 +55,9 @@
 #include <limits.h>
 #include <bits/stdc++.h>
 #include "ns3/random-variable-stream.h"
+#include <random>     // std::mt19937, std::shuffle
+#include <algorithm>  // std::shuffle, std::round
+#include <vector>     // std::vector (for RSU candidate list)
 #include "ns3/core-module.h"
 #include <chrono>
 #include <iostream>

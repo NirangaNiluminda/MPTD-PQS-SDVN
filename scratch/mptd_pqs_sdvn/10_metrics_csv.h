@@ -70,18 +70,17 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    // APPEND mode: keep all runs in the same file so ML pipeline has a rich dataset.
-    // Header is written only if the file doesn't exist yet (checked via file size).
+    // OVERWRITE each run: truncate on first call so CSV always reflects current run only.
+    // Use static flag (reset to true each new process) to detect first call per run.
+    static bool beacon_first_call = true;
     std::ofstream fout;
     std::string path = NS3_ROOT "/analytics/results/beacon_log.csv";
-    std::ifstream check(path);
-    bool file_exists = check.good() && check.peek() != std::ifstream::traits_type::eof();
-    check.close();
 
-    if (!file_exists) {
+    if (beacon_first_call) {
         fout.open(path, std::ios::out | std::ios::trunc);
         fout << "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
              << "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct\n";
+        beacon_first_call = false;
     } else {
         fout.open(path, std::ios::out | std::ios::app);
     }
@@ -100,6 +99,103 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
          << psi                     << ","
          << attack_number           << ","
          << attack_percentage       << "\n";
+    fout.close();
+}
+
+// ── TP-S1 Before/After Poison Log ─────────────────────────────────────────────
+// Writes one row per poisoned beacon showing honest vs RSU-modified values.
+// Output: analytics/results/tp_s1_poison_log.csv
+void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
+                      double sim_t,
+                      double real_px, double real_py,
+                      double fake_px, double fake_py,
+                      double speed,   double heading, double accel,
+                      double drift_x, double drift_y, double disp_err)
+{
+    ensure_analytics_dir(NS3_ROOT "/analytics");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results");
+
+    std::string path = NS3_ROOT "/analytics/results/tp_s1_poison_log.csv";
+    static bool poison_first_call = true;
+    std::ofstream fout;
+    if (poison_first_call) {
+        fout.open(path, std::ios::out | std::ios::trunc);
+        fout << "sim_time,vehicle_id,rsu_id,attack_pct,"
+             << "real_pos_x,real_pos_y,"
+             << "fake_pos_x,fake_pos_y,"
+             << "drift_x,drift_y,disp_err_m,"
+             << "speed_ms,heading_rad,accel_ms2\n";
+        poison_first_call = false;
+    } else {
+        fout.open(path, std::ios::out | std::ios::app);
+    }
+
+    fout << std::fixed << std::setprecision(4)
+         << sim_t          << ","
+         << vid            << ","
+         << rsu_id         << ","
+         << attack_percentage << ","
+         << real_px        << ","
+         << real_py        << ","
+         << fake_px        << ","
+         << fake_py        << ","
+         << drift_x        << ","
+         << drift_y        << ","
+         << disp_err       << ","
+         << speed          << ","
+         << heading        << ","
+         << accel          << "\n";
+    fout.close();
+}
+
+// ── RSU Relay Log — every beacon at RSU level (clean + poisoned) ──────────────
+// Writes one row per beacon processed by an RSU node (Option B path).
+// Shows real_pos (what vehicle sent) vs recv_pos (what management_node receives).
+// For clean beacons: real_pos == recv_pos, drift=0, disp_err=0.
+// Output: analytics/results/rsu_relay_log.csv
+void log_rsu_relay(uint32_t vid, uint32_t rsu_id, double sim_t, bool is_poisoned,
+                   double real_px, double real_py,   // honest vehicle position
+                   double recv_px, double recv_py,   // position after RSU relay (poisoned or same)
+                   double speed,   double heading, double accel)
+{
+    ensure_analytics_dir(NS3_ROOT "/analytics");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results");
+
+    std::string path = NS3_ROOT "/analytics/results/rsu_relay_log.csv";
+    static bool relay_first_call = true;
+    std::ofstream fout;
+    if (relay_first_call) {
+        fout.open(path, std::ios::out | std::ios::trunc);
+        fout << "sim_time,vehicle_id,rsu_id,attack_pct,is_poisoned,"
+             << "real_pos_x,real_pos_y,"
+             << "recv_pos_x,recv_pos_y,"
+             << "drift_x,drift_y,disp_err_m,"
+             << "speed_ms,heading_rad,accel_ms2\n";
+        relay_first_call = false;
+    } else {
+        fout.open(path, std::ios::out | std::ios::app);
+    }
+
+    double drift_x   = recv_px - real_px;
+    double drift_y   = recv_py - real_py;
+    double disp_err  = std::sqrt(drift_x*drift_x + drift_y*drift_y);
+
+    fout << std::fixed << std::setprecision(4)
+         << sim_t          << ","
+         << vid            << ","
+         << rsu_id         << ","
+         << attack_percentage << ","
+         << (is_poisoned ? 1 : 0) << ","
+         << real_px        << ","
+         << real_py        << ","
+         << recv_px        << ","
+         << recv_py        << ","
+         << drift_x        << ","
+         << drift_y        << ","
+         << disp_err       << ","
+         << speed          << ","
+         << heading        << ","
+         << accel          << "\n";
     fout.close();
 }
 

@@ -51,13 +51,14 @@ int main(int argc, char *argv[])
     cmd.AddValue ("routing_algorithm", "routing_algorithm", routing_algorithm);
     cmd.AddValue ("qf", "qf", qf);
     cmd.AddValue ("attack_percentage", "attack_percentage", attack_percentage);
+    cmd.AddValue ("rsu_seed", "RSU compromise random seed (0=random each run)", rsu_seed);
     cmd.Parse (argc, argv);	
     
     if (routing_test == true)
     {
-        // Use N_Vehicles from cmd-line or config default (16); clamp to ≥16 for eval
+        // Enforce minimum topology for evaluation (can be overridden via --N_Vehicles=N)
         if (N_Vehicles < 16) N_Vehicles = 16;
-        N_RSUs = 4;
+        if (N_RSUs    <  4) N_RSUs    = 4;
     }
     
     ueBusy.resize(total_size, false);
@@ -105,25 +106,26 @@ int main(int argc, char *argv[])
   	    Vehicle_Nodes.Create(N_Vehicles);
 	    MobilityHelper custom_mobility;
 	    Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
-	    // Vehicles spread near 4 RSUs at (750,1200),(1150,1200),(1550,1200),(1950,1200)
-	    // 16 vehicles — 4 per RSU at (750,1200),(1150,1200),(1550,1200),(1950,1200)
-	    // Each cluster slightly spread to avoid Sybil false-positives
-	    positionAlloc->Add(Vector(730.0,  1150.0, 0.0)); // V0  near RSU0
-	    positionAlloc->Add(Vector(760.0,  1150.0, 0.0)); // V1  near RSU0
-	    positionAlloc->Add(Vector(750.0,  1170.0, 0.0)); // V2  near RSU0
-	    positionAlloc->Add(Vector(750.0,  1130.0, 0.0)); // V3  near RSU0
-	    positionAlloc->Add(Vector(1130.0, 1150.0, 0.0)); // V4  near RSU1
-	    positionAlloc->Add(Vector(1160.0, 1150.0, 0.0)); // V5  near RSU1
-	    positionAlloc->Add(Vector(1150.0, 1170.0, 0.0)); // V6  near RSU1
-	    positionAlloc->Add(Vector(1150.0, 1130.0, 0.0)); // V7  near RSU1
-	    positionAlloc->Add(Vector(1530.0, 1150.0, 0.0)); // V8  near RSU2
-	    positionAlloc->Add(Vector(1560.0, 1150.0, 0.0)); // V9  near RSU2
-	    positionAlloc->Add(Vector(1550.0, 1170.0, 0.0)); // V10 near RSU2
-	    positionAlloc->Add(Vector(1550.0, 1130.0, 0.0)); // V11 near RSU2
-	    positionAlloc->Add(Vector(1930.0, 1150.0, 0.0)); // V12 near RSU3
-	    positionAlloc->Add(Vector(1960.0, 1150.0, 0.0)); // V13 near RSU3
-	    positionAlloc->Add(Vector(1950.0, 1170.0, 0.0)); // V14 near RSU3
-	    positionAlloc->Add(Vector(1950.0, 1130.0, 0.0)); // V15 near RSU3
+	    // Road at y=570/590; RSUs just above at y=480:
+	    //   RSU0=(250,480)  RSU1=(750,480)  RSU2=(1250,480)  RSU3=(1750,480)
+	    // V2I gap ≈ 90-110 m — realistic and visually the clusters sit under each RSU
+	    // Mgmt=(1000,50)  Controller=(850,50)
+	    positionAlloc->Add(Vector(210.0,  570.0, 0.0)); // V0  near RSU0
+	    positionAlloc->Add(Vector(250.0,  590.0, 0.0)); // V1  near RSU0
+	    positionAlloc->Add(Vector(280.0,  570.0, 0.0)); // V2  near RSU0
+	    positionAlloc->Add(Vector(290.0,  590.0, 0.0)); // V3  near RSU0
+	    positionAlloc->Add(Vector(710.0,  570.0, 0.0)); // V4  near RSU1
+	    positionAlloc->Add(Vector(750.0,  590.0, 0.0)); // V5  near RSU1
+	    positionAlloc->Add(Vector(780.0,  570.0, 0.0)); // V6  near RSU1
+	    positionAlloc->Add(Vector(790.0,  590.0, 0.0)); // V7  near RSU1
+	    positionAlloc->Add(Vector(1210.0, 570.0, 0.0)); // V8  near RSU2
+	    positionAlloc->Add(Vector(1250.0, 590.0, 0.0)); // V9  near RSU2
+	    positionAlloc->Add(Vector(1280.0, 570.0, 0.0)); // V10 near RSU2
+	    positionAlloc->Add(Vector(1290.0, 590.0, 0.0)); // V11 near RSU2
+	    positionAlloc->Add(Vector(1710.0, 570.0, 0.0)); // V12 near RSU3
+	    positionAlloc->Add(Vector(1750.0, 590.0, 0.0)); // V13 near RSU3
+	    positionAlloc->Add(Vector(1780.0, 570.0, 0.0)); // V14 near RSU3
+	    positionAlloc->Add(Vector(1790.0, 590.0, 0.0)); // V15 near RSU3
 	    /*
 	    positionAlloc->Add(Vector(0.0, -x*3, 0.0)); // Custom position for Node 3
 	    positionAlloc->Add(Vector(0.0, -x*4, 0.0)); // Custom position for Node 4
@@ -152,25 +154,33 @@ int main(int argc, char *argv[])
 
 	  // Set custom velocity and acceleration for each node
 	  
+	    // Vehicles move along the road at realistic urban speed (10 m/s ≈ 36 km/h).
+	    // RSU zones are 500 m apart → a vehicle crosses one zone in ~50 s.
+	    // With simTime=60 s, V0-V7 will visibly handover from RSU0→RSU1 / RSU1→RSU2.
+	    // V12-V15 move in the opposite direction (−x) to show bidirectional traffic.
+	    double routing_speeds[16] = {
+	        10.0, 9.0, 11.0, 8.0,   // V0-V3  → right, RSU0 zone → RSU1
+	        10.0, 9.0, 11.0, 8.0,   // V4-V7  → right, RSU1 zone → RSU2
+	        10.0, 9.0, 11.0, 8.0,   // V8-V11 → right, RSU2 zone → RSU3
+	       -10.0,-9.0,-11.0,-8.0    // V12-V15← left,  RSU3 zone → RSU2 (oncoming)
+	    };
 	    for (uint32_t i = 0; i < Vehicle_Nodes.GetN(); i++)
 	    {
-
 	    	Ptr<ConstantVelocityMobilityModel> cvmm = DynamicCast <ConstantVelocityMobilityModel> (Vehicle_Nodes.Get(i)->GetObject<MobilityModel>());
-	    	// All vehicles move slowly so they stay near their respective RSU
-	    	cvmm->SetVelocity(Vector(2.0, 0.0, 0.0));
-
-	    	//cvmm->SetAcceleration(Vector(0.0, 0.0, 0.0)); // Custom acceleration for each node
-
+	    	cvmm->SetVelocity(Vector(routing_speeds[i], 0.0, 0.0));
 	    }
 	  
   }
   
 
  
-  //Install and configure the RSUs  
+  //Install and configure the RSUs
   if(N_RSUs > 0)
   {
   	RSU_Nodes.Create (N_RSUs);
+  	// ── Option B: record first RSU node ID for StartApplication() ──────────────
+  	g_first_rsu_node_id = RSU_Nodes.Get(0)->GetId();
+  	g_num_active_rsus   = N_RSUs;
   }
   
   //configuring the CSMA interface    
@@ -193,7 +203,11 @@ int main(int argc, char *argv[])
   	  address.SetBase ("10.1.1.0", "255.255.255.0");
   	  stack.Install (csma_nodes);
   	  csmaInterfaces = address.Assign (csmaDevices);
-  } 
+  	  // ── Option B: management_node is the last entry in csma_nodes ──────────────
+  	  // Order: RSU0..RSU(N_RSUs-1), controller, management → index = N_RSUs + 1
+  	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + 1);
+  	  cout << "[OPT-B] management CSMA IP = " << g_management_csma_ip << endl;
+  }
   
   AodvHelper aodv;
   InternetStackHelper stack_AODV;
@@ -646,12 +660,24 @@ int main(int argc, char *argv[])
   
   if (routing_test == true)//routing_test
   {
-  	man_base_posx = 500;
-  	man_base_posy = 0;
-  	con_base_posx = 550;
-  	con_base_posy = 0;
-  	lte_base_posx = 525;
-  	lte_base_posy = 0;
+    // Layout: road at y=600, RSUs above road at y=300, mgmt/ctrl at top-centre
+    man_base_posx = 1000;
+    man_base_posy = 50;
+    con_base_posx = 850;
+    con_base_posy = 50;
+    lte_base_posx = 925;
+    lte_base_posy = 50;
+    // Override urban RSU allocator: 4 RSUs evenly spaced just above the road.
+    // Vehicles are at y≈570-610; RSUs at y=480 → ~100 m gap (realistic V2I).
+    // RSU0=(250,480) RSU1=(750,480) RSU2=(1250,480) RSU3=(1750,480)
+    RSU_mobility.SetPositionAllocator(
+      "ns3::GridPositionAllocator",
+      "MinX",      DoubleValue(250.0),
+      "MinY",      DoubleValue(480.0),
+      "DeltaX",    DoubleValue(500.0),
+      "DeltaY",    DoubleValue(0.0),
+      "GridWidth", UintegerValue(4),
+      "LayoutType",StringValue("RowFirst"));
   }
   
   if (N_RSUs > 0)
@@ -1312,6 +1338,17 @@ int main(int argc, char *argv[])
   Ipv4InterfaceContainer dsrc_interfaces_184;
   address_dsrc.SetBase ("3.0.0.0", "255.0.0.0");
   dsrc_interfaces = address_dsrc.Assign (wifidevices);
+  // ── Option B: record RSU DSRC IPs for vehicle → RSU unicast ─────────────────
+  // dsrc_Nodes order: Vehicle_Nodes(0..N_Vehicles-1), RSU_Nodes(0..N_RSUs-1)
+  // So RSU r's DSRC IP is at dsrc_interfaces index (N_Vehicles + r).
+  if (N_RSUs > 0) {
+      for (uint32_t r = 0; r < N_RSUs && r < 4; r++) {
+          g_rsu_dsrc_ip[r] = dsrc_interfaces.GetAddress(N_Vehicles + r);
+          cout << "[OPT-B] RSU" << r << " DSRC IP = " << g_rsu_dsrc_ip[r] << endl;
+      }
+      g_option_b_active = true;  // all Option B globals are now set
+      cout << "[OPT-B] DSRC-RSU relay ACTIVE (routing_test=" << routing_test << ")" << endl;
+  }
   address_dsrc_172.SetBase ("4.0.0.0", "255.0.0.0");
   dsrc_interfaces_172 = address_dsrc_172.Assign (wifidevices_172);
   address_dsrc_174.SetBase ("5.0.0.0", "255.0.0.0");
@@ -1770,59 +1807,102 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 	}
   //Config::ConnectFailSafe("/NodeList/*/DeviceList/*/$ns3::WifiNetDevice/Mac/ns3::RegularWifiMac/DcaTxop/Queue/Dequeue",MakeCallback (&Dequeue)); 
   
-  AnimationInterface anim(NS3_ROOT "/routing.xml");  
+  // ── NetAnim: MPTD-PQS attack-aware visualization ─────────────────────────────
+  // Color legend:
+  //   RED    (255,  0,  0) — compromised RSU (TP-S1 / MP-S1 attacker)
+  //   YELLOW (255,200,  0) — clean RSU
+  //   ORANGE (255,128,  0) — vehicle in a compromised RSU zone (beacons poisoned)
+  //   GREEN  (  0,200,  0) — vehicle in a clean RSU zone
+  //   BLUE   (  0,  0,255) — management node (SDN control plane)
+  //   PURPLE (150,  0,220) — SDN controller
+  ensure_analytics_dir(NS3_ROOT "/analytics");
+  ensure_analytics_dir(NS3_ROOT "/analytics/results");
+  std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_a")
+                         + std::to_string(attack_number)
+                         + "_p" + std::to_string(attack_percentage) + ".xml";
+  AnimationInterface anim(anim_path);
+  // NOTE: EnablePacketMetadata(true) is intentionally omitted — NS-3 3.35 requires
+  // it to be called before ANY packet is created (before scheduling), otherwise it
+  // triggers SIGIOT.  Packet-level animation data is not needed for topology colours.
+  std::cout << "[ANIM-DBG] architecture=" << architecture
+            << " N_RSUs=" << N_RSUs << " N_Vehicles=" << N_Vehicles << std::endl;
 
+  // ── Management node — BLUE ──────────────────────────────────────────────────
+  if (architecture != 1)
+  {
+      std::cout << "[ANIM-DBG] coloring management node " << management_Node.Get(0)->GetId() << std::endl;
+      anim.UpdateNodeColor(management_Node.Get(0), 0, 0, 255);
+      anim.UpdateNodeSize(management_Node.Get(0)->GetId(), 35.0, 35.0);
+      anim.UpdateNodeDescription(management_Node.Get(0),
+          routing_test ? "MANAGEMENT\nMPTD-PQS Detection\n(DSRC-RSU relay)"
+                       : "MANAGEMENT\n(SDN control)");
+
+      anim.UpdateNodeColor(controller_Node.Get(0), 150, 0, 220);
+      anim.UpdateNodeSize(controller_Node.Get(0)->GetId(), 35.0, 35.0);
+      anim.UpdateNodeDescription(controller_Node.Get(0),
+          routing_test ? "SDN CONTROLLER\n(MPTD-PQS)" : "CONTROLLER");
+  }
+
+  // ── RSU nodes — RED if compromised, YELLOW if clean ────────────────────────
   if (N_RSUs > 0)
   {
-	  for (uint32_t i=0; i<RSU_Nodes.GetN() ; i++)
-	  {
-	  	anim.UpdateNodeColor(RSU_Nodes.Get(i),255,255,0);//RSUs in yellow color
-	  	Ptr <Node> ni = DynamicCast <Node> (RSU_Nodes.Get(i));
-	  	anim.UpdateNodeSize(ni->GetId(),20.0,20.0);
-	  }
+      for (uint32_t i = 0; i < RSU_Nodes.GetN(); i++)
+      {
+          bool comp = (i < 4) && compromised_rsu[i];
+          if (comp)
+              anim.UpdateNodeColor(RSU_Nodes.Get(i), 255, 0, 0);    // RED = attacker RSU
+          else
+              anim.UpdateNodeColor(RSU_Nodes.Get(i), 255, 200, 0);  // YELLOW = clean RSU
+          anim.UpdateNodeSize(RSU_Nodes.Get(i)->GetId(), 40.0, 40.0);
+          std::string label = "RSU" + std::to_string(i)
+                            + (comp ? "\n[COMPROMISED]" : "\n[CLEAN]");
+          anim.UpdateNodeDescription(RSU_Nodes.Get(i), label);
+      }
   }
-  
+
+  // ── Vehicle nodes — ORANGE if in compromised RSU zone, GREEN if clean ───────
+  // routing_test layout: V0-V3→RSU0, V4-V7→RSU1, V8-V11→RSU2, V12-V15→RSU3
   if (N_Vehicles > 0)
   {
-	  for (uint32_t i=0; i<Vehicle_Nodes.GetN() ; i++)
-	  {
-	  	anim.UpdateNodeColor(Vehicle_Nodes.Get(i),0,255,0);//vehicle nodes are green color
-	  	Ptr <Node> ni = DynamicCast <Node> (Vehicle_Nodes.Get(i));
-	  	anim.UpdateNodeSize(ni->GetId(),20.0,20.0);
-	  }
-	   
-	  if (architecture !=1)
-	  {
-		  for (uint32_t i=0; i<other_stationary_LTE_nodes.GetN() ; i++)
-		  {
-		  	anim.UpdateNodeColor(other_stationary_LTE_nodes.Get(i),0,0,255);//LTE stationary nodes are blue color
-		  	Ptr <Node> ni = DynamicCast <Node> (other_stationary_LTE_nodes.Get(i));
-		  	anim.UpdateNodeSize(ni->GetId(),20.0,20.0);
-		  }
-	  }
+      for (uint32_t i = 0; i < Vehicle_Nodes.GetN(); i++)
+      {
+          uint32_t rsu_zone = i / 4;  // 4 vehicles per RSU cluster
+          bool affected = (rsu_zone < 4) && compromised_rsu[rsu_zone];
+          if (affected)
+              anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 255, 128, 0); // ORANGE
+          else
+              anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 0, 200, 0);   // GREEN
+          anim.UpdateNodeSize(Vehicle_Nodes.Get(i)->GetId(), 20.0, 20.0);
+          std::string vlabel = "V" + std::to_string(i)
+                             + "\nRSU" + std::to_string(rsu_zone)
+                             + (affected ? " AFFECTED" : " CLEAN");
+          anim.UpdateNodeDescription(Vehicle_Nodes.Get(i), vlabel);
+      }
+
+      if (architecture != 1)
+      {
+          for (uint32_t i = 0; i < other_stationary_LTE_nodes.GetN(); i++)
+          {
+              if (routing_test)
+              {
+                  // Paper's proposed architecture (DSRC-RSU relay) has NO LTE core.
+                  // Hide eNodeB / PGW / SGW / remote-host nodes: white + 1×1 = invisible.
+                  anim.UpdateNodeColor(other_stationary_LTE_nodes.Get(i), 255, 255, 255);
+                  anim.UpdateNodeSize(other_stationary_LTE_nodes.Get(i)->GetId(), 1.0, 1.0);
+                  anim.UpdateNodeDescription(other_stationary_LTE_nodes.Get(i), "");
+              }
+              else
+              {
+                  // Legacy LTE architecture — show as light-blue
+                  anim.UpdateNodeColor(other_stationary_LTE_nodes.Get(i), 100, 100, 255);
+                  anim.UpdateNodeSize(other_stationary_LTE_nodes.Get(i)->GetId(), 20.0, 20.0);
+              }
+          }
+      }
   }
-  
-    if (architecture != 1)
-    {
-	    anim.UpdateNodeColor(controller_Node.Get(0),255,0,255);//controller node is purple color.
-	    Ptr <Node> node_controller = DynamicCast <Node> (controller_Node.Get(0));
-	    anim.UpdateNodeSize(node_controller->GetId(),20.0,20.0);
-	    
-	    anim.UpdateNodeColor(management_Node.Get(0),255,0,0);//management node is red color.
-	    Ptr <Node> node_management = DynamicCast <Node> (management_Node.Get(0));
-	    anim.UpdateNodeSize(node_management->GetId(),20.0,20.0);
-    }
- 
-  //AnimationInterface anim(NS3_ROOT "/routing.xml"); 
-  
-  /*
-  for (uint32_t i=0; i<Custom_Nodes.GetN() ; i++)
-  {
-  	anim.UpdateNodeColor(Custom_Nodes.Get(i),255,255,0);//RSUs in yellow color
-  	Ptr <Node> ni = DynamicCast <Node> (Custom_Nodes.Get(i));
-  	anim.UpdateNodeSize(ni->GetId(),20.0,20.0);
-  }
-  */
+
+  std::cout << "[NETANIM] XML → " << anim_path << std::endl;
+  std::cout << "[NETANIM] Open with: netanim " << anim_path << std::endl;
   
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();

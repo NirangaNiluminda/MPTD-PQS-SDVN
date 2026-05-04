@@ -29,19 +29,27 @@
 using namespace std::chrono;
 
 // ── SDVN Topology ──────────────────────────────────────────────────────────
+// Test network (routing_test=true):  16 vehicles, 4 RSUs, 1 controller, 1 management node
+// Full network (routing_test=false): N_Vehicles/N_RSUs set via command-line args
 #define MAX_NODES 40
 
-const int total_size = 16;
-uint32_t N_RSUs     = 0;
-uint32_t N_Vehicles = 16;
+const int total_size = 16;  // vehicle array size (= N_Vehicles for routing_test topology)
+uint32_t N_RSUs     = 4;    // 4 RSUs at x={750,1150,1550,1950}, y=1200 (routing_test default)
+uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
 
 uint16_t N_eNodeBs = 1 + N_Vehicles / 40;
 int      var       = N_Vehicles + N_RSUs;
 
 // ── Simulation Time & Mobility ─────────────────────────────────────────────
-double simTime              = 13.7;
+double simTime              = 15.0;
 int    mobility_scenario    = 0;   // 0=urban, 1=non-urban, 2=highway
 int    maxspeed             = 60;  // km/h max vehicle speed
+
+// ── RSU Compromise Seed (TP-S1 / MP-S1 random selection) ──────────────────
+// 0 = different random RSUs each run  (uses system clock)
+// N = fixed seed N → same RSUs compromised every run (reproducible)
+// Example: --rsu_seed=42 --attack_percentage=40 → always same 2 RSUs
+uint32_t rsu_seed = 0;
 
 double data_transmission_frequency = 2.0;    // 2 Hz → 0.5s per beacon round (was 0.33 Hz)
 double data_transmission_period    = 1.0 / data_transmission_frequency;

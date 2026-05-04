@@ -37,8 +37,9 @@ public:
     static TypeId GetTypeId();
     virtual TypeId GetInstanceTypeId() const;
 
-    void HandleReadOne(Ptr<Socket> socket);   // implemented in 08_detection_engine.h
+    void HandleReadOne(Ptr<Socket> socket);       // implemented in 08_detection_engine.h
     void HandleReadTwo(Ptr<Socket> socket);
+    void HandleBeaconAtRSU(Ptr<Socket> socket);  // RSU DSRC receive handler (Option B)
 
     void SendPacket(Ptr<Packet> packet, Ipv4Address destination, uint16_t port);
     void test();
@@ -53,12 +54,14 @@ private:
 
     Ptr<Socket> m_recv_socket1;
     Ptr<Socket> m_recv_socket2;
+    Ptr<Socket> m_recv_socket3;   // RSU: DSRC beacon receive (port 6666) — Option B
     uint16_t m_port1;
     uint16_t m_port2;
 
     Ptr<Socket> m_send_socket;
     Ptr<Socket> m_uplink_send_socket;
     Ptr<Socket> m_downlink_send_socket;
+    Ptr<Socket> m_relay_socket;   // RSU: forwards poisoned/clean beacon to management_node
 };
 
 // ── Color macros for NS-3 log output ─────────────────────────────────────────
@@ -110,28 +113,61 @@ void SimpleUdpApplication::SetupReceiveSocket(Ptr<Socket> socket, uint16_t port)
 void SimpleUdpApplication::StartApplication()
 {
     TypeId tid = TypeId::LookupByName("ns3::UdpSocketFactory");
-    m_recv_socket1 = Socket::CreateSocket(GetNode(), tid);
-    m_recv_socket2 = Socket::CreateSocket(GetNode(), tid);
+    uint32_t nid = GetNode()->GetId();
 
-    SetupReceiveSocket(m_recv_socket1, m_port1);
-    SetupReceiveSocket(m_recv_socket2, m_port2);
+    // Detect whether this application instance runs on an RSU node (Option B).
+    // g_first_rsu_node_id and g_num_active_rsus are set in 12_main.h after node creation.
+    bool is_rsu = g_option_b_active &&
+                  (g_num_active_rsus > 0) &&
+                  (nid >= g_first_rsu_node_id) &&
+                  (nid <  g_first_rsu_node_id + g_num_active_rsus);
 
-    m_recv_socket1->SetRecvCallback(MakeCallback(&SimpleUdpApplication::HandleReadOne, this));
-    m_recv_socket2->SetRecvCallback(MakeCallback(&SimpleUdpApplication::HandleReadTwo, this));
+    if (is_rsu) {
+        // ── RSU node: listen on port 6666 for vehicle DSRC beacons ───────────────
+        m_recv_socket3 = Socket::CreateSocket(GetNode(), tid);
+        SetupReceiveSocket(m_recv_socket3, 6666);
+        m_recv_socket3->SetRecvCallback(
+            MakeCallback(&SimpleUdpApplication::HandleBeaconAtRSU, this));
+        m_recv_socket3->SetAllowBroadcast(true);
 
-    m_send_socket          = Socket::CreateSocket(GetNode(), tid);
-    m_uplink_send_socket   = Socket::CreateSocket(GetNode(), tid);
-    m_downlink_send_socket = Socket::CreateSocket(GetNode(), tid);
+        // ── RSU relay socket: forward beacons to management_node via CSMA ────────
+        m_relay_socket = Socket::CreateSocket(GetNode(), tid);
+        m_relay_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 51000));
+        m_relay_socket->SetAllowBroadcast(false);
 
-    m_uplink_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 10000));
-    m_downlink_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 30000));
-    m_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 20000));
+        // Keep send socket for any legacy calls
+        m_send_socket = Socket::CreateSocket(GetNode(), tid);
+        m_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 20000));
+        m_send_socket->SetAllowBroadcast(true);
 
-    m_recv_socket1->SetAllowBroadcast(true);
-    m_recv_socket2->SetAllowBroadcast(true);
-    m_send_socket->SetAllowBroadcast(true);
-    m_uplink_send_socket->SetAllowBroadcast(true);
-    m_downlink_send_socket->SetAllowBroadcast(true);
+        cout << "[OPT-B] RSU node " << nid
+             << " (idx=" << (nid - g_first_rsu_node_id) << ")"
+             << " listening on DSRC port 6666" << endl;
+    } else {
+        // ── Management/vehicle node: standard socket setup ────────────────────────
+        m_recv_socket1 = Socket::CreateSocket(GetNode(), tid);
+        m_recv_socket2 = Socket::CreateSocket(GetNode(), tid);
+
+        SetupReceiveSocket(m_recv_socket1, m_port1);
+        SetupReceiveSocket(m_recv_socket2, m_port2);
+
+        m_recv_socket1->SetRecvCallback(MakeCallback(&SimpleUdpApplication::HandleReadOne, this));
+        m_recv_socket2->SetRecvCallback(MakeCallback(&SimpleUdpApplication::HandleReadTwo, this));
+
+        m_send_socket          = Socket::CreateSocket(GetNode(), tid);
+        m_uplink_send_socket   = Socket::CreateSocket(GetNode(), tid);
+        m_downlink_send_socket = Socket::CreateSocket(GetNode(), tid);
+
+        m_uplink_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 10000));
+        m_downlink_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 30000));
+        m_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 20000));
+
+        m_recv_socket1->SetAllowBroadcast(true);
+        m_recv_socket2->SetAllowBroadcast(true);
+        m_send_socket->SetAllowBroadcast(true);
+        m_uplink_send_socket->SetAllowBroadcast(true);
+        m_downlink_send_socket->SetAllowBroadcast(true);
+    }
 }
 
 void SimpleUdpApplication::test()

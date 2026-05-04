@@ -82,10 +82,12 @@ void PoisonTrajectoryByType(Vector &position, Vector &velocity, Vector &accelera
     {
         case 1:
             // TP-S1 (attack_number=1): Compromised RSU — position drift (Fig 3.1)
-            // TP-S1: Location Spoofing — position drift only (Eq. 3.10)
-            // Triggers: TP-S1 (kinematic), TP-S4 (dead-reckoning), TP-S5 (drift)
-            position.x += theta * max_position_deviation * sin(t * 0.7);
-            position.y += theta * max_position_deviation * cos(t * 0.5);
+            // NEVER REACHED: for attack=1 all vehicle flags are false → is_mal=false
+            // for every vehicle, so PoisonTrajectoryByType() is never called.
+            // The actual TP-S1 poisoning happens at the RSU level inside
+            // HandleBeaconReceived() (08_detection_engine.h), which intercepts the
+            // honest vehicle beacon and overwrites its position field directly.
+            // This case exists only as a reference; it has no runtime effect.
             break;
 
         case 2:
@@ -331,28 +333,63 @@ void declare_attackers()
 
 }
 
-// ── declare_compromised_rsus() — set which RSUs are compromised ───────────────
-// Called for attack_number 1 (TP-S1) and 3 (MP-S1) where the RSU is attacker.
-// Uses attack_percentage to determine how many of the 4 RSUs are compromised:
-//   10–33%  → 1 RSU (RSU 0)
-//   34–66%  → 2 RSUs (RSU 0, 1)
-//   67–100% → 3 RSUs (RSU 0, 1, 2)
+// ── declare_compromised_rsus() — randomly select which RSUs are compromised ───
+// Called for attack_number 1 (TP-S1) and 3 (MP-S1) where the RSU is the attacker.
+//
+// Number of compromised RSUs = round(N_RSUs * attack_percentage / 100)
+//   attack_percentage=25 → 1 of 4 RSUs  (25%)
+//   attack_percentage=50 → 2 of 4 RSUs  (50%)
+//   attack_percentage=75 → 3 of 4 RSUs  (75%)
+//
+// WHICH RSUs are compromised is chosen by random shuffle:
+//   rsu_seed=0  → random each run (seeded from system clock)
+//   rsu_seed=N  → same RSUs every run (reproducible, pass --rsu_seed=N)
+//
+// The resulting compromised_rsu[] array drives:
+//   - HandleBeaconAtRSU()  (poisoning gate)
+//   - NetAnim colors        (RED vs YELLOW RSUs, ORANGE vs GREEN vehicles)
+//   - rsu_relay_log.csv     (is_poisoned column)
 void declare_compromised_rsus()
 {
     compromised_rsu[0] = compromised_rsu[1] = compromised_rsu[2] = compromised_rsu[3] = false;
 
     if (attack_number != 1 && attack_number != 3) return; // only RSU-level attacks
 
-    if (attack_percentage >= 10)  compromised_rsu[0] = true;
-    if (attack_percentage >= 34)  compromised_rsu[1] = true;
-    if (attack_percentage >= 67)  compromised_rsu[2] = true;
+    // How many RSUs to compromise
+    int n_active = (int)N_RSUs;
+    if (n_active > 4) n_active = 4;
+    int n_comp = (int)std::round((double)n_active * attack_percentage / 100.0);
+    if (n_comp < 0) n_comp = 0;
+    if (n_comp > n_active) n_comp = n_active;
 
-    for (int r = 0; r < 4; r++) {
+    // Build candidate list [0, 1, 2, ..., n_active-1]
+    std::vector<int> candidates;
+    for (int r = 0; r < n_active; r++) candidates.push_back(r);
+
+    // Seed the RNG
+    uint32_t actual_seed = (rsu_seed == 0)
+        ? (uint32_t)std::chrono::system_clock::now().time_since_epoch().count()
+        : rsu_seed;
+    std::mt19937 rng(actual_seed);
+    std::shuffle(candidates.begin(), candidates.end(), rng);
+
+    // Mark first n_comp entries as compromised
+    for (int i = 0; i < n_comp; i++)
+        compromised_rsu[candidates[i]] = true;
+
+    // Report
+    cout << "\n[RSU-SELECTION] attack=" << attack_number
+         << "  pct=" << attack_percentage << "%"
+         << "  compromising " << n_comp << "/" << n_active << " RSUs"
+         << "  seed=" << actual_seed << endl;
+    for (int r = 0; r < n_active; r++)
+    {
         if (compromised_rsu[r])
-            cout << "[RSU-COMPROMISE] RSU " << r << " is COMPROMISED"
-                 << " (attack=" << attack_number
-                 << " pct=" << attack_percentage << "%)" << endl;
+            cout << "  [RSU-COMPROMISE] RSU" << r << " → COMPROMISED (will poison beacons)" << endl;
+        else
+            cout << "  [RSU-CLEAN]      RSU" << r << " → CLEAN       (passes beacons untouched)" << endl;
     }
+    cout << endl;
 }
 
 // ── End of 06a_attack_models.h ───────────────────────────────────────────────

@@ -23,12 +23,25 @@
 #include <sstream>
 #include <time.h>   // clock_gettime for PBPO timing
 
+// ── Internal forward declarations ────────────────────────────────────────────
+static uint32_t nearest_rsu_for_position(double px, double py); // defined later in this file
+
 // ── Forward declarations (defined in 10_metrics_csv.h) ───────────────────────
 // 10_metrics_csv.h is included after this file in simulation.cc, so we
 // forward-declare here to allow HandleBeaconReceived() to call them.
 void update_confusion_matrix(bool is_poisoned, bool detected);
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi);
+void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
+                      double sim_t,
+                      double real_px, double real_py,
+                      double fake_px, double fake_py,
+                      double speed,   double heading, double accel,
+                      double drift_x, double drift_y, double disp_err);
+void log_rsu_relay(uint32_t vid, uint32_t rsu_id, double sim_t, bool is_poisoned,
+                   double real_px, double real_py,
+                   double recv_px, double recv_py,
+                   double speed,   double heading, double accel);
 // PBPO timing accumulator (defined in 02_config_globals.h)
 // pbpo_time_sum_ms and pbpo_cnt are global — updated directly here.
 
@@ -316,60 +329,80 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     clock_gettime(CLOCK_MONOTONIC, &t_start);
 
     // ── TP-S1: Compromised RSU intercepts and modifies honest beacon (attack_number==1) ──
-    // Paper §3.4.1 (Figure 3.1): Vehicle sends CORRECT data. The RSU is the
-    // attacker and corrupts it before any processing occurs.
-    // trajectory_poisoning_malicious_nodes[N_Vehicles + rsu_id] = compromised RSU flag
-    if (attack_number == 1 &&
+    // When Option B is active, this poisoning happens at HandleBeaconAtRSU() on the
+    // actual RSU node before forwarding to management_node. This block is the legacy
+    // fallback for when Option B is disabled (g_option_b_active=false).
+    // TP-S1: compromised_rsu[] already encodes attack_percentage (set by declare_compromised_rsus).
+    // No second probability gate — ALL vehicles at a compromised RSU are poisoned.
+    if (!g_option_b_active &&
+        attack_number == 1 &&
         rsu_id < 4 &&
-        compromised_rsu[rsu_id] &&
-        GetBooleanWithProbability(attack_percentage, vehicle_id)) // only attack_pct% of vehicles
+        compromised_rsu[rsu_id])
     {
-        double real_px = tag.GetPosX();
-        double real_py = tag.GetPosY();
-        double t = Simulator::Now().GetSeconds();
-        // RSU applies position drift poisoning to the honest beacon
-        double fake_px = real_px + poisoning_intensity_theta * max_position_deviation * sin(t * 0.7);
-        double fake_py = real_py + poisoning_intensity_theta * max_position_deviation * cos(t * 0.5);
-        // Clamp to simulation area bounds
+        double real_px  = tag.GetPosX();
+        double real_py  = tag.GetPosY();
+        double real_spd = tag.GetSpeed();
+        double real_hdg = tag.GetHeading();
+        double real_acc = tag.GetAcceleration();
+        double t        = Simulator::Now().GetSeconds();
+
+        double drift_x  = poisoning_intensity_theta * max_position_deviation * sin(t * 0.7);
+        double drift_y  = poisoning_intensity_theta * max_position_deviation * cos(t * 0.5);
+        double fake_px  = real_px + drift_x;
+        double fake_py  = real_py + drift_y;
         fake_px = (fake_px < min_position_x) ? min_position_x : (fake_px > max_position_x ? max_position_x : fake_px);
         fake_py = (fake_py < min_position_y) ? min_position_y : (fake_py > max_position_y ? max_position_y : fake_py);
+
         tag.SetPosition(fake_px, fake_py);
-        tag.SetIsPoisoned(true);     // honest vehicle's data was corrupted by RSU
+        tag.SetIsPoisoned(true);
         tag.SetAttackType(1);
-        // Accumulate TDEE / TPE (displacement error introduced at RSU level)
-        double dx = fake_px - real_px, dy = fake_py - real_py;
+
+        double dx       = fake_px - real_px;
+        double dy       = fake_py - real_py;
         double disp_err = std::sqrt(dx*dx + dy*dy);
         tdee_error_sum += disp_err;
         tdee_error_cnt++;
         tpe_sq_sum += disp_err * disp_err;
         tpe_cnt++;
-        cout << "[TP-S1-RSU] RSU " << rsu_id << " corrupted V" << vehicle_id
-             << " (" << real_px << "," << real_py << ")→("
-             << fake_px << "," << fake_py << ")" << endl;
+
+        bool det_likely = (disp_err > s_max * T_b);
+        cout << "\n[TP-S1-DEBUG] ══════════════════════════════════════════════" << endl;
+        cout << "  t=" << std::fixed << std::setprecision(3) << t
+             << "s  RSU=" << rsu_id << "  Vehicle=" << vehicle_id
+             << "  theta=" << poisoning_intensity_theta << endl;
+        cout << std::fixed << std::setprecision(4);
+        cout << "  pos_x " << real_px << " → " << fake_px
+             << "  (drift " << std::showpos << drift_x << std::noshowpos << " m)" << endl;
+        cout << "  pos_y " << real_py << " → " << fake_py
+             << "  (drift " << std::showpos << drift_y << std::noshowpos << " m)" << endl;
+        cout << "  disp_err=" << disp_err << " m  s_max*T_b=" << s_max*T_b
+             << "  detect=" << (det_likely ? "LIKELY" : "below-threshold") << endl;
+        cout << "[TP-S1-DEBUG] ══════════════════════════════════════════════\n" << endl;
+
+        log_tp_s1_poison(vehicle_id, rsu_id, t,
+                         real_px, real_py, fake_px, fake_py,
+                         real_spd, real_hdg, real_acc,
+                         drift_x,  drift_y,  disp_err);
     }
 
     // ── MP-S1: Compromised RSU injects ghost vehicle IDs (attack_number==3) ──────
-    // Paper §3.4.2 (Figure 3.4): RSU receives real beacons but ALSO generates
-    // additional forged mobility reports with invented vehicle identities.
-    // This inflates the RSU identity density count → triggers MP-S1 detection.
-    if (attack_number == 3 &&
+    // Fallback for when Option B is disabled (g_option_b_active=false).
+    // When Option B is active, this happens at HandleBeaconAtRSU() on the actual RSU node.
+    // MP-S1: same logic — no second probability gate.
+    if (!g_option_b_active &&
+        attack_number == 3 &&
         rsu_id < 4 &&
-        compromised_rsu[rsu_id] &&
-        GetBooleanWithProbability(attack_percentage, vehicle_id))  // only attack_pct% of vehicles affected
+        compromised_rsu[rsu_id])
     {
-        tag.SetIsPoisoned(true);    // this beacon is part of the ghost-ID attack
+        tag.SetIsPoisoned(true);
         tag.SetAttackType(3);
         double now_t = Simulator::Now().GetSeconds();
-        // NOTE: ghost ID inflation (rsu_id_set.count += N_ghost) now happens inside
-        // run_syb_detect() AFTER register_vehicle_at_rsu(), to avoid window-reset race.
-        // TDEE proxy: ghost vehicles have no real position (fabricated identities)
         double ghost_err = R_max_comm * poisoning_intensity_theta;
         tdee_error_sum += ghost_err;
         tdee_error_cnt++;
         tpe_sq_sum += ghost_err * ghost_err;
         tpe_cnt++;
         cout << "[MP-S1-RSU] RSU " << rsu_id << " ghosting V" << vehicle_id
-             << " (ghost inflation in run_syb_detect)"
              << " at t=" << now_t << endl;
     }
 
@@ -554,24 +587,191 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 }
 
 // ============================================================
-// HandleReadOne / HandleReadTwo — SimpleUdpApplication member stubs
-// Declared in 07_security.h; body was in 08_lldp_handlers.h.
-// Replaced with beacon-oriented dispatch until Stage 6 cleanup.
+// HandleBeaconAtRSU — Option B: actual NS-3 RSU node receives vehicle DSRC beacon
+// Called when a vehicle unicasts to this RSU's DSRC IP on port 6666.
+// Applies RSU-level poisoning (TP-S1, MP-S1) if compromised, stamps rsu_id,
+// then forwards the (possibly-poisoned) beacon to management_node via CSMA:7777.
 // ============================================================
-void SimpleUdpApplication::HandleReadOne(Ptr<Socket> socket)
+void SimpleUdpApplication::HandleBeaconAtRSU(Ptr<Socket> socket)
 {
-    // In the paper simulation, received DSRC packets arrive as BSM beacons
-    // already processed through HandleBeaconReceived().
-    // This socket callback is kept as a stub to satisfy the linker.
     Ptr<Packet> packet;
     Address     from;
     while ((packet = socket->RecvFrom(from)) != nullptr)
     {
-        // Peek for BsmBeaconTag and dispatch to HandleBeaconReceived
+        BsmBeaconTag tag;
+        if (!packet->RemovePacketTag(tag)) continue; // not a BSM beacon
+
+        uint32_t nid     = GetNode()->GetId();
+        uint32_t rsu_idx = nid - g_first_rsu_node_id;
+        uint32_t vid     = tag.GetVehicleId();
+        double   t       = Simulator::Now().GetSeconds();
+
+        // Capture honest vehicle position BEFORE any RSU modification
+        double real_px = tag.GetPosX();
+        double real_py = tag.GetPosY();
+
+        // Geographic filter: each RSU only processes beacons from its own vehicles.
+        // (All RSUs on the DSRC channel hear the unicast, but only the addressed
+        //  one should act — in NS-3 unicast this is automatic; this guard is a
+        //  belt-and-suspenders check for the nearest-RSU logic in the vehicle TX.)
+        uint32_t nearest = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
+        if (nearest != rsu_idx) {
+            // Not our vehicle — silently drop
+            continue;
+        }
+
+        cout << "[DSRC-RSU" << rsu_idx << "] V" << vid
+             << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
+             << " compromised=" << (compromised_rsu[rsu_idx] ? "YES" : "no") << endl;
+
+        // ── TP-S1: Compromised RSU modifies trajectory (paper §3.4.1 Figure 3.1) ──
+        // compromised_rsu[] already reflects attack_percentage via declare_compromised_rsus().
+        // No second per-vehicle gate — ALL vehicles at a compromised RSU are poisoned.
+        if (attack_number == 1 &&
+            rsu_idx < 4 &&
+            compromised_rsu[rsu_idx])
+        {
+            double real_px  = tag.GetPosX();
+            double real_py  = tag.GetPosY();
+            double real_spd = tag.GetSpeed();
+            double real_hdg = tag.GetHeading();
+            double real_acc = tag.GetAcceleration();
+
+            double drift_x  = poisoning_intensity_theta * max_position_deviation * sin(t * 0.7);
+            double drift_y  = poisoning_intensity_theta * max_position_deviation * cos(t * 0.5);
+            double fake_px  = real_px + drift_x;
+            double fake_py  = real_py + drift_y;
+            fake_px = (fake_px < min_position_x) ? min_position_x : (fake_px > max_position_x ? max_position_x : fake_px);
+            fake_py = (fake_py < min_position_y) ? min_position_y : (fake_py > max_position_y ? max_position_y : fake_py);
+
+            tag.SetPosition(fake_px, fake_py);
+            tag.SetIsPoisoned(true);
+            tag.SetAttackType(1);
+
+            double dx = fake_px - real_px, dy = fake_py - real_py;
+            double disp_err = std::sqrt(dx*dx + dy*dy);
+            tdee_error_sum += disp_err;
+            tdee_error_cnt++;
+            tpe_sq_sum += disp_err * disp_err;
+            tpe_cnt++;
+
+            bool det_likely = (disp_err > s_max * T_b);
+            cout << "\n[TP-S1-RSU" << rsu_idx << "] ═════════════════════════════════════" << endl;
+            cout << "  t=" << std::fixed << std::setprecision(3) << t
+                 << "s  V=" << vid << "  theta=" << poisoning_intensity_theta << endl;
+            cout << std::fixed << std::setprecision(4);
+            cout << "  pos_x " << real_px << " → " << fake_px
+                 << "  (drift " << std::showpos << drift_x << std::noshowpos << " m)" << endl;
+            cout << "  pos_y " << real_py << " → " << fake_py
+                 << "  (drift " << std::showpos << drift_y << std::noshowpos << " m)" << endl;
+            cout << "  disp_err=" << disp_err << " m  detect=" << (det_likely ? "LIKELY" : "below-threshold") << endl;
+            cout << "[TP-S1-RSU" << rsu_idx << "] ═════════════════════════════════════\n" << endl;
+
+            log_tp_s1_poison(vid, rsu_idx, t, real_px, real_py, fake_px, fake_py,
+                             real_spd, real_hdg, real_acc, drift_x, drift_y, disp_err);
+        }
+
+        // ── MP-S1: Compromised RSU ghost-inflates identity density (paper §3.4.2) ──
+        // No second per-vehicle gate — same reasoning as TP-S1 above.
+        if (attack_number == 3 &&
+            rsu_idx < 4 &&
+            compromised_rsu[rsu_idx])
+        {
+            tag.SetIsPoisoned(true);
+            tag.SetAttackType(3);
+            double ghost_err = R_max_comm * poisoning_intensity_theta;
+            tdee_error_sum += ghost_err;
+            tdee_error_cnt++;
+            tpe_sq_sum += ghost_err * ghost_err;
+            tpe_cnt++;
+            cout << "[MP-S1-RSU" << rsu_idx << "] ghosting V" << vid << " at t=" << t << endl;
+        }
+
+        // Stamp RSU index into tag so management_node knows which RSU relayed this beacon
+        tag.SetRsuId(rsu_idx);
+
+        // Re-attach modified tag to packet
+        packet->AddPacketTag(tag);
+
+        // Log every beacon (clean + poisoned) with real vs received positions
+        log_rsu_relay(vid, rsu_idx, t, tag.GetIsPoisoned(),
+                      real_px, real_py,
+                      tag.GetPosX(), tag.GetPosY(),
+                      tag.GetSpeed(), tag.GetHeading(), tag.GetAcceleration());
+
+        // Forward to management_node via CSMA (10.1.1.6 : 7777)
+        if (m_relay_socket) {
+            int err = m_relay_socket->SendTo(packet, 0,
+                          InetSocketAddress(g_management_csma_ip, 7777));
+            if (err < 0) {
+                cout << "[RSU-FWD-ERR] RSU" << rsu_idx
+                     << " failed to relay V" << vid << " beacon" << endl;
+            } else {
+                cout << "[RSU-FWD] RSU" << rsu_idx << " → MGT " << g_management_csma_ip
+                     << ":7777  V=" << vid << endl;
+            }
+        }
+    }
+}
+
+// ============================================================
+// HandleReadOne / HandleReadTwo — SimpleUdpApplication member stubs
+// Declared in 07_security.h; body was in 08_lldp_handlers.h.
+// Replaced with beacon-oriented dispatch until Stage 6 cleanup.
+// ============================================================
+// ── Nearest-RSU lookup ────────────────────────────────────────────────────────
+// routing_test layout (12_main.h GridPositionAllocator, routing_test=true):
+//   RSU0=(250,480)  RSU1=(750,480)  RSU2=(1250,480)  RSU3=(1750,480)
+// Legacy urban layout (routing_test=false, mobility_scenario=0):
+//   RSU0=(750,1200) RSU1=(1150,1200) RSU2=(1550,1200) RSU3=(1950,1200)
+// Uses g_rsu_actual_pos[] populated at startup so positions never go stale.
+// ─────────────────────────────────────────────────────────────────────────────
+static double g_rsu_actual_pos_x[4] = {250.0, 750.0, 1250.0, 1750.0}; // routing_test default
+static double g_rsu_actual_pos_y[4] = {480.0, 480.0,  480.0,  480.0};
+
+static uint32_t nearest_rsu_for_position(double px, double py)
+{
+    // Use actual RSU positions (set at startup, matches 12_main.h topology)
+    static const double (&rsu_x)[4] = g_rsu_actual_pos_x;
+    static const double (&rsu_y)[4] = g_rsu_actual_pos_y;
+    int active = (N_RSUs > 0 && N_RSUs <= 4) ? (int)N_RSUs : 4;
+    uint32_t nearest = 0;
+    double   min_d2  = 1e18;
+    for (int r = 0; r < active; r++) {
+        double dx = px - rsu_x[r], dy = py - rsu_y[r];
+        double d2 = dx*dx + dy*dy;
+        if (d2 < min_d2) { min_d2 = d2; nearest = (uint32_t)r; }
+    }
+    return nearest;
+}
+
+void SimpleUdpApplication::HandleReadOne(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet;
+    Address     from;
+    while ((packet = socket->RecvFrom(from)) != nullptr)
+    {
         BsmBeaconTag beaconTag;
         if (packet->PeekPacketTag(beaconTag)) {
-            uint32_t vid   = beaconTag.GetVehicleId();
-            uint32_t rsuId = 0; // stub: RSU id
+            uint32_t vid = beaconTag.GetVehicleId();
+            uint32_t rsuId;
+            if (g_option_b_active) {
+                // Option B: RSU already stamped its index in the tag before forwarding
+                rsuId = beaconTag.GetRsuId();
+                cout << "[MGT-RX] V" << vid
+                     << " from RSU" << rsuId
+                     << " pos(" << beaconTag.GetPosX() << "," << beaconTag.GetPosY() << ")"
+                     << " poisoned=" << (beaconTag.GetIsPoisoned() ? "YES" : "no")
+                     << endl;
+            } else {
+                // Legacy fallback: assign RSU geographically (no actual DSRC path)
+                rsuId = nearest_rsu_for_position(beaconTag.GetPosX(), beaconTag.GetPosY());
+                cout << "[RSU-ASSIGN] V" << vid
+                     << " pos(" << beaconTag.GetPosX() << "," << beaconTag.GetPosY() << ")"
+                     << " → RSU" << rsuId
+                     << " compromised=" << (compromised_rsu[rsuId] ? "YES" : "no")
+                     << endl;
+            }
             HandleBeaconReceived(vid, beaconTag, rsuId);
         }
     }

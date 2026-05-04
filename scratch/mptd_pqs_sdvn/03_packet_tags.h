@@ -42,6 +42,7 @@ public:
     void SetIsPoisoned(bool p)             { m_is_poisoned = p; }
     void SetAttackType(uint32_t at)        { m_attack_type = at; }
     void SetSigViolated(uint32_t sv)       { m_sig_violated = sv; }  // bitmask: bit0=TP-S1 .. bit8=MP-S4
+    void SetRsuId(uint32_t id)             { m_rsu_id = id; }        // RSU that relayed this beacon (Option B)
 
     // Getters
     double   GetPosX()         const { return m_pos_x; }
@@ -54,6 +55,7 @@ public:
     bool     GetIsPoisoned()   const { return m_is_poisoned; }
     uint32_t GetAttackType()   const { return m_attack_type; }
     uint32_t GetSigViolated()  const { return m_sig_violated; }
+    uint32_t GetRsuId()        const { return m_rsu_id; }
 
 private:
     double   m_pos_x        = 0.0;
@@ -66,6 +68,7 @@ private:
     bool     m_is_poisoned  = false;
     uint32_t m_attack_type  = 0;     // 1-7 matching attack_number
     uint32_t m_sig_violated = 0;     // bitmask: bit0=TP-S1 .. bit8=MP-S4
+    uint32_t m_rsu_id       = 0;     // RSU index that relayed this beacon (Option B DSRC path)
 };
 
 NS_OBJECT_ENSURE_REGISTERED(BsmBeaconTag);
@@ -82,7 +85,7 @@ ns3::TypeId BsmBeaconTag::GetInstanceTypeId(void) const {
     return BsmBeaconTag::GetTypeId();
 }
 uint32_t BsmBeaconTag::GetSerializedSize(void) const {
-    return 6 * sizeof(double) + 3 * sizeof(uint32_t) + sizeof(bool);
+    return 6 * sizeof(double) + 4 * sizeof(uint32_t) + sizeof(bool);
 }
 void BsmBeaconTag::Serialize(ns3::TagBuffer i) const {
     i.WriteDouble(m_pos_x);
@@ -95,6 +98,7 @@ void BsmBeaconTag::Serialize(ns3::TagBuffer i) const {
     i.WriteU8(m_is_poisoned ? 1 : 0);
     i.WriteU32(m_attack_type);
     i.WriteU32(m_sig_violated);
+    i.WriteU32(m_rsu_id);
 }
 void BsmBeaconTag::Deserialize(ns3::TagBuffer i) {
     m_pos_x       = i.ReadDouble();
@@ -107,6 +111,7 @@ void BsmBeaconTag::Deserialize(ns3::TagBuffer i) {
     m_is_poisoned = (i.ReadU8() != 0);
     m_attack_type  = i.ReadU32();
     m_sig_violated = i.ReadU32();
+    m_rsu_id       = i.ReadU32();
 }
 void BsmBeaconTag::Print(std::ostream &os) const {
     os << "BSM[v=" << m_vehicle_id
