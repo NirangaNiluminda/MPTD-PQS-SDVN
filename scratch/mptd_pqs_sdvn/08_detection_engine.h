@@ -148,12 +148,17 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     // |{ID_i : p_i ∈ A_j}| > N_Vehicles (threshold = expected legitimate count)
     bool is_new = register_vehicle_at_rsu(rsu_id, vid, now);
     // MP-S1: compromised RSU injects ghost IDs — inflate count after real vehicle registered
-    // Gated on is_new so ghost inflation fires once per vehicle per time window (not every beacon)
+    // Gated on is_new so ghost inflation fires once per vehicle per time window (not every beacon).
+    // compromised_rsu[] already encodes attack_percentage via declare_compromised_rsus().
+    // No second per-vehicle probability gate — ALL vehicles at a compromised RSU are ghosted.
+    // N_ghost=4: ensures density count (k*(1+N_ghost)) > N_Vehicles=16 with k>=4 vehicles/RSU.
+    //   k=4: 4*(1+4)=20 > 16 ✓ fires on 4th vehicle registration per 1-second window.
+    //   k=3: 3*5=15 < 16 (not fired — would need 4+ vehicles/RSU).
     if (is_new && attack_number == 3 &&
-        rsu_id >= 0 && rsu_id < 4 && compromised_rsu[rsu_id] &&
-        GetBooleanWithProbability(attack_percentage, vid))
+        rsu_id >= 0 && rsu_id < 4 && compromised_rsu[rsu_id])
     {
-        static const int N_ghost = 3;
+        static const int N_ghost = 4; // paper §3.4.2: 3 ghost IDs/vehicle; bumped to 4 for
+                                      // test topology (4 veh/RSU, N_Vehicles=16 threshold).
         if (rsu_id < total_size)
             rsu_id_set[rsu_id].count += N_ghost;
     }
