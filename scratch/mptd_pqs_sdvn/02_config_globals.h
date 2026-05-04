@@ -79,6 +79,11 @@ const char* attack_scenario_name[] = {
 
 bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 
+// ── Controller-Switch Mitigation Flag ─────────────────────────────────────────
+// Set to true by detection engine when primary controller is confirmed malicious.
+// Future: routes beacon flow to backup_controller_Node and updates NetAnim colours.
+bool g_backup_controller_active = false;
+
 // ── Stage 7: Post-Quantum Crypto flag ──────────────────────────────────────
 // Set to false for ablation study A4 (disables TRS + FHE)
 // Paper §3.3.2-3.3.3; Eq. 3.58-3.65

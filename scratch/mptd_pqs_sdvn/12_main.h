@@ -91,7 +91,11 @@ int main(int argc, char *argv[])
     clear_delta_at_controller(delta_at_controller_inst);
   
   controller_Node.Create(1);
-  management_Node.Create(1); 
+  // Backup SDN controller — standby node for future controller-switching mitigation.
+  // When the primary controller is detected as malicious (attacks 5/7), the system
+  // revokes primary and promotes backup_controller_Node as the active controller.
+  backup_controller_Node.Create(1);
+  management_Node.Create(1);
   if (routing_test == false)
   {
   	  if(N_Vehicles > 0)
@@ -198,15 +202,23 @@ int main(int argc, char *argv[])
   {
 	  csma_nodes.Add(RSU_Nodes);
 	  csma_nodes.Add(controller_Node);
-	  csma_nodes.Add(management_Node);  
+	  csma_nodes.Add(management_Node);
+	  // Backup controller joins the same CSMA backhaul as the primary — it is
+	  // pre-connected so no topology change is needed at switch-over time.
+	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management, backup_controller
+	  // → management stays at index N_RSUs+1 (index unchanged from before).
+	  csma_nodes.Add(backup_controller_Node);
 	  csmaDevices = csma.Install (csma_nodes);
   	  address.SetBase ("10.1.1.0", "255.255.255.0");
   	  stack.Install (csma_nodes);
   	  csmaInterfaces = address.Assign (csmaDevices);
-  	  // ── Option B: management_node is the last entry in csma_nodes ──────────────
-  	  // Order: RSU0..RSU(N_RSUs-1), controller, management → index = N_RSUs + 1
+  	  // ── Option B: management_node is the 3rd-last entry in csma_nodes ─────────
+  	  // Order: RSU0..RSU(N_RSUs-1), controller, management, backup_controller
+  	  //   → management index = N_RSUs + 1 (unchanged)
+  	  //   → backup_controller index = N_RSUs + 2
   	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + 1);
-  	  cout << "[OPT-B] management CSMA IP = " << g_management_csma_ip << endl;
+  	  cout << "[OPT-B] management CSMA IP  = " << g_management_csma_ip << endl;
+  	  cout << "[OPT-B] backup ctrl CSMA IP = " << csmaInterfaces.GetAddress(N_RSUs + 2) << endl;
   }
   
   AodvHelper aodv;
@@ -706,6 +718,7 @@ int main(int argc, char *argv[])
 	  MobilityHelper other_stationary_mobility;
 	  other_stationary_mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
 	  other_stationary_mobility.Install(controller_Node);
+	  other_stationary_mobility.Install(backup_controller_Node);
 	  other_stationary_mobility.Install(management_Node);
 	  if (N_Vehicles > 0)
 	  {
@@ -745,7 +758,14 @@ int main(int argc, char *argv[])
 	   Ptr<ConstantVelocityMobilityModel> mdl_controller = DynamicCast <ConstantVelocityMobilityModel> (controller_Node.Get(0)->GetObject<MobilityModel>());
 	   mdl_controller->SetPosition(Vector(con_base_posx, con_base_posy, 0));
 	   mdl_controller->SetVelocity(Vector(0, 0, 0));//centralized controller placement
-	   
+
+	   // Backup controller: placed 150 m to the left of primary in the same row.
+	   // routing_test layout: primary at (850,50) → backup at (700,50).
+	   // Other scenarios shift by the same offset relative to con_base_posx.
+	   Ptr<ConstantVelocityMobilityModel> mdl_backup = DynamicCast <ConstantVelocityMobilityModel> (backup_controller_Node.Get(0)->GetObject<MobilityModel>());
+	   mdl_backup->SetPosition(Vector(con_base_posx - 150, con_base_posy, 0));
+	   mdl_backup->SetVelocity(Vector(0, 0, 0));
+
 	  //setting the position of management node
 	  //int man_base_posx = rand()%3000;
 	  //int man_base_posy = ;
@@ -1809,12 +1829,13 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   
   // ── NetAnim: MPTD-PQS attack-aware visualization ─────────────────────────────
   // Color legend:
-  //   RED    (255,  0,  0) — compromised RSU (TP-S1 / MP-S1 attacker)
+  //   RED    (255,  0,  0) — compromised RSU (TP-S1/MP-S1) OR malicious controller (TP-S3/MP-S4)
   //   YELLOW (255,200,  0) — clean RSU
   //   ORANGE (255,128,  0) — vehicle in a compromised RSU zone (beacons poisoned)
   //   GREEN  (  0,200,  0) — vehicle in a clean RSU zone
   //   BLUE   (  0,  0,255) — management node (SDN control plane)
-  //   PURPLE (150,  0,220) — SDN controller
+  //   PURPLE (150,  0,220) — honest SDN controller
+  //   CYAN   (  0,210,210) — backup controller (STANDBY, not yet active)
   ensure_analytics_dir(NS3_ROOT "/analytics");
   ensure_analytics_dir(NS3_ROOT "/analytics/results");
   std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_a")
@@ -1837,10 +1858,27 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
           routing_test ? "MANAGEMENT\nMPTD-PQS Detection\n(DSRC-RSU relay)"
                        : "MANAGEMENT\n(SDN control)");
 
-      anim.UpdateNodeColor(controller_Node.Get(0), 150, 0, 220);
+      // ── Primary controller: RED if malicious (attacks 5/7), PURPLE if honest ──
+      bool ctrl_malicious = (attack_number == 5 || attack_number == 7);
+      if (ctrl_malicious) {
+          anim.UpdateNodeColor(controller_Node.Get(0), 255, 0, 0);  // RED = compromised
+          anim.UpdateNodeDescription(controller_Node.Get(0),
+              routing_test ? "SDN CTRL\n[COMPROMISED]\nTP-S3/MP-S4" : "CTRL [COMPROMISED]");
+      } else {
+          anim.UpdateNodeColor(controller_Node.Get(0), 150, 0, 220); // PURPLE = honest
+          anim.UpdateNodeDescription(controller_Node.Get(0),
+              routing_test ? "SDN CONTROLLER\n(MPTD-PQS)" : "CONTROLLER");
+      }
       anim.UpdateNodeSize(controller_Node.Get(0)->GetId(), 35.0, 35.0);
-      anim.UpdateNodeDescription(controller_Node.Get(0),
-          routing_test ? "SDN CONTROLLER\n(MPTD-PQS)" : "CONTROLLER");
+
+      // ── Backup controller: CYAN = STANDBY (switches to BLUE when activated) ──
+      // g_backup_controller_active is set by detection engine once primary is revoked.
+      // At simulation start it is always false → always shown as STANDBY here.
+      anim.UpdateNodeColor(backup_controller_Node.Get(0), 0, 210, 210); // CYAN = standby
+      anim.UpdateNodeSize(backup_controller_Node.Get(0)->GetId(), 35.0, 35.0);
+      anim.UpdateNodeDescription(backup_controller_Node.Get(0),
+          ctrl_malicious ? "BACKUP CTRL\n[STANDBY]\n← ready to switch"
+                         : "BACKUP CTRL\n[STANDBY]");
   }
 
   // ── RSU nodes — RED if compromised, YELLOW if clean ────────────────────────

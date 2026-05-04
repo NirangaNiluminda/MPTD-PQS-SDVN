@@ -33,7 +33,8 @@ long lte_total_packet_size   = 0;
 // ── Simulation node/app containers (used by 12_main.h) ───────────────────────
 ApplicationContainer apps;
 ApplicationContainer RSU_apps;
-NodeContainer controller_Node;
+NodeContainer controller_Node;         // primary SDN controller (Node index 0)
+NodeContainer backup_controller_Node;  // standby controller — activated when primary is revoked
 NodeContainer management_Node;
 NodeContainer Vehicle_Nodes;
 NodeContainer RSU_Nodes;
