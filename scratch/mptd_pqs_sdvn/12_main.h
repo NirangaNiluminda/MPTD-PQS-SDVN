@@ -1860,14 +1860,39 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
       }
   }
 
-  // ── Vehicle nodes — ORANGE if in compromised RSU zone, GREEN if clean ───────
+  // ── Vehicle nodes — attack-aware coloring ────────────────────────────────────
+  // Color legend per attack type:
+  //   Attacks 1,3 (RSU-level): ORANGE = vehicle in compromised RSU zone
+  //   Attacks 2,4,6 (vehicle-level): ORANGE = this vehicle is malicious
+  //   Attacks 5,7 (controller-level): ORANGE = all vehicles affected
+  //   GREEN = honest / unaffected vehicle
   // routing_test layout: V0-V3→RSU0, V4-V7→RSU1, V8-V11→RSU2, V12-V15→RSU3
   if (N_Vehicles > 0)
   {
       for (uint32_t i = 0; i < Vehicle_Nodes.GetN(); i++)
       {
           uint32_t rsu_zone = i / 4;  // 4 vehicles per RSU cluster
-          bool affected = (rsu_zone < 4) && compromised_rsu[rsu_zone];
+          bool affected = false;
+          std::string reason = "CLEAN";
+
+          if (attack_number == 1 || attack_number == 3) {
+              // RSU-level attack: vehicle affected if its RSU zone is compromised
+              affected = (rsu_zone < 4) && compromised_rsu[rsu_zone];
+              reason   = affected ? "COMPROMISED ZONE" : "CLEAN ZONE";
+          } else if (attack_number == 2) {
+              // TP-S2: vehicle is the attacker — check tp_vehicle_nodes[]
+              affected = (i < (uint32_t)total_size) && tp_vehicle_nodes[i];
+              reason   = affected ? "MALICIOUS" : "HONEST";
+          } else if (attack_number == 4 || attack_number == 6) {
+              // MP-S2 / MP-S3: sybil / MitM vehicle attackers
+              affected = (i < (uint32_t)total_size) && sybil_mitm_nodes[i];
+              reason   = affected ? "MALICIOUS" : "HONEST";
+          } else if (attack_number == 5 || attack_number == 7) {
+              // TP-S3 / MP-S4: controller-level — ALL vehicles' beacons are corrupted
+              affected = true;
+              reason   = "CTRL-AFFECTED";
+          }
+
           if (affected)
               anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 255, 128, 0); // ORANGE
           else
@@ -1875,7 +1900,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
           anim.UpdateNodeSize(Vehicle_Nodes.Get(i)->GetId(), 20.0, 20.0);
           std::string vlabel = "V" + std::to_string(i)
                              + "\nRSU" + std::to_string(rsu_zone)
-                             + (affected ? " AFFECTED" : " CLEAN");
+                             + "\n" + reason;
           anim.UpdateNodeDescription(Vehicle_Nodes.Get(i), vlabel);
       }
 

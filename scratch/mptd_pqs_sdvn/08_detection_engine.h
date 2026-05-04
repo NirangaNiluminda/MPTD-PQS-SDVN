@@ -42,6 +42,12 @@ void log_rsu_relay(uint32_t vid, uint32_t rsu_id, double sim_t, bool is_poisoned
                    double real_px, double real_py,
                    double recv_px, double recv_py,
                    double speed,   double heading, double accel);
+void log_vehicle_tx(uint32_t vid, uint32_t nearest_rsu,
+                    double sim_t,   bool is_malicious,
+                    double real_px, double real_py,
+                    double sent_px, double sent_py,
+                    double real_spd, double sent_spd,
+                    double real_hdg, double sent_hdg);
 // PBPO timing accumulator (defined in 02_config_globals.h)
 // pbpo_time_sum_ms and pbpo_cnt are global — updated directly here.
 

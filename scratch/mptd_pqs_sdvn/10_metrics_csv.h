@@ -199,6 +199,65 @@ void log_rsu_relay(uint32_t vid, uint32_t rsu_id, double sim_t, bool is_poisoned
     fout.close();
 }
 
+// ── Vehicle TX Log — one row per beacon at the moment the vehicle sends it ────
+// Shows real position + what the vehicle actually transmitted (poisoned or honest).
+// For honest vehicles: sent_pos == real_pos, drift == 0.
+// For malicious vehicles: sent_pos reflects PoisonTrajectoryByType() output.
+// Output: analytics/results/vehicle_tx_log.csv
+void log_vehicle_tx(uint32_t vid, uint32_t nearest_rsu,
+                    double sim_t,   bool is_malicious,
+                    double real_px, double real_py,
+                    double sent_px, double sent_py,
+                    double real_spd, double sent_spd,
+                    double real_hdg, double sent_hdg)
+{
+    ensure_analytics_dir(NS3_ROOT "/analytics");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results");
+
+    std::string path = NS3_ROOT "/analytics/results/vehicle_tx_log.csv";
+    static bool tx_first_call = true;
+    std::ofstream fout;
+    if (tx_first_call) {
+        fout.open(path, std::ios::out | std::ios::trunc);
+        fout << "sim_time,vehicle_id,nearest_rsu,attack_number,attack_pct,is_malicious,"
+             << "real_pos_x,real_pos_y,sent_pos_x,sent_pos_y,"
+             << "drift_x,drift_y,disp_err_m,"
+             << "real_speed_ms,sent_speed_ms,speed_delta_ms,"
+             << "real_heading_rad,sent_heading_rad,heading_delta_rad\n";
+        tx_first_call = false;
+    } else {
+        fout.open(path, std::ios::out | std::ios::app);
+    }
+
+    double drift_x      = sent_px  - real_px;
+    double drift_y      = sent_py  - real_py;
+    double disp_err     = std::sqrt(drift_x*drift_x + drift_y*drift_y);
+    double spd_delta    = sent_spd - real_spd;
+    double hdg_delta    = sent_hdg - real_hdg;
+
+    fout << std::fixed << std::setprecision(4)
+         << sim_t          << ","
+         << vid            << ","
+         << nearest_rsu    << ","
+         << attack_number  << ","
+         << attack_percentage << ","
+         << (is_malicious ? 1 : 0) << ","
+         << real_px        << ","
+         << real_py        << ","
+         << sent_px        << ","
+         << sent_py        << ","
+         << drift_x        << ","
+         << drift_y        << ","
+         << disp_err       << ","
+         << real_spd       << ","
+         << sent_spd       << ","
+         << spd_delta      << ","
+         << real_hdg       << ","
+         << sent_hdg       << ","
+         << hdg_delta      << "\n";
+    fout.close();
+}
+
 // ── 7 Paper Metric Computations (§3.5) ───────────────────────────────────────
 
 // MCC: Matthews Correlation Coefficient

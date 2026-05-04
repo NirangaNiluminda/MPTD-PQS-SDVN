@@ -149,6 +149,16 @@ void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
 			tpe_sq_sum += disp_err * disp_err;
 			tpe_cnt++;
 		}
+
+		// ── Vehicle TX log: record real vs sent fields for every beacon ───────────
+		// Shows which vehicles are malicious and exactly what they transmitted.
+		// For honest vehicles: sent == real, all deltas == 0.
+		// For malicious vehicles: sent reflects PoisonTrajectoryByType() output.
+		log_vehicle_tx(nid, nearest_rsu_idx,
+		               Simulator::Now().GetSeconds(), is_mal,
+		               real_px, real_py, tx_px, tx_py,
+		               real_spd, tx_spd,
+		               real_hdg, tx_hdg);
 	}
 
 	// Build BsmBeaconTag directly from computed tx values
