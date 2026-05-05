@@ -328,8 +328,11 @@ void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
 }
 
 // ============================================================
-// HandleBeaconReceived() — main RSU beacon handler
-// Called when RSU receives a BSM beacon from a vehicle.
+// HandleBeaconReceived() — management node beacon processing
+// Professor's term: this is the management-side processing triggered AFTER
+//   handle_readone (RSU) forwards the beacon via send_rsu_dataunicast_alone.
+// Called from handle_readone() once beacon arrives at management_node:7777.
+// Runs all MPTD-PQS detection algorithms (TP-S1..S5, MP-S1..S4).
 // ============================================================
 void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id)
 {
@@ -492,6 +495,26 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
              << ") spd " << real_spd << "→" << fake_spd << endl;
     }
 
+    // ── MP-S2 state-contamination guard (attack 4: stolen-ID beacons) ───────────
+    // Problem: stolen beacons carry honest vehicle IDs at the attacker's position.
+    // When pushed into vehicle_state[honest_vid], the attacker's fake position
+    // becomes the "previous" reference for that vehicle.  The next REAL beacon
+    // from honest_vid then sees an impossible jump (fake→real pos) and fires
+    // MP-S4 → false positive on an honest beacon.
+    //
+    // Fix: before pushing a potentially stolen beacon, save vehicle_state for
+    // the impersonated vehicle (honest, is_poisoned=true).  After detection, if
+    // MP-S4 fires, restore the saved state so the contaminated position does NOT
+    // persist as baseline.  This leaves the attacker's own beacon state intact
+    // (attacker is sybil_mitm_nodes[vid]=true → no save/restore for them).
+    bool save_state = (attack_number == 4)
+                   && (vehicle_id < (uint32_t)total_size)
+                   && tag.GetIsPoisoned()
+                   && !sybil_mitm_nodes[vehicle_id]; // stolen ID = honest vehicle
+    VehicleBeaconState vs_backup;
+    if (save_state)
+        vs_backup = vehicle_state[vehicle_id];
+
     // 1. Push new beacon into circular state buffer
     push_beacon(vehicle_id,
                 tag.GetPosX(), tag.GetPosY(),
@@ -504,6 +527,12 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     uint32_t mitm_flags = run_mitm_detect(vehicle_id, rsu_id, tag);// Alg 3: MP-S3 (KL)
     mp_flags           |= mitm_flags; // merge: bit 2 (MP-S3) now comes from MITM-DETECT
     uint32_t cp_flags   = run_cp_detect(tag);                      // Alg 4: CP
+
+    // Restore honest vehicle state if stolen beacon triggered MP-S4
+    // This prevents the fake position from persisting as the baseline reference,
+    // which would cause the next real honest beacon to generate a false positive.
+    if (save_state && (mp_flags & (1 << 3)))
+        vehicle_state[vehicle_id] = vs_backup;
 
     // Combine: sig_violated bitmask (bits 0-4 = TP-S1..S5, bits 5-8 = MP-S1..S4)
     uint32_t sig_violated = tp_flags | (mp_flags << 5) | (cp_flags << 9);
@@ -595,15 +624,135 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     }
 
     (void)now;
+
+    // ── Step 11: Downlink control response (Steps 6-8 in paper Figures 3.1-3.7) ──────
+    // After detection, management sends a control packet back down through the RSU to
+    // the vehicle(s) — completing the uplink→detect→downlink SDVN control loop.
+    //
+    // Professor's terms:
+    //   centralized_dsrc_data_unicast   → targeted response to one vehicle (attacks 1-4,6)
+    //   centralized_dsrc_data_broadcast → sent to ALL vehicles (attacks 5 & 7)
+    //
+    // For attacks 5 & 7 (controller malicious): downlink IS the attack — the compromised
+    // controller deliberately sends alert_type=2 (WRONG_ROUTING) to all vehicles,
+    // misdirecting their routing decisions (Figures 3.3 and 3.7, Steps 7-8).
+    // For honest attacks 1-4,6: downlink delivers alert_type=1 (ATTACK_DETECTED) or
+    // alert_type=0 (CLEAN_ROUTING) as a corrective safety broadcast.
+    if (g_option_b_active && rsu_id < 4 && g_mgmt_downlink_socket) {
+        uint8_t alert_type;
+        bool    bcast;
+
+        if (attack_number == 5 || attack_number == 7) {
+            // Controller malicious: sends WRONG routing instructions to all vehicles
+            alert_type = 2;    // WRONG_ROUTING
+            bcast      = true; // broadcast to all — entire network receives wrong data
+        } else {
+            alert_type = detected ? 1 : 0;  // ATTACK_DETECTED or CLEAN_ROUTING
+            bcast      = false;             // unicast to the specific flagged vehicle
+        }
+
+        DownlinkControlTag dl_tag;
+        dl_tag.SetVehicleId   (bcast ? 0 : vehicle_id);  // 0 = all vehicles
+        dl_tag.SetAlertType   (alert_type);
+        dl_tag.SetSpeedAdvice (detected ? (s_max * 0.5) : s_max);  // 50% advisory if attack
+        dl_tag.SetTimestamp   (Simulator::Now().GetSeconds());
+        dl_tag.SetRsuId       (rsu_id);
+
+        Ptr<Packet> dl_pkt = Create<Packet>(0);
+        dl_pkt->AddPacketTag(dl_tag);
+
+        // Management → RSU CSMA IP (10.1.1.x) port 8888
+        // RSU handle_downlink_at_rsu() then forwards to vehicles on DSRC:9999
+        int err = g_mgmt_downlink_socket->SendTo(
+                      dl_pkt, 0,
+                      InetSocketAddress(g_rsu_csma_ip[rsu_id], 8888));
+
+        const char* alert_str = (alert_type == 0) ? "CLEAN_ROUTING" :
+                                (alert_type == 1) ? "ATTACK_DETECTED" : "WRONG_ROUTING";
+        const char* dl_fn = bcast ? "centralized_dsrc_data_broadcast"
+                                  : "centralized_dsrc_data_unicast";
+        if (err >= 0)
+            cout << "[DL-MGT-TX] → RSU" << rsu_id
+                 << " vid=" << (bcast ? 0U : vehicle_id)
+                 << " alert=" << alert_str
+                 << "  [" << dl_fn << "]" << endl;
+    }
 }
 
 // ============================================================
-// HandleBeaconAtRSU — Option B: actual NS-3 RSU node receives vehicle DSRC beacon
-// Called when a vehicle unicasts to this RSU's DSRC IP on port 6666.
-// Applies RSU-level poisoning (TP-S1, MP-S1) if compromised, stamps rsu_id,
-// then forwards the (possibly-poisoned) beacon to management_node via CSMA:7777.
+// handle_downlink_at_rsu — RSU receives management downlink, forwards to vehicles
+// Professor's terms: centralized_dsrc_data_broadcast (vid=0 → all vehicles)
+//                    centralized_dsrc_data_unicast   (vid>0 → specific vehicle)
+//
+// Sequence (Steps 6-8 in paper Figures 3.1-3.7):
+//   Management → g_mgmt_downlink_socket → RSU CSMA:8888  [DL-MGT-TX]
+//   RSU receives here                                      [DL-RSU-RX]
+//   RSU re-broadcasts DownlinkControlTag → DSRC:9999       [DL-RSU-FWD]
+//   Vehicle receives in HandleReadTwo()                     [DL-VEH-RX]
+//
+// alert_type=0 CLEAN_ROUTING   — honest network, forward normal speed advice
+// alert_type=1 ATTACK_DETECTED — anomaly found, broadcast safety alert
+// alert_type=2 WRONG_ROUTING   — controller malicious (attacks 5 & 7)
 // ============================================================
-void SimpleUdpApplication::HandleBeaconAtRSU(Ptr<Socket> socket)
+void SimpleUdpApplication::handle_downlink_at_rsu(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet;
+    Address     from;
+    while ((packet = socket->RecvFrom(from)) != nullptr)
+    {
+        DownlinkControlTag dl_tag;
+        if (!packet->RemovePacketTag(dl_tag)) continue;
+
+        uint32_t rsu_idx = GetNode()->GetId() - g_first_rsu_node_id;
+        uint32_t vid     = dl_tag.GetVehicleId();
+        double   t       = Simulator::Now().GetSeconds();
+
+        const char* alert_str = (dl_tag.GetAlertType() == 0) ? "CLEAN_ROUTING" :
+                                (dl_tag.GetAlertType() == 1) ? "ATTACK_DETECTED" :
+                                                               "WRONG_ROUTING";
+        cout << "[DL-RSU" << rsu_idx << "-RX] from MGT"
+             << " vid=" << vid
+             << " alert=" << alert_str
+             << " t=" << t << endl;
+
+        // Forward to vehicles via DSRC broadcast on 3.255.255.255:9999
+        // Uses subnet-directed broadcast (3.0.0.0/8) so it stays on DSRC channel only
+        // and does NOT leak back to the management/controller on the CSMA segment.
+        Ptr<Packet> fwd_pkt = Create<Packet>(0);
+        fwd_pkt->AddPacketTag(dl_tag);
+
+        if (m_send_socket) {
+            int err = m_send_socket->SendTo(
+                          fwd_pkt, 0,
+                          InetSocketAddress(Ipv4Address("3.255.255.255"), 9999));
+            const char* dl_fn = (vid == 0) ? "centralized_dsrc_data_broadcast"
+                                           : "centralized_dsrc_data_unicast";
+            if (err >= 0)
+                cout << "[DL-RSU" << rsu_idx << "-FWD] → V"
+                     << (vid == 0 ? "ALL" : std::to_string(vid - 2))
+                     << " :9999  [" << dl_fn << "]" << endl;
+            else
+                cout << "[DL-RSU" << rsu_idx << "-FWD-ERR] failed fwd vid=" << vid << endl;
+        }
+    }
+}
+
+// ============================================================
+// handle_readone — RSU-side packet reception (professor's term)
+// Professor's naming: handle_readone in SimpleUdpApplication
+//   → fires when a vehicle unicasts a BSM beacon to this RSU's DSRC IP (port 6666)
+//
+// Sequence (matches professor's attack diagram steps):
+//   Step 1: RSU receives vehicle beacon           [DSRC-RX]
+//   Step 2: RSU applies attack if compromised     [TP-S1-RSU / MP-S1-RSU]
+//   Step 3: RSU forwards to management node       [RSU-FWD]  ← send_rsu_dataunicast_alone
+//   Step 4: Management node runs MPTD-PQS detect  [MGT-RX]   ← HandleBeaconReceived
+//
+// Professor's related terms:
+//   send_rsu_dataunicast_alone  = the RSU-FWD step (RSU sends its OWN beacon to controller)
+//   send_rsu_dataunicast_agent  = NOT USED (RSU forwards each vehicle individually, not aggregated)
+// ============================================================
+void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 {
     Ptr<Packet> packet;
     Address     from;
@@ -710,7 +859,12 @@ void SimpleUdpApplication::HandleBeaconAtRSU(Ptr<Socket> socket)
                       tag.GetPosX(), tag.GetPosY(),
                       tag.GetSpeed(), tag.GetHeading(), tag.GetAcceleration());
 
-        // Forward to management_node via CSMA (10.1.1.6 : 7777)
+        // ── send_rsu_dataunicast_alone: RSU forwards its own received beacon to management ──
+        // Professor's term: send_rsu_dataunicast_alone
+        //   RSU sends ONLY the beacon it just received (one vehicle's data, no aggregation).
+        //   If RSU needed to send collected data from multiple vehicles it would be
+        //   send_rsu_dataunicast_agent — not used here because each vehicle beacon is
+        //   forwarded immediately on arrival, not batched.
         if (m_relay_socket) {
             int err = m_relay_socket->SendTo(packet, 0,
                           InetSocketAddress(g_management_csma_ip, 7777));
@@ -719,7 +873,8 @@ void SimpleUdpApplication::HandleBeaconAtRSU(Ptr<Socket> socket)
                      << " failed to relay V" << vid << " beacon" << endl;
             } else {
                 cout << "[RSU-FWD] RSU" << rsu_idx << " → MGT " << g_management_csma_ip
-                     << ":7777  V=" << vid << endl;
+                     << ":7777  V=" << vid
+                     << "  [send_rsu_dataunicast_alone]" << endl;
             }
         }
     }

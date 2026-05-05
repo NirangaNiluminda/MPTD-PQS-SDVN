@@ -91,11 +91,10 @@ int main(int argc, char *argv[])
     clear_delta_at_controller(delta_at_controller_inst);
   
   controller_Node.Create(1);
-  // Backup SDN controller — standby node for future controller-switching mitigation.
-  // When the primary controller is detected as malicious (attacks 5/7), the system
-  // revokes primary and promotes backup_controller_Node as the active controller.
-  backup_controller_Node.Create(1);
   management_Node.Create(1);
+  // NOTE: backup_controller_Node is created AFTER RSU_Nodes (see below) so that
+  // vehicle node IDs remain at nid=2..17 and vid=nid-2 stays correct (0..15).
+  // Creating backup here would shift all vehicle nids by 1, breaking vid indexing.
   if (routing_test == false)
   {
   	  if(N_Vehicles > 0)
@@ -186,6 +185,13 @@ int main(int argc, char *argv[])
   	g_first_rsu_node_id = RSU_Nodes.Get(0)->GetId();
   	g_num_active_rsus   = N_RSUs;
   }
+
+  // ── Backup SDN controller — created AFTER vehicles and RSUs ─────────────────
+  // Placement here preserves nid assignment:
+  //   nid=0: controller | nid=1: management | nid=2..17: vehicles | nid=18..21: RSUs
+  //   nid=22: backup_controller  ← safe, vid=nid-2 still gives 0..15 for vehicles
+  // When primary controller is detected malicious (attacks 5/7), backup is promoted.
+  backup_controller_Node.Create(1);
   
   //configuring the CSMA interface    
   CsmaHelper csma;
@@ -219,6 +225,13 @@ int main(int argc, char *argv[])
   	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + 1);
   	  cout << "[OPT-B] management CSMA IP  = " << g_management_csma_ip << endl;
   	  cout << "[OPT-B] backup ctrl CSMA IP = " << csmaInterfaces.GetAddress(N_RSUs + 2) << endl;
+  	  // ── Store RSU CSMA IPs for management → RSU downlink (port 8888) ──────────────
+  	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management, backup_controller
+  	  // RSU r is at csmaInterfaces index r → IPs 10.1.1.1 .. 10.1.1.4
+  	  for (uint32_t r = 0; r < N_RSUs && r < 4; r++) {
+  	      g_rsu_csma_ip[r] = csmaInterfaces.GetAddress(r);
+  	      cout << "[OPT-B] RSU" << r << " CSMA IP = " << g_rsu_csma_ip[r] << endl;
+  	  }
   }
   
   AodvHelper aodv;
@@ -1595,7 +1608,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 						// Stagger = T_b/N per vehicle (≈6.25ms for 16 vehicles), so MP-S2 tau_sync=1ms
 							// does not fire on normal beacons (honest vehicles 6.25ms apart >> 1ms threshold).
 							double stagger = T_b / (double)Vehicle_Nodes.GetN();
-							Simulator::Schedule(Seconds(t + stagger * u),send_LTE_metadata_uplink_alone,udp_app,Vehicle_Nodes.Get(u),management_Node.Get(0), u);
+							Simulator::Schedule(Seconds(t + stagger * u),send_lte_dataunicast_alone,udp_app,Vehicle_Nodes.Get(u),management_Node.Get(0), u);
 					  }
 					  //calculate the routing solution
 					  //unicast the solution back to nodes
@@ -1830,12 +1843,39 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // ── NetAnim: MPTD-PQS attack-aware visualization ─────────────────────────────
   // Color legend:
   //   RED    (255,  0,  0) — compromised RSU (TP-S1/MP-S1) OR malicious controller (TP-S3/MP-S4)
+  //                          OR honest vehicle being impersonated (MP-S2 Sybil victim)
   //   YELLOW (255,200,  0) — clean RSU
-  //   ORANGE (255,128,  0) — vehicle in a compromised RSU zone (beacons poisoned)
-  //   GREEN  (  0,200,  0) — vehicle in a clean RSU zone
+  //   ORANGE (255,128,  0) — malicious vehicle (attacker) — sends poisoned/stolen beacons
+  //   GREEN  (  0,200,  0) — honest / unaffected vehicle
   //   BLUE   (  0,  0,255) — management node (SDN control plane)
   //   PURPLE (150,  0,220) — honest SDN controller
   //   CYAN   (  0,210,210) — backup controller (STANDBY, not yet active)
+  //
+  // Attack 4 (MP-S2) 3-way vehicle coloring:
+  //   ORANGE = attacker vehicle (sybil_mitm_nodes=true):   sends N_stolen stolen-ID beacons
+  //   RED    = victim vehicle (first N_stolen=2 honest):   identity is stolen by ALL attackers
+  //   GREEN  = other honest vehicles:                      not targeted in this interval
+
+  // Pre-compute which honest vehicles are Sybil victims (attack 4 only).
+  // Replicates the inject_mp_s2_stolen_beacons() loop selection: iterate vid 0..N-1,
+  // collect the first N_stolen=2 vehicles where sybil_mitm_nodes[vid]=false.
+  static const int NETANIM_N_STOLEN = 2;
+  bool sybil_victim_nodes[MAX_NODES] = {};
+  if (attack_number == 4 && N_Vehicles > 0)
+  {
+      int victim_count = 0;
+      for (uint32_t vid = 0; vid < (uint32_t)N_Vehicles && victim_count < NETANIM_N_STOLEN; vid++)
+      {
+          if (!sybil_mitm_nodes[vid]) {
+              sybil_victim_nodes[vid] = true;
+              victim_count++;
+          }
+      }
+      std::cout << "[ANIM-DBG] MP-S2 Sybil victims (RED): ";
+      for (uint32_t vid = 0; vid < (uint32_t)N_Vehicles; vid++)
+          if (sybil_victim_nodes[vid]) std::cout << "V" << vid << " ";
+      std::cout << std::endl;
+  }
   ensure_analytics_dir(NS3_ROOT "/analytics");
   ensure_analytics_dir(NS3_ROOT "/analytics/results");
   std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_a")
@@ -1913,28 +1953,53 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
           bool affected = false;
           std::string reason = "CLEAN";
 
+          // node colour: 0=green, 1=orange(attacker), 2=red(victim)
+          int colour_class = 0;
+
           if (attack_number == 1 || attack_number == 3) {
               // RSU-level attack: vehicle affected if its RSU zone is compromised
               affected = (rsu_zone < 4) && compromised_rsu[rsu_zone];
               reason   = affected ? "COMPROMISED ZONE" : "CLEAN ZONE";
+              colour_class = affected ? 1 : 0;
           } else if (attack_number == 2) {
               // TP-S2: vehicle is the attacker — check tp_vehicle_nodes[]
               affected = (i < (uint32_t)total_size) && tp_vehicle_nodes[i];
               reason   = affected ? "MALICIOUS" : "HONEST";
-          } else if (attack_number == 4 || attack_number == 6) {
-              // MP-S2 / MP-S3: sybil / MitM vehicle attackers
+              colour_class = affected ? 1 : 0;
+          } else if (attack_number == 4) {
+              // MP-S2 Sybil: 3-way coloring
+              //   ORANGE = attacker (sends stolen-ID beacons)
+              //   RED    = victim honest vehicle (identity stolen by attackers)
+              //   GREEN  = other honest vehicles
+              bool is_attacker = (i < (uint32_t)total_size) && sybil_mitm_nodes[i];
+              bool is_victim   = (i < (uint32_t)total_size) && sybil_victim_nodes[i];
+              if (is_attacker) {
+                  colour_class = 1;  // ORANGE
+                  reason = "ATTACKER\n(sends stolen IDs)";
+              } else if (is_victim) {
+                  colour_class = 2;  // RED
+                  reason = "VICTIM\n(ID stolen by all\nattackers)";
+              } else {
+                  colour_class = 0;  // GREEN
+                  reason = "HONEST";
+              }
+          } else if (attack_number == 6) {
+              // MP-S3: MitM vehicle attackers
               affected = (i < (uint32_t)total_size) && sybil_mitm_nodes[i];
               reason   = affected ? "MALICIOUS" : "HONEST";
+              colour_class = affected ? 1 : 0;
           } else if (attack_number == 5 || attack_number == 7) {
               // TP-S3 / MP-S4: controller-level — ALL vehicles' beacons are corrupted
               affected = true;
               reason   = "CTRL-AFFECTED";
+              colour_class = 1;
           }
 
-          if (affected)
-              anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 255, 128, 0); // ORANGE
-          else
-              anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 0, 200, 0);   // GREEN
+          switch (colour_class) {
+              case 2:  anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 255,   0,   0); break; // RED
+              case 1:  anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 255, 128,   0); break; // ORANGE
+              default: anim.UpdateNodeColor(Vehicle_Nodes.Get(i),   0, 200,   0); break; // GREEN
+          }
           anim.UpdateNodeSize(Vehicle_Nodes.Get(i)->GetId(), 20.0, 20.0);
           std::string vlabel = "V" + std::to_string(i)
                              + "\nRSU" + std::to_string(rsu_zone)

@@ -110,10 +110,12 @@ bool compromised_rsu[4] = {false, false, false, false};
 //   Vehicle → DSRC unicast → RSU (HandleBeaconAtRSU) → CSMA → management_node
 // When false: legacy LTE path (Vehicle → LTE → management_node directly).
 Ipv4Address g_management_csma_ip;            // management_node CSMA IP (10.1.1.6)
-Ipv4Address g_rsu_dsrc_ip[4];                // RSU DSRC IPs from dsrc_interfaces
+Ipv4Address g_rsu_dsrc_ip[4];                // RSU DSRC IPs from dsrc_interfaces (3.x.x.x)
+Ipv4Address g_rsu_csma_ip[4];               // RSU CSMA IPs for management → RSU downlink (10.1.1.x)
 uint32_t    g_first_rsu_node_id = 0;         // NS-3 NodeID of RSU_Nodes.Get(0)
 uint32_t    g_num_active_rsus   = 0;         // = N_RSUs when routing_test=true
 bool        g_option_b_active   = false;     // set true by 12_main.h when relay is ready
+Ptr<Socket>  g_mgmt_downlink_socket;         // management node's downlink send socket (set in StartApplication)
 
 void init_rsu_id_sets() {
     for (int i = 0; i < total_size; i++) {

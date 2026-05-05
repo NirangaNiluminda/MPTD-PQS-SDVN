@@ -37,9 +37,11 @@ public:
     static TypeId GetTypeId();
     virtual TypeId GetInstanceTypeId() const;
 
-    void HandleReadOne(Ptr<Socket> socket);       // implemented in 08_detection_engine.h
-    void HandleReadTwo(Ptr<Socket> socket);
-    void HandleBeaconAtRSU(Ptr<Socket> socket);  // RSU DSRC receive handler (Option B)
+    void HandleReadOne(Ptr<Socket> socket);       // management node receive (legacy LDA path)
+    void HandleReadTwo(Ptr<Socket> socket);      // vehicle downlink receive [DL-VEH-RX]
+    void handle_readone(Ptr<Socket> socket);     // RSU DSRC receive handler (professor's term)
+    void handle_downlink_at_rsu(Ptr<Socket> socket); // RSU receives management downlink → forwards to vehicles
+                                                 // = fires when vehicle beacon arrives at RSU:6666
 
     void SendPacket(Ptr<Packet> packet, Ipv4Address destination, uint16_t port);
     void test();
@@ -55,6 +57,7 @@ private:
     Ptr<Socket> m_recv_socket1;
     Ptr<Socket> m_recv_socket2;
     Ptr<Socket> m_recv_socket3;   // RSU: DSRC beacon receive (port 6666) — Option B
+    Ptr<Socket> m_recv_socket_dl; // RSU: management downlink receive (port 8888)
     uint16_t m_port1;
     uint16_t m_port2;
 
@@ -127,7 +130,7 @@ void SimpleUdpApplication::StartApplication()
         m_recv_socket3 = Socket::CreateSocket(GetNode(), tid);
         SetupReceiveSocket(m_recv_socket3, 6666);
         m_recv_socket3->SetRecvCallback(
-            MakeCallback(&SimpleUdpApplication::HandleBeaconAtRSU, this));
+            MakeCallback(&SimpleUdpApplication::handle_readone, this)); // professor's term
         m_recv_socket3->SetAllowBroadcast(true);
 
         // ── RSU relay socket: forward beacons to management_node via CSMA ────────
@@ -135,14 +138,22 @@ void SimpleUdpApplication::StartApplication()
         m_relay_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 51000));
         m_relay_socket->SetAllowBroadcast(false);
 
-        // Keep send socket for any legacy calls
+        // Keep send socket for any legacy calls (also used by downlink forward to vehicles)
         m_send_socket = Socket::CreateSocket(GetNode(), tid);
         m_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 20000));
         m_send_socket->SetAllowBroadcast(true);
 
+        // ── RSU downlink socket: receive control response from management (port 8888) ─────
+        // centralized_dsrc_data_broadcast / centralized_dsrc_data_unicast arrive here
+        // before being re-broadcast to vehicles on DSRC port 9999.
+        m_recv_socket_dl = Socket::CreateSocket(GetNode(), tid);
+        SetupReceiveSocket(m_recv_socket_dl, 8888);
+        m_recv_socket_dl->SetRecvCallback(
+            MakeCallback(&SimpleUdpApplication::handle_downlink_at_rsu, this));
+
         cout << "[OPT-B] RSU node " << nid
              << " (idx=" << (nid - g_first_rsu_node_id) << ")"
-             << " listening on DSRC port 6666" << endl;
+             << " listening on DSRC port 6666, downlink port 8888" << endl;
     } else {
         // ── Management/vehicle node: standard socket setup ────────────────────────
         m_recv_socket1 = Socket::CreateSocket(GetNode(), tid);
@@ -167,6 +178,16 @@ void SimpleUdpApplication::StartApplication()
         m_send_socket->SetAllowBroadcast(true);
         m_uplink_send_socket->SetAllowBroadcast(true);
         m_downlink_send_socket->SetAllowBroadcast(true);
+
+        // ── Management node (nid=1): store downlink socket globally ──────────────────
+        // HandleBeaconReceived() is a free function without `this`, so it uses
+        // g_mgmt_downlink_socket to send centralized_dsrc_data_broadcast/unicast.
+        // nid==1 is always management_node (controller_Node is nid=0, created first).
+        if (GetNode()->GetId() == 1) {
+            g_mgmt_downlink_socket = m_downlink_send_socket;
+            cout << "[DL-INIT] management node " << nid
+                 << " downlink socket registered (port 30000)" << endl;
+        }
     }
 }
 
@@ -175,14 +196,42 @@ void SimpleUdpApplication::test()
     cout << "Test function" << endl;
 }
 
+// HandleReadTwo — vehicle receives downlink control packet from RSU
+// Professor's terms: receives centralized_dsrc_data_broadcast / centralized_dsrc_data_unicast
+// Flow: management → [DL-MGT-TX] → RSU:8888 → [DL-RSU-FWD] → vehicle:9999 → here → [DL-VEH-RX]
 void SimpleUdpApplication::HandleReadTwo(Ptr<Socket> socket)
 {
     NS_LOG_FUNCTION(this << socket);
     Ptr<Packet> packet;
     Address from;
     while ((packet = socket->RecvFrom(from))) {
-        NS_LOG_INFO(PURPLE_CODE << "HandleReadTwo: Received a Packet of size: "
-                    << packet->GetSize() << " at time " << Now().GetSeconds() << END_CODE);
+        uint32_t my_nid = GetNode()->GetId();
+
+        // Guard: skip management/controller/RSU nodes — only vehicles log downlink receipt
+        // (RSU broadcasts on 3.255.255.255 which may also reach management on CSMA)
+        bool is_vehicle = (my_nid >= 2) &&
+                          !(g_option_b_active && my_nid >= g_first_rsu_node_id);
+        if (!is_vehicle) continue;
+
+        DownlinkControlTag dl_tag;
+        if (packet->RemovePacketTag(dl_tag)) {
+            // ── Downlink control packet: alert from management/controller ─────────────
+            const char* alert_str = (dl_tag.GetAlertType() == 0) ? "CLEAN_ROUTING" :
+                                    (dl_tag.GetAlertType() == 1) ? "ATTACK_DETECTED" :
+                                                                   "WRONG_ROUTING";
+            // vid displayed as V(nid-2) so it matches vehicle index used in logs
+            uint32_t vid = my_nid - 2;
+            cout << "[DL-VEH-RX] V" << vid
+                 << " (nid=" << my_nid << ")"
+                 << " from RSU" << dl_tag.GetRsuId()
+                 << " alert=" << alert_str
+                 << " spd_adv=" << dl_tag.GetSpeedAdvice() << " m/s"
+                 << " t=" << Simulator::Now().GetSeconds() << endl;
+        } else {
+            NS_LOG_INFO(PURPLE_CODE << "HandleReadTwo: V" << (my_nid - 2)
+                        << " received packet size=" << packet->GetSize()
+                        << " t=" << Now().GetSeconds() << END_CODE);
+        }
     }
 }
 

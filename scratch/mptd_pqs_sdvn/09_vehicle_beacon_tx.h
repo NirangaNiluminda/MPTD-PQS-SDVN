@@ -2,13 +2,22 @@
 // 09_vehicle_beacon_tx.h — Vehicle Beacon Transmit Functions (MPTD-PQS)
 // Renamed + cleaned from 09_send_lte.h (Stage 10B cleanup)
 // ============================================================
-// Despite the "LTE" name in the original file, this module handles
-// 802.11p / WAVE DSRC beacon uplink from vehicle to management node.
-// The LTE name is a fossil from the old LDA routing code.
+// Professor's function naming convention (mapped to this file):
+//
+//   Professor term                  | This file's function
+//   --------------------------------|---------------------------------------------
+//   send_lte_dataunicast_alone()    | send_lte_dataunicast_alone()   ← vehicle BSM
+//   (vehicle → controller, no agg) |   DSRC 802.11p → RSU:6666 → Management:7777
+//   send_lte_dataunicast_agent()    | NOT USED — no per-vehicle aggregation needed
+//   (vehicle → controller, agg)    |
+//
+// Note: professor uses "LTE" in the function name generically to mean
+// "vehicle uplink to controller". In this project the actual transport
+// is 802.11p DSRC (Option B relay via RSU), not cellular LTE.
 //
 // Contents:
-//   send_LTE_metadata_uplink_alone()  — vehicle BSM beacon uplink (§3.4.3)
-//   inject_mp_s2_stolen_beacons()     — MP-S2 identity theft injection (§3.4.2)
+//   send_lte_dataunicast_alone()    — vehicle BSM beacon uplink (§3.4.3)
+//   inject_mp_s2_stolen_beacons()  — MP-S2 identity theft injection (§3.4.2)
 //
 // Removed vs 09_send_lte.h:
 //   routing_time, average_* metric globals (LDA routing artifacts)
@@ -21,14 +30,18 @@
 void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication>, uint32_t,
                                   double, double, double, double, double, Ipv4Address);
 
-// ── Vehicle → Management Node: beacon state via LTE uplink ──────────────────
-// Replaces legacy 25-variant switch(size){case 0:..case 25:}.
+// ── send_lte_dataunicast_alone() — Vehicle → Management Node beacon uplink ──
+// Professor's term: send_lte_dataunicast_alone
+//   Vehicle sends its own BSM beacon data directly to the controller/management
+//   node without aggregating other vehicles' data (alone = this node's data only).
+// Implementation: DSRC 802.11p unicast → nearest RSU (port 6666) → CSMA backhaul
+//   → Management node (port 7777). When Option B inactive: direct UDP to management.
 // Sends a BsmBeaconTag packet carrying the vehicle's latest
 // position, speed, heading, acceleration, and attack state.
-void send_LTE_metadata_uplink_alone(Ptr<SimpleUdpApplication> udp_app,
-                                    Ptr<Node> node_source,
-                                    Ptr<Node> destination_node,
-                                    uint32_t node_index)
+void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
+                                Ptr<Node> node_source,
+                                Ptr<Node> destination_node,
+                                uint32_t node_index)
 {
 	// ── Option B: send to nearest RSU's DSRC IP (port 6666) ─────────────────────
 	// When g_option_b_active=true, the beacon travels via 802.11p DSRC through
@@ -233,7 +246,12 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 		fake_tag.SetSpeed(tx_spd);
 		fake_tag.SetHeading(tx_hdg);
 		fake_tag.SetAcceleration(tx_acc);
-		fake_tag.SetTimestamp(Simulator::Now().GetSeconds());
+		// Timestamp = scheduled send time (not NOW) so that when the management node
+		// pushes this beacon into vehicle_state[honest_vid], the stored timestamp
+		// reflects the 5ms stagger and tdiff > 0 in the MP-S4 transit-impossibility
+		// check (d/tdiff > s_max).  Using Now() here (same as the real vehicle's
+		// beacon) would give tdiff=0 → guard fails → MP-S4 never fires on stolen beacon.
+		fake_tag.SetTimestamp(Simulator::Now().GetSeconds() + 0.005 * (stolen_count + 1));
 		fake_tag.SetIsPoisoned(true);               // impersonation beacon = poisoned
 		fake_tag.SetAttackType(4);
 		fake_tag.SetSigViolated(0);

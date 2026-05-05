@@ -124,4 +124,88 @@ void BsmBeaconTag::Print(std::ostream &os) const {
        << "]";
 }
 
+// ============================================================
+// DownlinkControlTag — Management → RSU → Vehicle control response
+// Professor's terms: centralized_dsrc_data_broadcast (all vehicles)
+//                    centralized_dsrc_data_unicast   (specific vehicle)
+//
+// Sequence (Steps 6-8 in paper Figures 3.1-3.7):
+//   HandleBeaconReceived() → [DL-MGT-TX] → RSU CSMA:8888
+//   handle_downlink_at_rsu() → [DL-RSU-FWD] → DSRC:9999
+//   HandleReadTwo() → [DL-VEH-RX]
+//
+// alert_type values:
+//   0 = CLEAN_ROUTING   — no attack, forward normal routing advice
+//   1 = ATTACK_DETECTED — anomaly found, send safety speed advisory
+//   2 = WRONG_ROUTING   — controller malicious (attacks 5 & 7): sends wrong instructions
+// ============================================================
+class DownlinkControlTag : public ns3::Tag {
+public:
+    static ns3::TypeId GetTypeId(void);
+    virtual ns3::TypeId GetInstanceTypeId(void) const;
+    virtual uint32_t GetSerializedSize(void) const;
+    virtual void Serialize(ns3::TagBuffer i) const;
+    virtual void Deserialize(ns3::TagBuffer i);
+    virtual void Print(std::ostream &os) const;
+
+    DownlinkControlTag() {}
+
+    void SetVehicleId  (uint32_t id) { m_vehicle_id  = id; }  // 0 = all vehicles (broadcast)
+    void SetAlertType  (uint8_t  a)  { m_alert_type  = a;  }
+    void SetSpeedAdvice(double   s)  { m_speed_advice = s; }
+    void SetTimestamp  (double   t)  { m_timestamp   = t;  }
+    void SetRsuId      (uint32_t r)  { m_rsu_id      = r;  }
+
+    uint32_t GetVehicleId()   const { return m_vehicle_id;   }
+    uint8_t  GetAlertType()   const { return m_alert_type;   }
+    double   GetSpeedAdvice() const { return m_speed_advice; }
+    double   GetTimestamp()   const { return m_timestamp;    }
+    uint32_t GetRsuId()       const { return m_rsu_id;       }
+
+private:
+    uint32_t m_vehicle_id   = 0;
+    uint8_t  m_alert_type   = 0;   // 0=CLEAN, 1=ATTACK_DETECTED, 2=WRONG_ROUTING
+    double   m_speed_advice = 0.0; // suggested speed (m/s)
+    double   m_timestamp    = 0.0;
+    uint32_t m_rsu_id       = 0;
+};
+
+NS_OBJECT_ENSURE_REGISTERED(DownlinkControlTag);
+
+ns3::TypeId DownlinkControlTag::GetTypeId(void) {
+    static ns3::TypeId tid = ns3::TypeId("ns3::DownlinkControlTag")
+        .SetParent<ns3::Tag>()
+        .AddConstructor<DownlinkControlTag>();
+    return tid;
+}
+ns3::TypeId DownlinkControlTag::GetInstanceTypeId(void) const {
+    return DownlinkControlTag::GetTypeId();
+}
+uint32_t DownlinkControlTag::GetSerializedSize(void) const {
+    return sizeof(uint32_t) + sizeof(uint8_t) + 2 * sizeof(double) + sizeof(uint32_t);
+}
+void DownlinkControlTag::Serialize(ns3::TagBuffer i) const {
+    i.WriteU32(m_vehicle_id);
+    i.WriteU8(m_alert_type);
+    i.WriteDouble(m_speed_advice);
+    i.WriteDouble(m_timestamp);
+    i.WriteU32(m_rsu_id);
+}
+void DownlinkControlTag::Deserialize(ns3::TagBuffer i) {
+    m_vehicle_id   = i.ReadU32();
+    m_alert_type   = i.ReadU8();
+    m_speed_advice = i.ReadDouble();
+    m_timestamp    = i.ReadDouble();
+    m_rsu_id       = i.ReadU32();
+}
+void DownlinkControlTag::Print(std::ostream &os) const {
+    const char* a = (m_alert_type == 0) ? "CLEAN_ROUTING" :
+                    (m_alert_type == 1) ? "ATTACK_DETECTED" : "WRONG_ROUTING";
+    os << "DL[vid=" << m_vehicle_id
+       << " alert=" << a
+       << " spd_adv=" << m_speed_advice
+       << " t=" << m_timestamp
+       << " rsu=" << m_rsu_id << "]";
+}
+
 #endif // MPTD_PQS_PACKET_TAGS_H
