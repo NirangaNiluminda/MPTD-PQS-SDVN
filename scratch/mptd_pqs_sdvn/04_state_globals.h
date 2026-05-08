@@ -95,6 +95,9 @@ struct RsuIdentitySet {
     uint32_t ids[MAX_IDS_PER_RSU];
     int      count;
     double   window_start; // time window start for density check
+    bool     ghost_seen;   // true if ANY ghost packet (vid>=10000) registered this window
+                           // Set by compromised RSU ghost injection (MP-S1 attack 3 only)
+                           // Cleared on window reset. Used for CSMA-order-robust detection.
 };
 
 RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
@@ -121,6 +124,7 @@ void init_rsu_id_sets() {
     for (int i = 0; i < total_size; i++) {
         rsu_id_set[i].count        = 0;
         rsu_id_set[i].window_start = 0.0;
+        rsu_id_set[i].ghost_seen   = false;
         for (int j = 0; j < MAX_IDS_PER_RSU; j++)
             rsu_id_set[i].ids[j] = 0;
     }
@@ -132,8 +136,9 @@ bool register_vehicle_at_rsu(int rsu_id, uint32_t vehicle_id, double now) {
     RsuIdentitySet &rs = rsu_id_set[rsu_id];
     // Reset window every second
     if (now - rs.window_start > 1.0) {
-        rs.count = 0;
+        rs.count      = 0;
         rs.window_start = now;
+        rs.ghost_seen = false;  // clear ghost flag for new window
     }
     for (int i = 0; i < rs.count; i++)
         if (rs.ids[i] == vehicle_id) return false;

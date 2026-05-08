@@ -30,6 +30,12 @@
 void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication>, uint32_t,
                                   double, double, double, double, double, Ipv4Address);
 
+// Forward declaration — inject_mp_s3_mitm_beacons() is defined later in this file
+// MP-S3 (attack_number=6): true MitM — intercept nearby honest vehicle beacons,
+// modify speed to corrupt regional KL distribution, forward under victim's identity.
+void inject_mp_s3_mitm_beacons(Ptr<SimpleUdpApplication>, uint32_t,
+                                double, double, Ipv4Address);
+
 // ── send_lte_dataunicast_alone() — Vehicle → Management Node beacon uplink ──
 // Professor's term: send_lte_dataunicast_alone
 //   Vehicle sends its own BSM beacon data directly to the controller/management
@@ -209,6 +215,17 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 		inject_mp_s2_stolen_beacons(udp_app, nid, tx_px, tx_py,
 		                             tx_spd, tx_hdg, tx_acc, dest_ip);
 
+	// ── MP-S3 MitM Injection (§3.4.2, Figure 3.6) ───────────────────────────────
+	// True MitM: attacker intercepts nearby honest vehicle beacons on the DSRC
+	// channel (all 802.11p broadcasts are receivable by nearby nodes), modifies
+	// the speed field to corrupt the regional speed distribution, then forwards
+	// the packet to the RSU under the victim's original identity.
+	// Paper steps: ①honest sends → ②MitM intercepts → ④MitM forwards modified
+	// beacon to RSU with victim's ID but amplified speed → ⑤RSU sends both
+	// legitimate and poisoned data to controller → ⑥controller model corrupted.
+	if (attack_number == 6 && is_mal)
+		inject_mp_s3_mitm_beacons(udp_app, nid, real_px, real_py, dest_ip);
+
 	// MP-S4 (attack_number=7): controller-malicious-only attack — vehicles are honest.
 	// No vehicle-level injection here. Controller applies global mobility model
 	// poisoning in HandleBeaconReceived() (08_detection_engine.h). is_mal=false always.
@@ -230,15 +247,26 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
                                   Ipv4Address dest_ip)
 {
 	static const int N_stolen = 2; // identities stolen per beacon interval (paper §3.4.2)
-	int stolen_count = 0;
 
-	for (uint32_t other_nid = 2;
-	     other_nid < (uint32_t)(N_Vehicles + 2) && stolen_count < N_stolen;
-	     other_nid++)
-	{
-		if (other_nid == attacker_nid) continue; // don't steal own ID
-		uint32_t other_vid = other_nid - 2;
-		if (sybil_mitm_nodes[other_vid]) continue; // only steal from honest vehicles
+	// ── Realistic random victim selection ────────────────────────────────────────
+	// Build list of all eligible honest vehicle node IDs (not self, not attacker).
+	// Then shuffle with a per-attacker deterministic seed so:
+	//   • Every attacker steals from a DIFFERENT pair of victims (realistic spread)
+	//   • Same attacker steals the same pair every beacon interval (consistent identity)
+	//   • Seed = attacker_nid * prime → unique permutation per attacker across runs
+	std::vector<uint32_t> eligible;
+	for (uint32_t nid = 2; nid < (uint32_t)(N_Vehicles + 2); nid++) {
+		if (nid == attacker_nid) continue;              // don't steal own ID
+		if (sybil_mitm_nodes[nid - 2]) continue;        // only steal from honest vehicles
+		eligible.push_back(nid);
+	}
+	// Per-attacker deterministic seed → each attacker gets a unique victim pair
+	std::mt19937 rng(attacker_nid * 7919u);
+	std::shuffle(eligible.begin(), eligible.end(), rng);
+
+	int stolen_count = 0;
+	for (uint32_t other_nid : eligible) {
+		if (stolen_count >= N_stolen) break;
 
 		BsmBeaconTag fake_tag;
 		fake_tag.SetVehicleId(other_nid);           // stolen identity
@@ -269,6 +297,163 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 		cout << "[MP-S2-SYB] V" << attacker_nid << " impersonating V" << other_nid
 		     << " at pos(" << tx_px << "," << tx_py << ")" << endl;
 		stolen_count++;
+	}
+}
+
+// ── inject_mp_s3_mitm_beacons() — MP-S3 true MitM interception (Figure 3.6) ──
+// Paper §3.4.2 (Figure 3.6) 7-step attack model:
+//
+//   Step ①: Honest vehicles transmit correct mobility data to RSU (data plane)
+//   Step ②: MitM attacker intercepts packets; learns valid vehicle identities
+//            and mobility formats from observed legitimate messages
+//   Step ③: Attacker FABRICATES new mobility reports by modifying:
+//            - location  (small realistic GPS drift ±10-30% of max_pos_deviation)
+//            - speed     (progressive escalation over time to exceed D_KL > κ_th)
+//            - acceleration (positive, consistent with speed escalation pattern)
+//            Keeps values "realistic to avoid detection" — generated over MULTIPLE
+//            time steps to mimic normal driving behaviour
+//   Step ④: Poisoned packets forwarded to RSU as if sent by legitimate vehicles
+//   Step ⑤: RSU forwards both legitimate AND poisoned mobility to controller
+//   Step ⑥: Controller aggregates poisoned data into global learning model
+//   Step ⑦: Vehicles receive incorrect control decisions from corrupted model
+//
+// Key difference vs MP-S2 (attack 4):
+//   MP-S2: attacker places VICTIM'S ID at ATTACKER'S position  (identity theft)
+//   MP-S3: attacker places VICTIM'S ID at VICTIM'S (slightly drifted) position,
+//          escalates SPEED + ACCELERATION to corrupt KL distribution
+//
+// Detection target: D_KL(P_t || P_hist) > κ_th=1.5  →  MP-S3 fires (Eq. 3.18)
+void inject_mp_s3_mitm_beacons(Ptr<SimpleUdpApplication> udp_app,
+                                uint32_t attacker_nid,
+                                double atk_px, double atk_py,
+                                Ipv4Address dest_ip)
+{
+	static const int N_intercept = 2; // max victims intercepted per beacon interval
+
+	// Per-attacker-victim step counter for progressive escalation tracking.
+	// step_count[attacker_vid][victim_vid] = number of interceptions so far.
+	// Starts at 0; incremented each beacon interval — mimics "multiple time steps".
+	static uint32_t step_count[MAX_NODES][MAX_NODES] = {};
+
+	int intercepted = 0;
+	double t = Simulator::Now().GetSeconds();
+	uint32_t attacker_vid = (attacker_nid >= 2) ? (attacker_nid - 2) : 0;
+
+	// [A6-STEP2] MitM attacker actively scans DSRC channel for interceptable beacons
+	cout << "[A6-STEP2] V" << attacker_nid << " (MitM) scanning DSRC channel"
+	     << " pos(" << std::fixed << std::setprecision(1) << atk_px << "," << atk_py << ")"
+	     << " t=" << t << endl;
+
+	for (uint32_t vid = 0; vid < (uint32_t)N_Vehicles; vid++) {
+		if (intercepted >= N_intercept) break;
+
+		uint32_t victim_nid = vid + 2;
+		if (victim_nid == attacker_nid) continue;   // skip self
+		if (sybil_mitm_nodes[vid]) continue;         // only intercept honest vehicles
+
+		// ── Step ②: Intercept — read victim's real beacon from NS-3 mobility model
+		// In real DSRC, all 802.11p broadcasts are receivable by nearby nodes.
+		// In NS-3 we read MobilityModel directly (equivalent to overhearing the frame).
+		Ptr<Node> victim_node = NodeList::GetNode(victim_nid);
+		if (!victim_node) continue;
+		Ptr<MobilityModel> vic_mob = victim_node->GetObject<MobilityModel>();
+		if (!vic_mob) continue;
+
+		Vector vic_pos = vic_mob->GetPosition();
+		Vector vic_vel = vic_mob->GetVelocity();
+
+		// DSRC range guard: attacker must be within R_max_comm of victim
+		double dx = atk_px - vic_pos.x;
+		double dy = atk_py - vic_pos.y;
+		double dist = std::sqrt(dx*dx + dy*dy);
+		if (dist > R_max_comm) continue;
+
+		double real_spd = std::sqrt(vic_vel.x*vic_vel.x + vic_vel.y*vic_vel.y);
+		double real_hdg = (real_spd > 1e-6) ? std::atan2(vic_vel.y, vic_vel.x) : 0.0;
+
+		// [A6-STEP2] Attacker observed victim's identity and mobility format
+		uint32_t av = (attacker_vid < (uint32_t)MAX_NODES) ? attacker_vid : 0u;
+		uint32_t vv = (vid          < (uint32_t)MAX_NODES) ? vid          : 0u;
+		step_count[av][vv]++;
+		uint32_t step = step_count[av][vv];
+
+		// ── Step ③: Fabricate forged mobility report ─────────────────────────────
+		//
+		// Speed — progressive escalation over simulation time:
+		//   Phase 1 (t < 5 s): mild elevation (×1.3–1.7) — "realistic" range,
+		//                       attacker mimics normal driving while building cover
+		//   Phase 2 (t ≥ 5 s): ramps to ×2.5–3.0 to reliably exceed D_KL > κ_th
+		// This models the paper's "multiple time steps to mimic normal driving".
+		double phase    = std::min(t / 5.0, 1.0);    // 0→1 over first 5 seconds
+		double base_amp = 1.3 + poisoning_intensity_theta * 0.4;  // 1.3 – 1.7×
+		double peak_amp = 2.5 + poisoning_intensity_theta * 0.5;  // 2.5 – 3.0×
+		double amp      = base_amp + (peak_amp - base_amp) * phase;
+		double mitm_spd = real_spd * amp;
+		// Hard floor: ensures D_KL > κ_th=1.5 even if real_spd is very low.
+		// With regional mean ≈ 15 m/s, detection fires when mitm_spd > 42.5 m/s.
+		double spd_floor = 35.0 + poisoning_intensity_theta * 10.0;
+		if (mitm_spd < spd_floor) mitm_spd = spd_floor;
+
+		// Location — small realistic GPS-level drift (±10–25 m):
+		//   Paper: "modifying attributes such as location … keeping values realistic"
+		//   Effect: pos passes basic range/format checks but accumulates positioning error
+		double drift_scale = (0.10 + 0.10 * poisoning_intensity_theta);
+		double fake_px = vic_pos.x + drift_scale * max_position_deviation
+		                           * std::sin(t * 0.9 + (double)vid);
+		double fake_py = vic_pos.y + drift_scale * max_position_deviation
+		                           * std::cos(t * 0.7 + (double)vid);
+
+		// Acceleration — positive value consistent with the speed escalation trend:
+		//   Reporting positive acceleration alongside elevated speed makes the
+		//   fabricated trajectory coherent; otherwise a_i(t) = 0 with high v looks odd.
+		double fake_acc = poisoning_intensity_theta * 0.35 * a_max
+		                * (1.0 + 0.2 * std::sin(t * 1.3 + (double)vid));
+
+		// ── Step ④: Forward poisoned packet to RSU under victim's identity ────────
+		BsmBeaconTag mitm_tag;
+		mitm_tag.SetVehicleId(victim_nid);          // ← victim's identity (preserved)
+		mitm_tag.SetPosition(fake_px, fake_py);     // ← slight location drift
+		mitm_tag.SetSpeed(mitm_spd);                // ← progressively escalated speed
+		mitm_tag.SetHeading(real_hdg);              // ← victim's real heading (believable)
+		mitm_tag.SetAcceleration(fake_acc);         // ← positive accel (coherent with spd)
+		// Stagger timestamp: 5ms per victim so RSU sees distinct receive events
+		mitm_tag.SetTimestamp(t + 0.005 * (intercepted + 1));
+		mitm_tag.SetIsPoisoned(true);
+		mitm_tag.SetAttackType(6);
+		mitm_tag.SetSigViolated(0);
+
+		Ptr<Packet> mitm_pkt = Create<Packet>(0);
+		mitm_pkt->AddPacketTag(mitm_tag);
+		lte_total_packet_size += mitm_pkt->GetSerializedSize();
+
+		uint16_t mitm_port = g_option_b_active ? 6666 : 7777;
+		Simulator::Schedule(Seconds(0.005 * (intercepted + 1)),
+		                    &SimpleUdpApplication::SendPacket,
+		                    udp_app, mitm_pkt, dest_ip, mitm_port);
+
+		// TDEE/TPE: use speed-displacement proxy (speed error × T_b = distance error)
+		double spd_err = std::fabs(mitm_spd - real_spd) * T_b;
+		tdee_error_sum += spd_err;
+		tdee_error_cnt++;
+		tpe_sq_sum += spd_err * spd_err;
+		tpe_cnt++;
+
+		cout << "[A6-STEP4] V" << attacker_nid << " → RSU forged beacon"
+		     << " claiming V" << victim_nid
+		     << " pos(" << std::fixed << std::setprecision(1) << fake_px << "," << fake_py << ")"
+		     << " real_spd=" << real_spd
+		     << " mitm_spd=" << mitm_spd
+		     << " fake_acc=" << std::setprecision(2) << fake_acc
+		     << " step#" << step
+		     << " dist=" << std::setprecision(1) << dist << "m" << endl;
+
+		// Log interception event to dedicated MitM CSV (Step 2→4 record)
+		log_mitm_intercept(t, attacker_nid, victim_nid,
+		                   vic_pos.x, vic_pos.y, real_spd, real_hdg,
+		                   fake_px, fake_py, mitm_spd, fake_acc,
+		                   dist, (int)step);
+
+		intercepted++;
 	}
 }
 

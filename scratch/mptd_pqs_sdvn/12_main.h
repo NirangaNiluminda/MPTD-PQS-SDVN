@@ -1843,9 +1843,9 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // ── NetAnim: MPTD-PQS attack-aware visualization ─────────────────────────────
   // Color legend:
   //   RED    (255,  0,  0) — compromised RSU (TP-S1/MP-S1) OR malicious controller (TP-S3/MP-S4)
-  //                          OR honest vehicle being impersonated (MP-S2 Sybil victim)
+  //                          OR malicious vehicle (attacker) — sends poisoned/stolen beacons
   //   YELLOW (255,200,  0) — clean RSU
-  //   ORANGE (255,128,  0) — malicious vehicle (attacker) — sends poisoned/stolen beacons
+  //   ORANGE (255,128,  0) — vehicle in compromised RSU zone (attacks 1,3) OR Sybil victim (attack 4)
   //   GREEN  (  0,200,  0) — honest / unaffected vehicle
   //   BLUE   (  0,  0,255) — management node (SDN control plane)
   //   PURPLE (150,  0,220) — honest SDN controller
@@ -1857,25 +1857,78 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   //   GREEN  = other honest vehicles:                      not targeted in this interval
 
   // Pre-compute which honest vehicles are Sybil victims (attack 4 only).
-  // Replicates the inject_mp_s2_stolen_beacons() loop selection: iterate vid 0..N-1,
-  // collect the first N_stolen=2 vehicles where sybil_mitm_nodes[vid]=false.
+  // Replicates the RANDOMIZED selection in inject_mp_s2_stolen_beacons():
+  // each attacker uses a per-attacker seed (attacker_nid * 7919) to shuffle
+  // the eligible honest vehicle list, then steals the first N_stolen=2.
+  // Running the same shuffle here ensures NetAnim ORANGE colors match runtime.
   static const int NETANIM_N_STOLEN = 2;
   bool sybil_victim_nodes[MAX_NODES] = {};
   if (attack_number == 4 && N_Vehicles > 0)
   {
-      int victim_count = 0;
-      for (uint32_t vid = 0; vid < (uint32_t)N_Vehicles && victim_count < NETANIM_N_STOLEN; vid++)
+      for (uint32_t attacker_nid = 2; attacker_nid < (uint32_t)(N_Vehicles + 2); attacker_nid++)
       {
-          if (!sybil_mitm_nodes[vid]) {
-              sybil_victim_nodes[vid] = true;
-              victim_count++;
+          uint32_t attacker_vid = attacker_nid - 2;
+          if (!sybil_mitm_nodes[attacker_vid]) continue; // only process attacker nodes
+
+          // Build same eligible list as inject_mp_s2_stolen_beacons()
+          std::vector<uint32_t> eligible;
+          for (uint32_t nid = 2; nid < (uint32_t)(N_Vehicles + 2); nid++) {
+              if (nid == attacker_nid) continue;
+              if (sybil_mitm_nodes[nid - 2]) continue;
+              eligible.push_back(nid);
+          }
+          // Same per-attacker seed → identical victim selection as runtime
+          std::mt19937 rng(attacker_nid * 7919u);
+          std::shuffle(eligible.begin(), eligible.end(), rng);
+
+          int count = 0;
+          for (uint32_t nid : eligible) {
+              if (count >= NETANIM_N_STOLEN) break;
+              sybil_victim_nodes[nid - 2] = true;
+              count++;
           }
       }
-      std::cout << "[ANIM-DBG] MP-S2 Sybil victims (RED): ";
+      std::cout << "[ANIM-DBG] MP-S2 Sybil victims (ORANGE): ";
       for (uint32_t vid = 0; vid < (uint32_t)N_Vehicles; vid++)
           if (sybil_victim_nodes[vid]) std::cout << "V" << vid << " ";
       std::cout << std::endl;
   }
+  // Pre-compute MitM victim vehicles for Attack 6 (MP-S3) NetAnim coloring.
+  // A vehicle is an initial MitM victim if it lies within R_max_comm of any
+  // attacker at simulation start.  Provides 3-way coloring:
+  //   RED    = MitM attacker (actively intercepts & forges beacons)
+  //   ORANGE = honest vehicle within interception range (initial victim)
+  //   GREEN  = honest vehicle outside all attacker ranges
+  bool mitm_victim_nodes[MAX_NODES] = {};
+  if (attack_number == 6 && N_Vehicles > 0)
+  {
+      for (uint32_t atk_vid = 0; atk_vid < (uint32_t)N_Vehicles; atk_vid++) {
+          if (!sybil_mitm_nodes[atk_vid]) continue;
+          Ptr<Node> atk_node = Vehicle_Nodes.Get(atk_vid);
+          if (!atk_node) continue;
+          Ptr<MobilityModel> atk_mob = atk_node->GetObject<MobilityModel>();
+          if (!atk_mob) continue;
+          Vector atk_pos = atk_mob->GetPosition();
+
+          for (uint32_t vic_vid = 0; vic_vid < (uint32_t)N_Vehicles; vic_vid++) {
+              if (vic_vid == atk_vid) continue;
+              if (sybil_mitm_nodes[vic_vid]) continue; // other attackers not victims
+              Ptr<Node> vic_node = Vehicle_Nodes.Get(vic_vid);
+              if (!vic_node) continue;
+              Ptr<MobilityModel> vic_mob_n = vic_node->GetObject<MobilityModel>();
+              if (!vic_mob_n) continue;
+              Vector vic_pos = vic_mob_n->GetPosition();
+              double ddx = atk_pos.x - vic_pos.x, ddy = atk_pos.y - vic_pos.y;
+              if (std::sqrt(ddx*ddx + ddy*ddy) <= R_max_comm)
+                  mitm_victim_nodes[vic_vid] = true;
+          }
+      }
+      std::cout << "[ANIM-DBG] MP-S3 MitM initial victims (ORANGE): ";
+      for (uint32_t v = 0; v < (uint32_t)N_Vehicles; v++)
+          if (mitm_victim_nodes[v]) std::cout << "V" << v << " ";
+      std::cout << std::endl;
+  }
+
   ensure_analytics_dir(NS3_ROOT "/analytics");
   ensure_analytics_dir(NS3_ROOT "/analytics/results");
   std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_a")
@@ -1941,7 +1994,8 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // ── Vehicle nodes — attack-aware coloring ────────────────────────────────────
   // Color legend per attack type:
   //   Attacks 1,3 (RSU-level): ORANGE = vehicle in compromised RSU zone
-  //   Attacks 2,4,6 (vehicle-level): ORANGE = this vehicle is malicious
+  //   Attacks 2,6 (vehicle-level): RED = this vehicle is malicious (attacker)
+  //   Attack 4 (MP-S2 Sybil): RED = attacker, ORANGE = Sybil victim (identity stolen)
   //   Attacks 5,7 (controller-level): ORANGE = all vehicles affected
   //   GREEN = honest / unaffected vehicle
   // routing_test layout: V0-V3→RSU0, V4-V7→RSU1, V8-V11→RSU2, V12-V15→RSU3
@@ -1962,32 +2016,45 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
               reason   = affected ? "COMPROMISED ZONE" : "CLEAN ZONE";
               colour_class = affected ? 1 : 0;
           } else if (attack_number == 2) {
-              // TP-S2: vehicle is the attacker — check tp_vehicle_nodes[]
+              // TP-S2: vehicle is the attacker — RED
               affected = (i < (uint32_t)total_size) && tp_vehicle_nodes[i];
               reason   = affected ? "MALICIOUS" : "HONEST";
-              colour_class = affected ? 1 : 0;
+              colour_class = affected ? 2 : 0;  // RED = attacker
           } else if (attack_number == 4) {
               // MP-S2 Sybil: 3-way coloring
-              //   ORANGE = attacker (sends stolen-ID beacons)
-              //   RED    = victim honest vehicle (identity stolen by attackers)
+              //   RED    = attacker (sends stolen-ID beacons)
+              //   ORANGE = victim honest vehicle (identity stolen by attackers)
               //   GREEN  = other honest vehicles
               bool is_attacker = (i < (uint32_t)total_size) && sybil_mitm_nodes[i];
               bool is_victim   = (i < (uint32_t)total_size) && sybil_victim_nodes[i];
               if (is_attacker) {
-                  colour_class = 1;  // ORANGE
+                  colour_class = 2;  // RED = attacker
                   reason = "ATTACKER\n(sends stolen IDs)";
               } else if (is_victim) {
-                  colour_class = 2;  // RED
+                  colour_class = 1;  // ORANGE = victim
                   reason = "VICTIM\n(ID stolen by all\nattackers)";
               } else {
                   colour_class = 0;  // GREEN
                   reason = "HONEST";
               }
           } else if (attack_number == 6) {
-              // MP-S3: MitM vehicle attackers
-              affected = (i < (uint32_t)total_size) && sybil_mitm_nodes[i];
-              reason   = affected ? "MALICIOUS" : "HONEST";
-              colour_class = affected ? 1 : 0;
+              // MP-S3 MitM: 3-way coloring (mirrors Attack 4 pattern)
+              //   RED    = MitM attacker  (intercepts + forges speed/location/accel)
+              //   ORANGE = initial victim (honest vehicle in attacker's DSRC range)
+              //   GREEN  = other honest vehicles (outside all attacker ranges)
+              bool is_atk = (i < (uint32_t)total_size) && sybil_mitm_nodes[i];
+              bool is_vic = (i < (uint32_t)total_size) && mitm_victim_nodes[i];
+              if (is_atk) {
+                  colour_class = 2;  // RED
+                  reason = "MitM ATTACKER\n(forges speed/loc/acc)";
+              } else if (is_vic) {
+                  colour_class = 1;  // ORANGE
+                  reason = "MitM VICTIM\n(in interception range)";
+              } else {
+                  colour_class = 0;  // GREEN
+                  reason = "HONEST\n(outside range)";
+              }
+              affected = is_atk || is_vic;
           } else if (attack_number == 5 || attack_number == 7) {
               // TP-S3 / MP-S4: controller-level — ALL vehicles' beacons are corrupted
               affected = true;

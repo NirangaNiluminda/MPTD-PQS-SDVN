@@ -48,6 +48,17 @@ void log_vehicle_tx(uint32_t vid, uint32_t nearest_rsu,
                     double sent_px, double sent_py,
                     double real_spd, double sent_spd,
                     double real_hdg, double sent_hdg);
+void log_ghost_identity(double sim_t, int rsu_id, int real_vid,
+                        double real_px, double real_py,
+                        int count_before, int n_ghost,
+                        double ghost_displacement_m, int density_lim);
+void log_mitm_intercept(double sim_t,
+                        uint32_t attacker_id, uint32_t victim_id,
+                        double real_px, double real_py,
+                        double real_spd, double real_hdg,
+                        double fake_px, double fake_py,
+                        double fake_spd, double fake_acc,
+                        double range_m, int step_num);
 // PBPO timing accumulator (defined in 02_config_globals.h)
 // pbpo_time_sum_ms and pbpo_cnt are global — updated directly here.
 
@@ -146,30 +157,36 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 
     // MP-S1: identity density check (Eq. 3.7)
     // |{ID_i : p_i ∈ A_j}| > N_Vehicles (threshold = expected legitimate count)
-    bool is_new = register_vehicle_at_rsu(rsu_id, vid, now);
-    // MP-S1: compromised RSU injects ghost IDs — inflate count after real vehicle registered
-    // Gated on is_new so ghost inflation fires once per vehicle per time window (not every beacon).
-    // compromised_rsu[] already encodes attack_percentage via declare_compromised_rsus().
-    // No second per-vehicle probability gate — ALL vehicles at a compromised RSU are ghosted.
-    // N_ghost=4: ensures density count (k*(1+N_ghost)) > N_Vehicles=16 with k>=4 vehicles/RSU.
-    //   k=4: 4*(1+4)=20 > 16 ✓ fires on 4th vehicle registration per 1-second window.
-    //   k=3: 3*5=15 < 16 (not fired — would need 4+ vehicles/RSU).
-    if (is_new && attack_number == 3 &&
-        rsu_id >= 0 && rsu_id < 4 && compromised_rsu[rsu_id])
-    {
-        static const int N_ghost = 4; // paper §3.4.2: 3 ghost IDs/vehicle; bumped to 4 for
-                                      // test topology (4 veh/RSU, N_Vehicles=16 threshold).
-        if (rsu_id < total_size)
-            rsu_id_set[rsu_id].count += N_ghost;
-    }
-    // density_limit = legitimate vehicle count; ghost-inflated window exceeds this.
-    // Only flag the current beacon if it is already marked as poisoned (i.e., this
-    // beacon came from an unregistered ghost ID — the RSU checks against its PKI
-    // allowlist and rejects unrecognised vehicle identifiers in the paper model).
-    double density_limit = (double)N_Vehicles; // threshold = expected legitimate count
-    if (is_new && rsu_id >= 0 && rsu_id < total_size &&
-        rsu_id_set[rsu_id].count > (int)density_limit &&
-        tag.GetIsPoisoned())  // only flag unknown IDs (simulated via is_poisoned flag)
+    register_vehicle_at_rsu(rsu_id, vid, now);  // count++ for this real vehicle
+    // MP-S1: Ghost count is now built by REAL ghost UDP packets transmitted by the
+    // compromised RSU in handle_readone() (Fig 3.4 Steps 4-6).
+    // Each ghost packet calls register_vehicle_at_rsu() here via HandleBeaconReceived()
+    // early-return path, incrementing count by 1 per ghost before the real beacon arrives.
+    // By the time the real vehicle's beacon reaches this point, count is already
+    // (N_ghost) from ghost registrations + 1 from register_vehicle_at_rsu() above = N_ghost+1.
+    // No manual count inflation needed — the ghost UDP packets do it naturally. (is_new unused here)
+    // MP-S1: identity density check (Eq. 3.7) — two complementary conditions:
+    //
+    // Condition A — count-based (classic paper check):
+    //   count > density_limit (N_Vehicles/N_RSUs = 4)
+    //   Fires when ≥ density_limit ghost packets arrive before the real beacon.
+    //   N_ghost=4 ghosts sent first via CSMA → count=5 > 4 if all arrive in order.
+    //
+    // Condition B — ghost_seen flag (CSMA-robust extension):
+    //   rsu_id_set[rsu_id].ghost_seen == true
+    //   Set the moment ANY ghost packet (vid>=10000) is received from RSU j.
+    //   Persists for the whole window. Handles the case where CSMA contention causes
+    //   ghost packets to arrive AFTER the real beacon (would otherwise be a FN).
+    //   FP guard: honest RSUs never send ghost packets → ghost_seen never set → FP=0.
+    //
+    // Both conditions also require tag.GetIsPoisoned() (set by compromised RSU only).
+    // Honest RSU beacons always have IsPoisoned=false → condition short-circuits → FP=0.
+    double density_limit = (double)(N_Vehicles / N_RSUs); // per-RSU expected count = 4
+    bool count_exceeded  = (rsu_id >= 0 && rsu_id < total_size &&
+                            rsu_id_set[rsu_id].count > (int)density_limit);
+    bool ghost_seen_flag = (rsu_id >= 0 && rsu_id < total_size &&
+                            rsu_id_set[rsu_id].ghost_seen);
+    if ((count_exceeded || ghost_seen_flag) && tag.GetIsPoisoned())
         violated |= (1 << 0);
 
     // MP-S2: synchronized beacon timing (Eq. 3.17)
@@ -338,6 +355,32 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 {
     double now = Simulator::Now().GetSeconds();
 
+    // ── Ghost packet fast-path (MP-S1 Attack 3) ──────────────────────────────────
+    // Ghost vehicle IDs are >= GHOST_VID_BASE (10000), far above real vehicle IDs (2–17).
+    // These packets are synthetic identities injected by the compromised RSU in
+    // handle_readone() (Fig 3.4 Steps 4-6). Their ONLY purpose is to increment the
+    // RSU identity density count via register_vehicle_at_rsu() so that when the real
+    // vehicle's beacon arrives next, count > density_limit → MP-S1 detection fires.
+    // Ghost packets skip: TP/SYB/MITM detection, confusion matrix, beacon_log.csv,
+    //                     downlink response — they are purely density-injection packets.
+    static const uint32_t GHOST_VID_BASE = 10000;
+    if (vehicle_id >= GHOST_VID_BASE) {
+        bool is_new_ghost = register_vehicle_at_rsu((int)rsu_id, vehicle_id, now);
+        // Mark this RSU's window as ghost-infected — used for CSMA-order-robust detection.
+        // Even if CSMA interleaving delivers this ghost after the real beacon, the NEXT
+        // real beacon from this RSU in the same window will still be detected.
+        if ((int)rsu_id < total_size)
+            rsu_id_set[rsu_id].ghost_seen = true;
+        cout << "[MP-S1-GHOST-RX] ghost_id=" << vehicle_id
+             << " RSU" << rsu_id
+             << " pos(" << std::fixed << std::setprecision(2)
+             << tag.GetPosX() << "," << tag.GetPosY() << ")"
+             << " density_count=" << rsu_id_set[rsu_id].count
+             << " ghost_seen=YES"
+             << (is_new_ghost ? " +1 (new)" : " (dup-same-window)") << endl;
+        return; // ← Ghost packet handled. No detection/metrics/downlink for ghost IDs.
+    }
+
     // PBPO: start wall-clock timer (§4.1.2 Eq 4.7)
     struct timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC, &t_start);
@@ -418,6 +461,17 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tpe_cnt++;
         cout << "[MP-S1-RSU] RSU " << rsu_id << " ghosting V" << vehicle_id
              << " at t=" << now_t << endl;
+    }
+
+    // ── A6-STEP6: Controller aggregates MitM-poisoned data into global mobility model ──
+    // Paper (Fig 3.6 Step 6): Controller receives forged beacons and merges them into
+    // its global learning model. Over time, accumulated false speed/location data
+    // corrupts the learned mobility patterns and the model sends back degraded control.
+    if (attack_number == 6 && tag.GetIsPoisoned()) {
+        cout << "[A6-STEP6] Controller aggregating MitM-poisoned V" << vehicle_id
+             << " data: spd=" << std::fixed << std::setprecision(2) << tag.GetSpeed()
+             << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
+             << " → corrupting global mobility model" << endl;
     }
 
     // ── MP-S4: Controller-level global mobility model poisoning (attack_number==7) ──
@@ -507,10 +561,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // MP-S4 fires, restore the saved state so the contaminated position does NOT
     // persist as baseline.  This leaves the attacker's own beacon state intact
     // (attacker is sybil_mitm_nodes[vid]=true → no save/restore for them).
-    bool save_state = (attack_number == 4)
+    // For attack 6 (MP-S3 MitM): intercepted beacons carry the VICTIM's ID at the
+    // victim's real position but with amplified speed. This contaminates the victim's
+    // vehicle_state speed history. Save/restore prevents the poisoned speed from
+    // persisting as the baseline for the next honest beacon from that victim.
+    bool save_state = ((attack_number == 4) || (attack_number == 6))
                    && (vehicle_id < (uint32_t)total_size)
                    && tag.GetIsPoisoned()
-                   && !sybil_mitm_nodes[vehicle_id]; // stolen ID = honest vehicle
+                   && !sybil_mitm_nodes[vehicle_id]; // intercepted/stolen ID = honest vehicle
     VehicleBeaconState vs_backup;
     if (save_state)
         vs_backup = vehicle_state[vehicle_id];
@@ -671,11 +729,20 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 (alert_type == 1) ? "ATTACK_DETECTED" : "WRONG_ROUTING";
         const char* dl_fn = bcast ? "centralized_dsrc_data_broadcast"
                                   : "centralized_dsrc_data_unicast";
-        if (err >= 0)
-            cout << "[DL-MGT-TX] → RSU" << rsu_id
-                 << " vid=" << (bcast ? 0U : vehicle_id)
-                 << " alert=" << alert_str
-                 << "  [" << dl_fn << "]" << endl;
+        if (err >= 0) {
+            // A6-STEP7: vehicle receives control decision derived from poisoned model
+            if (attack_number == 6) {
+                cout << "[A6-STEP7] V" << (bcast ? 0U : vehicle_id)
+                     << " ← control decision based on MitM-corrupted model"
+                     << " alert=" << alert_str
+                     << "  [" << dl_fn << "]" << endl;
+            } else {
+                cout << "[DL-MGT-TX] → RSU" << rsu_id
+                     << " vid=" << (bcast ? 0U : vehicle_id)
+                     << " alert=" << alert_str
+                     << "  [" << dl_fn << "]" << endl;
+            }
+        }
     }
 }
 
@@ -831,20 +898,88 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                              real_spd, real_hdg, real_acc, drift_x, drift_y, disp_err);
         }
 
-        // ── MP-S1: Compromised RSU ghost-inflates identity density (paper §3.4.2) ──
-        // No second per-vehicle gate — same reasoning as TP-S1 above.
+        // ── MP-S1: Compromised RSU steals identity and injects ghost beacons (paper §3.4.2) ──
+        // Paper Fig 3.4 Steps 3-6:
+        //   Step 3: RSU intercepts real beacon → marks it poisoned
+        //   Step 4: RSU generates N_ghost ghost vehicle IDs (fake identities)
+        //   Step 5: RSU packages ghost IDs as separate beacon-like UDP packets
+        //   Step 6: RSU forwards ghost packets to controller FIRST (before real beacon)
+        //
+        // Practical justification for ghost-first ordering:
+        //   The RSU must receive and process the real beacon before it can generate ghosts
+        //   (it needs the real vehicle's position). This processing delay naturally means
+        //   ghost packets are sent first; the real beacon follows. CSMA FIFO guarantees
+        //   ghosts arrive at the controller before the real beacon → count is pre-inflated
+        //   when the real beacon arrives → density check fires on the real beacon. ✓
         if (attack_number == 3 &&
             rsu_idx < 4 &&
             compromised_rsu[rsu_idx])
         {
+            // Step 3: Mark real beacon as poisoned (ground-truth provenance flag)
             tag.SetIsPoisoned(true);
             tag.SetAttackType(3);
-            double ghost_err = R_max_comm * poisoning_intensity_theta;
-            tdee_error_sum += ghost_err;
+            double ghost_disp = R_max_comm * poisoning_intensity_theta; // 150 m
+            tdee_error_sum += ghost_disp;
             tdee_error_cnt++;
-            tpe_sq_sum += ghost_err * ghost_err;
+            tpe_sq_sum += ghost_disp * ghost_disp;
             tpe_cnt++;
-            cout << "[MP-S1-RSU" << rsu_idx << "] ghosting V" << vid << " at t=" << t << endl;
+            cout << "[MP-S1-RSU" << rsu_idx << "] intercepting V" << vid
+                 << " at t=" << t << " → generating ghost IDs" << endl;
+
+            // Steps 4-6: Generate N_ghost ghost packets and send to controller BEFORE
+            // the real beacon. Ghost IDs are unique per (RSU, vehicle, ghost-index):
+            //   ghost_vid = GHOST_VID_BASE + rsu_idx*100 + vid*10 + gi
+            // Placed evenly at ghost_disp (150 m) radius around the real vehicle.
+            static const int    N_ghost        = 4;
+            static const uint32_t GHOST_VID_BASE = 10000;
+            for (int gi = 0; gi < N_ghost; gi++) {
+                double angle    = gi * (2.0 * M_PI / N_ghost); // 0°, 90°, 180°, 270°
+                double ghost_px = real_px + ghost_disp * std::cos(angle);
+                double ghost_py = real_py + ghost_disp * std::sin(angle);
+                uint32_t ghost_vid = GHOST_VID_BASE + rsu_idx * 100 + vid * 10 + gi;
+
+                // Build ghost beacon packet
+                Ptr<Packet> ghost_pkt = Create<Packet>(0);
+                BsmBeaconTag ghost_tag;
+                ghost_tag.SetVehicleId(ghost_vid);
+                ghost_tag.SetPosition(ghost_px, ghost_py);
+                ghost_tag.SetSpeed(tag.GetSpeed());
+                ghost_tag.SetHeading(tag.GetHeading());
+                ghost_tag.SetAcceleration(0.0);
+                ghost_tag.SetTimestamp(t);
+                ghost_tag.SetIsPoisoned(true);
+                ghost_tag.SetAttackType(3);
+                ghost_tag.SetRsuId(rsu_idx);
+                ghost_pkt->AddPacketTag(ghost_tag);
+
+                // Send ghost packet to controller — queued BEFORE the real beacon
+                if (m_relay_socket) {
+                    m_relay_socket->SendTo(ghost_pkt, 0,
+                        InetSocketAddress(g_management_csma_ip, 7777));
+                    cout << "[MP-S1-GHOST-TX] RSU" << rsu_idx
+                         << " ghost_id=" << ghost_vid
+                         << " pos(" << std::fixed << std::setprecision(2)
+                         << ghost_px << "," << ghost_py << ")"
+                         << " → MGT (Fig3.4 Step5/6)" << endl;
+                }
+            }
+            // Log ghost identities to CSV (records positions of all N_ghost fake vehicles)
+            log_ghost_identity(t, rsu_idx, (int)vid,
+                               real_px, real_py,
+                               0 /*count_before: ghosts not yet registered*/,
+                               N_ghost, ghost_disp, (int)(N_Vehicles / N_RSUs));
+        }
+
+        // ── A6-STEP3/5: RSU receives MitM forged beacon (attack_number==6) ──────────
+        // Paper (Fig 3.6): RSU cannot distinguish forged MitM packets from legitimate ones.
+        // It forwards BOTH the honest vehicle beacon (Step 1→3) AND the MitM forged
+        // beacon (Step 4→5) to the controller, which then corrupts its global model.
+        if (attack_number == 6 && tag.GetIsPoisoned()) {
+            cout << "[A6-STEP3] RSU" << rsu_idx
+                 << " received MitM forged beacon for V" << vid
+                 << " spd=" << std::fixed << std::setprecision(2) << tag.GetSpeed()
+                 << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
+                 << " t=" << t << endl;
         }
 
         // Stamp RSU index into tag so management_node knows which RSU relayed this beacon
@@ -872,9 +1007,17 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                 cout << "[RSU-FWD-ERR] RSU" << rsu_idx
                      << " failed to relay V" << vid << " beacon" << endl;
             } else {
-                cout << "[RSU-FWD] RSU" << rsu_idx << " → MGT " << g_management_csma_ip
-                     << ":7777  V=" << vid
-                     << "  [send_rsu_dataunicast_alone]" << endl;
+                // A6-STEP5: RSU forwards (both legitimate and forged) beacons to controller
+                if (attack_number == 6 && tag.GetIsPoisoned()) {
+                    cout << "[A6-STEP5] RSU" << rsu_idx
+                         << " forwarding MitM-forged V" << vid
+                         << " beacon to controller (controller receives poisoned data)"
+                         << "  [send_rsu_dataunicast_alone]" << endl;
+                } else {
+                    cout << "[RSU-FWD] RSU" << rsu_idx << " → MGT " << g_management_csma_ip
+                         << ":7777  V=" << vid
+                         << "  [send_rsu_dataunicast_alone]" << endl;
+                }
             }
         }
     }

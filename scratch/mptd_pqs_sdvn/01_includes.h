@@ -19,6 +19,7 @@
 #include "ns3/internet-module.h"
 #include "ns3/applications-module.h"
 #include "ns3/node.h"
+#include "ns3/node-list.h"
 #include "ns3/core-module.h"
 //#include "ns3/ns3-ai-module.h"
 #include "ns3/log.h"
