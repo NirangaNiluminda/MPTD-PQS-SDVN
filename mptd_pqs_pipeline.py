@@ -43,7 +43,8 @@ from mptd_pqs.metrics_calculator import MetricsCalculator, MetricsResult, Confus
 from mptd_pqs.metrics_visualization import plot_all, plot_ablation, plot_baseline_comparison
 
 
-SIM_DIR     = "/home/niranga/ns-allinone-3.35/ns-3.35"
+# Default paths (can be overridden via CLI)
+SIM_DIR     = os.path.dirname(os.path.abspath(__file__))  # Current directory
 NS3_BINARY  = os.path.join(SIM_DIR, "build/scratch/lda_attack_scenario1")
 LIB_PATH    = os.path.join(SIM_DIR, "build/lib")
 SIM_TIME    = 15
@@ -251,12 +252,15 @@ def main():
                         help="Skip running simulations (use existing output files)")
     parser.add_argument("--attack-pcts", nargs="+", type=int,
                         default=ATTACK_PCTS, help="Attack percentages to evaluate")
-    parser.add_argument("--output-dir", default=SIM_DIR,
-                        help="Directory for output charts and JSON")
+    parser.add_argument("--output-dir", default="results",
+                        help="Directory for output charts and JSON (default: results/)")
     parser.add_argument("--variant", default="FULL",
                         choices=["FULL", "A1", "A2", "A3", "A4", "A5"],
                         help="Detection variant")
     args = parser.parse_args()
+    
+    # Ensure output directory exists
+    os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 60)
     print("  MPTD-PQS Evaluation Pipeline")
