@@ -59,6 +59,12 @@ void log_mitm_intercept(double sim_t,
                         double fake_px, double fake_py,
                         double fake_spd, double fake_acc,
                         double range_m, int step_num);
+void log_controller_poison(double sim_t,
+                           uint32_t vehicle_id, uint32_t rsu_id,
+                           double real_spd, double fake_spd,
+                           double shift_factor,
+                           double real_hdg,  double fake_hdg,
+                           uint8_t alert_type, double spd_adv);
 // PBPO timing accumulator (defined in 02_config_globals.h)
 // pbpo_time_sum_ms and pbpo_cnt are global — updated directly here.
 
@@ -508,6 +514,20 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tpe_cnt++;
         cout << "[MP-S4-CTRL] controller poisoned global model V" << vehicle_id
              << " spd " << real_spd << "->" << fake_spd << endl;
+        // ── A7-STEP5: Controller intentionally corrupts model despite correct inputs ──
+        // Paper Fig 3.7 §3.4.2: Malicious controller receives honest data but
+        // systematically shifts speed distribution to misrepresent traffic conditions.
+        cout << "[A7-STEP5] Controller POISONING mobility model V" << vehicle_id
+             << " real_spd=" << real_spd
+             << " → fake_spd=" << fake_spd
+             << " shift×" << shift
+             << " — intentional corruption despite HONEST input" << endl;
+        // Write to controller_poison_log.csv
+        log_controller_poison(t_mp4, vehicle_id, rsu_id,
+                              real_spd, fake_spd, shift,
+                              real_hdg, fake_hdg,
+                              2,            // alert_type=2 WRONG_ROUTING
+                              s_max * 0.5); // spd_adv matches downlink value
     }
 
     // ── TP-S3: Controller-level trajectory poisoning (attack_number==5) ──────────
@@ -736,6 +756,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                      << " ← control decision based on MitM-corrupted model"
                      << " alert=" << alert_str
                      << "  [" << dl_fn << "]" << endl;
+            } else if (attack_number == 7) {
+                // A7-STEP5-TX: Malicious controller sends WRONG_ROUTING to all vehicles
+                // Paper Fig 3.7: Controller generates incorrect control packets from
+                // poisoned model and sends them back to RSU via control plane.
+                cout << "[A7-STEP5-TX] Controller → RSU" << rsu_id
+                     << " WRONG_ROUTING control packet (poisoned model output)"
+                     << " vid=" << (bcast ? 0U : vehicle_id)
+                     << "  [" << dl_fn << "]" << endl;
             } else {
                 cout << "[DL-MGT-TX] → RSU" << rsu_id
                      << " vid=" << (bcast ? 0U : vehicle_id)
@@ -850,6 +878,17 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         cout << "[DSRC-RSU" << rsu_idx << "] V" << vid
              << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
              << " compromised=" << (compromised_rsu[rsu_idx] ? "YES" : "no") << endl;
+
+        // ── A7-STEP3: RSU receives HONEST beacon from vehicle (data plane correct) ──
+        // Paper Fig 3.7: RSU operates correctly — no modification at this stage.
+        // Controller is malicious but RSU is honest; beacon arrives unchanged.
+        if (attack_number == 7) {
+            cout << "[A7-STEP3] RSU" << rsu_idx
+                 << " received HONEST V" << vid
+                 << " spd=" << tag.GetSpeed()
+                 << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
+                 << " — RSU NOT compromised, forwarding as-is" << endl;
+        }
 
         // ── TP-S1: Compromised RSU modifies trajectory (paper §3.4.1 Figure 3.1) ──
         // compromised_rsu[] already reflects attack_percentage via declare_compromised_rsus().
@@ -1017,6 +1056,15 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     cout << "[RSU-FWD] RSU" << rsu_idx << " → MGT " << g_management_csma_ip
                          << ":7777  V=" << vid
                          << "  [send_rsu_dataunicast_alone]" << endl;
+                    // ── A7-STEP4: RSU forwards HONEST data to controller via control plane ──
+                    // Paper Fig 3.7: RSU correctly relays unmodified beacon to controller.
+                    // At this point both vehicle and RSU have behaved honestly.
+                    if (attack_number == 7) {
+                        cout << "[A7-STEP4] RSU" << rsu_idx
+                             << " → Controller: forwarding HONEST V" << vid
+                             << " via control plane — controller receives correct data"
+                             << "  [send_rsu_dataunicast_alone]" << endl;
+                    }
                 }
             }
         }

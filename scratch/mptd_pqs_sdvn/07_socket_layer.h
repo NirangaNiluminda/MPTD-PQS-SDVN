@@ -227,6 +227,16 @@ void SimpleUdpApplication::HandleReadTwo(Ptr<Socket> socket)
                  << " alert=" << alert_str
                  << " spd_adv=" << dl_tag.GetSpeedAdvice() << " m/s"
                  << " t=" << Simulator::Now().GetSeconds() << endl;
+            // ── A7-STEP6: Vehicle receives WRONG control decision from poisoned controller ──
+            // Paper Fig 3.7: RSU forwards incorrect control packets to vehicles via data
+            // plane. Safety warnings suppressed; collision risks misread as safe.
+            if (attack_number == 7 && dl_tag.GetAlertType() == 2) {
+                cout << "[A7-STEP6] V" << vid
+                     << " ← WRONG_ROUTING from poisoned controller"
+                     << " spd_adv=" << dl_tag.GetSpeedAdvice() << " m/s"
+                     << " (safety warnings suppressed / traffic mismanaged)"
+                     << " t=" << Simulator::Now().GetSeconds() << endl;
+            }
         } else {
             NS_LOG_INFO(PURPLE_CODE << "HandleReadTwo: V" << (my_nid - 2)
                         << " received packet size=" << packet->GetSize()

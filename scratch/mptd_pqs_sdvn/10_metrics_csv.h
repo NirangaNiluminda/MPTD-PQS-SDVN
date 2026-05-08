@@ -380,6 +380,55 @@ void log_vehicle_tx(uint32_t vid, uint32_t nearest_rsu,
     fout.close();
 }
 
+// ── Controller Poison Log — Attack 7 (MP-S4): one row per beacon poisoned ────
+// Shows real speed from honest vehicle vs the poisoned speed the controller used.
+// Controller receives correct data but intentionally shifts distribution upward.
+// Output: analytics/results/controller_poison_log.csv
+void log_controller_poison(double sim_t,
+                           uint32_t vehicle_id, uint32_t rsu_id,
+                           double real_spd, double fake_spd,
+                           double shift_factor,
+                           double real_hdg,  double fake_hdg,
+                           uint8_t alert_type, double spd_adv)
+{
+    ensure_analytics_dir(NS3_ROOT "/analytics");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results");
+
+    std::string path = NS3_ROOT "/analytics/results/controller_poison_log.csv";
+    static bool cp_first_call = true;
+    std::ofstream fout;
+    if (cp_first_call) {
+        fout.open(path, std::ios::out | std::ios::trunc);
+        fout << "sim_time,vehicle_id,rsu_id,attack_pct,"
+             << "real_speed_ms,poisoned_speed_ms,speed_shift_factor,"
+             << "spd_delta_ms,"
+             << "real_heading_rad,poisoned_heading_rad,hdg_delta_rad,"
+             << "alert_type,spd_adv_ms\n";
+        cp_first_call = false;
+    } else {
+        fout.open(path, std::ios::out | std::ios::app);
+    }
+
+    double spd_delta = fake_spd - real_spd;
+    double hdg_delta = fake_hdg - real_hdg;
+
+    fout << std::fixed << std::setprecision(4)
+         << sim_t            << ","
+         << vehicle_id       << ","
+         << rsu_id           << ","
+         << attack_percentage << ","
+         << real_spd         << ","
+         << fake_spd         << ","
+         << shift_factor     << ","
+         << spd_delta        << ","
+         << real_hdg         << ","
+         << fake_hdg         << ","
+         << hdg_delta        << ","
+         << (int)alert_type  << ","
+         << spd_adv          << "\n";
+    fout.close();
+}
+
 // ── 7 Paper Metric Computations (§3.5) ───────────────────────────────────────
 
 // MCC: Matthews Correlation Coefficient

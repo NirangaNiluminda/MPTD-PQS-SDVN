@@ -202,6 +202,17 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 		cout << "[DSRC-TX] V" << nid << " → RSU" << nearest_rsu_idx
 		     << " (" << dest_ip << ":" << dest_port << ") at "
 		     << Simulator::Now().GetSeconds() << endl;
+		// ── A7-STEP1/STEP2: All vehicles transmit HONEST beacons (data plane clean) ──
+		// Paper Fig 3.7 §3.4.2: Vehicles and RSUs operate correctly — no data-plane
+		// poisoning. Even vehicles alternate Step 1, odd vehicles alternate Step 2.
+		if (attack_number == 7) {
+			int step_label = (nid % 2 == 0) ? 1 : 2;
+			cout << "[A7-STEP" << step_label << "] V" << nid
+			     << " → RSU" << nearest_rsu_idx
+			     << " HONEST beacon: spd=" << tx_spd
+			     << " pos(" << tx_px << "," << tx_py << ")"
+			     << " — data plane correct" << endl;
+		}
 	} else {
 		cout << "[LTE-UP] V" << nid << " → MGT (" << dest_ip << ") at "
 		     << Simulator::Now().GetSeconds() << endl;
