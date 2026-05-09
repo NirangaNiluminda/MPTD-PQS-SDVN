@@ -204,12 +204,11 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			}
 		}
 
-		// Accumulate displacement error for TDEE / TPE metrics (§4.1.2)
-		double dx = tx_px - real_px, dy = tx_py - real_py;
-		double disp_err = std::sqrt(dx * dx + dy * dy);
-		tdee_error_sum += disp_err;
-		tdee_error_cnt++;
+		// Accumulate TPE metric — injection error for malicious vehicle beacons only (§4.1.2)
+		// TDEE is now computed at the management node in 08_detection_engine.h (density-based).
 		if (is_mal) {
+			double dx = tx_px - real_px, dy = tx_py - real_py;
+			double disp_err = std::sqrt(dx * dx + dy * dy);
 			tpe_sq_sum += disp_err * disp_err;
 			tpe_cnt++;
 		}
@@ -487,10 +486,9 @@ void inject_mp_s3_mitm_beacons(Ptr<SimpleUdpApplication> udp_app,
 		                    &SimpleUdpApplication::SendPacket,
 		                    udp_app, mitm_pkt, dest_ip, mitm_port);
 
-		// TDEE/TPE: use speed-displacement proxy (speed error × T_b = distance error)
+		// TPE: speed-displacement proxy for MitM injection beacons (speed error × T_b)
+		// TDEE is computed at management node via density counts; no send-side accumulation.
 		double spd_err = std::fabs(mitm_spd - real_spd) * T_b;
-		tdee_error_sum += spd_err;
-		tdee_error_cnt++;
 		tpe_sq_sum += spd_err * spd_err;
 		tpe_cnt++;
 
