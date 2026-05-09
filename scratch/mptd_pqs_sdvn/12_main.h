@@ -52,7 +52,11 @@ int main(int argc, char *argv[])
     cmd.AddValue ("qf", "qf", qf);
     cmd.AddValue ("attack_percentage", "attack_percentage", attack_percentage);
     cmd.AddValue ("rsu_seed", "RSU compromise random seed (0=random each run)", rsu_seed);
-    cmd.Parse (argc, argv);	
+    cmd.AddValue ("sybil_registration_pct",
+                  "Attack 3 enhanced mode: % of vehicles pre-registered as Sybil at startup "
+                  "(0=original ghost-ID mode, >0=behavioural detection via MP-S3 KL)",
+                  sybil_registration_pct);
+    cmd.Parse (argc, argv);
     
     if (routing_test == true)
     {
@@ -1554,6 +1558,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 		  	double t0 = 6.000;
 		  	cout<<t0<<endl;			
 		       //unicast metadata from RSU nodes to management server - only in the first data cycle
+			declare_pre_registered_sybils(); // Attack 3 enhanced: pre-register Sybil in pool
 			declare_attack_states();
 			declare_attackers();
 			declare_compromised_rsus(); // TP-S1, MP-S1: set which RSUs are compromised

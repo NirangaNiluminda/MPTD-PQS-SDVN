@@ -149,7 +149,13 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			// attack 6 (MP-S3 MitM): extreme speed must reach detector unclamped.
 			// attack 7 (MP-S4 Coordinated): speed amplification must reach detector unclamped.
 			// All other attacks maintain plausible-looking trajectories via EnforceRealism.
-			if (attack_number != 6 && attack_number != 7) {
+			// Skip EnforceRealism for attacks that intentionally exceed physical speed bounds:
+			//   attack 6 (MP-S3 MitM):         speed ~66 m/s for KL detection
+			//   attack 7 (MP-S4 Coordinated):   speed amplification for distribution corruption
+			//   attack 3 + sybil_reg_pct > 0:   speed ~66 m/s for MP-S3 KL detection (enhanced mode)
+			// EnforceRealism would clamp velocity to s_max=33.33 m/s and nullify the signal.
+			if (attack_number != 6 && attack_number != 7 &&
+			    !(attack_number == 3 && sybil_registration_pct > 0)) {
 				EnforceRealism(fpos, fvel, facc);
 			}
 			tx_px  = fpos.x;

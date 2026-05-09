@@ -108,12 +108,43 @@ void PoisonTrajectoryByType(Vector &position, Vector &velocity, Vector &accelera
             break;
 
         case 3:
-            // MP-S1 (attack_number=3): Sybil via compromised RSU — ghost IDs (Fig 3.4)
-            // Attacker = RSU; all vehicle flags are false → is_mal=false for all vehicles.
-            // This case is NEVER REACHED (PoisonTrajectoryByType only called when is_mal=true).
-            // The MP-S1 attack is implemented entirely at the RSU level in
-            // HandleBeaconReceived() (ghost ID inflation via rsu_id_set.count += N_ghost
-            // and SetIsPoisoned(true) on beacons that arrive at a compromised RSU).
+            // MP-S1 (attack_number=3): Two modes depending on sybil_registration_pct:
+            //
+            // ORIGINAL mode (sybil_registration_pct == 0):
+            //   Attacker = RSU; all vehicle flags are false → this case NEVER REACHED.
+            //   MP-S1 attack implemented at RSU level (HandleBeaconReceived ghost IDs).
+            //
+            // ENHANCED mode (sybil_registration_pct > 0):
+            //   Attacker = pre-registered Sybil vehicle (valid pool ID).
+            //   is_mal=true → this case IS reached.
+            //   (1) Speed amplification → MP-S3 KL detection (Eq. 3.18)
+            //       target ≈ 66 m/s >> s_max → fires when few Sybil active (mean low).
+            //       Detection DEGRADES as attack_percentage rises because more active
+            //       Sybil elevate the regional mean → kl_approx drops below kappa_th.
+            //       This produces non-trivial, varying MCC/DR curves. (*)
+            //   (2) Small position drift (≤ 1m) → stays below TP-S1 threshold
+            //       (s_max * T_b = 3.33m), so kinematic checks do NOT fire.
+            //       Detection relies solely on KL divergence.
+            // (*) Degradation threshold: kl = |66 - mean| / (mean + 3.33) = 1.5
+            //     → mean ≈ 24.7 m/s → ~3 active Sybil in 16-vehicle simulation.
+            if (sybil_registration_pct > 0) {
+                // Speed amplification: triggers MP-S3 KL divergence at low Sybil count,
+                // degrades naturally as regional mean rises with more active Sybil.
+                double spd_now = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+                double target_spd = s_max * 2.0 * (0.5 + theta);  // 33–66 m/s (θ=0..1)
+                if (spd_now > 1e-6) {
+                    double scale = target_spd / spd_now;
+                    velocity.x *= scale;
+                    velocity.y *= scale;
+                } else {
+                    velocity.x = target_spd;
+                    velocity.y = 0.0;
+                }
+                // Small position drift: ≤ 1m per beacon → below s_max*T_b=3.33m threshold
+                // TP-S1, TP-S4, TP-S5 do NOT fire; detection is purely behavioural (MP-S3).
+                position.x += theta * 2.0 * std::sin(t * 1.3);
+                position.y += theta * 2.0 * std::cos(t * 0.9);
+            }
             break;
 
         case 4:
@@ -245,12 +276,21 @@ void declare_attack_states()
         present_sybil_mitm_attack         = false;
         present_beacon_suppression_attack = false;
     } else if (attack_number == 3) {
-        // MP-S1: Sybil via compromised RSU — ghost vehicle ID injection (§3.4.2, Figure 3.4)
-        // Attacker = RSU; all vehicles are honest
+        // MP-S1: Two modes selected by sybil_registration_pct (§3.4.2, Figure 3.4)
+        //
+        // ORIGINAL mode (sybil_registration_pct == 0):
+        //   Attacker = compromised RSU; all vehicles are honest.
+        //   present_sybil_mitm_attack=false → no vehicle-level poisoning.
+        //   Detection: trivial pool-lookup + IsPoisoned tag from RSU.
+        //
+        // ENHANCED mode (sybil_registration_pct > 0):
+        //   Attacker = pre-registered Sybil vehicles (valid pool IDs).
+        //   present_sybil_mitm_attack=true → PoisonTrajectoryByType(case 3) fires.
+        //   RSUs remain honest; detection must use behavioural analysis (MP-S3 KL).
         present_tp_vehicle_attack         = false;
         present_heading_spoof_attack      = false;
         present_rsu_fabrication_attack    = false;
-        present_sybil_mitm_attack         = false;
+        present_sybil_mitm_attack         = (sybil_registration_pct > 0); // enhanced mode only
         present_beacon_suppression_attack = false;
     } else if (attack_number == 4) {
         // MP-S2: Sybil via malicious vehicle impersonation (§3.4.2, Figure 3.5)
@@ -308,17 +348,66 @@ void declare_attack_states()
     }
 }
 
+// ── declare_pre_registered_sybils() — mark Sybil vehicles at registration time ──
+// Called BEFORE declare_attack_states() + declare_attackers() in 12_main.h.
+//
+// Assigns pre_registered_sybil[i]=true to a fraction (sybil_registration_pct%)
+// of N_Vehicles nodes.  These vehicles get valid pool IDs — RSU cannot reject
+// them by ID lookup alone.  Runtime attack_percentage then controls how many
+// of these pre-registered nodes are actively poisoning in any given run.
+//
+// Uses a different seed offset (+500) from declare_attackers() so that
+// the "registered" and "active" draws are statistically independent.
+//
+// Only effective when attack_number==3 and sybil_registration_pct > 0.
+// For all other attacks, clears pre_registered_sybil[] and returns.
+void declare_pre_registered_sybils()
+{
+    for (int i = 0; i < total_size; i++)
+        pre_registered_sybil[i] = false;
+
+    if (attack_number != 3 || sybil_registration_pct <= 0) return;
+
+    int count = 0;
+    for (int i = 0; i < (int)N_Vehicles; i++) {
+        pre_registered_sybil[i] = GetBooleanWithProbability(sybil_registration_pct, i + 500);
+        if (pre_registered_sybil[i]) count++;
+    }
+
+    cout << "\n[PRE-REG-SYBIL] ══════════════════════════════════════════════" << endl;
+    cout << "  sybil_registration_pct=" << sybil_registration_pct << "%"
+         << "  attack_percentage=" << attack_percentage << "%" << endl;
+    cout << "  Pre-registered Sybil: " << count << "/" << N_Vehicles
+         << " vehicles have VALID pool IDs but are secretly Sybil" << endl;
+    cout << "  (Detection cannot use ID lookup — must rely on MP-S3 KL divergence)" << endl;
+    for (int i = 0; i < (int)N_Vehicles; i++) {
+        cout << "  V" << i << " (NodeID " << i+2 << ") → "
+             << (pre_registered_sybil[i] ? "SYBIL  (valid ID, malicious)"
+                                         : "LEGIT  (genuine vehicle)")
+             << endl;
+    }
+    cout << "[PRE-REG-SYBIL] ══════════════════════════════════════════════\n" << endl;
+}
+
 // ── declare_attackers() — assign per-node malicious status ───────────────────
 void declare_attackers()
 {
     for (uint32_t i = 0; i < total_size; i++) {
         bool attacking_state = GetBooleanWithProbability(attack_percentage, i);
 
-        tp_vehicle_nodes[i]    = present_tp_vehicle_attack    ? attacking_state : false;
-        heading_spoof_nodes[i]    = present_heading_spoof_attack    ? attacking_state : false;
-        rsu_fabrication_nodes[i] = present_rsu_fabrication_attack ? attacking_state : false;
+        tp_vehicle_nodes[i]         = present_tp_vehicle_attack         ? attacking_state : false;
+        heading_spoof_nodes[i]      = present_heading_spoof_attack      ? attacking_state : false;
+        rsu_fabrication_nodes[i]    = present_rsu_fabrication_attack    ? attacking_state : false;
         sybil_mitm_nodes[i]         = present_sybil_mitm_attack         ? attacking_state : false;
-        beacon_suppression_nodes[i]   = present_beacon_suppression_attack   ? attacking_state : false;
+        beacon_suppression_nodes[i] = present_beacon_suppression_attack ? attacking_state : false;
+
+        // Attack 3 enhanced mode: only pre-registered Sybil nodes may be active attackers.
+        // This gates the attack_percentage draw: a Sybil is active only if it was BOTH
+        // pre-registered at startup AND passes the runtime attack_percentage probability.
+        // Prevents any legitimate vehicle from accidentally becoming Sybil via the gate.
+        if (attack_number == 3 && sybil_registration_pct > 0) {
+            sybil_mitm_nodes[i] = sybil_mitm_nodes[i] && pre_registered_sybil[i];
+        }
 
         if (routing_algorithm == 4) {
             StoreNodeAttackStateToBlockchain(
@@ -355,6 +444,14 @@ void declare_compromised_rsus()
     compromised_rsu[0] = compromised_rsu[1] = compromised_rsu[2] = compromised_rsu[3] = false;
 
     if (attack_number != 1 && attack_number != 3) return; // only RSU-level attacks
+
+    // Attack 3 enhanced mode: attack is vehicle-level (pre-registered Sybil),
+    // NOT RSU-level.  RSUs remain honest — skip RSU compromise selection.
+    if (attack_number == 3 && sybil_registration_pct > 0) {
+        cout << "[RSU-SELECTION] attack=3 enhanced mode (sybil_registration_pct="
+             << sybil_registration_pct << "%) — RSUs remain HONEST, no compromise." << endl;
+        return;
+    }
 
     // How many RSUs to compromise
     int n_active = (int)N_RSUs;

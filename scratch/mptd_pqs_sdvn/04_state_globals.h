@@ -54,6 +54,15 @@ struct VehicleBeaconState {
 
 VehicleBeaconState vehicle_state[total_size];
 
+// ── Pre-registered Sybil flags (Attack 3 enhanced mode) ──────────────────────
+// pre_registered_sybil[i] = true means vehicle i was designated as Sybil
+// BEFORE the simulation starts — it has a valid, registered pool ID.
+// Set by declare_pre_registered_sybils() in 06a_attack_models.h.
+// Used by declare_attackers() to gate sybil_mitm_nodes[] assignment:
+//   sybil_mitm_nodes[i] = present_sybil_mitm_attack && attack_pct_gate && pre_registered_sybil[i]
+// This ensures only pre-registered vehicles can be active Sybil in attack 3 enhanced mode.
+bool pre_registered_sybil[total_size];
+
 // Initialise all vehicle beacon state buffers
 void init_vehicle_states() {
     for (int i = 0; i < total_size; i++) {
@@ -61,6 +70,7 @@ void init_vehicle_states() {
         vehicle_state[i].count = 0;
         vehicle_state[i].drift_score  = 0.0;
         vehicle_state[i].is_malicious = false;
+        pre_registered_sybil[i]       = false;  // cleared; set by declare_pre_registered_sybils()
         for (int j = 0; j < BEACON_HISTORY; j++) {
             vehicle_state[i].pos_x[j]     = 0.0;
             vehicle_state[i].pos_y[j]     = 0.0;

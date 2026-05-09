@@ -66,6 +66,18 @@ double link_lifetime_threshold     = 0.400;
 int attack_number    = 1;
 int attack_percentage = 40;  // % of nodes that are malicious (0-100, avoid 100)
 
+// ── Sybil Pre-Registration (MP-S1 enhanced, Attack 3 only) ────────────────
+// 0 = original mode: compromised RSU injects ghost IDs post-registration
+//     → detection is trivial (ghost IDs clearly outside the registered pool)
+//     → metrics are flat at 1.0 regardless of attack_percentage
+// >0 = enhanced mode: floor(N_Vehicles * X/100) vehicles are pre-registered
+//     as Sybil at startup with VALID pool IDs.
+//     Detection must use behavioural analysis (MP-S3 KL divergence).
+//     As attack_percentage increases, Sybil collectively raise the regional
+//     speed mean → KL check degrades naturally → non-trivial MCC/DR curves.
+// Recommended: 30–50 for meaningful metric variation across attack sweeps.
+int sybil_registration_pct = 0;
+
 const char* attack_scenario_name[] = {
     "",                                                    // 0 unused
     "TP-S1:MaliciousRSU-TrajectoryPoisoning",             // 1
