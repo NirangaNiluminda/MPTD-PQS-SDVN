@@ -4,9 +4,9 @@
 // Implements the 7 evaluation metrics from §3.5 of the paper:
 //   MCC  - Matthews Correlation Coefficient
 //   FPR  - False Positive Rate
-//   PARR - Poisoning Attack Rejection Rate
-//   CDER - Correct Detection-to-Error Ratio
-//   TDEE - Trajectory Data Error Exposure
+//   PARR - Poisoning Attack Rejection Rate (TRS blockchain revocation rate, Eq. 4.3)
+//   CDER - Correct Detection-to-Error Ratio (Accuracy = (TP+TN)/total, higher=better)
+//   TDEE - Traffic Density Estimation Error (dimensionless per-RSU relative error, Eq. 4.5)
 //   TPE  - Trajectory Poisoning Exposure
 //   PBPO - Post-Blockchain Poisoning Offset
 //
@@ -449,37 +449,68 @@ double compute_FPR()
     return fp / (fp + tn);
 }
 
-// PARR: Poisoning Attack Rejection Rate  —  TP / (TP + FN)  [= Recall]
+// PARR: Poisoning Attack Rejection Rate (Eq. 4.3)
+// Fraction of poisoned blockchain submissions correctly rejected by the TRS layer.
+// A "TRS rejection" occurs when a vehicle accumulates ≥ REVOKE_THRESHOLD (3)
+// consecutive detection events — the ring signature quorum refuses to countersign.
+// Unlike DR = TP/(TP+FN) (per-beacon detection rate), PARR measures the blockchain
+// enforcement outcome: an attacker must sustain 3+ catches before being revoked.
+// In short simulations PARR < DR; over longer runs PARR approaches DR.
 double compute_PARR()
 {
-    double tp = cm_TP, fn = cm_FN;
-    if (tp + fn < 1e-9) return 0.0;
-    return tp / (tp + fn);
+    if (parr_poisoned_total == 0) return 0.0;
+    return (double)parr_trs_rejected / (double)parr_poisoned_total;
 }
 
-// CDER: Control Decision Error Rate  —  (FP + FN) / (TP + FP + TN + FN)
-// Fraction of all beacons where the detection decision was wrong.
-// (1 − Accuracy). High CDER = many wrong control decisions.
+// CDER: Correct Detection-to-Error Ratio (paper §4.1.2, Eq. 4.4)
+// Fraction of all beacon processing decisions that were correct.
+// = (TP + TN) / (TP + FP + TN + FN) = Accuracy
+// Higher value = better (more correct control decisions).
+// Previous code computed (FP+FN)/total = 1−Accuracy (error rate, lower-better):
+// corrected here to match the paper's "correct ratio" naming and direction.
 double compute_CDER()
 {
     double tp = cm_TP, fp = cm_FP, tn = cm_TN, fn = cm_FN;
     double total = tp + fp + tn + fn;
     if (total < 1e-9) return 0.0;
-    return (fp + fn) / total;
+    return (tp + tn) / total;
 }
 
-// TDEE: Traffic Density Estimation Error  —  mean |reported_pos − real_pos| (m)
-// Measures how far received beacon positions deviate from NS-3 ground truth.
-// Accumulated in 09_send_lte.h at send time; zero for honest vehicles.
+// TDEE: Traffic Density Estimation Error (Eq. 4.5, dimensionless)
+// Measures relative error in per-RSU vehicle count estimation.
+// Paper: TDEE = |ρ̂(t) − ρ_gt(t)| / ρ_gt(t)  (avoids SUMO by using RSU beacon counts)
+//
+// Implementation (no SUMO needed):
+//   tdee_gt_count[j]  = beacons received via RSU j  (ground-truth: vehicle is near RSU j)
+//   tdee_est_count[j] = beacons whose reported position maps to RSU j's cell
+//   TDEE_j = |est_j − gt_j| / gt_j  (0 when positions are honest, rises when forged)
+//   TDEE   = mean over active RSU cells (j with gt_count > 0)
+//
+// Behaviour per attack type:
+//   TP-S1/S3: forged position maps to wrong RSU cell → TDEE rises
+//   MP-S1:    ghost beacons arrive at same RSU → inflate est_count for that cell
+//   TP-S2/MP-S2/MP-S3/MP-S4: positions honest or same cell → TDEE ≈ 0
 double compute_TDEE()
 {
-    if (tdee_error_cnt == 0) return 0.0;
-    return tdee_error_sum / (double)tdee_error_cnt;
+    double sum   = 0.0;
+    int    valid = 0;
+    for (int j = 0; j < 4; j++) {
+        if (tdee_gt_count[j] == 0) continue;
+        sum += std::fabs((double)tdee_est_count[j] - (double)tdee_gt_count[j])
+               / (double)tdee_gt_count[j];
+        valid++;
+    }
+    return (valid > 0) ? (sum / valid) : 0.0;
 }
 
-// TPE: Trajectory Prediction Error  —  RMSE of position error for malicious beacons (m)
-// Captures the magnitude of trajectory manipulation for attacker vehicles.
-// sqrt(mean(|poisoned_pos − real_pos|²)) over malicious-vehicle beacons.
+// TPE: Trajectory Poisoning Error  —  RMSE of injection error for malicious beacons (m)
+// Paper Eq. 4.6 defines TPE as: mean displacement between the controller's predicted
+// position and SUMO ground truth (requires an internal Kalman/DR prediction model).
+// Implementation proxy: RMSE of |poisoned_pos − real_pos| over malicious-vehicle beacons,
+// i.e. measures the magnitude of position/speed manipulation the attacker introduced.
+// This correlates with the paper's definition (larger injection → larger prediction error)
+// but is not identical — it measures attack injection magnitude, not controller prediction
+// residual. True TPE would require comparing controller state estimates vs SUMO truth.
 double compute_TPE()
 {
     if (tpe_cnt == 0) return 0.0;
@@ -506,9 +537,9 @@ void print_mptd_metrics()
               << "  FN=" << cm_FN << std::endl;
     std::cout << "  MCC  = " << compute_MCC()  << "  (Matthews Correlation Coefficient)" << std::endl;
     std::cout << "  FPR  = " << compute_FPR()  << "  (False Positive Rate)" << std::endl;
-    std::cout << "  PARR = " << compute_PARR() << "  (Poisoning Attack Rejection Rate = Recall)" << std::endl;
-    std::cout << "  CDER = " << compute_CDER() << "  (Control Decision Error Rate = 1 - Accuracy)" << std::endl;
-    std::cout << "  TDEE = " << compute_TDEE() << " m  (mean beacon position error, all vehicles)" << std::endl;
+    std::cout << "  PARR = " << compute_PARR() << "  (TRS blockchain rejection rate; " << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned submissions revoked)" << std::endl;
+    std::cout << "  CDER = " << compute_CDER() << "  (Correct Detection-to-Error Ratio = Accuracy = (TP+TN)/total)" << std::endl;
+    std::cout << "  TDEE = " << compute_TDEE() << "    (traffic density estimation error, dimensionless)" << std::endl;
     std::cout << "  TPE  = " << compute_TPE()  << " m  (RMSE position error, malicious vehicles only)" << std::endl;
     std::cout << "  PBPO = " << compute_PBPO() << " ms (mean per-beacon detection overhead)" << std::endl;
     std::cout << "──────────────────────────────────────────────────────" << std::endl;

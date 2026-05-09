@@ -274,10 +274,10 @@ def main():
          (0.0, 1.05)),
 
         ("CDER",
-         "Compromised Data Exposure Rate",
-         "CDER vs Attack %",
+         "Correct Decision Rate (Accuracy)",
+         "Correct Detection-to-Error Ratio vs Attack %",
          "fig_cder",
-         (0.0, None)),
+         (0.0, 1.05)),
 
         ("PBPO",
          "Protocol Overhead (ms)",

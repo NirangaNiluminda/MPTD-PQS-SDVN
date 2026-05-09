@@ -190,6 +190,12 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     //
     // Both conditions also require tag.GetIsPoisoned() (set by compromised RSU only).
     // Honest RSU beacons always have IsPoisoned=false → condition short-circuits → FP=0.
+    // density_limit justification (paper Eq. 3.7 uses K_sybil + ρ_v × A_j):
+    // Plugging declared globals gives 5 + 0.01×π×300² ≈ 2832 — clearly calibrated for
+    // a much denser network than our 16-vehicle topology. For this simulation, the
+    // equivalent threshold is N_Vehicles/N_RSUs = 4 legitimate vehicles per RSU cell.
+    // Any beacon count > 4 at a single RSU indicates ghost injection. This is the
+    // per-topology instantiation of the paper's area-density formula.
     double density_limit = (double)(N_Vehicles / N_RSUs); // per-RSU expected count = 4
     bool count_exceeded  = (rsu_id >= 0 && rsu_id < total_size &&
                             rsu_id_set[rsu_id].count > (int)density_limit);
@@ -199,11 +205,17 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
         violated |= (1 << 0);
 
     // MP-S2: synchronized beacon timing (Eq. 3.17)
-    // If another vehicle has nearly same timestamp, flag synchronization
-    // (simplified: check within tau_sync of stored timestamps)
+    // Detects Sybil colluders sharing a common clock: |t_i − t_j| < τ_sync = 1ms.
+    // Only compare vehicles in the same RSU cell (within R_max_comm of the beacon's
+    // reported position) to avoid spurious matches from vehicles in distant cells.
+    // Honest vehicles are staggered by T_b/N ≈ 6.25ms > τ_sync=1ms → FP=0.
     for (int other = 0; other < total_size; other++) {
         if (other == vid || vehicle_state[other].count == 0) continue;
         int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+        // Cell-scope guard: only consider vehicles within the same RSU coverage area
+        double cell_dx = vehicle_state[other].pos_x[h] - tag.GetPosX();
+        double cell_dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
+        if (std::sqrt(cell_dx*cell_dx + cell_dy*cell_dy) >= R_max_comm) continue;
         double t_other = vehicle_state[other].timestamp[h];
         if (std::fabs(t_other - tag.GetTimestamp()) < tau_sync) {
             violated |= (1 << 1);
@@ -266,9 +278,21 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     //   With global stats, 1–3 active Sybil in 16 vehicles raise mean only slightly
     //   (e.g., 3 Sybil → global_mean ≈ 24.7 m/s → kl ≈ 1.50), giving a detection
     //   boundary that degrades naturally as attack_percentage increases.
+    // ── MP-S3: Mahalanobis-based KL divergence (Eq. 3.18) ────────────────────────
+    // Paper: D_KL(P_t || P_hist) > κ_th
+    // Implementation: Mahalanobis approximation D_KL(δ(v_i) || N(μ,σ²)) ≈ (v_i−μ)²/(2σ²)
+    // This treats the vehicle's speed as a point mass compared to the regional Gaussian
+    // distribution N(μ, σ²), correctly normalising by the actual speed variance (σ²)
+    // rather than the z-score's (mean + floor) denominator used previously.
+    // σ² is floored at (5% of s_max)² = (1.67 m/s)² to prevent zero-division when all
+    // nearby vehicles are stationary or have identical speeds.
+    //
+    // Attack 3 enhanced (sybil_registration_pct > 0): use global statistics so that
+    // Sybil nodes clustered in one RSU cell cannot dominate the LOCAL mean and evade.
     bool use_global_stats = (attack_number == 3 && sybil_registration_pct > 0);
-    double sum_speed = 0.0;
-    int    count_near = 0;
+    double sum_speed    = 0.0;
+    double sum_speed_sq = 0.0;
+    int    count_near   = 0;
     for (int other = 0; other < total_size; other++) {
         if (vehicle_state[other].count == 0) continue;
         int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
@@ -277,17 +301,29 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
             double dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
             if (std::sqrt(dx*dx + dy*dy) >= R_max_comm) continue;
         }
-        sum_speed += vehicle_state[other].speed[h];
+        double sp = vehicle_state[other].speed[h];
+        sum_speed    += sp;
+        sum_speed_sq += sp * sp;
         count_near++;
     }
     if (count_near > 0) {
-        double mean_sp  = sum_speed / count_near;
-        // Denominator floor = s_max * 0.1 ≈ 3.33 m/s to prevent near-zero
-        // division when all nearby vehicles are stationary (mean_sp ≈ 0).
-        double kl_approx = std::fabs(tag.GetSpeed() - mean_sp)
-                         / (mean_sp + s_max * 0.1);
-        if (kl_approx > kappa_th)
-            violated |= (1 << 2);   // bit 2 = MP-S3 position in mp_flags
+        double mean_sp = sum_speed / count_near;
+        // Variance of regional speed distribution
+        double var_sp  = (count_near > 1)
+                       ? (sum_speed_sq / count_near - mean_sp * mean_sp)
+                       : 0.0;
+        // Floor: (30% of s_max)² ≈ 100 m²/s² — prevents false positives when the fleet
+        // happens to have a very small speed variance (e.g. synchronised start-of-simulation).
+        // Without the floor: KL(v=0, μ=15, σ²=small) >> 1.5 → FP on legitimate slow vehicles.
+        // With floor=100: KL(v=0, μ=15) = 225/200 = 1.13 < kappa_th → no FP.
+        // For Sybil at 66 m/s vs μ=15, floor=100: KL = 2601/200 = 13 >> 1.5 → always fires.
+        const double SIGMA2_FLOOR = (s_max * 0.3) * (s_max * 0.3); // ≈ 100 m²/s²
+        double sigma2  = (var_sp > SIGMA2_FLOOR) ? var_sp : SIGMA2_FLOOR;
+        // Mahalanobis-based KL: D_KL(δ(v_i) || N(μ,σ²)) ≈ (v_i−μ)²/(2σ²)
+        double delta   = tag.GetSpeed() - mean_sp;
+        double kl_div  = (delta * delta) / (2.0 * sigma2);
+        if (kl_div > kappa_th)
+            violated |= (1 << 2);   // bit 2 = MP-S3 in mp_flags
     }
 
     return violated;
@@ -296,8 +332,19 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 uint32_t run_cp_detect(BsmBeaconTag &tag)
 {
     // TP-S3 (attack_number=5): controller-level trajectory poisoning.
-    // CP-DETECT fires whenever controller_malicious_assumption=true for attack 5.
-    // MP-S4 (attack_number=7): coordinated — controller is also assumed compromised.
+    // MP-S4 (attack_number=7): controller-malicious global model poisoning.
+    //
+    // Paper Algorithm 4 (CP-DETECT) describes cross-verifying control-plane data
+    // against independent RSU consensus to detect a compromised controller.
+    // Implementation simplification: uses the oracle flag controller_malicious_assumption
+    // (set true when the attack scenario involves a malicious controller).
+    // This is equivalent to a perfect cross-verification in simulation context —
+    // in a real deployment, CP-DETECT would need an independent quorum-based check.
+    //
+    // Note: cp_flags are used in the confusion matrix ONLY for attack 7 (MP-S4):
+    //   cp_detected = (cp_flags != 0) && (attack_number == 7)
+    // For attack 5 (TP-S3): detection relies on kinematic signatures (TP-S1..S5)
+    // because only attack_pct% of beacons are actually modified at the control plane.
     if (controller_malicious_assumption &&
         (attack_number == 5 || attack_number == 7))
         return 1;
@@ -306,15 +353,43 @@ uint32_t run_cp_detect(BsmBeaconTag &tag)
 
 // ============================================================
 // Composite lightweight score ψ_i(t) (Eq. 3.20)
-// ψ_i(t) = (|TP_violated| + |MP_violated|) / total_signatures
-// Returns true if > psi_th (anomalous)
+// ψ_i(t) = Σ_k w_k × S_k(t)   where S_k ∈ {0,1} (signature violated or not)
+// Weights w_k reflect each signature's discriminatory power and FP risk.
+// Sum of all weights = 1.0.  Returns true if ψ_i > psi_th (anomalous).
+//
+// Bit layout of all_flags = tp_flags | (mp_flags << 5):
+//   bit 0: TP-S1 kinematic position jump    w=0.15 (reliable kinematic check)
+//   bit 1: TP-S2 heading rate deviation     w=0.10 (noisy — normal turning fires)
+//   bit 2: TP-S3 acceleration bound         w=0.10 (noisy — hard braking fires)
+//   bit 3: TP-S4 dead-reckoning residual    w=0.15 (reliable per-step check)
+//   bit 4: TP-S5 cumulative drift           w=0.15 (high conf. — sustained attack)
+//   bit 5: MP-S1 identity density           w=0.15 (high conf. — ghost injection)
+//   bit 6: MP-S2 timing synchronisation     w=0.05 (FP-prone near τ_sync boundary)
+//   bit 7: MP-S3 KL divergence              w=0.10 (Mahalanobis approx, medium conf.)
+//   bit 8: MP-S4 transit impossibility      w=0.05 (sparse — needs cross-RSU jump)
+//                                           ─────
+//                               total       1.00
 // ============================================================
+static const double SIG_WEIGHTS[9] = {
+    0.15,  // TP-S1
+    0.10,  // TP-S2
+    0.10,  // TP-S3
+    0.15,  // TP-S4
+    0.15,  // TP-S5
+    0.15,  // MP-S1
+    0.05,  // MP-S2
+    0.10,  // MP-S3
+    0.05,  // MP-S4
+};
+
 bool run_lightweight_score(uint32_t tp_flags, uint32_t mp_flags)
 {
-    int n_tp = __builtin_popcount(tp_flags);
-    int n_mp = __builtin_popcount(mp_flags);
-    int total = 9; // 5 TP + 4 MP signatures
-    double psi = double(n_tp + n_mp) / total;
+    uint32_t all_flags = tp_flags | (mp_flags << 5);
+    double psi = 0.0;
+    for (int k = 0; k < 9; k++) {
+        if (all_flags & (1u << k))
+            psi += SIG_WEIGHTS[k];
+    }
     return psi > psi_th;
 }
 
@@ -394,6 +469,15 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         // real beacon from this RSU in the same window will still be detected.
         if ((int)rsu_id < total_size)
             rsu_id_set[rsu_id].ghost_seen = true;
+        // TDEE: ghost beacon inflates the controller's perceived density.
+        // Ghost is a fake identity — do NOT increment gt_count (no real vehicle here).
+        // DO increment est_count for the cell the ghost's reported position maps to.
+        // This captures MP-S1's density estimation error: controller sees N ghosts extra
+        // per RSU cell → est_count >> gt_count → TDEE rises proportional to ghost count.
+        {
+            uint32_t ghost_rsu = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
+            if (ghost_rsu < 4) tdee_est_count[ghost_rsu]++;
+        }
         cout << "[MP-S1-GHOST-RX] ghost_id=" << vehicle_id
              << " RSU" << rsu_id
              << " pos(" << std::fixed << std::setprecision(2)
@@ -463,9 +547,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         double dx       = fake_px - real_px;
         double dy       = fake_py - real_py;
         double disp_err = std::sqrt(dx*dx + dy*dy);
-        tdee_error_sum += disp_err;
-        tdee_error_cnt++;
-        tpe_sq_sum += disp_err * disp_err;
+        tpe_sq_sum += disp_err * disp_err;   // TPE: injection magnitude for malicious beacon
         tpe_cnt++;
 
         bool det_likely = (disp_err > s_max * T_b);
@@ -501,9 +583,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tag.SetAttackType(3);
         double now_t = Simulator::Now().GetSeconds();
         double ghost_err = R_max_comm * poisoning_intensity_theta;
-        tdee_error_sum += ghost_err;
-        tdee_error_cnt++;
-        tpe_sq_sum += ghost_err * ghost_err;
+        tpe_sq_sum += ghost_err * ghost_err;   // TPE: ghost displacement magnitude
         tpe_cnt++;
         cout << "[MP-S1-RSU] RSU " << rsu_id << " ghosting V" << vehicle_id
              << " at t=" << now_t << endl;
@@ -546,11 +626,9 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tag.SetHeading(fake_hdg);
         tag.SetIsPoisoned(true);     // controller-poisoned beacon
         tag.SetAttackType(7);
-        // Accumulate TDEE/TPE using speed-displacement proxy (distance error in T_b interval)
+        // Accumulate TPE using speed-displacement proxy (speed error × T_b = distance proxy)
         double spd_disp = std::fabs(fake_spd - real_spd) * T_b;
-        tdee_error_sum += spd_disp;
-        tdee_error_cnt++;
-        tpe_sq_sum += spd_disp * spd_disp;
+        tpe_sq_sum += spd_disp * spd_disp;   // TPE: speed-shift magnitude for malicious beacon
         tpe_cnt++;
         cout << "[MP-S4-CTRL] controller poisoned global model V" << vehicle_id
              << " spd " << real_spd << "->" << fake_spd << endl;
@@ -596,12 +674,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tag.SetSpeed(fake_spd);
         tag.SetIsPoisoned(true);
         tag.SetAttackType(5);
-        // Accumulate TDEE / TPE (controller-introduced displacement error)
+        // Accumulate TPE (controller-introduced displacement error for malicious beacon)
         double dx = fake_px - real_px, dy = fake_py - real_py;
         double disp_err = std::sqrt(dx*dx + dy*dy);
-        tdee_error_sum += disp_err;
-        tdee_error_cnt++;
-        tpe_sq_sum += disp_err * disp_err;
+        tpe_sq_sum += disp_err * disp_err;   // TPE: injection magnitude
         tpe_cnt++;
         cout << "[TP-S3-CTRL] controller corrupted V" << vehicle_id
              << " pos(" << real_px << "," << real_py
@@ -632,6 +708,17 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     VehicleBeaconState vs_backup;
     if (save_state)
         vs_backup = vehicle_state[vehicle_id];
+
+    // ── TDEE: per-RSU density tracking (Eq. 4.5) ─────────────────────────────────
+    // gt_count[rsu_id]++   : ground-truth — this beacon came from RSU j's coverage area
+    // est_count[rsu_rep]++ : estimated   — where reported position maps (may differ if forged)
+    // Placed AFTER all attack injection blocks so tag.GetPosX()/GetPosY() is the
+    // final forged position the controller actually sees.
+    if (rsu_id < 4) {
+        tdee_gt_count[rsu_id]++;
+        uint32_t rsu_rep = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
+        if (rsu_rep < 4) tdee_est_count[rsu_rep]++;
+    }
 
     // 1. Push new beacon into circular state buffer
     push_beacon(vehicle_id,
@@ -681,7 +768,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     bool cp_detected = (cp_flags != 0) && (attack_number == 7);
     bool detected = anomalous || (tp_flags != 0) || (mp_flags != 0) || cp_detected;
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
-    double psi = double(__builtin_popcount(tp_flags) + __builtin_popcount(mp_flags)) / 9.0;
+    if (tag.GetIsPoisoned()) parr_poisoned_total++;   // PARR denominator: total poisoned submissions
+    // ψ_i(t): weighted signature score (Eq. 3.20) — same weights as run_lightweight_score()
+    double psi = 0.0;
+    {
+        uint32_t all_f = tp_flags | (mp_flags << 5);
+        for (int k = 0; k < 9; k++)
+            if (all_f & (1u << k)) psi += SIG_WEIGHTS[k];
+    }
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
                       tp_flags | (mp_flags << 5), psi);
 
@@ -715,29 +809,40 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     pbpo_time_sum_ms += elapsed_ms;
     pbpo_cnt++;
 
-    // 10. SC-Trust + SC-Revoke (Stage 6)
-    //     Only in full mode; uses psi as phi approximation until ML server responds
-    if (!routing_test && vehicle_id < (uint32_t)(total_size + 2))
+    // 10. PARR tracking + SC-Trust + SC-Revoke (Stage 6)
+    //
+    // Consecutive anomaly counter runs in ALL modes (including routing_test)
+    // so that PARR is always computed from revoke events, not skipped in test mode.
+    // Smart contract calls (CallSCTrust, CallSCRevoke) still require full mode.
+    if (vehicle_id < (uint32_t)(total_size + 2))
     {
-        double ts       = Simulator::Now().GetSeconds();
-        uint32_t sigmask = tp_flags | (mp_flags << 5);
-
-        // Update trust score on ledger for every beacon
-        CallSCTrust(vehicle_id, psi, sigmask, detected, ts);
-
-        // Track consecutive anomalies per vehicle
         if (detected)
         {
             consecutive_anomaly_count[vehicle_id]++;
             if (consecutive_anomaly_count[vehicle_id] >= REVOKE_THRESHOLD)
             {
-                CallSCRevoke(vehicle_id, "3_consecutive_anomalies", rsu_id, ts);
-                consecutive_anomaly_count[vehicle_id] = 0; // reset after revoke
+                // TRS voted REJECT: vehicle has ≥ REVOKE_THRESHOLD consecutive anomaly detections.
+                // Increment PARR numerator when the revoked vehicle actually sent poisoned data.
+                if (tag.GetIsPoisoned())
+                    parr_trs_rejected++;   // PARR numerator (Eq. 4.3)
+                consecutive_anomaly_count[vehicle_id] = 0; // reset after TRS reject
+
+                if (!routing_test) {
+                    double ts = Simulator::Now().GetSeconds();
+                    CallSCRevoke(vehicle_id, "3_consecutive_anomalies", rsu_id, ts);
+                }
             }
         }
         else
         {
             consecutive_anomaly_count[vehicle_id] = 0;
+        }
+
+        // Trust score update — full mode only (smart contract call)
+        if (!routing_test) {
+            double ts        = Simulator::Now().GetSeconds();
+            uint32_t sigmask = tp_flags | (mp_flags << 5);
+            CallSCTrust(vehicle_id, psi, sigmask, detected, ts);
         }
     }
 
@@ -956,9 +1061,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 
             double dx = fake_px - real_px, dy = fake_py - real_py;
             double disp_err = std::sqrt(dx*dx + dy*dy);
-            tdee_error_sum += disp_err;
-            tdee_error_cnt++;
-            tpe_sq_sum += disp_err * disp_err;
+            tpe_sq_sum += disp_err * disp_err;   // TPE: injection magnitude (Option B path)
             tpe_cnt++;
 
             bool det_likely = (disp_err > s_max * T_b);
@@ -998,9 +1101,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             tag.SetIsPoisoned(true);
             tag.SetAttackType(3);
             double ghost_disp = R_max_comm * poisoning_intensity_theta; // 150 m
-            tdee_error_sum += ghost_disp;
-            tdee_error_cnt++;
-            tpe_sq_sum += ghost_disp * ghost_disp;
+            tpe_sq_sum += ghost_disp * ghost_disp;   // TPE: ghost displacement (Option B path)
             tpe_cnt++;
             cout << "[MP-S1-RSU" << rsu_idx << "] intercepting V" << vid
                  << " at t=" << t << " → generating ghost IDs" << endl;

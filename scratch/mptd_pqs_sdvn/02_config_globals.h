@@ -134,10 +134,11 @@ double tau_sync  = 0.001;   // 1ms synchronization detection window (s)
 double rho_sync  = 0.8;     // Co-occurrence rate threshold
 
 // MP-S3: Regional speed distribution shift (Eq. 3.18)
-// kappa_th = 1.5: speed must deviate > 150% of regional mean to be flagged.
-// Lower value (e.g., 0.5) caused stationary honest vehicles near fast malicious
-// vehicles to be falsely flagged (legitimate zero-speed near 8 m/s mean gives kl=1.0).
-double kappa_th  = 1.5;     // KL divergence threshold
+// Formula (updated): Mahalanobis-based KL ≈ (v_i − μ)² / (2σ²)
+// kappa_th = 1.5 ≈ requires speed deviation > √(2×1.5) × σ = √3 × σ ≈ 1.73 std devs
+// Calibration: honest vehicle at μ±σ → KL=0.5 (no flag); at μ±2σ → KL=2.0 (flag).
+// Sybil at 66 m/s vs mean 15 m/s, σ 5 m/s → KL=(51)²/(2×25)=52.0 >> 1.5 (always fires).
+double kappa_th  = 1.5;     // Mahalanobis KL divergence threshold
 
 // Composite rule-based anomaly threshold (Eq. 3.20)
 double psi_th    = 0.3;     // Lightweight mode isolation threshold
@@ -165,10 +166,23 @@ uint32_t total_trajectories_received         = 0;
 uint32_t total_trajectories_poisoned         = 0;
 uint32_t total_trajectories_stored_blockchain = 0;
 
-// ── TDEE / TPE displacement error accumulators (populated in 09_send_lte.h) ──
-// TDEE: mean |reported_pos - real_pos| over all beacons (m)
-double   tdee_error_sum   = 0.0;
-uint32_t tdee_error_cnt   = 0;
+// ── TDEE: per-RSU beacon density accumulators (paper Eq. 4.5, dimensionless) ──
+// Populated by HandleBeaconReceived() in 08_detection_engine.h.
+// gt_count[j]  = beacons received via RSU j  (ground-truth: vehicle is near RSU j)
+// est_count[j] = beacons whose REPORTED position maps into RSU j's cell
+// TDEE_j = |est_j − gt_j| / gt_j  →  TDEE = mean_j(TDEE_j)
+uint32_t tdee_gt_count [4] = {};
+uint32_t tdee_est_count[4] = {};
+
+// ── PARR: TRS blockchain rejection accumulators (paper Eq. 4.3) ─────────────
+// parr_trs_rejected  = poisoned beacons where vehicle hit TRS revoke threshold
+//                      (≥ REVOKE_THRESHOLD=3 consecutive detections → ring sig refuses)
+// parr_poisoned_total = total poisoned beacons submitted to the blockchain ledger
+// PARR = parr_trs_rejected / parr_poisoned_total   (distinct from DR = TP/(TP+FN))
+uint32_t parr_trs_rejected   = 0;
+uint32_t parr_poisoned_total = 0;
+
+// ── TPE displacement error accumulators (populated in 09_vehicle_beacon_tx.h) ──
 // TPE: RMSE of |reported_pos - real_pos| for malicious-vehicle beacons only (m)
 double   tpe_sq_sum       = 0.0;
 uint32_t tpe_cnt          = 0;
