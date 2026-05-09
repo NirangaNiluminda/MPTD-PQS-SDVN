@@ -25,6 +25,9 @@
 
 // ── Internal forward declarations ────────────────────────────────────────────
 static uint32_t nearest_rsu_for_position(double px, double py); // defined later in this file
+static uint32_t best_rsu_for_position(double px, double py,    // LL-based selection (§RSU-LL)
+                                       double vx, double vy,
+                                       uint32_t vid, bool is_mal);
 
 // ── Forward declarations (defined in 10_metrics_csv.h) ───────────────────────
 // 10_metrics_csv.h is included after this file in simulation.cc, so we
@@ -1137,6 +1140,128 @@ static uint32_t nearest_rsu_for_position(double px, double py)
         if (d2 < min_d2) { min_d2 = d2; nearest = (uint32_t)r; }
     }
     return nearest;
+}
+
+// ── Link-Lifetime RSU Selection (§RSU-LL) ────────────────────────────────────
+// Replaces pure nearest-RSU with a normalized score:
+//
+//   score(RSU_i) = LL_norm / d_norm
+//               = (LL_i / T_REF) / (d_i / R_max_comm)
+//               = (LL_i × R_max_comm) / (d_i × T_REF)
+//
+// LL_i  = time (s) the vehicle will remain in RSU_i's range, computed via
+//         the quadratic exit-time formula (see compute_link_lifetime).
+// T_REF = 2×R_max_comm/s_max = 18 s  — minimum traversal time at max speed;
+//         normalises LL to a dimensionless "coverage fraction".
+// d_i   = current distance to RSU_i (m); normalised by R_max_comm → (0,1].
+//
+// Constraints:
+//   • Only RSUs with d_i ≤ R_max_comm are candidates (vehicle in range).
+//   • Hysteresis δ=0.15: switch only when score(new) > 1.15×score(current).
+//   • Fallback: if no RSU in range, return nearest RSU (keeps LTE path alive).
+//
+// Parameters (fixed for this SDVN topology):
+//   T_MAX = 30 s   — LL cap for stopped/slow vehicles (> simTime=15 s)
+//   T_REF = 18 s   — 2×300/33.33 = traversal reference
+//   δ     = 0.15   — hysteresis: 15% improvement required to trigger handoff
+// ─────────────────────────────────────────────────────────────────────────────
+static const double LL_T_MAX = 30.0;   // cap for LL when vehicle is stopped (s)
+static const double LL_T_REF = 18.0;   // 2*R_max_comm/s_max — traversal reference (s)
+static const double LL_DELTA = 0.15;   // hysteresis threshold (15 %)
+
+// Per-vehicle hysteresis state: last selected RSU index and score.
+static uint32_t g_vehicle_rsu_choice[MAX_NODES] = {};    // last selected RSU
+static double   g_vehicle_rsu_score [MAX_NODES] = {};    // last selected RSU score
+static bool     g_vehicle_rsu_init  [MAX_NODES] = {};    // false until first selection
+
+// Compute how long (s) a vehicle at (px,py) moving with velocity (vx,vy) will
+// remain within R_max_comm of the RSU at (rx,ry).
+//
+// Derivation:  d(t)² = (dx+vx·t)² + (dy+vy·t)² = R²
+//              a·t² + b·t + c = 0
+//              a=|v|², b=2(r⃗·v⃗), c=d²−R²
+// Vehicle is currently inside range → c < 0 → one negative + one positive root.
+// LL = positive root = (−b + √disc) / (2a).
+static double compute_link_lifetime(double px, double py,
+                                    double vx, double vy,
+                                    double rx, double ry)
+{
+    double dx   = px - rx,  dy  = py - ry;
+    double a    = vx*vx + vy*vy;
+    double b    = 2.0*(dx*vx + dy*vy);
+    double c    = dx*dx + dy*dy - R_max_comm*R_max_comm;
+
+    if (c > 0.0)  return 0.0;           // outside range — not a candidate
+    if (a < 1e-9) return LL_T_MAX;      // vehicle stopped → stays indefinitely
+
+    double disc = b*b - 4.0*a*c;
+    if (disc < 0.0) return LL_T_MAX;    // moves in circle inside range
+
+    double t_exit = (-b + std::sqrt(disc)) / (2.0*a);
+    if (t_exit < 0.0) t_exit = 0.0;
+    return std::min(t_exit, LL_T_MAX);
+}
+
+// Select the best RSU using the normalized LL/d score with hysteresis.
+// vx,vy = vehicle's REAL velocity (from MobilityModel — not the poisoned beacon).
+// is_mal is passed for diagnostic logging only; selection always uses real motion.
+static uint32_t best_rsu_for_position(double px, double py,
+                                       double vx, double vy,
+                                       uint32_t vid, bool is_mal)
+{
+    (void)is_mal; // reserved for future per-attack diagnostic hooks
+    static const double (&rsu_x)[4] = g_rsu_actual_pos_x;
+    static const double (&rsu_y)[4] = g_rsu_actual_pos_y;
+    int active = (N_RSUs > 0 && N_RSUs <= 4) ? (int)N_RSUs : 4;
+
+    uint32_t best_idx   = 0;
+    double   best_score = -1.0;
+    bool     any_in_range = false;
+
+    for (int r = 0; r < active; r++) {
+        double dx  = px - rsu_x[r],  dy = py - rsu_y[r];
+        double d   = std::sqrt(dx*dx + dy*dy);
+
+        if (d > R_max_comm) continue;   // out of range — skip
+        any_in_range = true;
+
+        // d_norm ∈ (0,1]: avoid div/0 when vehicle sits on RSU antenna
+        // Note: std::max avoided — #define max 40 in 02_config_globals.h
+        double d_raw   = d / R_max_comm;
+        double d_norm  = (d_raw > 1e-6) ? d_raw : 1e-6;
+
+        double ll      = compute_link_lifetime(px, py, vx, vy, rsu_x[r], rsu_y[r]);
+        double ll_norm = ll / LL_T_REF;  // may exceed 1.0 for slow vehicles — intentional
+
+        double score   = ll_norm / d_norm;
+
+        if (score > best_score) { best_score = score; best_idx = (uint32_t)r; }
+    }
+
+    // No RSU in communication range → fall back to nearest RSU (LTE path)
+    if (!any_in_range) return nearest_rsu_for_position(px, py);
+
+    // ── Hysteresis: only switch RSU if improvement exceeds δ=15 % ────────────
+    uint32_t safe_vid = (vid < MAX_NODES) ? vid : 0u;
+    if (g_vehicle_rsu_init[safe_vid]) {
+        uint32_t old_rsu   = g_vehicle_rsu_choice[safe_vid];
+        double   old_score = g_vehicle_rsu_score [safe_vid];
+        if (best_idx != old_rsu && best_score <= old_score * (1.0 + LL_DELTA)) {
+            // Improvement is marginal — keep current RSU if still reachable
+            double odx = px - rsu_x[old_rsu], ody = py - rsu_y[old_rsu];
+            if (std::sqrt(odx*odx + ody*ody) <= R_max_comm) {
+                best_idx   = old_rsu;
+                best_score = old_score;
+            }
+        }
+    }
+
+    // Persist hysteresis state
+    g_vehicle_rsu_choice[safe_vid] = best_idx;
+    g_vehicle_rsu_score [safe_vid] = best_score;
+    g_vehicle_rsu_init  [safe_vid] = true;
+
+    return best_idx;
 }
 
 void SimpleUdpApplication::HandleReadOne(Ptr<Socket> socket)

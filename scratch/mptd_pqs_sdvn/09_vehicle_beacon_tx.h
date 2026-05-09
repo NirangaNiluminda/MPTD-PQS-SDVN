@@ -73,6 +73,7 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	// (send side would use vid=nid-2, receive side uses nid directly).
 	double tx_px = 0.0, tx_py = 0.0, tx_spd = 0.0, tx_hdg = 0.0, tx_acc = 0.0;
 	double real_px = 0.0, real_py = 0.0;
+	double real_vx = 0.0, real_vy = 0.0;   // real velocity for LL-based RSU selection
 	bool   is_mal  = false;
 	{
 		Ptr<MobilityModel> mob = node_source->GetObject<MobilityModel>();
@@ -82,6 +83,8 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			Vector vel = mob->GetVelocity();
 			real_px  = pos.x;
 			real_py  = pos.y;
+			real_vx  = vel.x;   // stored for LL-based RSU selection below
+			real_vy  = vel.y;
 			real_spd = std::sqrt(vel.x * vel.x + vel.y * vel.y);
 			real_hdg = (real_spd > 1e-6) ? std::atan2(vel.y, vel.x) : 0.0;
 			// Accel: approximate from separate send-side speed history (not vehicle_state)
@@ -107,7 +110,23 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 
 		// Now that real_px/real_py are known, resolve destination
 		if (g_option_b_active && g_num_active_rsus > 0) {
-			nearest_rsu_idx = nearest_rsu_for_position(real_px, real_py);
+			// ── LL-based RSU selection: score = (LL/T_REF) / (d/R_max_comm) ────────
+			// Uses vehicle's REAL velocity (from MobilityModel) — not the poisoned
+			// beacon value — so the vehicle's own navigation remains accurate.
+			// Hysteresis δ=0.15 prevents ping-pong at RSU coverage boundaries.
+			uint32_t ll_rsu  = best_rsu_for_position(real_px, real_py,
+			                                          real_vx, real_vy,
+			                                          vid, is_mal);
+			uint32_t geo_rsu = nearest_rsu_for_position(real_px, real_py);
+			nearest_rsu_idx  = ll_rsu;
+			if (ll_rsu != geo_rsu) {
+				cout << "[LL-SEL] V" << nid
+				     << " LL→RSU" << ll_rsu
+				     << " (nearest=RSU" << geo_rsu << ")"
+				     << " score=" << std::fixed << std::setprecision(3)
+				     << g_vehicle_rsu_score[(vid < MAX_NODES) ? vid : 0]
+				     << " t=" << Simulator::Now().GetSeconds() << endl;
+			}
 			dest_ip   = g_rsu_dsrc_ip[nearest_rsu_idx];
 			dest_port = 6666;
 		} else {
@@ -163,6 +182,26 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			tx_spd = std::sqrt(fvel.x * fvel.x + fvel.y * fvel.y);
 			tx_hdg = (tx_spd > 1e-6) ? std::atan2(fvel.y, fvel.x) : 0.0;
 			tx_acc = std::sqrt(facc.x * facc.x + facc.y * facc.y);
+		}
+
+		// ── Poisoned-velocity RSU divergence log ──────────────────────────────────
+		// Log when the poisoned beacon velocity would have selected a DIFFERENT RSU
+		// than the real velocity.  Selection still uses real velocity (correct design);
+		// this log exposes the discrepancy as a detectable side-effect of the attack.
+		if (is_mal && g_option_b_active) {
+			double tx_vx_p = tx_spd * std::cos(tx_hdg);
+			double tx_vy_p = tx_spd * std::sin(tx_hdg);
+			uint32_t poison_rsu = nearest_rsu_for_position(tx_px, tx_py);
+			// Quick geo check using poisoned position (no hysteresis side-effect)
+			(void)tx_vx_p; (void)tx_vy_p;
+			if (poison_rsu != nearest_rsu_idx) {
+				cout << "[LL-POISON] V" << nid
+				     << " poisoned-pos→RSU" << poison_rsu
+				     << " real-LL-sel→RSU" << nearest_rsu_idx
+				     << " tx_spd=" << std::fixed << std::setprecision(1) << tx_spd
+				     << " real_spd=" << std::sqrt(real_vx*real_vx + real_vy*real_vy)
+				     << " t=" << Simulator::Now().GetSeconds() << endl;
+			}
 		}
 
 		// Accumulate displacement error for TDEE / TPE metrics (§4.1.2)
