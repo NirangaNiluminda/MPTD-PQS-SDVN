@@ -68,17 +68,26 @@ def load_data():
     data   = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
     data   = data[data["total_received"] > 0].copy()
 
-    tp, fp = data["cm_TP"].astype(float), data["cm_FP"].astype(float)
-    tn, fn = data["cm_TN"].astype(float), data["cm_FN"].astype(float)
+    # ε = 10⁻⁶ : supervisor-specified numerical stability constant.
+    # Added to all four CM cells before any metric computation so the
+    # MCC denominator never reaches exactly zero (occurs when TN=0 and
+    # FP=0 at 100 % attack percentage).  Value is small enough that it
+    # does not visibly distort counts that are already non-zero.
+    eps = 1e-6
+    tp = data["cm_TP"].astype(float) + eps
+    fp = data["cm_FP"].astype(float) + eps
+    tn = data["cm_TN"].astype(float) + eps
+    fn = data["cm_FN"].astype(float) + eps
 
-    data["DR"]        = np.where(tp+fn > 0, tp/(tp+fn),           np.nan)
-    data["Precision"] = np.where(tp+fp > 0, tp/(tp+fp),           np.nan)
-    data["F1"]        = np.where(2*tp+fp+fn > 0,
-                                  2*tp/(2*tp+fp+fn),              np.nan)
+    data["DR"]        = tp / (tp + fn)
+    data["Precision"] = tp / (tp + fp)
+    data["F1"]        = 2*tp / (2*tp + fp + fn)
 
-    # zero MCC on degenerate cases → NaN so lines gap cleanly
+    # Recompute MCC from smoothed counts (replaces raw CSV MCC value).
+    # Denominator is now always > 0 → defined at every attack percentage
+    # including 100 % where TN_raw = 0.
     denom = np.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
-    data["MCC"] = np.where(denom > 0, data["MCC"], np.nan)
+    data["MCC"] = (tp*tn - fp*fn) / denom
 
     return data
 

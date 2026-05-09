@@ -76,36 +76,26 @@ def load_sweep_data():
     data = data[data["total_received"] > 0].copy()
 
     # ── Derived performance metrics ────────────────────────────────────────────
-    tp = data["cm_TP"].astype(float)
-    fp = data["cm_FP"].astype(float)
-    tn = data["cm_TN"].astype(float)
-    fn = data["cm_FN"].astype(float)
+    # ε = 10⁻⁶ : supervisor-specified numerical stability constant.
+    # Added to all four CM cells before any metric computation so the
+    # MCC denominator never reaches exactly zero (occurs when TN=0 and
+    # FP=0 at 100 % attack percentage).  Value is small enough that it
+    # does not visibly distort counts that are already non-zero.
+    eps = 1e-6
+    tp = data["cm_TP"].astype(float) + eps
+    fp = data["cm_FP"].astype(float) + eps
+    tn = data["cm_TN"].astype(float) + eps
+    fn = data["cm_FN"].astype(float) + eps
 
-    # Detection Rate (Recall / Sensitivity)
-    data["DR"] = np.where(
-        tp + fn > 0,
-        tp / (tp + fn),
-        np.nan
-    )
+    data["DR"]        = tp / (tp + fn)
+    data["Precision"] = tp / (tp + fp)
+    data["F1"]        = 2*tp / (2*tp + fp + fn)
 
-    # Precision
-    data["Precision"] = np.where(
-        tp + fp > 0,
-        tp / (tp + fp),
-        np.nan
-    )
-
-    # F1-Score
-    data["F1"] = np.where(
-        2 * tp + fp + fn > 0,
-        2 * tp / (2 * tp + fp + fn),
-        np.nan
-    )
-
-    # Replace any 0 MCC where there are no true positives/negatives with NaN
-    # so the line gaps rather than shows misleading zeros
-    data.loc[(tp == 0) & (fn == 0), "MCC"] = np.nan
-    data.loc[(tp == 0) & (tn == 0), "MCC"] = np.nan
+    # Recompute MCC from smoothed counts (replaces raw CSV MCC value).
+    # Denominator is now always > 0 → defined at every attack percentage
+    # including 100 % where TN_raw = 0.
+    denom = np.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
+    data["MCC"] = (tp*tn - fp*fn) / denom
 
     return data
 
