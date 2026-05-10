@@ -927,7 +927,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                     send_lkh_rekey_to_vehicles(vehicle_id, rsu_id, ts);
                 }
 
-                if (!routing_test) {
+                // A5 ablation: skip blockchain SC-Revoke to measure BC contribution (RQ6)
+                if (!routing_test && ablation_mode != 5) {
                     CallSCRevoke(vehicle_id, "3_consecutive_anomalies", rsu_id, ts);
                 }
             }
@@ -937,8 +938,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             consecutive_anomaly_count[vehicle_id] = 0;
         }
 
-        // Trust score update — full mode only (smart contract call)
-        if (!routing_test) {
+        // Trust score update — full mode only; A5 ablation skips SC-Trust (RQ6)
+        if (!routing_test && ablation_mode != 5) {
             double ts        = Simulator::Now().GetSeconds();
             uint32_t sigmask = tp_flags | (mp_flags << 5);
             CallSCTrust(vehicle_id, psi, sigmask, detected, ts);

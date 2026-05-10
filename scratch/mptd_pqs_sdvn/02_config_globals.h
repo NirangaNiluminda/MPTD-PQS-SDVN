@@ -96,8 +96,18 @@ bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 // Future: routes beacon flow to backup_controller_Node and updates NetAnim colours.
 bool g_backup_controller_active = false;
 
+// ── Ablation study selector (paper §4.1, mind.md §11) ─────────────────────
+// Controls which MPTD-PQS components are active for ablation comparison.
+// Pass via --ablation_mode=N on the command line.
+//   1 = A1  Lightweight only : Rules + HMAC, no GAT, no AE, no TRS/FHE  ← DEFAULT
+//   2 = A2  GAT only         : Spatial detection stub (GAT not yet implemented → same as A1)
+//   3 = A3  AE only          : Temporal AE stub (AE not yet implemented  → same as A1)
+//   4 = A4  Full, no PQ      : Rules + HMAC, TRS/FHE disabled (use_pq_crypto=false)
+//   5 = A5  Full, no BC      : Rules + HMAC, blockchain SC calls skipped
+int ablation_mode = 1;
+
 // ── Stage 7: Post-Quantum Crypto flag ──────────────────────────────────────
-// Set to false for ablation study A4 (disables TRS + FHE)
+// Forced false automatically when ablation_mode == 4 (set in 12_main.h after cmd.Parse).
 // Paper §3.3.2-3.3.3; Eq. 3.58-3.65
 bool use_pq_crypto = true;
 

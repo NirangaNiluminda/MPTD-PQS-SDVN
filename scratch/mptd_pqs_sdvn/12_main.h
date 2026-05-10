@@ -56,8 +56,30 @@ int main(int argc, char *argv[])
                   "Attack 3 enhanced mode: % of vehicles pre-registered as Sybil at startup "
                   "(0=original ghost-ID mode, >0=behavioural detection via MP-S3 KL)",
                   sybil_registration_pct);
+    cmd.AddValue ("ablation_mode",
+                  "Ablation variant: 1=A1 LW-only, 2=A2 GAT-stub, 3=A3 AE-stub, "
+                  "4=A4 no-PQ, 5=A5 no-blockchain (default=1)",
+                  ablation_mode);
     cmd.Parse (argc, argv);
-    
+
+    // ── Apply ablation mode overrides ─────────────────────────────────────────
+    // A4: disable TRS + FHE to measure cryptographic mitigation contribution (RQ5)
+    if (ablation_mode == 4) {
+        use_pq_crypto = false;
+        std::cout << "[ABLATION] Mode A4: PQ crypto (TRS+FHE) DISABLED" << std::endl;
+    }
+    // A2/A3: GAT and AE not yet implemented — behave identically to A1 for now
+    if (ablation_mode == 2 || ablation_mode == 3) {
+        std::cout << "[ABLATION] Mode A" << ablation_mode
+                  << ": AI component stub — running as A1 (lightweight) until"
+                  << " GAT/AE implemented" << std::endl;
+    }
+    if (ablation_mode == 5) {
+        std::cout << "[ABLATION] Mode A5: Blockchain SC calls DISABLED" << std::endl;
+    }
+    std::cout << "[ABLATION] Active mode: A" << ablation_mode
+              << "  use_pq_crypto=" << (use_pq_crypto ? "YES" : "NO") << std::endl;
+
     if (routing_test == true)
     {
         // Enforce minimum topology for evaluation (can be overridden via --N_Vehicles=N)

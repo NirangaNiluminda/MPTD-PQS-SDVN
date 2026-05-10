@@ -596,16 +596,18 @@ void write_mptd_results_csv()
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
     ensure_analytics_dir(NS3_ROOT "/analytics/results/sweep");
 
-    // Filename includes speed regime so sweeps over {20,50,100} km/h don't overwrite
+    // Filename: metrics_a{attack}_p{pct}_s{speed}_m{ablation}.csv
+    // Each dimension is encoded so sweeps never overwrite each other.
     std::ostringstream fname;
     fname << NS3_ROOT "/analytics/results/sweep/metrics_a"
           << attack_number << "_p" << attack_percentage
-          << "_s" << maxspeed << ".csv";
+          << "_s" << maxspeed
+          << "_m" << ablation_mode << ".csv";
 
     std::ofstream fout(fname.str(), std::ios::out | std::ios::trunc);
 
     // Header — note: TDEE=-1, TPE=-1 (SUMO required); CDER from ctrl-plane decisions
-    fout << "attack_number,attack_pct,maxspeed_kmh,"
+    fout << "attack_number,attack_pct,maxspeed_kmh,ablation_mode,"
          << "cm_TP,cm_FP,cm_TN,cm_FN,"
          << "MCC,FPR,PARR,"
          << "CDER,ctrl_decisions_total,ctrl_decisions_wrong,"
@@ -617,6 +619,7 @@ void write_mptd_results_csv()
     fout << attack_number              << ","
          << attack_percentage          << ","
          << maxspeed                   << ","
+         << ablation_mode              << ","
          << cm_TP                      << ","
          << cm_FP                      << ","
          << cm_TN                      << ","
