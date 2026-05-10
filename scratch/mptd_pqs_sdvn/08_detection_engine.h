@@ -82,6 +82,92 @@ static int consecutive_anomaly_count[total_size + 2] = {};
 static const int REVOKE_THRESHOLD = 3;
 
 // ============================================================
+// send_lkh_rekey_to_vehicles() — Real NS-3 rekey packet transmission
+// Called after revocation (consecutive_anomaly_count ≥ REVOKE_THRESHOLD).
+//
+// Steps (§3.5.2, Eq.3.33–3.34):
+//   1. lkh_rekey_on_revoke() regenerates keys on the revoked vehicle's path
+//   2. For each non-revoked vehicle: increment nonce η_i, recompute K_i
+//   3. Send unicast RekeyTag UDP packet (port LKH_REKEY_PORT=5555) to each
+//      vehicle via the RSU's DSRC send socket — REAL NS-3 packet transmission
+//   4. Receive side: HandleRekeyReceived() in 07_socket_layer.h
+// ============================================================
+static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
+                                        uint32_t rsu_id,
+                                        double   sim_time)
+{
+    // veh_idx of the revoked vehicle
+    int rev_idx = lkh_veh_idx(revoked_vehicle_id);
+
+    // Regenerate LKH path keys (Eq.3.34: N_rekey = log₂|V_j| messages)
+    int rekey_path[32] = {};
+    int n_rekeyed = lkh_rekey_on_revoke(rev_idx, sim_time, rekey_path, 32);
+
+    // RSU rekey socket (set in 07_socket_layer.h StartApplication)
+    Ptr<Socket> rekey_sock = (rsu_id < 4) ? g_rsu_rekey_socket[rsu_id] : nullptr;
+    if (!rekey_sock) {
+        cout << "[LKH-REKEY] WARNING: no rekey socket for RSU" << rsu_id << endl;
+        return;
+    }
+
+    int packets_sent = 0;
+
+    // Send unicast RekeyTag to every non-revoked, IP-known vehicle
+    for (int vi = 0; vi < (int)N_Vehicles && vi < LKH_MAX_VEH; vi++) {
+        uint32_t veh_nid = (uint32_t)(vi + 2);
+        if (veh_nid == revoked_vehicle_id) continue;   // skip revoked vehicle itself
+
+        // Increment nonce η_i → new K_i cannot be derived from old K_leaf
+        g_vehicle_nonce[vi]++;
+
+        // Recompute K_i = KDF(new_K_leaf, new_η_i, ID_i) [Eq.3.33]
+        lkh_compute_session_key(vi);
+
+        // Build RekeyTag with this vehicle's new leaf key
+        int leaf_idx = g_lkh_first_leaf + vi;
+        RekeyTag rk;
+        rk.SetTargetVehicleId(veh_nid);
+        rk.SetNewLeafKey(g_lkh_tree[leaf_idx].key);
+        rk.SetNewNonce(g_vehicle_nonce[vi]);
+        rk.SetRsuId(rsu_id);
+        rk.SetTimestamp(sim_time);
+
+        Ptr<Packet> rk_pkt = Create<Packet>(0);
+        rk_pkt->AddPacketTag(rk);
+
+        // Unicast to vehicle's DSRC IP if known; otherwise broadcast on DSRC subnet
+        int err = -1;
+        if (g_vehicle_ip_known[vi]) {
+            // True unicast to this vehicle's DSRC address
+            err = rekey_sock->SendTo(rk_pkt, 0,
+                      InetSocketAddress(g_vehicle_dsrc_ip[vi], LKH_REKEY_PORT));
+            cout << "[LKH-REKEY-TX] RSU" << rsu_id
+                 << " → V" << vi
+                 << " (" << g_vehicle_dsrc_ip[vi] << ":" << LKH_REKEY_PORT << ")"
+                 << " nonce=" << g_vehicle_nonce[vi]
+                 << " (unicast, Eq.3.33)" << endl;
+        } else {
+            // Fallback: broadcast on DSRC subnet — vehicle filters by target_vehicle_id
+            err = rekey_sock->SendTo(rk_pkt, 0,
+                      InetSocketAddress(Ipv4Address("3.255.255.255"), LKH_REKEY_PORT));
+            cout << "[LKH-REKEY-TX] RSU" << rsu_id
+                 << " → V" << vi
+                 << " (broadcast fallback, IP not yet recorded)"
+                 << " nonce=" << g_vehicle_nonce[vi] << endl;
+        }
+
+        if (err >= 0) packets_sent++;
+    }
+
+    cout << "[LKH-REKEY] Revoked V" << (revoked_vehicle_id - 2)
+         << ": rekeyed " << n_rekeyed << " tree nodes,"
+         << " sent " << packets_sent << " rekey packets"
+         << " (Eq.3.34 N_rekey=log2(" << g_lkh_n_leaves
+         << ")=" << (int)std::log2((double)g_lkh_n_leaves) << ")"
+         << " t=" << sim_time << endl;
+}
+
+// ============================================================
 // TP-DETECT — Algorithm 1 (§3.4.4)
 // Returns bitmask of violated signatures (bit 0 = TP-S1 ... bit 4 = TP-S5)
 // ============================================================
@@ -827,8 +913,21 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                     parr_trs_rejected++;   // PARR numerator (Eq. 4.3)
                 consecutive_anomaly_count[vehicle_id] = 0; // reset after TRS reject
 
+                double ts = Simulator::Now().GetSeconds();
+
+                // ── LKH Rekey: transmit real NS-3 rekey packets to all remaining vehicles ──
+                // Paper §3.5.2, Eq.3.34: N_rekey = log₂|V_j| messages sent.
+                // send_lkh_rekey_to_vehicles() calls lkh_rekey_on_revoke() then sends
+                // unicast RekeyTag UDP packets (port 5555) to each non-revoked vehicle.
+                // This is REAL NS-3 packet transmission — not a counter.
+                if (rsu_id < 4) {
+                    cout << "[LKH-REVOKE] V" << (vehicle_id - 2)
+                         << " revoked after " << REVOKE_THRESHOLD << " anomalies"
+                         << " → triggering group rekey (Eq.3.34)" << endl;
+                    send_lkh_rekey_to_vehicles(vehicle_id, rsu_id, ts);
+                }
+
                 if (!routing_test) {
-                    double ts = Simulator::Now().GetSeconds();
                     CallSCRevoke(vehicle_id, "3_consecutive_anomalies", rsu_id, ts);
                 }
             }
@@ -895,6 +994,18 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         const char* dl_fn = bcast ? "centralized_dsrc_data_broadcast"
                                   : "centralized_dsrc_data_unicast";
         if (err >= 0) {
+            // CDER: track correctness of this downlink control decision (Eq.4.4)
+            // Each sent DownlinkControlTag is one control-plane decision.
+            // Wrong decisions (incorrect control-plane output):
+            //   alert_type=2 WRONG_ROUTING  → always wrong (malicious controller)
+            //   alert_type=0 CLEAN_ROUTING  on a poisoned beacon → FN at decision level
+            //   alert_type=1 ATTACK_DETECTED on a clean beacon   → FP at decision level
+            ctrl_decisions_total++;
+            bool wrong_ctrl = (alert_type == 2) ||                  // malicious controller
+                              (alert_type == 0 &&  is_poisoned) ||  // missed attack (FN)
+                              (alert_type == 1 && !is_poisoned);    // false alarm (FP)
+            if (wrong_ctrl) ctrl_decisions_wrong++;
+
             // A6-STEP7: vehicle receives control decision derived from poisoned model
             if (attack_number == 6) {
                 cout << "[A6-STEP7] V" << (bcast ? 0U : vehicle_id)
@@ -1018,6 +1129,87 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         if (nearest != rsu_idx) {
             // Not our vehicle — silently drop
             continue;
+        }
+
+        // ── LKH: Record vehicle DSRC IP on first reception (used for unicast rekey) ──
+        // InetSocketAddress::ConvertFrom(from) gives the sender's IP:port.
+        // Vehicle nid → veh_idx = nid - 2, stored in g_vehicle_dsrc_ip[veh_idx].
+        {
+            int v_idx = lkh_veh_idx(vid);
+            if (v_idx >= 0 && v_idx < LKH_MAX_VEH && !g_vehicle_ip_known[v_idx]) {
+                InetSocketAddress sender = InetSocketAddress::ConvertFrom(from);
+                g_vehicle_dsrc_ip[v_idx] = sender.GetIpv4();
+                g_vehicle_ip_known[v_idx] = true;
+                cout << "[LKH-IP] V" << (vid - 2)
+                     << " DSRC IP recorded: " << sender.GetIpv4()
+                     << " (used for unicast rekey)" << endl;
+            }
+        }
+
+        // ── LKH HMAC gate (Eq.3.37) — first gate before any detection ────────────
+        // MAC_i(t) = HMAC_{K_i}(b_i(t)‖t‖ID_i)
+        // RSU recomputes the expected HMAC and compares with the tag's m_hmac field.
+        // If HMAC is missing or invalid: reject beacon immediately (counts as detected=true,
+        // is_poisoned set to true if vehicle had no valid key — attacker cannot forge).
+        // Ghost packets (vid >= 10000) bypass HMAC: they are injected locally by the RSU
+        // itself (MP-S1 attack) so they never carry a valid vehicle session key.
+        //
+        // PBPO_LW: time only the RSU-side lightweight HMAC gate (Eq.4.7, lightweight mode).
+        // This is the per-beacon overhead at the RSU before any controller involvement.
+        // Separate from PBPO_Full (controller pipeline) measured in HandleBeaconReceived().
+        struct timespec t_lw_start, t_lw_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_lw_start);
+        bool hmac_gate_pass = true;
+        if (vid < 10000) {  // skip HMAC check for RSU-injected ghost packets
+            int v_idx = lkh_veh_idx(vid);
+            if (v_idx >= 0 && v_idx < LKH_MAX_VEH && tag.GetHmacSet()) {
+                uint8_t recv_mac[8];
+                tag.GetHmac(recv_mac);
+                bool mac_ok = lkh_verify_beacon_hmac(
+                    v_idx,
+                    tag.GetPosX(), tag.GetPosY(),
+                    tag.GetSpeed(), tag.GetHeading(), tag.GetAcceleration(),
+                    tag.GetTimestamp(), vid, recv_mac);
+                tag.SetHmacValid(mac_ok);
+                if (!mac_ok) {
+                    hmac_gate_pass = false;
+                    cout << "[LKH-HMAC-FAIL] RSU" << rsu_idx
+                         << " V" << (vid - 2)
+                         << " HMAC verification FAILED → beacon rejected"
+                         << " t=" << t << endl;
+                }
+            } else if (v_idx >= 0 && !tag.GetHmacSet()) {
+                // No HMAC present — treat as HMAC failure (unauthenticated beacon)
+                hmac_gate_pass = false;
+                cout << "[LKH-HMAC-MISSING] RSU" << rsu_idx
+                     << " V" << (vid - 2)
+                     << " beacon has no HMAC tag → rejected" << endl;
+            }
+        }
+
+        // PBPO_LW: stop HMAC gate timer — captures RSU-side lightweight overhead per beacon.
+        // Accumulated regardless of pass/fail so the mean reflects ALL beacon arrivals.
+        clock_gettime(CLOCK_MONOTONIC, &t_lw_end);
+        pbpo_lw_time_sum_ms += (t_lw_end.tv_sec  - t_lw_start.tv_sec)  * 1000.0
+                             + (t_lw_end.tv_nsec - t_lw_start.tv_nsec) / 1e6;
+        pbpo_lw_cnt++;
+
+        // If HMAC gate fails: do not forward to management node (drop the beacon)
+        // The beacon is silently dropped — no detection pipeline, no downlink response.
+        // In a real system a short alert could be sent; here we track it via PARR.
+        if (!hmac_gate_pass) {
+            // Count as a detected poisoned beacon for confusion matrix
+            // (attacker who can't forge HMAC is trivially detected)
+            if (tag.GetIsPoisoned()) {
+                update_confusion_matrix(true, true);   // TP
+                parr_poisoned_total++;
+            } else {
+                // An honest vehicle with wrong key (e.g., after rekey lag): FP
+                // This can happen in the brief window before the vehicle receives
+                // its RekeyTag. Counted as FP — drives system design to minimise rekey lag.
+                update_confusion_matrix(false, true);  // FP
+            }
+            continue;  // drop: do not forward to management
         }
 
         cout << "[DSRC-RSU" << rsu_idx << "] V" << vid

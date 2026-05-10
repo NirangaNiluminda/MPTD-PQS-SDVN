@@ -16,6 +16,7 @@
 #include "ns3/tag.h"
 #include "ns3/vector.h"
 #include "ns3/simulator.h"
+#include <cstring>  // memcpy / memset for HMAC and RekeyTag fields
 
 // ============================================================
 // BsmBeaconTag — Paper §3.4.4 Eq. (3.9)
@@ -44,6 +45,14 @@ public:
     void SetSigViolated(uint32_t sv)       { m_sig_violated = sv; }  // bitmask: bit0=TP-S1 .. bit8=MP-S4
     void SetRsuId(uint32_t id)             { m_rsu_id = id; }        // RSU that relayed this beacon (Option B)
 
+    // HMAC beacon tag (Eq.3.37): MAC_i(t) = HMAC_{K_i}(b_i(t)‖t‖ID_i)
+    // 8-byte truncated HMAC-SHA256 carried in every beacon (LKH_HMAC_TRUNC=8)
+    void SetHmac(const uint8_t mac[8]) { std::memcpy(m_hmac, mac, 8); m_hmac_set = true; }
+    void GetHmac(uint8_t mac[8])  const { std::memcpy(mac, m_hmac, 8); }
+    bool GetHmacSet()             const { return m_hmac_set; }
+    void SetHmacValid(bool v)           { m_hmac_valid = v; }
+    bool GetHmacValid()           const { return m_hmac_valid; }
+
     // Getters
     double   GetPosX()         const { return m_pos_x; }
     double   GetPosY()         const { return m_pos_y; }
@@ -69,6 +78,10 @@ private:
     uint32_t m_attack_type  = 0;     // 1-7 matching attack_number
     uint32_t m_sig_violated = 0;     // bitmask: bit0=TP-S1 .. bit8=MP-S4
     uint32_t m_rsu_id       = 0;     // RSU index that relayed this beacon (Option B DSRC path)
+    // HMAC-SHA256 truncated to 8 bytes (Eq.3.37)
+    uint8_t  m_hmac[8]      = {};    // truncated HMAC-SHA256 of beacon payload
+    bool     m_hmac_set     = false; // true once vehicle has written HMAC
+    bool     m_hmac_valid   = false; // set by RSU after verification
 };
 
 NS_OBJECT_ENSURE_REGISTERED(BsmBeaconTag);
@@ -85,7 +98,8 @@ ns3::TypeId BsmBeaconTag::GetInstanceTypeId(void) const {
     return BsmBeaconTag::GetTypeId();
 }
 uint32_t BsmBeaconTag::GetSerializedSize(void) const {
-    return 6 * sizeof(double) + 4 * sizeof(uint32_t) + sizeof(bool);
+    // 6 doubles + 4 uint32 + 1 bool (poisoned) + 8 bytes HMAC + 2 bool (hmac_set, hmac_valid)
+    return 6 * sizeof(double) + 4 * sizeof(uint32_t) + sizeof(uint8_t) + 8 + 2;
 }
 void BsmBeaconTag::Serialize(ns3::TagBuffer i) const {
     i.WriteDouble(m_pos_x);
@@ -99,6 +113,10 @@ void BsmBeaconTag::Serialize(ns3::TagBuffer i) const {
     i.WriteU32(m_attack_type);
     i.WriteU32(m_sig_violated);
     i.WriteU32(m_rsu_id);
+    // HMAC bytes (Eq.3.37)
+    for (int b = 0; b < 8; b++) i.WriteU8(m_hmac[b]);
+    i.WriteU8(m_hmac_set   ? 1 : 0);
+    i.WriteU8(m_hmac_valid ? 1 : 0);
 }
 void BsmBeaconTag::Deserialize(ns3::TagBuffer i) {
     m_pos_x       = i.ReadDouble();
@@ -112,6 +130,10 @@ void BsmBeaconTag::Deserialize(ns3::TagBuffer i) {
     m_attack_type  = i.ReadU32();
     m_sig_violated = i.ReadU32();
     m_rsu_id       = i.ReadU32();
+    // HMAC bytes (Eq.3.37)
+    for (int b = 0; b < 8; b++) m_hmac[b] = i.ReadU8();
+    m_hmac_set   = (i.ReadU8() != 0);
+    m_hmac_valid = (i.ReadU8() != 0);
 }
 void BsmBeaconTag::Print(std::ostream &os) const {
     os << "BSM[v=" << m_vehicle_id
@@ -206,6 +228,93 @@ void DownlinkControlTag::Print(std::ostream &os) const {
        << " spd_adv=" << m_speed_advice
        << " t=" << m_timestamp
        << " rsu=" << m_rsu_id << "]";
+}
+
+// ============================================================
+// RekeyTag — LKH rekey message RSU → Vehicle (§3.5.2, Eq.3.33/3.34)
+// Carries the new K_leaf value for a specific vehicle after group rekeying.
+//
+// Flow:
+//   RSU detects revocation → lkh_rekey_on_revoke() regenerates leaf key
+//   RSU sends RekeyTag (UDP unicast, port LKH_REKEY_PORT=5555) to each
+//   non-revoked vehicle whose subtree path overlapped the revoked node.
+//   Vehicle receives → updates g_vehicle_session_key[veh_idx] via Eq.3.33.
+//
+// Security note: key sent in plaintext inside NS-3 UDP (no packet encryption).
+//   In a real deployment, the new K_leaf would be wrapped with the sibling
+//   key at the split point. The NS-3 channel here provides addressing isolation.
+// ============================================================
+class RekeyTag : public ns3::Tag {
+public:
+    static ns3::TypeId GetTypeId(void);
+    virtual ns3::TypeId GetInstanceTypeId(void) const;
+    virtual uint32_t GetSerializedSize(void) const;
+    virtual void Serialize(ns3::TagBuffer i) const;
+    virtual void Deserialize(ns3::TagBuffer i);
+    virtual void Print(std::ostream &os) const;
+
+    RekeyTag() { std::memset(m_new_leaf_key, 0, 32); }
+
+    // Target vehicle (NS-3 node ID — 0 = broadcast to all vehicles in group)
+    void     SetTargetVehicleId(uint32_t id)          { m_target_vehicle_id = id; }
+    uint32_t GetTargetVehicleId()              const   { return m_target_vehicle_id; }
+
+    // New K_leaf value for the target vehicle (32 bytes, Eq.3.33 input)
+    void SetNewLeafKey(const uint8_t key[32])          { std::memcpy(m_new_leaf_key, key, 32); }
+    void GetNewLeafKey(uint8_t key[32])        const   { std::memcpy(key, m_new_leaf_key, 32); }
+
+    // New nonce η_i accompanying this rekey (vehicle increments and recomputes K_i)
+    void     SetNewNonce(uint32_t n)                   { m_new_nonce = n; }
+    uint32_t GetNewNonce()                     const   { return m_new_nonce; }
+
+    // RSU that issued this rekey message
+    void     SetRsuId(uint32_t r)                      { m_rsu_id = r; }
+    uint32_t GetRsuId()                        const   { return m_rsu_id; }
+
+    // Simulation timestamp of the rekey event
+    void   SetTimestamp(double t)                      { m_timestamp = t; }
+    double GetTimestamp()                      const   { return m_timestamp; }
+
+private:
+    uint32_t m_target_vehicle_id = 0;
+    uint8_t  m_new_leaf_key[32]  = {};   // new K_leaf (32 bytes, Eq.3.33)
+    uint32_t m_new_nonce         = 0;    // new η_i
+    uint32_t m_rsu_id            = 0;
+    double   m_timestamp         = 0.0;
+};
+
+NS_OBJECT_ENSURE_REGISTERED(RekeyTag);
+
+ns3::TypeId RekeyTag::GetTypeId(void) {
+    static ns3::TypeId tid = ns3::TypeId("ns3::RekeyTag")
+        .SetParent<ns3::Tag>()
+        .AddConstructor<RekeyTag>();
+    return tid;
+}
+ns3::TypeId RekeyTag::GetInstanceTypeId(void) const { return RekeyTag::GetTypeId(); }
+uint32_t RekeyTag::GetSerializedSize(void) const {
+    // 2×uint32 + 32 bytes key + uint32 nonce + uint32 rsu + double timestamp
+    return 4 + 32 + 4 + 4 + 8;
+}
+void RekeyTag::Serialize(ns3::TagBuffer i) const {
+    i.WriteU32(m_target_vehicle_id);
+    for (int b = 0; b < 32; b++) i.WriteU8(m_new_leaf_key[b]);
+    i.WriteU32(m_new_nonce);
+    i.WriteU32(m_rsu_id);
+    i.WriteDouble(m_timestamp);
+}
+void RekeyTag::Deserialize(ns3::TagBuffer i) {
+    m_target_vehicle_id = i.ReadU32();
+    for (int b = 0; b < 32; b++) m_new_leaf_key[b] = i.ReadU8();
+    m_new_nonce = i.ReadU32();
+    m_rsu_id    = i.ReadU32();
+    m_timestamp = i.ReadDouble();
+}
+void RekeyTag::Print(std::ostream &os) const {
+    os << "Rekey[vid=" << m_target_vehicle_id
+       << " rsu=" << m_rsu_id
+       << " nonce=" << m_new_nonce
+       << " t=" << m_timestamp << "]";
 }
 
 #endif // MPTD_PQS_PACKET_TAGS_H

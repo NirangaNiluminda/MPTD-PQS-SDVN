@@ -2104,6 +2104,11 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   std::cout << "[NETANIM] XML → " << anim_path << std::endl;
   std::cout << "[NETANIM] Open with: netanim " << anim_path << std::endl;
   
+  // ── LKH: initialise tree + session keys + RSU ring keys before simulation ────
+  // Must be called AFTER N_Vehicles and N_RSUs are finalised (set in cmd args above)
+  // and BEFORE Simulator::Run() so all vehicles have valid K_i for HMAC on first beacon.
+  lkh_init_all((int)N_Vehicles, (int)N_RSUs);
+
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
   Simulator::Destroy();

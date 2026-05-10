@@ -4,6 +4,8 @@ def build(bld):
          'mobility', 'wave', 'applications', 'point-to-point',
          'flow-monitor', 'netanim'])
     obj.source = ['simulation.cc']
+    # No external crypto library needed: HMAC-SHA256 is implemented inline in
+    # 00_lkh_keys.h (pure C++ FIPS 180-4 + RFC 2104) — waf/ns-3.35 compatible.
     # Stage 7: OpenFHE Post-Quantum Crypto (TRS + CKKS FHE)
     # Uncomment when OpenFHE is installed:
     #   sudo apt-get install -y libgmp-dev

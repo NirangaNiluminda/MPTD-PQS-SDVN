@@ -35,6 +35,7 @@
 
 #include "01_includes.h"
 #include "02_config_globals.h"
+#include "00_lkh_keys.h"   // LKH tree + HMAC-SHA256 (Eq.3.33–3.37) — must come before 03
 #include "03_packet_tags.h"
 // 03c_generated_tags.h REMOVED - legacy LDA tag classes (replaced by BsmBeaconTag)
 #include "04_state_globals.h"

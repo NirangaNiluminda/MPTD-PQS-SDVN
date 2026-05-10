@@ -15,6 +15,11 @@
 
 bool routing_test = true;
 
+// ── LKH rekey sockets — one per RSU, set in StartApplication() ───────────────
+// Indexed by RSU index (0..3). Used by send_lkh_rekey_to_vehicle() in 08_detection_engine.h
+// to unicast RekeyTag packets to vehicles via DSRC broadcast (3.255.255.255:5555).
+Ptr<Socket> g_rsu_rekey_socket[4];
+
 // ── DSRC device containers (installed in 12_main.h) ──────────────────────────
 NetDeviceContainer wifidevices;
 // Legacy DSRC channel device containers (used by 12_main.h channel setup)
@@ -37,11 +42,11 @@ public:
     static TypeId GetTypeId();
     virtual TypeId GetInstanceTypeId() const;
 
-    void HandleReadOne(Ptr<Socket> socket);       // management node receive (legacy LDA path)
-    void HandleReadTwo(Ptr<Socket> socket);      // vehicle downlink receive [DL-VEH-RX]
-    void handle_readone(Ptr<Socket> socket);     // RSU DSRC receive handler (professor's term)
-    void handle_downlink_at_rsu(Ptr<Socket> socket); // RSU receives management downlink → forwards to vehicles
-                                                 // = fires when vehicle beacon arrives at RSU:6666
+    void HandleReadOne(Ptr<Socket> socket);           // management node receive (legacy LDA path)
+    void HandleReadTwo(Ptr<Socket> socket);           // vehicle downlink receive [DL-VEH-RX]
+    void handle_readone(Ptr<Socket> socket);          // RSU DSRC receive handler (professor's term)
+    void handle_downlink_at_rsu(Ptr<Socket> socket);  // RSU receives management downlink → forwards to vehicles
+    void HandleRekeyReceived(Ptr<Socket> socket);     // Vehicle: receives LKH rekey from RSU (port 5555)
 
     void SendPacket(Ptr<Packet> packet, Ipv4Address destination, uint16_t port);
     void test();
@@ -56,15 +61,17 @@ private:
 
     Ptr<Socket> m_recv_socket1;
     Ptr<Socket> m_recv_socket2;
-    Ptr<Socket> m_recv_socket3;   // RSU: DSRC beacon receive (port 6666) — Option B
-    Ptr<Socket> m_recv_socket_dl; // RSU: management downlink receive (port 8888)
+    Ptr<Socket> m_recv_socket3;      // RSU: DSRC beacon receive (port 6666) — Option B
+    Ptr<Socket> m_recv_socket_dl;    // RSU: management downlink receive (port 8888)
+    Ptr<Socket> m_recv_socket_rekey; // Vehicle: LKH rekey messages from RSU (port 5555)
     uint16_t m_port1;
     uint16_t m_port2;
 
     Ptr<Socket> m_send_socket;
     Ptr<Socket> m_uplink_send_socket;
     Ptr<Socket> m_downlink_send_socket;
-    Ptr<Socket> m_relay_socket;   // RSU: forwards poisoned/clean beacon to management_node
+    Ptr<Socket> m_relay_socket;      // RSU: forwards poisoned/clean beacon to management_node
+    Ptr<Socket> m_rekey_send_socket; // RSU: unicast rekey messages to vehicles (port 5555)
 };
 
 // ── Color macros for NS-3 log output ─────────────────────────────────────────
@@ -138,6 +145,18 @@ void SimpleUdpApplication::StartApplication()
         m_relay_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 51000));
         m_relay_socket->SetAllowBroadcast(false);
 
+        // ── RSU rekey socket: unicast LKH rekey messages to vehicles (port 5555) ──
+        // Used by send_lkh_rekey_to_vehicle() in 08_detection_engine.h.
+        m_rekey_send_socket = Socket::CreateSocket(GetNode(), tid);
+        m_rekey_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 52000));
+        m_rekey_send_socket->SetAllowBroadcast(true);  // allow broadcast fallback
+        // Store globally so detection engine can call it without 'this'
+        {
+            uint32_t rsu_idx_local = nid - g_first_rsu_node_id;
+            if (rsu_idx_local < 4)
+                g_rsu_rekey_socket[rsu_idx_local] = m_rekey_send_socket;
+        }
+
         // Keep send socket for any legacy calls (also used by downlink forward to vehicles)
         m_send_socket = Socket::CreateSocket(GetNode(), tid);
         m_send_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 20000));
@@ -164,6 +183,18 @@ void SimpleUdpApplication::StartApplication()
 
         m_recv_socket1->SetRecvCallback(MakeCallback(&SimpleUdpApplication::HandleReadOne, this));
         m_recv_socket2->SetRecvCallback(MakeCallback(&SimpleUdpApplication::HandleReadTwo, this));
+
+        // ── LKH rekey receive socket — vehicles only (not management node) ────────
+        // Listens on LKH_REKEY_PORT (5555) for RekeyTag packets from RSU.
+        // Management node (nid=1) does not need this — it has the full LKH state.
+        bool is_vehicle_node = (nid >= 2);
+        if (is_vehicle_node) {
+            m_recv_socket_rekey = Socket::CreateSocket(GetNode(), tid);
+            SetupReceiveSocket(m_recv_socket_rekey, LKH_REKEY_PORT);
+            m_recv_socket_rekey->SetRecvCallback(
+                MakeCallback(&SimpleUdpApplication::HandleRekeyReceived, this));
+            m_recv_socket_rekey->SetAllowBroadcast(true);
+        }
 
         m_send_socket          = Socket::CreateSocket(GetNode(), tid);
         m_uplink_send_socket   = Socket::CreateSocket(GetNode(), tid);
@@ -294,6 +325,58 @@ void SimpleUdpApplication::DownlinkSendPacket(Ptr<Packet> packet, Ipv4Address de
 uint32_t CW_min  = 15;
 double   SIFS    = 12;    // Short Inter-Frame Space (µs), 802.11p
 double   T_slot  = 20.0; // Slot time (µs), 802.11p
+
+// ============================================================
+// HandleRekeyReceived — Vehicle processes LKH rekey message from RSU
+// Port 5555, RekeyTag packet sent after a group member is revoked.
+//
+// Flow (§3.5.2, Eq.3.33):
+//   1. RSU calls lkh_rekey_on_revoke() → generates new K_leaf for subtree
+//   2. RSU sends RekeyTag (unicast UDP, port 5555) to each non-revoked vehicle
+//   3. Vehicle receives here → updates g_vehicle_session_key[veh_idx]
+//      by recomputing K_i = KDF(new_K_leaf, new_nonce, ID_i) [Eq.3.33]
+//   4. From this point, HMAC on vehicle beacons uses the new K_i
+//   5. Old K_i (revoked vehicle's) can no longer forge valid HMACs ← forward secrecy
+// ============================================================
+void SimpleUdpApplication::HandleRekeyReceived(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet;
+    Address     from;
+    while ((packet = socket->RecvFrom(from)) != nullptr)
+    {
+        RekeyTag rk;
+        if (!packet->RemovePacketTag(rk)) continue;
+
+        uint32_t my_nid    = GetNode()->GetId();
+        uint32_t target_id = rk.GetTargetVehicleId();
+
+        // Accept if this message targets us specifically, or is a group broadcast (vid=0)
+        if (target_id != 0 && target_id != my_nid) continue;
+
+        int veh_idx = lkh_veh_idx(my_nid);
+        if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH) continue;
+
+        // 1. Install new K_leaf into the tree
+        uint8_t new_leaf[LKH_KEY_BYTES];
+        rk.GetNewLeafKey(new_leaf);
+        int leaf_node_idx = g_lkh_first_leaf + veh_idx;
+        if (leaf_node_idx < g_lkh_total_nodes)
+            std::memcpy(g_lkh_tree[leaf_node_idx].key, new_leaf, LKH_KEY_BYTES);
+
+        // 2. Update nonce η_i (new nonce from RSU, Eq.3.33)
+        g_vehicle_nonce[veh_idx] = rk.GetNewNonce();
+
+        // 3. Recompute K_i = KDF(new_K_leaf, new_η_i, ID_i) [Eq.3.33]
+        lkh_compute_session_key(veh_idx);
+
+        cout << "[LKH-REKEY-RX] V" << (my_nid - 2)
+             << " (nid=" << my_nid << ")"
+             << " new K_i from RSU" << rk.GetRsuId()
+             << " nonce=" << rk.GetNewNonce()
+             << " t=" << rk.GetTimestamp()
+             << " ← forward secrecy ensured (Eq.3.33)" << endl;
+    }
+}
 
 // ── Legacy LDA routing stubs — dead code when routing_test=true ──────────────
 // Kept here to satisfy 12_main.h scheduler calls without modification.

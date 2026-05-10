@@ -60,6 +60,8 @@
 #include <algorithm>  // std::shuffle, std::round
 #include <vector>     // std::vector (for RSU candidate list)
 #include "ns3/core-module.h"
+// OpenSSL headers NOT needed: HMAC-SHA256 implemented inline in 00_lkh_keys.h
+// (pure C++ FIPS 180-4 — avoids waf/linker complications with ns-3.35 build system)
 #include <chrono>
 #include <iostream>
 #include <string>

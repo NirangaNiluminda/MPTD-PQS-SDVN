@@ -1,19 +1,26 @@
 // ============================================================
 // SECTION 10: MPTD-PQS Paper Metrics + CSV Output (Stage 4)
 // ============================================================
-// Implements the 7 evaluation metrics from §3.5 of the paper:
-//   MCC  - Matthews Correlation Coefficient
-//   FPR  - False Positive Rate
-//   PARR - Poisoning Attack Rejection Rate (TRS blockchain revocation rate, Eq. 4.3)
-//   CDER - Correct Detection-to-Error Ratio (Accuracy = (TP+TN)/total, higher=better)
-//   TDEE - Traffic Density Estimation Error (dimensionless per-RSU relative error, Eq. 4.5)
-//   TPE  - Trajectory Poisoning Exposure
-//   PBPO - Post-Blockchain Poisoning Offset
+// Implements evaluation metrics from §4.1 of the paper:
+//   MCC       - Matthews Correlation Coefficient
+//   FPR       - False Positive Rate
+//   PARR      - Poisoning Attack Rejection Rate (TRS blockchain, Eq. 4.3)
+//   CDER      - Control Decision Error Rate (Eq.4.4, ctrl-plane; lower=better)
+//               Measured from actual DownlinkControlTag sends, not beacon CM.
+//               Attacks 5&7 (malicious controller) → CDER→1.0 (all decisions wrong).
+//   TDEE      - Traffic Density Estimation Error (Eq.4.5) = -1 (requires SUMO ρ_gt(t))
+//   TPE       - Trajectory Poisoning Exposure (Eq.4.6) = -1 (requires SUMO + ctrl predictor)
+//   PBPO_LW   - Per-Beacon Processing Overhead, lightweight RSU HMAC gate (Eq.4.7)
+//   PBPO_Full - Per-Beacon Processing Overhead, full controller pipeline (Eq.4.7)
 //
 // Globals (updated by update_confusion_matrix() each beacon):
 //   cm_TP, cm_FP, cm_TN, cm_FN
+// Globals (updated by downlink block in 08_detection_engine.h):
+//   ctrl_decisions_total, ctrl_decisions_wrong  (CDER)
+// Globals (updated by HMAC gate in 08_detection_engine.h handle_readone()):
+//   pbpo_lw_time_sum_ms, pbpo_lw_cnt            (PBPO_LW)
 //
-// Called from 08_beacon_handlers.h (via forward decls):
+// Called from 08_detection_engine.h (via forward decls):
 //   update_confusion_matrix(bool is_poisoned, bool detected)
 //   log_beacon_to_csv(vid, rsu_id, tag, detected, sig_mask, psi)
 //
@@ -21,8 +28,9 @@
 //   write_mptd_results_csv()
 //
 // Output paths (NS3_ROOT = /home/niranga/ns-allinone-3.35/ns-3.35):
-//   analytics/results/beacon_log.csv          — per-beacon rows
-//   analytics/results/sweep/metrics_a{N}_p{P}.csv — per-run summary
+//   analytics/results/beacon_log.csv                        — per-beacon rows
+//   analytics/results/sweep/metrics_a{N}_p{P}_s{S}.csv     — per-run summary
+//     N=attack_number, P=attack_pct, S=maxspeed_kmh
 // ============================================================
 
 #ifndef MPTD_PQS_METRICS_CSV_H
@@ -462,74 +470,84 @@ double compute_PARR()
     return (double)parr_trs_rejected / (double)parr_poisoned_total;
 }
 
-// CDER: Correct Detection-to-Error Ratio (paper §4.1.2, Eq. 4.4)
-// Fraction of all beacon processing decisions that were correct.
-// = (TP + TN) / (TP + FP + TN + FN) = Accuracy
-// Higher value = better (more correct control decisions).
-// Previous code computed (FP+FN)/total = 1−Accuracy (error rate, lower-better):
-// corrected here to match the paper's "correct ratio" naming and direction.
+// CDER: Control Decision Error Rate (paper §4.1.2, Eq. 4.4)
+// Eq. 4.4: CDER = wrong_ctrl_decisions / total_ctrl_decisions (lower=better)
+// Measured at the DOWNLINK control plane (DownlinkControlTag sends by management node):
+//   WRONG_ROUTING (alert_type=2): always wrong — malicious controller output
+//   CLEAN_ROUTING (alert_type=0) for poisoned beacon: FN at control-plane level
+//   ATTACK_DETECTED (alert_type=1) for clean beacon:  FP at control-plane level
+// Attacks 5 & 7: controller is malicious → alert_type=2 for every beacon → CDER→1.0
+// Fallback (Option B inactive / no downlink decisions): beacon-level (FP+FN)/total.
 double compute_CDER()
 {
-    double tp = cm_TP, fp = cm_FP, tn = cm_TN, fn = cm_FN;
-    double total = tp + fp + tn + fn;
+    if (ctrl_decisions_total > 0)
+        return (double)ctrl_decisions_wrong / (double)ctrl_decisions_total;
+    // Fallback: beacon-level confusion matrix (FP+FN)/total
+    double total = (double)(cm_TP + cm_FP + cm_TN + cm_FN);
     if (total < 1e-9) return 0.0;
-    return (tp + tn) / total;
+    return (double)(cm_FP + cm_FN) / total;
 }
 
 // TDEE: Traffic Density Estimation Error (Eq. 4.5, dimensionless)
-// Measures relative error in per-RSU vehicle count estimation.
-// Paper: TDEE = |ρ̂(t) − ρ_gt(t)| / ρ_gt(t)  (avoids SUMO by using RSU beacon counts)
+// Paper Eq. 4.5: TDEE = |ρ̂(t) − ρ_gt(t)| / ρ_gt(t)
+//   ρ_gt(t)  = SUMO ground-truth vehicle density per cell at time t
+//   ρ̂(t)     = controller's estimated density from received beacons
 //
-// Implementation (no SUMO needed):
-//   tdee_gt_count[j]  = beacons received via RSU j  (ground-truth: vehicle is near RSU j)
-//   tdee_est_count[j] = beacons whose reported position maps to RSU j's cell
-//   TDEE_j = |est_j − gt_j| / gt_j  (0 when positions are honest, rises when forged)
-//   TDEE   = mean over active RSU cells (j with gt_count > 0)
-//
-// Behaviour per attack type:
-//   TP-S1/S3: forged position maps to wrong RSU cell → TDEE rises
-//   MP-S1:    ghost beacons arrive at same RSU → inflate est_count for that cell
-//   TP-S2/MP-S2/MP-S3/MP-S4: positions honest or same cell → TDEE ≈ 0
+// NOT computable from NS-3 alone: requires SUMO to provide ρ_gt(t).
+// The previous proxy (RSU beacon-count comparison) was a simulation assumption —
+// beacon counts at the RSU are not equivalent to SUMO ground-truth density.
+// Returns -1 to signal "unavailable — integrate SUMO for real TDEE".
+// Applicable metric for MP attacks {3,4,6,7} per paper §4.1.2.
 double compute_TDEE()
 {
-    double sum   = 0.0;
-    int    valid = 0;
-    for (int j = 0; j < 4; j++) {
-        if (tdee_gt_count[j] == 0) continue;
-        sum += std::fabs((double)tdee_est_count[j] - (double)tdee_gt_count[j])
-               / (double)tdee_gt_count[j];
-        valid++;
-    }
-    return (valid > 0) ? (sum / valid) : 0.0;
+    return -1.0;  // requires SUMO ρ_gt(t) — not available in NS-3 standalone
 }
 
-// TPE: Trajectory Poisoning Error  —  RMSE of injection error for malicious beacons (m)
-// Paper Eq. 4.6 defines TPE as: mean displacement between the controller's predicted
-// position and SUMO ground truth (requires an internal Kalman/DR prediction model).
-// Implementation proxy: RMSE of |poisoned_pos − real_pos| over malicious-vehicle beacons,
-// i.e. measures the magnitude of position/speed manipulation the attacker introduced.
-// This correlates with the paper's definition (larger injection → larger prediction error)
-// but is not identical — it measures attack injection magnitude, not controller prediction
-// residual. True TPE would require comparing controller state estimates vs SUMO truth.
+// TPE: Trajectory Poisoning Exposure (Eq. 4.6)
+// Paper Eq. 4.6: TPE = RMSE( p̂_ctrl(t) − p_sumo(t) )
+//   p̂_ctrl(t) = controller's predicted vehicle position (Kalman/DR internal state)
+//   p_sumo(t)  = SUMO ground-truth vehicle position at time t
+//
+// NOT computable from NS-3 alone: requires SUMO ground-truth positions AND an internal
+// controller prediction model (Kalman filter or dead-reckoning state estimator).
+// The previous proxy (injection RMSE = |poisoned_pos − real_pos|) measures attack
+// magnitude, not controller prediction residual — these are conceptually different.
+// Returns -1 to signal "unavailable — integrate SUMO + controller state for real TPE".
+// Applicable metric for TP attacks {1,2,5} per paper §4.1.2.
 double compute_TPE()
 {
-    if (tpe_cnt == 0) return 0.0;
-    return std::sqrt(tpe_sq_sum / (double)tpe_cnt);
+    return -1.0;  // requires SUMO ground truth + controller predictor — not available in NS-3
 }
 
-// PBPO: Per-Beacon Processing Overhead  —  mean detection time per beacon (ms)
-// Measures real-time feasibility: mean wall-clock time from beacon arrival
-// to detection decision, measured with clock_gettime() in 08_beacon_handlers.h.
+// PBPO_Full: Per-Beacon Processing Overhead — full controller-side pipeline (ms)
+// Mean wall-clock time from beacon arrival at HandleBeaconReceived() to detection
+// decision. Measured with clock_gettime(CLOCK_MONOTONIC) in 08_detection_engine.h.
+// Covers: TP-DETECT (Alg 1) + SYB-DETECT (Alg 2) + MITM-DETECT (Alg 3) + CP-DETECT (Alg 4)
+// + confusion matrix update + beacon CSV log + downlink packet construction.
 double compute_PBPO()
 {
     if (pbpo_cnt == 0) return 0.0;
     return pbpo_time_sum_ms / (double)pbpo_cnt;
 }
 
-// ── Print all 7 metrics to stdout ─────────────────────────────────────────────
+// PBPO_LW: RSU-side lightweight HMAC gate overhead (ms) — Eq.4.7, lightweight mode
+// Mean wall-clock time of the HMAC verification step at the RSU (before forwarding
+// to the controller). This is the per-beacon cost of the first-line authentication gate.
+// Measured separately from PBPO_Full so both modes are independently characterised.
+double compute_PBPO_LW()
+{
+    if (pbpo_lw_cnt == 0) return 0.0;
+    return pbpo_lw_time_sum_ms / (double)pbpo_lw_cnt;
+}
+
+// ── Print all metrics to stdout ────────────────────────────────────────────────
 void print_mptd_metrics()
 {
     std::cout << "\n── MPTD-PQS Detection Metrics ────────────────────────" << std::endl;
+    std::cout << "  Attack: " << attack_number
+              << " (" << attack_scenario_name[attack_number] << ")"
+              << "  pct=" << attack_percentage
+              << "%  speed=" << maxspeed << " km/h" << std::endl;
     std::cout << "  Confusion matrix:"
               << "  TP=" << cm_TP
               << "  FP=" << cm_FP
@@ -537,58 +555,91 @@ void print_mptd_metrics()
               << "  FN=" << cm_FN << std::endl;
     std::cout << "  MCC  = " << compute_MCC()  << "  (Matthews Correlation Coefficient)" << std::endl;
     std::cout << "  FPR  = " << compute_FPR()  << "  (False Positive Rate)" << std::endl;
-    std::cout << "  PARR = " << compute_PARR() << "  (TRS blockchain rejection rate; " << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned submissions revoked)" << std::endl;
-    std::cout << "  CDER = " << compute_CDER() << "  (Correct Detection-to-Error Ratio = Accuracy = (TP+TN)/total)" << std::endl;
-    std::cout << "  TDEE = " << compute_TDEE() << "    (traffic density estimation error, dimensionless)" << std::endl;
-    std::cout << "  TPE  = " << compute_TPE()  << " m  (RMSE position error, malicious vehicles only)" << std::endl;
-    std::cout << "  PBPO = " << compute_PBPO() << " ms (mean per-beacon detection overhead)" << std::endl;
+    std::cout << "  PARR = " << compute_PARR()
+              << "  (TRS blockchain rejection; "
+              << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned revoked)" << std::endl;
+    // CDER: show source (control-plane decisions or fallback)
+    if (ctrl_decisions_total > 0)
+        std::cout << "  CDER = " << compute_CDER()
+                  << "  (ctrl-plane decisions: " << ctrl_decisions_wrong
+                  << "/" << ctrl_decisions_total
+                  << " wrong, Eq.4.4, lower=better)" << std::endl;
+    else
+        std::cout << "  CDER = " << compute_CDER()
+                  << "  (beacon-level (FP+FN)/total fallback, Eq.4.4, lower=better)" << std::endl;
+    // TDEE & TPE: both require SUMO — not computable from NS-3 alone
+    std::cout << "  TDEE = -1  (requires SUMO ρ_gt(t), Eq.4.5"
+              << "; applicable for MP attacks {3,4,6,7})" << std::endl;
+    std::cout << "  TPE  = -1  (requires SUMO + ctrl predictor, Eq.4.6"
+              << "; applicable for TP attacks {1,2,5})" << std::endl;
+    // PBPO: separate lightweight (RSU) and full (controller) modes
+    std::cout << "  PBPO_LW   = " << compute_PBPO_LW()
+              << " ms (" << pbpo_lw_cnt << " beacons, RSU HMAC gate, Eq.4.7 LW)" << std::endl;
+    std::cout << "  PBPO_Full = " << compute_PBPO()
+              << " ms (" << pbpo_cnt << " beacons, controller pipeline, Eq.4.7 Full)" << std::endl;
     std::cout << "──────────────────────────────────────────────────────" << std::endl;
 }
 
 // ── Master results CSV — one row per simulation run ───────────────────────────
-// Output: analytics/results/sweep/metrics_a{attack_number}_p{attack_percentage}.csv
+// Output: analytics/results/sweep/metrics_a{N}_p{P}_s{S}.csv
+//   N = attack_number (1-7)
+//   P = attack_percentage (5,10,20,30)
+//   S = maxspeed km/h (20,50,100)
 // Scheduled from 12_main.h after Simulator::Run().
+//
+// TDEE and TPE columns are -1 (require SUMO integration — see compute_TDEE/TPE).
+// CDER uses control-plane decision counters when Option B is active (Eq.4.4).
+// PBPO_LW = RSU HMAC gate overhead; PBPO_Full = controller detection pipeline.
 void write_mptd_results_csv()
 {
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
     ensure_analytics_dir(NS3_ROOT "/analytics/results/sweep");
 
+    // Filename includes speed regime so sweeps over {20,50,100} km/h don't overwrite
     std::ostringstream fname;
     fname << NS3_ROOT "/analytics/results/sweep/metrics_a"
-          << attack_number << "_p" << attack_percentage << ".csv";
+          << attack_number << "_p" << attack_percentage
+          << "_s" << maxspeed << ".csv";
 
     std::ofstream fout(fname.str(), std::ios::out | std::ios::trunc);
 
-    // Header
-    fout << "attack_number,attack_pct,"
+    // Header — note: TDEE=-1, TPE=-1 (SUMO required); CDER from ctrl-plane decisions
+    fout << "attack_number,attack_pct,maxspeed_kmh,"
          << "cm_TP,cm_FP,cm_TN,cm_FN,"
-         << "MCC,FPR,PARR,CDER,TDEE,TPE,PBPO,"
+         << "MCC,FPR,PARR,"
+         << "CDER,ctrl_decisions_total,ctrl_decisions_wrong,"
+         << "TDEE,TPE,"
+         << "PBPO_LW_ms,PBPO_Full_ms,"
          << "total_received,total_poisoned,total_stored\n";
 
     // Values
-    fout << attack_number        << ","
-         << attack_percentage    << ","
-         << cm_TP                << ","
-         << cm_FP                << ","
-         << cm_TN                << ","
-         << cm_FN                << ","
-         << compute_MCC()        << ","
-         << compute_FPR()        << ","
-         << compute_PARR()       << ","
-         << compute_CDER()       << ","
-         << compute_TDEE()       << ","
-         << compute_TPE()        << ","
-         << compute_PBPO()       << ","
-         << total_trajectories_received         << ","
-         << total_trajectories_poisoned         << ","
+    fout << attack_number              << ","
+         << attack_percentage          << ","
+         << maxspeed                   << ","
+         << cm_TP                      << ","
+         << cm_FP                      << ","
+         << cm_TN                      << ","
+         << cm_FN                      << ","
+         << compute_MCC()              << ","
+         << compute_FPR()              << ","
+         << compute_PARR()             << ","
+         << compute_CDER()             << ","
+         << ctrl_decisions_total       << ","
+         << ctrl_decisions_wrong       << ","
+         << compute_TDEE()             << ","   // -1 (requires SUMO)
+         << compute_TPE()              << ","   // -1 (requires SUMO)
+         << compute_PBPO_LW()          << ","
+         << compute_PBPO()             << ","
+         << total_trajectories_received          << ","
+         << total_trajectories_poisoned          << ","
          << total_trajectories_stored_blockchain << "\n";
     fout.close();
 
     // Also print to stdout and note the file written
     print_mptd_metrics();
-    std::cout << "  Results CSV: " << fname.str() << std::endl;
-    std::cout << "  Beacon log : " NS3_ROOT "/analytics/results/beacon_log.csv" << std::endl;
+    std::cout << "  Results CSV : " << fname.str() << std::endl;
+    std::cout << "  Beacon log  : " NS3_ROOT "/analytics/results/beacon_log.csv" << std::endl;
 }
 
 #endif // MPTD_PQS_METRICS_CSV_H

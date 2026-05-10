@@ -186,9 +186,18 @@ uint32_t parr_poisoned_total = 0;
 // TPE: RMSE of |reported_pos - real_pos| for malicious-vehicle beacons only (m)
 double   tpe_sq_sum       = 0.0;
 uint32_t tpe_cnt          = 0;
-// PBPO: mean beacon processing time per receive-side call (ms)
+// PBPO_Full: mean beacon processing time per receive-side call (controller pipeline, ms)
 double   pbpo_time_sum_ms = 0.0;
 uint32_t pbpo_cnt         = 0;
+// CDER: control-decision level tracking (Eq.4.4 at downlink control plane)
+// Tracks correctness of each DownlinkControlTag sent by management node.
+// WRONG_ROUTING always wrong; CLEAN for poisoned = FN; ATTACK_DETECTED for clean = FP.
+uint32_t ctrl_decisions_total = 0;
+uint32_t ctrl_decisions_wrong = 0;
+// PBPO_LW: RSU-side lightweight HMAC gate processing time (Eq.4.7, lightweight mode)
+// Separate from PBPO_Full (controller-side full detection pipeline).
+double   pbpo_lw_time_sum_ms = 0.0;
+uint32_t pbpo_lw_cnt         = 0;
 
 // ── Send-side speed/time history — separate from receive-side vehicle_state ──
 // Used only in send_LTE_metadata_uplink_alone() to compute accel at send time.

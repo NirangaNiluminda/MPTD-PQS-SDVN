@@ -236,6 +236,23 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	tag.SetAttackType(static_cast<uint32_t>(attack_number));
 	tag.SetSigViolated(0); // sig_violated set by detector (08_detection_engine.h)
 
+	// ── LKH HMAC beacon tag (Eq.3.37): MAC_i(t) = HMAC_{K_i}(b_i(t)‖t‖ID_i) ──
+	// Honest vehicles compute HMAC with their current session key K_i.
+	// Malicious vehicles (attackers) also compute HMAC with their K_i —
+	// but their K_i changes after revocation → future beacons rejected at RSU gate.
+	// A completely external attacker (no valid K_i) cannot forge a valid HMAC.
+	{
+		int v_idx = lkh_veh_idx(nid);
+		if (v_idx >= 0 && v_idx < LKH_MAX_VEH) {
+			double tx_t = Simulator::Now().GetSeconds();
+			uint8_t mac[LKH_HMAC_TRUNC];
+			lkh_compute_beacon_hmac(v_idx,
+			                        tx_px, tx_py, tx_spd, tx_hdg, tx_acc,
+			                        tx_t, nid, mac);
+			tag.SetHmac(mac);
+		}
+	}
+
 	Ptr<Packet> packet1 = Create<Packet>(0);
 	packet1->AddPacketTag(tag);
 	lte_total_packet_size += packet1->GetSerializedSize();
