@@ -104,6 +104,7 @@ bool g_backup_controller_active = false;
 //   3 = A3  AE only          : Temporal AE stub (AE not yet implemented  → same as A1)
 //   4 = A4  Full, no PQ      : Rules + HMAC, TRS/FHE disabled (use_pq_crypto=false)
 //   5 = A5  Full, no BC      : Rules + HMAC, blockchain SC calls skipped
+//   6 = B1  Ghaleb (2014)    : LTT baseline — speed plausibility + cross-RSU reachability only
 int ablation_mode = 1;
 
 // ── Stage 7: Post-Quantum Crypto flag ──────────────────────────────────────

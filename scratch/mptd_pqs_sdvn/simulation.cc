@@ -49,6 +49,7 @@
 #include "06a_attack_models.h"
 // 08_lldp_handlers.h REMOVED - legacy LLDP state machine (replaced by 08_detection_engine.h)
 #include "07_socket_layer.h"
+#include "08b_baseline_ltt.h"   // B1: Ghaleb (2014) LTT baseline (ablation_mode=6)
 #include "08_detection_engine.h"
 #include "09_vehicle_beacon_tx.h"
 #include "10_metrics_csv.h"

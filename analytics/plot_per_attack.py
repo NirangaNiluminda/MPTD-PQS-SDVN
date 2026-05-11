@@ -1,23 +1,23 @@
 """
 plot_per_attack.py  —  MPTD-PQS  |  Metric vs Attack Percentage
 ================================================================
-Creates one publication-quality figure per ATTACK SCENARIO.
+Multi-line comparison: MPTD-PQS A1 (Proposed) vs A4 no-PQ vs B1 Ghaleb LTT
 
-Each figure:
-  X-axis : Attack Percentage (%)  — increasing left to right
-  Y-axis : Chosen metric (MCC, DR, FPR, Precision, F1)
-  Lines  : MPTD-PQS (Proposed)  — one line for now
-           [add baseline methods here later]
+Each MCC figure:
+  X-axis : Attack Percentage (%)
+  Y-axis : MCC (or other metric)
+  Lines  : Red   solid  — MPTD-PQS A1 (Proposed)    ablation_mode=1
+           Blue  dashed — A4: No PQ-Crypto            ablation_mode=4
+           Green dashed — B1: Ghaleb LTT (2014)       ablation_mode=6
 
-Supervisor's exact requirement:
-  "A plot per each metric.  Since you have still not implemented
-   existing techniques for result benchmarking, you will have only
-   1 graph per plot: the proposed method."
+Figure sets produced:
+  set 1  fig_a{1-7}_mcc.png/.pdf        — MCC per attack, 3 lines
+  set 2  fig_a{1-7}_all_metrics.png     — all 5 metrics, A1 only
+  set 3  fig_combined_mcc.png/.pdf      — all attacks, 3 lines each subplot
+  set 4  fig_combined_all.png/.pdf      — attacks x metrics grid (A1 only)
+  set 5  fig_mcc_comparison.png/.pdf    — ablation comparison grid (A1/A4/B1)
 
 Outputs  →  analytics/results/figures/per_attack/
-  fig_a1_mcc.png / .pdf  ...  fig_a7_mcc.png / .pdf
-  fig_a1_all.png / .pdf  ...  fig_a7_all.png / .pdf   (all 5 metrics)
-  fig_combined_mcc.png   — all attacks on one page (supervisor style)
 
 Run:
     cd /home/niranga/ns-allinone-3.35/ns-3.35
@@ -50,29 +50,45 @@ ATTACK_META = {
     7: ("A7", "MP-S4",  "Mobility Pattern:\nControl Plane Poisoning"),
 }
 
-# ─── Plot styling (matches supervisor's reference figure) ─────────────────────
-PROPOSED = dict(color="#D32F2F", marker="o", markersize=8,
-                linewidth=2.5, linestyle="-", label="MPTD-PQS (Proposed)", zorder=5)
-
-# Placeholder colours for future baseline methods
-BASELINES = [
-    dict(color="#1565C0", marker="*",  markersize=9,  linewidth=2, linestyle="--", label="Ack-based"),
-    dict(color="#E91E8C", marker="^",  markersize=8,  linewidth=2, linestyle="-.", label="Hop cnt-based"),
-    dict(color="#212121", marker="D",  markersize=7,  linewidth=2, linestyle=":",  label="RREQ-based"),
-    dict(color="#2E7D32", marker="s",  markersize=7,  linewidth=2, linestyle="-",  label="Hybrid"),
-]
+# ─── Method line styles (keyed by ablation_mode integer) ─────────────────────
+METHOD_STYLES = {
+    1: dict(color="#D32F2F", marker="o", markersize=8,  linewidth=2.5,
+            linestyle="-",  label="MPTD-PQS A1 (Proposed)", zorder=5),
+    4: dict(color="#1565C0", marker="s", markersize=7,  linewidth=2.0,
+            linestyle="--", label="A4: No PQ-Crypto",        zorder=4),
+    6: dict(color="#2E7D32", marker="^", markersize=8,  linewidth=2.0,
+            linestyle="--", label="B1: Ghaleb LTT (2014)",   zorder=3),
+}
 
 # ─── Load & prepare data ──────────────────────────────────────────────────────
 def load_data():
-    files  = sorted(glob.glob(os.path.join(SWEEP_DIR, "metrics_a*.csv")))
-    data   = pd.concat([pd.read_csv(f) for f in files], ignore_index=True)
-    data   = data[data["total_received"] > 0].copy()
+    """
+    Read all metrics_a*.csv files from SWEEP_DIR.
+    Computes DR, Precision, F1, MCC from confusion-matrix columns.
+    Ensures ablation_mode column is present (defaults to 1 for legacy files).
+    Returns one combined DataFrame.
+    """
+    files = sorted(glob.glob(os.path.join(SWEEP_DIR, "metrics_a*.csv")))
+    if not files:
+        raise FileNotFoundError(f"No CSV files found in {SWEEP_DIR}")
 
-    # ε = 10⁻⁶ : supervisor-specified numerical stability constant.
-    # Added to all four CM cells before any metric computation so the
-    # MCC denominator never reaches exactly zero (occurs when TN=0 and
-    # FP=0 at 100 % attack percentage).  Value is small enough that it
-    # does not visibly distort counts that are already non-zero.
+    frames = []
+    for f in files:
+        try:
+            frames.append(pd.read_csv(f))
+        except Exception as e:
+            print(f"  WARN: could not read {f}: {e}")
+
+    data = pd.concat(frames, ignore_index=True)
+    data = data[data["total_received"] > 0].copy()
+
+    # Ensure ablation_mode column (old CSVs without it default to m=1)
+    if "ablation_mode" not in data.columns:
+        data["ablation_mode"] = 1
+    data["ablation_mode"] = data["ablation_mode"].astype(int)
+
+    # ε = 10⁻⁶ : numerical stability so MCC denominator never reaches zero
+    # (occurs when TN=0 and FP=0 at 100% attack percentage)
     eps = 1e-6
     tp = data["cm_TP"].astype(float) + eps
     fp = data["cm_FP"].astype(float) + eps
@@ -83,15 +99,13 @@ def load_data():
     data["Precision"] = tp / (tp + fp)
     data["F1"]        = 2*tp / (2*tp + fp + fn)
 
-    # Recompute MCC from smoothed counts (replaces raw CSV MCC value).
-    # Denominator is now always > 0 → defined at every attack percentage
-    # including 100 % where TN_raw = 0.
+    # Recompute MCC from smoothed counts — always defined
     denom = np.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
     data["MCC"] = (tp*tn - fp*fn) / denom
 
     return data
 
-# ─── Helper: style one axes ───────────────────────────────────────────────────
+# ─── Helper: apply common axes style ─────────────────────────────────────────
 def _style_ax(ax, xlabel, ylabel, title, ylim=(0, 1.05)):
     ax.set_xlabel(xlabel, fontsize=12)
     ax.set_ylabel(ylabel, fontsize=12)
@@ -104,33 +118,31 @@ def _style_ax(ax, xlabel, ylabel, title, ylim=(0, 1.05)):
     ax.tick_params(labelsize=10)
     ax.grid(True, linestyle="--", alpha=0.45)
 
-# ─── Figure 1: One MCC figure per attack (supervisor style) ──────────────────
+# ─── Figure set 1: One MCC figure per attack, 3 lines ────────────────────────
 def plot_mcc_per_attack(data):
     """
-    7 separate figures — each looks like supervisor's Figure 11.
-    Currently 1 red line (proposed).  Add baselines below when ready.
+    7 separate figures (one per attack scenario).
+    Each shows MCC vs Attack % for A1, A4, B1 on the same axes.
+    Supervisor style: matches Figure 11 layout.
     """
     for atk_num, (short, pid, title) in ATTACK_META.items():
-        sub = (data[data["attack_number"] == atk_num]
-               .sort_values("attack_pct")
-               .dropna(subset=["MCC"]))
-
-        if sub.empty:
-            print(f"  SKIP A{atk_num}: no valid MCC data")
-            continue
-
         fig, ax = plt.subplots(figsize=(6, 4.5))
+        plotted = 0
 
-        # ── Proposed method (RED solid line) ──────────────────────────────────
-        ax.plot(sub["attack_pct"], sub["MCC"], **PROPOSED)
+        for mode, style in METHOD_STYLES.items():
+            sub = (data[(data["attack_number"] == atk_num) &
+                        (data["ablation_mode"] == mode)]
+                   .sort_values("attack_pct")
+                   .dropna(subset=["MCC"]))
+            if sub.empty:
+                continue
+            ax.plot(sub["attack_pct"], sub["MCC"], **style)
+            plotted += 1
 
-        # ── TO ADD BASELINES LATER — uncomment and fill values ────────────────
-        # baseline_pcts = [0, 20, 40, 60, 80, 100]
-        # ax.plot(baseline_pcts, [0.86, 0.81, 0.75, 0.62, 0.43, 0.10],
-        #         **BASELINES[0])   # Ack-based
-        # ax.plot(baseline_pcts, [0.88, 0.60, 0.40, 0.20, 0.10, 0.05],
-        #         **BASELINES[1])   # Hop cnt-based
-        # ─────────────────────────────────────────────────────────────────────
+        if plotted == 0:
+            print(f"  SKIP A{atk_num}: no valid MCC data")
+            plt.close(fig)
+            continue
 
         _style_ax(ax,
                   xlabel="Attack Percentage (%)",
@@ -146,30 +158,31 @@ def plot_mcc_per_attack(data):
         plt.close(fig)
         print(f"  [OK] {out}.png")
 
-# ─── Figure 2: All metrics for one attack (5-line subplot) ───────────────────
+# ─── Figure set 2: All 5 metrics per attack — proposed method only ────────────
 METRIC_SPECS = [
-    ("MCC",       "MCC",                           (0, 1.05), "#D32F2F"),
-    ("DR",        "Detection Rate",                (0, 1.05), "#1565C0"),
-    ("FPR",       "False Positive Rate",           (0, 1.05), "#E91E8C"),
-    ("Precision", "Precision",                     (0, 1.05), "#2E7D32"),
-    ("F1",        "F1-Score",                      (0, 1.05), "#FF6F00"),
+    ("MCC",       "MCC",                 (0, 1.05), "#D32F2F"),
+    ("DR",        "Detection Rate",      (0, 1.05), "#1565C0"),
+    ("FPR",       "False Positive Rate", (0, 1.05), "#E91E8C"),
+    ("Precision", "Precision",           (0, 1.05), "#2E7D32"),
+    ("F1",        "F1-Score",            (0, 1.05), "#FF6F00"),
 ]
 
 def plot_all_metrics_per_attack(data):
     """
-    For each attack: one figure with 5 metric lines vs attack percentage.
-    This gives a complete picture of proposed-method performance per attack.
+    For each attack: one figure with 5 metric lines (A1 proposed only).
+    Gives a complete per-attack picture for the proposed method chapter.
     """
-    for atk_num, (short, pid, title) in ATTACK_META.items():
-        sub = (data[data["attack_number"] == atk_num]
-               .sort_values("attack_pct"))
+    proposed = data[data["ablation_mode"] == 1]
 
+    for atk_num, (short, pid, title) in ATTACK_META.items():
+        sub = (proposed[proposed["attack_number"] == atk_num]
+               .sort_values("attack_pct"))
         if sub.empty:
             continue
 
         fig, ax = plt.subplots(figsize=(7, 5))
-
         any_plotted = False
+
         for col, lbl, ylim, clr in METRIC_SPECS:
             s = sub.dropna(subset=[col])
             if len(s) < 2:
@@ -185,7 +198,7 @@ def plot_all_metrics_per_attack(data):
 
         ax.set_xlabel("Attack Percentage (%)", fontsize=12)
         ax.set_ylabel("Metric Value",           fontsize=12)
-        ax.set_title(f"MPTD-PQS Performance — {pid}: {title.replace(chr(10), ' ')}",
+        ax.set_title(f"MPTD-PQS A1 — {pid}: {title.replace(chr(10), ' ')}",
                      fontsize=11, fontweight="bold")
         ax.set_xlim(0, 105)
         ax.set_ylim(0, 1.05)
@@ -202,15 +215,15 @@ def plot_all_metrics_per_attack(data):
         plt.close(fig)
         print(f"  [OK] {out}.png")
 
-# ─── Figure 3: Combined grid — all attacks, MCC only (supervisor overview) ───
+# ─── Figure set 3: Combined MCC grid — all attacks, 3 lines per subplot ───────
 def plot_combined_mcc_grid(data):
     """
-    Single page: 2 × 4 grid of MCC plots — one subplot per attack.
-    Looks like the supervisor's reference figure but for all 7 attacks.
+    Single page: 2×4 grid of MCC subplots.
+    Each subplot shows A1 (red), A4 (blue dashed), B1 (green dashed).
     """
-    attacks = [a for a in ATTACK_META if not
-               data[(data["attack_number"]==a) & data["MCC"].notna()].empty]
-
+    attacks = sorted([a for a in ATTACK_META
+                      if not data[(data["attack_number"]==a) &
+                                  data["MCC"].notna()].empty])
     ncol = 4
     nrow = int(np.ceil(len(attacks) / ncol))
 
@@ -222,14 +235,18 @@ def plot_combined_mcc_grid(data):
         ax   = fig.add_subplot(gs[r, c])
 
         short, pid, title = ATTACK_META[atk_num]
-        sub = (data[data["attack_number"] == atk_num]
-               .sort_values("attack_pct")
-               .dropna(subset=["MCC"]))
+        plotted_any = False
 
-        if not sub.empty:
-            ax.plot(sub["attack_pct"], sub["MCC"],
-                    color="#D32F2F", marker="o", markersize=6,
-                    linewidth=2.2, linestyle="-", label="MPTD-PQS")
+        for mode, style in METHOD_STYLES.items():
+            sub = (data[(data["attack_number"] == atk_num) &
+                        (data["ablation_mode"] == mode)]
+                   .sort_values("attack_pct")
+                   .dropna(subset=["MCC"]))
+            if sub.empty:
+                continue
+            small_style = dict(style, markersize=5, linewidth=1.8)
+            ax.plot(sub["attack_pct"], sub["MCC"], **small_style)
+            plotted_any = True
 
         ax.set_title(f"{pid}: {title.split(chr(10))[0]}", fontsize=9.5, fontweight="bold")
         ax.set_xlabel("Attack %", fontsize=9)
@@ -240,9 +257,10 @@ def plot_combined_mcc_grid(data):
         ax.yaxis.set_major_locator(ticker.MultipleLocator(0.2))
         ax.tick_params(labelsize=8)
         ax.grid(True, linestyle="--", alpha=0.45)
-        ax.legend(fontsize=7.5, loc="upper right", framealpha=0.85)
+        if plotted_any:
+            ax.legend(fontsize=7, loc="upper right", framealpha=0.85)
 
-    fig.suptitle("MPTD-PQS: MCC Analysis per Attack Scenario",
+    fig.suptitle("MPTD-PQS vs Ablations: MCC per Attack Scenario",
                  fontsize=14, fontweight="bold", y=1.02)
     fig.tight_layout()
 
@@ -252,13 +270,15 @@ def plot_combined_mcc_grid(data):
     plt.close(fig)
     print(f"  [OK] {out}.png")
 
-# ─── Figure 4: Combined grid — all attacks, all metrics ──────────────────────
+# ─── Figure set 4: Combined attacks×metrics grid — A1 proposed only ───────────
 def plot_combined_all_metrics_grid(data):
     """
-    Full overview: rows = attack scenarios, columns = metrics.
+    Full overview: rows = attack scenarios, columns = 5 metrics.
+    Uses A1 (proposed) data only — detailed method performance overview.
     """
+    proposed = data[data["ablation_mode"] == 1]
     attacks  = sorted([a for a in ATTACK_META if a != 0
-                       and not data[data["attack_number"]==a].empty])
+                       and not proposed[proposed["attack_number"]==a].empty])
     metrics  = [(col, lbl, clr) for col, lbl, _, clr in METRIC_SPECS]
 
     nrow, ncol = len(attacks), len(metrics)
@@ -267,7 +287,7 @@ def plot_combined_all_metrics_grid(data):
 
     for ri, atk_num in enumerate(attacks):
         short, pid, _ = ATTACK_META[atk_num]
-        sub = data[data["attack_number"] == atk_num].sort_values("attack_pct")
+        sub = proposed[proposed["attack_number"] == atk_num].sort_values("attack_pct")
 
         for ci, (col, lbl, clr) in enumerate(metrics):
             ax = fig.add_subplot(gs[ri, ci])
@@ -293,7 +313,7 @@ def plot_combined_all_metrics_grid(data):
             ax.tick_params(labelsize=7)
             ax.grid(True, linestyle="--", alpha=0.4)
 
-    fig.suptitle("MPTD-PQS: All Metrics per Attack Scenario (X = Attack %)",
+    fig.suptitle("MPTD-PQS A1 (Proposed): All Metrics per Attack Scenario",
                  fontsize=12, fontweight="bold", y=1.01)
     fig.tight_layout()
 
@@ -303,35 +323,108 @@ def plot_combined_all_metrics_grid(data):
     plt.close(fig)
     print(f"  [OK] {out}.png")
 
+# ─── Figure set 5: NEW — Ablation comparison grid (A1 vs A4 vs B1) ───────────
+def plot_mcc_comparison_grid(data):
+    """
+    2×4 grid, one subplot per attack.
+    All three methods on same axes with shared legend at bottom.
+    Key figure for RQ2 (ablation study) and RQ3 (baseline comparison).
+    """
+    attacks = sorted(ATTACK_META.keys())
+    ncol = 4
+    nrow = int(np.ceil(len(attacks) / ncol))
+
+    fig = plt.figure(figsize=(ncol * 4.5, nrow * 3.8 + 0.6))
+    gs  = GridSpec(nrow, ncol, figure=fig, hspace=0.60, wspace=0.38)
+
+    legend_handles = []
+    legend_labels  = []
+
+    for idx, atk_num in enumerate(attacks):
+        r, c = divmod(idx, ncol)
+        ax   = fig.add_subplot(gs[r, c])
+
+        short, pid, title = ATTACK_META[atk_num]
+
+        for mode, style in METHOD_STYLES.items():
+            sub = (data[(data["attack_number"] == atk_num) &
+                        (data["ablation_mode"] == mode)]
+                   .sort_values("attack_pct")
+                   .dropna(subset=["MCC"]))
+            if sub.empty:
+                continue
+            s2 = dict(style, markersize=5, linewidth=1.8)
+            h, = ax.plot(sub["attack_pct"], sub["MCC"], **s2)
+            if idx == 0:
+                legend_handles.append(h)
+                legend_labels.append(style["label"])
+
+        ax.set_title(f"{pid}: {title.split(chr(10))[0]}", fontsize=9.5, fontweight="bold")
+        ax.set_xlabel("Attack %", fontsize=8.5)
+        ax.set_ylabel("MCC",      fontsize=8.5)
+        ax.set_xlim(0, 105)
+        ax.set_ylim(0, 1.05)
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(20))
+        ax.yaxis.set_major_locator(ticker.MultipleLocator(0.2))
+        ax.tick_params(labelsize=7.5)
+        ax.grid(True, linestyle="--", alpha=0.45)
+
+    if legend_handles:
+        fig.legend(handles=legend_handles, labels=legend_labels,
+                   loc="lower center", ncol=3, fontsize=10,
+                   framealpha=0.92, bbox_to_anchor=(0.5, -0.03))
+
+    fig.suptitle("MCC Comparison: MPTD-PQS A1 vs A4 (No PQ) vs B1 Ghaleb LTT",
+                 fontsize=13, fontweight="bold", y=1.02)
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+
+    out = os.path.join(OUT_DIR, "fig_mcc_comparison")
+    fig.savefig(out + ".png", dpi=300, bbox_inches="tight")
+    fig.savefig(out + ".pdf",          bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [OK] {out}.png")
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 def main():
-    print("=" * 62)
-    print("  MPTD-PQS — Per-Attack Metric Plots (Supervisor Style)")
-    print("=" * 62)
+    print("=" * 64)
+    print("  MPTD-PQS — Per-Attack Plots  |  A1 vs A4 vs B1 Comparison")
+    print("=" * 64)
 
-    print(f"\nLoading: {SWEEP_DIR}")
+    print(f"\nLoading CSVs from: {SWEEP_DIR}")
     data = load_data()
-    print(f"  {len(data)} valid rows | attacks: {sorted(data['attack_number'].unique())}\n")
+    modes   = sorted(data["ablation_mode"].unique())
+    attacks = sorted(data["attack_number"].unique())
+    print(f"  {len(data)} valid rows")
+    print(f"  attack_numbers   : {attacks}")
+    print(f"  ablation_modes   : {modes}")
+    mode_labels = {1: "A1 (Proposed)", 4: "A4 no-PQ", 6: "B1 Ghaleb LTT"}
+    for m in modes:
+        n = len(data[data["ablation_mode"] == m])
+        print(f"    mode {m}  {mode_labels.get(m,'?'):20s} : {n} rows")
+    print()
 
-    print("── Figure set 1: MCC vs Attack %  (one figure per attack) ──")
+    print("── Figure set 1: MCC vs Attack %  (one figure per attack, 3 lines) ──")
     plot_mcc_per_attack(data)
 
-    print("\n── Figure set 2: All metrics vs Attack %  (one per attack) ──")
+    print("\n── Figure set 2: All metrics vs Attack %  (A1 proposed only) ──────")
     plot_all_metrics_per_attack(data)
 
-    print("\n── Figure set 3: Combined MCC grid  (all attacks one page) ──")
+    print("\n── Figure set 3: Combined MCC grid  (all 7 attacks, 3 lines each) ──")
     plot_combined_mcc_grid(data)
 
-    print("\n── Figure set 4: Full overview grid  (attacks × metrics) ────")
+    print("\n── Figure set 4: Full overview grid  (A1 attacks × 5 metrics) ──────")
     plot_combined_all_metrics_grid(data)
+
+    print("\n── Figure set 5: Ablation comparison grid  (A1 vs A4 vs B1) ────────")
+    plot_mcc_comparison_grid(data)
 
     print(f"\nAll outputs → {OUT_DIR}")
     files = sorted(os.listdir(OUT_DIR))
-    print(f"\n{'File':<42}  {'Size':>8}")
-    print("-" * 53)
+    print(f"\n{'File':<44}  {'Size':>8}")
+    print("-" * 55)
     for f in files:
         sz = os.path.getsize(os.path.join(OUT_DIR, f))
-        print(f"  {f:<40}  {sz/1024:7.1f} KB")
+        print(f"  {f:<42}  {sz/1024:7.1f} KB")
     print("\nDone!")
 
 if __name__ == "__main__":

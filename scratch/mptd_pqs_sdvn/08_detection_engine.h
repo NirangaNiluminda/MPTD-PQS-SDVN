@@ -812,12 +812,17 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                 tag.GetSpeed(), tag.GetHeading(),
                 tag.GetAcceleration(), tag.GetTimestamp());
 
-    // 2. Run detection algorithms (paper Algorithms 1–4)
-    uint32_t tp_flags   = run_tp_detect(vehicle_id, tag);          // Alg 1: TP-S1..S5
-    uint32_t mp_flags   = run_syb_detect(vehicle_id, rsu_id, tag); // Alg 2: MP-S1,S2,S4
-    uint32_t mitm_flags = run_mitm_detect(vehicle_id, rsu_id, tag);// Alg 3: MP-S3 (KL)
-    mp_flags           |= mitm_flags; // merge: bit 2 (MP-S3) now comes from MITM-DETECT
-    uint32_t cp_flags   = run_cp_detect(tag);                      // Alg 4: CP
+    // 2. Run detection algorithms
+    // B1 ablation (mode=6): Ghaleb (2014) LTT — two rule checks only, no MPTD-PQS sigs
+    // All other modes: full MPTD-PQS pipeline (Algorithms 1–4)
+    uint32_t tp_flags = 0, mp_flags = 0, cp_flags = 0;
+    if (ablation_mode != 6) {
+        tp_flags   = run_tp_detect(vehicle_id, tag);          // Alg 1: TP-S1..S5
+        mp_flags   = run_syb_detect(vehicle_id, rsu_id, tag); // Alg 2: MP-S1,S2,S4
+        uint32_t mitm_flags = run_mitm_detect(vehicle_id, rsu_id, tag); // Alg 3: MP-S3
+        mp_flags  |= mitm_flags;
+        cp_flags   = run_cp_detect(tag);                      // Alg 4: CP
+    }
 
     // Restore honest vehicle state if stolen beacon triggered MP-S4
     // This prevents the fake position from persisting as the baseline reference,
@@ -852,7 +857,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // handle per-beacon detection (only attack_pct% of beacons are actually modified),
     // so including cp_flags there would create false positives for unmodified beacons.
     bool cp_detected = (cp_flags != 0) && (attack_number == 7);
-    bool detected = anomalous || (tp_flags != 0) || (mp_flags != 0) || cp_detected;
+    bool detected;
+    if (ablation_mode == 6) {
+        // B1: Ghaleb (2014) LTT — speed plausibility + cross-RSU reachability
+        detected = run_ltt_detect(vehicle_id, rsu_id, tag);
+    } else {
+        // MPTD-PQS: composite score + individual signature flags
+        detected = anomalous || (tp_flags != 0) || (mp_flags != 0) || cp_detected;
+    }
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
     if (tag.GetIsPoisoned()) parr_poisoned_total++;   // PARR denominator: total poisoned submissions
     // ψ_i(t): weighted signature score (Eq. 3.20) — same weights as run_lightweight_score()
