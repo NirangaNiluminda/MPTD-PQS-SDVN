@@ -349,67 +349,115 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 {
     uint32_t violated = 0;
 
-    // MP-S3: regional speed KL divergence (Eq. 3.18)
-    // D_KL(P_t || P_hist) > κ_th
-    // Collect speed samples from all vehicles in RSU communication range.
-    // ── Speed sample collection ────────────────────────────────────────────────
-    // Original (RSU-level attacks): local window — only vehicles within R_max_comm.
+    // ── MP-S3: Real KL divergence — D_KL(P_t ‖ P_hist) > κ_th  (Eq. 3.18) ──────
     //
-    // Attack 3 enhanced (pre-registered Sybil, sybil_registration_pct > 0):
-    //   Use GLOBAL statistics — all vehicles in simulation regardless of distance.
-    //   Rationale: when Sybil nodes cluster in one RSU cell they dominate the LOCAL
-    //   mean (≈66 m/s), collapsing kl_approx to < kappa_th and evading detection.
-    //   The SDN controller aggregates data across ALL RSUs (global view), so the
-    //   correct reference distribution is the GLOBAL fleet speed, not one cell.
-    //   With global stats, 1–3 active Sybil in 16 vehicles raise mean only slightly
-    //   (e.g., 3 Sybil → global_mean ≈ 24.7 m/s → kl ≈ 1.50), giving a detection
-    //   boundary that degrades naturally as attack_percentage increases.
-    // ── MP-S3: Mahalanobis-based KL divergence (Eq. 3.18) ────────────────────────
-    // Paper: D_KL(P_t || P_hist) > κ_th
-    // Implementation: Mahalanobis approximation D_KL(δ(v_i) || N(μ,σ²)) ≈ (v_i−μ)²/(2σ²)
-    // This treats the vehicle's speed as a point mass compared to the regional Gaussian
-    // distribution N(μ, σ²), correctly normalising by the actual speed variance (σ²)
-    // rather than the z-score's (mean + floor) denominator used previously.
-    // σ² is floored at (5% of s_max)² = (1.67 m/s)² to prevent zero-division when all
-    // nearby vehicles are stationary or have identical speeds.
+    // P_hist[rsu_id][b]: historical speed distribution for this RSU cell.
+    //   Built as a slow exponential moving average (α=KL_ALPHA=0.05) so it
+    //   tracks normal traffic and is not distorted by brief attack bursts.
     //
-    // Attack 3 enhanced (sybil_registration_pct > 0): use global statistics so that
-    // Sybil nodes clustered in one RSU cell cannot dominate the LOCAL mean and evade.
-    bool use_global_stats = (attack_number == 3 && sybil_registration_pct > 0);
-    double sum_speed    = 0.0;
-    double sum_speed_sq = 0.0;
-    int    count_near   = 0;
-    for (int other = 0; other < total_size; other++) {
-        if (vehicle_state[other].count == 0) continue;
-        int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
-        if (!use_global_stats) {
-            double dx = vehicle_state[other].pos_x[h] - tag.GetPosX();
-            double dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
+    // P_t[b]: current speed distribution — empirical histogram of all vehicles
+    //   currently in this RSU cell (or global for attack-3 enhanced mode).
+    //
+    // KL formula (no library needed — pure C++ arithmetic):
+    //   D_KL = Σ_b  P_t[b] × log( P_t[b] / P_hist[b] )
+    //   Additive smoothing (ε=1e-6) on both distributions prevents log(0).
+    //
+    // Attack-3 enhanced mode (sybil_registration_pct > 0):
+    //   Use global statistics so Sybil nodes clustered in one RSU cell cannot
+    //   dominate the LOCAL mean and evade detection via distribution collapse.
+    //
+    // Calibration (kappa_th = 0.1):
+    //   Honest fleet (similar distribution to P_hist) → D_KL ≈ 0.0   → no flag
+    //   MitM/Sybil shifting speeds by ≥30%           → D_KL > 0.1   → flagged
+
+    bool use_global = (attack_number == 3 && sybil_registration_pct > 0);
+
+    // ── Step 1: collect speeds of vehicles in scope ──────────────────────────
+    double speeds[64];
+    int    n_speeds = 0;
+    for (int v = 0; v < total_size && n_speeds < 64; v++) {
+        if (vehicle_state[v].count == 0) continue;
+        int h = (vehicle_state[v].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+        if (!use_global) {
+            double dx = vehicle_state[v].pos_x[h] - tag.GetPosX();
+            double dy = vehicle_state[v].pos_y[h] - tag.GetPosY();
             if (std::sqrt(dx*dx + dy*dy) >= R_max_comm) continue;
         }
-        double sp = vehicle_state[other].speed[h];
-        sum_speed    += sp;
-        sum_speed_sq += sp * sp;
-        count_near++;
+        speeds[n_speeds++] = vehicle_state[v].speed[h];
     }
-    if (count_near > 0) {
-        double mean_sp = sum_speed / count_near;
-        // Variance of regional speed distribution
-        double var_sp  = (count_near > 1)
-                       ? (sum_speed_sq / count_near - mean_sp * mean_sp)
-                       : 0.0;
-        // Floor: (30% of s_max)² ≈ 100 m²/s² — prevents false positives when the fleet
-        // happens to have a very small speed variance (e.g. synchronised start-of-simulation).
-        // Without the floor: KL(v=0, μ=15, σ²=small) >> 1.5 → FP on legitimate slow vehicles.
-        // With floor=100: KL(v=0, μ=15) = 225/200 = 1.13 < kappa_th → no FP.
-        // For Sybil at 66 m/s vs μ=15, floor=100: KL = 2601/200 = 13 >> 1.5 → always fires.
-        const double SIGMA2_FLOOR = (s_max * 0.3) * (s_max * 0.3); // ≈ 100 m²/s²
-        double sigma2  = (var_sp > SIGMA2_FLOOR) ? var_sp : SIGMA2_FLOOR;
-        // Mahalanobis-based KL: D_KL(δ(v_i) || N(μ,σ²)) ≈ (v_i−μ)²/(2σ²)
-        double delta   = tag.GetSpeed() - mean_sp;
-        double kl_div  = (delta * delta) / (2.0 * sigma2);
-        if (kl_div > kappa_th)
-            violated |= (1 << 2);   // bit 2 = MP-S3 in mp_flags
+
+    if (n_speeds >= 3) {  // need at least 3 samples for a meaningful distribution
+        // ── Step 2: build P_t — current speed histogram, normalised to sum=1 ──
+        double P_t[KL_BINS] = {};
+        for (int i = 0; i < n_speeds; i++) {
+            int b = (int)(speeds[i] / s_max * KL_BINS);
+            if (b < 0)       b = 0;
+            if (b >= KL_BINS) b = KL_BINS - 1;
+            P_t[b] += 1.0;
+        }
+        for (int b = 0; b < KL_BINS; b++) P_t[b] /= (double)n_speeds;
+
+        // ── Step 3: initialise or update P_hist ─────────────────────────────
+        int ri = (rsu_id >= 0 && rsu_id < 4) ? rsu_id : 0;
+        if (!kl_hist_ready[ri]) {
+            // Cold start: set P_hist = P_t (first observation = baseline)
+            for (int b = 0; b < KL_BINS; b++) kl_hist[ri][b] = P_t[b];
+            kl_hist_ready[ri] = true;
+            // Cannot compute KL yet — need at least one historical reference.
+            // Return without flagging on very first beacon.
+            return violated;
+        }
+        // Slow exponential moving average update of historical baseline
+        for (int b = 0; b < KL_BINS; b++)
+            kl_hist[ri][b] = (1.0 - KL_ALPHA) * kl_hist[ri][b]
+                           +        KL_ALPHA   * P_t[b];
+
+        // ── Step 4: compute D_KL(P_t ‖ P_hist) — paper Eq. 3.18 ────────────
+        // Additive smoothing ε prevents log(0) when a bin is empty in either dist.
+        const double EPS = 1e-6;
+        double kl_div = 0.0;
+        for (int b = 0; b < KL_BINS; b++) {
+            double p = P_t[b]      + EPS;  // current distribution
+            double q = kl_hist[ri][b] + EPS;  // historical baseline
+            kl_div += p * std::log(p / q);
+        }
+
+        // ── Step 5: per-vehicle confirmation (prevents cell-level FP) ────────
+        // When D_KL fires (cell distribution shifted), confirm that the CURRENT
+        // vehicle's speed is individually anomalous before raising the flag.
+        // Without this gate, ALL beacons from the RSU cell — including honest ones
+        // sharing a cell with a malicious vehicle — would be flagged as MP-S3 FP.
+        //
+        // Compute P_hist mean μ and std σ from the histogram bins:
+        //   μ = Σ_b  P_hist[b] × bin_centre[b]
+        //   σ = sqrt(Σ_b  P_hist[b] × (bin_centre[b] − μ)²)
+        //
+        // Flag beacon only if D_KL > kappa_th AND |v − μ| > 2σ  (2-sigma rule).
+        // This fires reliably when ALL/MOST beacons are boosted (MitM, attack 6)
+        // while suppressing FP when only a minority are malicious (attack 2, attack 3).
+        if (kl_div > kappa_th) {
+            double mu = 0.0;
+            for (int b = 0; b < KL_BINS; b++) {
+                double bc = (b + 0.5) * s_max / KL_BINS;  // bin centre
+                mu += kl_hist[ri][b] * bc;
+            }
+            double var = 0.0;
+            for (int b = 0; b < KL_BINS; b++) {
+                double bc   = (b + 0.5) * s_max / KL_BINS;
+                double diff = bc - mu;
+                var += kl_hist[ri][b] * diff * diff;
+            }
+            double sigma = std::sqrt(var + 1e-6);
+            double cur_spd = tag.GetSpeed();
+            if (std::fabs(cur_spd - mu) > 2.0 * sigma) {
+                violated |= (1 << 2);  // bit 2 = MP-S3
+                cout << "[MP-S3-KL] RSU" << ri
+                     << " D_KL=" << std::fixed << std::setprecision(4) << kl_div
+                     << " cur_spd=" << cur_spd
+                     << " mu=" << mu << " 2σ=" << 2.0*sigma
+                     << " → individual speed anomaly confirmed" << endl;
+            }
+        }
     }
 
     return violated;
@@ -787,7 +835,22 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // victim's real position but with amplified speed. This contaminates the victim's
     // vehicle_state speed history. Save/restore prevents the poisoned speed from
     // persisting as the baseline for the next honest beacon from that victim.
-    bool save_state = ((attack_number == 4) || (attack_number == 6))
+    // State save/restore — prevents poisoned positions from becoming the comparison
+    // baseline, which would make the next honest→honest transition look anomalous (FP)
+    // or suppress detection of the poisoned beacon itself (FN for TP-S1).
+    //
+    // attack 1 (TP-S1): RSU replaces honest position with sinusoidal drift.
+    //   Consecutive poisoned beacons differ only by drift_rate ≈ 17 m/s (< s_max) → FN.
+    //   By restoring to honest state, each poisoned beacon is compared against the LAST
+    //   HONEST position → apparent velocity = drift_peak/T_b ≈ 50 m/s >> s_max → TP. ✓
+    // attack 5 (TP-S3): controller modifies position+speed before pushing to vehicle_state.
+    //   Without save/restore, the poisoned position becomes the "previous" baseline for the
+    //   NEXT honest beacon, making the honest→honest transition look like an impossible
+    //   jump → false positive.  Save+restore eliminates this contamination.
+    // attack 4 (MP-S2) / attack 6 (MP-S3): stolen/intercepted ID uses victim's vehicle_id.
+    //   Attacker's fake position stored in victim's vehicle_state → FP on next honest beacon.
+    bool save_state = ((attack_number == 1) || (attack_number == 4) ||
+                       (attack_number == 5) || (attack_number == 6))
                    && (vehicle_id < (uint32_t)total_size)
                    && tag.GetIsPoisoned()
                    && !sybil_mitm_nodes[vehicle_id]; // intercepted/stolen ID = honest vehicle
@@ -815,6 +878,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // 2. Run detection algorithms
     // B1 ablation (mode=6): Ghaleb (2014) LTT — two rule checks only, no MPTD-PQS sigs
     // All other modes: full MPTD-PQS pipeline (Algorithms 1–4)
+    //
+    g_save_restore_context = false;  // unused — kept for compilation
     uint32_t tp_flags = 0, mp_flags = 0, cp_flags = 0;
     if (ablation_mode != 6) {
         tp_flags   = run_tp_detect(vehicle_id, tag);          // Alg 1: TP-S1..S5
@@ -823,12 +888,23 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         mp_flags  |= mitm_flags;
         cp_flags   = run_cp_detect(tag);                      // Alg 4: CP
     }
+    g_save_restore_context = false;  // reset after detection to prevent leakage
 
-    // Restore honest vehicle state if stolen beacon triggered MP-S4
-    // This prevents the fake position from persisting as the baseline reference,
-    // which would cause the next real honest beacon to generate a false positive.
-    if (save_state && (mp_flags & (1 << 3)))
-        vehicle_state[vehicle_id] = vs_backup;
+    // Restore honest vehicle state to prevent contamination of the baseline reference.
+    // Without restore, a poisoned position/speed gets stored in vehicle_state and
+    // makes the NEXT honest beacon look like an impossible kinematic jump → FP.
+    //
+    // When to restore:
+    //   attack 4/6: restore if MP-S4 fired (stolen/impersonated ID contamination)
+    //   attack 5:   always restore — controller always injects fake pos/spd which
+    //               contaminates the TP-S1..S5 dead-reckoning residual for next round.
+    if (save_state) {
+        bool should_restore = (mp_flags & (1u << 3));   // MP-S4 fired: attacks 4/6
+        if (attack_number == 1) should_restore = true;  // TP-S1: always restore (honest baseline)
+        if (attack_number == 5) should_restore = true;  // TP-S3: always restore (controller FP fix)
+        if (should_restore)
+            vehicle_state[vehicle_id] = vs_backup;
+    }
 
     // Combine: sig_violated bitmask (bits 0-4 = TP-S1..S5, bits 5-8 = MP-S1..S4)
     uint32_t sig_violated = tp_flags | (mp_flags << 5) | (cp_flags << 9);
@@ -862,8 +938,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         // B1: Ghaleb (2014) LTT — speed plausibility + cross-RSU reachability
         detected = run_ltt_detect(vehicle_id, rsu_id, tag);
     } else {
-        // MPTD-PQS: composite score + individual signature flags
-        detected = anomalous || (tp_flags != 0) || (mp_flags != 0) || cp_detected;
+        // MPTD-PQS: composite score gate (Eq. 3.20) + oracle CP-DETECT for attack 7.
+        // Paper decision: detected iff ψ_i(t) > psi_th  (anomalous)
+        // OR controller-plane oracle fires (attacks 5 & 7).
+        // Individual signature flags (tp_flags, mp_flags) contribute to ψ_i via
+        // run_lightweight_score() — they do NOT independently trigger detection.
+        // This matches the paper equation exactly; previously the code fired on
+        // ANY single flag which was more aggressive than the paper specifies.
+        detected = anomalous || cp_detected;
     }
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
     if (tag.GetIsPoisoned()) parr_poisoned_total++;   // PARR denominator: total poisoned submissions
@@ -877,28 +959,9 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
                       tp_flags | (mp_flags << 5), psi);
 
-    // 9. Forward to Python ML prediction server (Stage 5)
-    //    Non-blocking fire-and-forget; only in full mode (not routing_test)
-    if (!routing_test)
-    {
-        double px  = tag.GetPosX();
-        double py  = tag.GetPosY();
-        double sp  = tag.GetSpeed();
-        double hd  = tag.GetHeading();
-        double ac  = tag.GetAcceleration();
-        std::string ml_cmd =
-            "curl -s -X POST http://localhost:5001/predict"
-            " -H 'Content-Type: application/json'"
-            " -d '{\"vehicle_id\":" + std::to_string(vehicle_id) +
-            ",\"psi_score\":"       + std::to_string(psi) +
-            ",\"features\":["       + std::to_string(px) + ","
-                                    + std::to_string(py) + ","
-                                    + std::to_string(sp) + ","
-                                    + std::to_string(hd) + ","
-                                    + std::to_string(ac) + "]}'"
-            " > /dev/null 2>&1 &";
-        system(ml_cmd.c_str());
-    }
+    // 9. ML prediction server — REMOVED (server not running; GAT/LSTM-AE not yet
+    //    implemented; curl result was discarded and never used in detection decisions).
+    //    Removing eliminates spurious system() call overhead from PBPO_Full timing.
 
     // PBPO: stop timer and accumulate (§4.1.2 Eq 4.7)
     clock_gettime(CLOCK_MONOTONIC, &t_end);

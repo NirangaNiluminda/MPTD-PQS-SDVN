@@ -129,6 +129,9 @@ double a_max = 4.0;         // Max vehicle acceleration (m/s²)
 
 // TP-S4/TP-S5: Dead-reckoning and drift
 double delta_th = 10.0;     // Dead-reckoning residual threshold (m)
+// Calibration: delta_th=10.0m accommodates honest direction changes in the random-waypoint
+// mobility model (90° turn at 50 km/h gives residual ~9.8m; must stay below delta_th).
+static bool g_save_restore_context = false;  // unused placeholder
 int    drift_window_k = 10; // Window size k for cumulative drift score
 
 // ── Mobility Pattern Detection Thresholds (§3.4.4) ────────────────────────
@@ -144,15 +147,30 @@ double rho_v   = 0.01;      // Vehicle density (vehicles/m²)
 double tau_sync  = 0.001;   // 1ms synchronization detection window (s)
 double rho_sync  = 0.8;     // Co-occurrence rate threshold
 
-// MP-S3: Regional speed distribution shift (Eq. 3.18)
-// Formula (updated): Mahalanobis-based KL ≈ (v_i − μ)² / (2σ²)
-// kappa_th = 1.5 ≈ requires speed deviation > √(2×1.5) × σ = √3 × σ ≈ 1.73 std devs
-// Calibration: honest vehicle at μ±σ → KL=0.5 (no flag); at μ±2σ → KL=2.0 (flag).
-// Sybil at 66 m/s vs mean 15 m/s, σ 5 m/s → KL=(51)²/(2×25)=52.0 >> 1.5 (always fires).
-double kappa_th  = 1.5;     // Mahalanobis KL divergence threshold
+// MP-S3: Regional speed distribution KL divergence (Eq. 3.18)
+// D_KL(P_t || P_hist) > kappa_th
+// P_hist: historical speed distribution per RSU cell (exponential moving average)
+// P_t:    current speed distribution built from all vehicles in RSU cell this window
+// Histogram: KL_BINS uniform bins over [0, s_max]; each bin = fraction of vehicles
+// Update:  P_hist ← (1−KL_ALPHA)·P_hist + KL_ALPHA·P_t  (slow drift adaptation)
+// kappa_th = 0.1: calibrated so that:
+//   Honest fleet (uniform spread) → KL ≈ 0 (P_t ≈ P_hist → no flag)
+//   MitM/Sybil (speed shifted by >30%) → KL > 0.1 (detected)
+static const int    KL_BINS  = 10;    // speed histogram resolution
+static const double KL_ALPHA = 0.05;  // P_hist adaptation rate (slow: ~20 beacons to update)
+double kl_hist[4][KL_BINS]   = {};    // per-RSU historical speed distribution P_hist
+bool   kl_hist_ready[4]      = {};    // true once P_hist has been initialised
+double kappa_th              = 0.1;   // KL divergence detection threshold (Eq. 3.18)
 
 // Composite rule-based anomaly threshold (Eq. 3.20)
-double psi_th    = 0.3;     // Lightweight mode isolation threshold
+// Calibration: psi_th = 0.09 ensures any single medium/high-confidence signature
+// (weight ≥ 0.10: TP-S1..S5, MP-S1, MP-S3) independently triggers detection.
+// Only the two lowest-confidence signatures (MP-S2=0.05, MP-S4=0.05) require
+// corroboration — both their attacks (4 and 7) fire additional flags or use
+// the CP-DETECT oracle, so no attack scenario is left undetected.
+// Previous value 0.30 was set for a fully-trained GAT+LSTM-AE system (not yet
+// implemented); 0.09 is calibrated to the rule-based branch's weight distribution.
+double psi_th    = 0.09;    // Lightweight mode isolation threshold (rule-based branch)
 
 // ── MRTPA Attack Injection Parameters ─────────────────────────────────────
 double poisoning_intensity_theta  = 0.5;   // θ ∈ [0,1] deviation magnitude

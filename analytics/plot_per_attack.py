@@ -103,6 +103,11 @@ def load_data():
     denom = np.sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn))
     data["MCC"] = (tp*tn - fp*fn) / denom
 
+    # When no attack exists (total_poisoned=0), all metrics are undefined → 0
+    no_attack = data["total_poisoned"] == 0
+    for col in ["MCC", "DR", "Precision", "F1"]:
+        data.loc[no_attack, col] = 0.0
+
     return data
 
 # ─── Helper: apply common axes style ─────────────────────────────────────────
@@ -323,6 +328,229 @@ def plot_combined_all_metrics_grid(data):
     plt.close(fig)
     print(f"  [OK] {out}.png")
 
+# ─── Figure set 6: PARR per attack — blockchain revocation effectiveness ──────
+def plot_parr_per_attack(data):
+    """
+    PARR = fraction of poisoned vehicles revoked by the blockchain layer
+    (3+ consecutive detections trigger ring-signature revocation).
+
+    One figure per attack, 3 lines (A1, A4, B1).
+    Lower detection quality (B1) → fewer revocations → lower PARR.
+    A4 ≈ A1 because revocation is driven by detection count, not TRS crypto itself.
+    """
+    for atk_num, (short, pid, title) in ATTACK_META.items():
+        fig, ax = plt.subplots(figsize=(6, 4.5))
+        plotted = 0
+
+        for mode, style in METHOD_STYLES.items():
+            sub = (data[(data["attack_number"] == atk_num) &
+                        (data["ablation_mode"] == mode)]
+                   .sort_values("attack_pct")
+                   .dropna(subset=["PARR"]))
+            if sub.empty:
+                continue
+            # Only show points where attack actually exists (pct > 0)
+            sub_atk = sub[sub["attack_pct"] > 0]
+            if sub_atk.empty:
+                continue
+            ax.plot(sub_atk["attack_pct"], sub_atk["PARR"], **style)
+            plotted += 1
+
+        if plotted == 0:
+            plt.close(fig)
+            continue
+
+        _style_ax(ax,
+                  xlabel="Attack Percentage (%)",
+                  ylabel="Poisoned Aggregate Rejection Rate",
+                  title=f"PARR — {pid}: {title.replace(chr(10), ' ')}")
+
+        ax.legend(fontsize=10, loc="best", framealpha=0.9)
+        fig.tight_layout()
+
+        out = os.path.join(OUT_DIR, f"fig_a{atk_num}_parr")
+        fig.savefig(out + ".png", dpi=300, bbox_inches="tight")
+        fig.savefig(out + ".pdf",          bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [OK] {out}.png")
+
+
+def plot_parr_combined_grid(data):
+    """
+    2×4 grid — PARR per attack, all three methods.
+    Key figure for RQ5: blockchain contribution.
+    """
+    attacks = sorted(ATTACK_META.keys())
+    ncol = 4
+    nrow = int(np.ceil(len(attacks) / ncol))
+
+    fig = plt.figure(figsize=(ncol * 4.5, nrow * 3.8 + 0.6))
+    gs  = GridSpec(nrow, ncol, figure=fig, hspace=0.60, wspace=0.38)
+
+    legend_handles = []
+    legend_labels  = []
+
+    for idx, atk_num in enumerate(attacks):
+        r, c = divmod(idx, ncol)
+        ax   = fig.add_subplot(gs[r, c])
+        short, pid, title = ATTACK_META[atk_num]
+
+        for mode, style in METHOD_STYLES.items():
+            sub = (data[(data["attack_number"] == atk_num) &
+                        (data["ablation_mode"] == mode) &
+                        (data["attack_pct"] > 0)]
+                   .sort_values("attack_pct")
+                   .dropna(subset=["PARR"]))
+            if sub.empty:
+                continue
+            s2 = dict(style, markersize=5, linewidth=1.8)
+            h, = ax.plot(sub["attack_pct"], sub["PARR"], **s2)
+            if idx == 0:
+                legend_handles.append(h)
+                legend_labels.append(style["label"])
+
+        ax.set_title(f"{pid}: {title.split(chr(10))[0]}", fontsize=9.5, fontweight="bold")
+        ax.set_xlabel("Attack %", fontsize=8.5)
+        ax.set_ylabel("PARR",     fontsize=8.5)
+        ax.set_xlim(15, 105)
+        ax.set_ylim(0, 1.05)
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(20))
+        ax.yaxis.set_major_locator(ticker.MultipleLocator(0.2))
+        ax.tick_params(labelsize=7.5)
+        ax.grid(True, linestyle="--", alpha=0.45)
+
+    if legend_handles:
+        fig.legend(handles=legend_handles, labels=legend_labels,
+                   loc="lower center", ncol=3, fontsize=10,
+                   framealpha=0.92, bbox_to_anchor=(0.5, -0.03))
+
+    fig.suptitle("PARR: Blockchain Revocation Effectiveness (A1 vs A4 vs B1)",
+                 fontsize=13, fontweight="bold", y=1.02)
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+
+    out = os.path.join(OUT_DIR, "fig_parr_combined")
+    fig.savefig(out + ".png", dpi=300, bbox_inches="tight")
+    fig.savefig(out + ".pdf",          bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [OK] {out}.png")
+
+
+# ─── Figure set 7: CDER per attack — end-to-end control-plane error rate ──────
+def plot_cder_per_attack(data):
+    """
+    CDER = fraction of SDN controller decisions corrupted by residual poisoning.
+    Lower = better. CDER=1.0 for attacks 5 & 7 (malicious controller — all decisions wrong).
+
+    One figure per attack, 3 lines (A1, A4, B1).
+    A1 should have lower CDER than B1 — fewer attacks slip through to the controller.
+    """
+    for atk_num, (short, pid, title) in ATTACK_META.items():
+        fig, ax = plt.subplots(figsize=(6, 4.5))
+        plotted = 0
+
+        for mode, style in METHOD_STYLES.items():
+            sub = (data[(data["attack_number"] == atk_num) &
+                        (data["ablation_mode"] == mode)]
+                   .sort_values("attack_pct")
+                   .dropna(subset=["CDER"]))
+            if sub.empty:
+                continue
+            ax.plot(sub["attack_pct"], sub["CDER"], **style)
+            plotted += 1
+
+        if plotted == 0:
+            plt.close(fig)
+            continue
+
+        _style_ax(ax,
+                  xlabel="Attack Percentage (%)",
+                  ylabel="Control Decision Error Rate  (lower = better)",
+                  title=f"CDER — {pid}: {title.replace(chr(10), ' ')}",
+                  ylim=(0, 1.05))
+
+        # Annotation for attacks where CDER=1 (malicious controller)
+        if atk_num in (5, 7):
+            ax.annotate("Malicious controller\n(CDER→1.0 by design)",
+                        xy=(50, 0.95), fontsize=8.5, ha="center",
+                        color="#555555",
+                        bbox=dict(boxstyle="round,pad=0.3", fc="lightyellow",
+                                  ec="grey", alpha=0.8))
+
+        ax.legend(fontsize=10, loc="upper left", framealpha=0.9)
+        fig.tight_layout()
+
+        out = os.path.join(OUT_DIR, f"fig_a{atk_num}_cder")
+        fig.savefig(out + ".png", dpi=300, bbox_inches="tight")
+        fig.savefig(out + ".pdf",          bbox_inches="tight")
+        plt.close(fig)
+        print(f"  [OK] {out}.png")
+
+
+def plot_cder_combined_grid(data):
+    """
+    2×4 grid — CDER per attack, all three methods.
+    Key figure for RQ2 and RQ6: end-to-end mitigation effectiveness.
+    """
+    attacks = sorted(ATTACK_META.keys())
+    ncol = 4
+    nrow = int(np.ceil(len(attacks) / ncol))
+
+    fig = plt.figure(figsize=(ncol * 4.5, nrow * 3.8 + 0.6))
+    gs  = GridSpec(nrow, ncol, figure=fig, hspace=0.60, wspace=0.38)
+
+    legend_handles = []
+    legend_labels  = []
+
+    for idx, atk_num in enumerate(attacks):
+        r, c = divmod(idx, ncol)
+        ax   = fig.add_subplot(gs[r, c])
+        short, pid, title = ATTACK_META[atk_num]
+
+        for mode, style in METHOD_STYLES.items():
+            sub = (data[(data["attack_number"] == atk_num) &
+                        (data["ablation_mode"] == mode)]
+                   .sort_values("attack_pct")
+                   .dropna(subset=["CDER"]))
+            if sub.empty:
+                continue
+            s2 = dict(style, markersize=5, linewidth=1.8)
+            h, = ax.plot(sub["attack_pct"], sub["CDER"], **s2)
+            if idx == 0:
+                legend_handles.append(h)
+                legend_labels.append(style["label"])
+
+        ax.set_title(f"{pid}: {title.split(chr(10))[0]}", fontsize=9.5, fontweight="bold")
+        ax.set_xlabel("Attack %", fontsize=8.5)
+        ax.set_ylabel("CDER",     fontsize=8.5)
+        ax.set_xlim(0, 105)
+        ax.set_ylim(0, 1.10)
+        ax.xaxis.set_major_locator(ticker.MultipleLocator(20))
+        ax.yaxis.set_major_locator(ticker.MultipleLocator(0.2))
+        ax.tick_params(labelsize=7.5)
+        ax.grid(True, linestyle="--", alpha=0.45)
+
+        # Mark malicious-controller attacks
+        if atk_num in (5, 7):
+            ax.text(0.5, 0.88, "ctrl malicious", transform=ax.transAxes,
+                    fontsize=7, ha="center", color="#888888",
+                    style="italic")
+
+    if legend_handles:
+        fig.legend(handles=legend_handles, labels=legend_labels,
+                   loc="lower center", ncol=3, fontsize=10,
+                   framealpha=0.92, bbox_to_anchor=(0.5, -0.03))
+
+    fig.suptitle("CDER: Control-Plane Error Rate — End-to-End Mitigation (A1 vs A4 vs B1)",
+                 fontsize=13, fontweight="bold", y=1.02)
+    fig.tight_layout(rect=[0, 0.05, 1, 1])
+
+    out = os.path.join(OUT_DIR, "fig_cder_combined")
+    fig.savefig(out + ".png", dpi=300, bbox_inches="tight")
+    fig.savefig(out + ".pdf",          bbox_inches="tight")
+    plt.close(fig)
+    print(f"  [OK] {out}.png")
+
+
 # ─── Figure set 5: NEW — Ablation comparison grid (A1 vs A4 vs B1) ───────────
 def plot_mcc_comparison_grid(data):
     """
@@ -417,6 +645,14 @@ def main():
 
     print("\n── Figure set 5: Ablation comparison grid  (A1 vs A4 vs B1) ────────")
     plot_mcc_comparison_grid(data)
+
+    print("\n── Figure set 6: PARR — blockchain revocation effectiveness ─────────")
+    plot_parr_per_attack(data)
+    plot_parr_combined_grid(data)
+
+    print("\n── Figure set 7: CDER — control-plane error rate ────────────────────")
+    plot_cder_per_attack(data)
+    plot_cder_combined_grid(data)
 
     print(f"\nAll outputs → {OUT_DIR}")
     files = sorted(os.listdir(OUT_DIR))
