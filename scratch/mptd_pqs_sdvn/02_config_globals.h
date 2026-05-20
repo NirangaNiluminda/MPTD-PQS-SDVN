@@ -51,7 +51,10 @@ int    maxspeed             = 60;  // km/h max vehicle speed
 // Example: --rsu_seed=42 --attack_percentage=40 → always same 2 RSUs
 uint32_t rsu_seed = 0;
 
-double data_transmission_frequency = 2.0;    // 2 Hz → 0.5s per beacon round (was 0.33 Hz)
+// Paper §3.4.4 IEEE 802.11p BSM rate: 10 Hz → T_b = 100 ms (Eq 3.9).
+// Detection gate s_max·T_b = 3.33 m is keyed to this; do not change without
+// re-calibrating all per-beacon thresholds (TP-S1..S5, ε_max stealth/abrupt).
+double data_transmission_frequency = 10.0;
 double data_transmission_period    = 1.0 / data_transmission_frequency;
 double link_lifetime_threshold     = 0.400;
 
@@ -177,6 +180,51 @@ double poisoning_intensity_theta  = 0.5;   // θ ∈ [0,1] deviation magnitude
 double max_position_deviation     = 50.0;  // Max position offset (m)
 double max_velocity_deviation     = 15.0;  // Max velocity offset (m/s)
 double max_acceleration_deviation = 5.0;   // Max acceleration offset (m/s²)
+
+// ── Bounded random-walk attack model (paper §3.4.3 Eq 3.5/3.6) ─────────────
+// Eq 3.5: per-beacon drift increment bound  ‖δ(t) − δ(t−T_b)‖ ≤ ε_max
+// Eq 3.6: cumulative drift after k beacons  ‖δ(t₀ + k·T_b)‖ ≤ k · ε_max
+//
+// Paper §3.4.3 leaves ε_max as a speed/handover-dependent quantity without
+// fixed numerics. We adopt a hybrid attacker model parameterised by two
+// branches (stealth + abrupt) so the A1-vs-full-mode ablation (RQ2 vs RQ3)
+// shows non-degenerate MCC:
+//
+//   STEALTH branch (drawn with prob θ_s):
+//     inc_step ∈ [0, ε_max_stealth] →  scaled by theta, stays BELOW the LW
+//     kinematic gate (s_max·T_b = 3.33 m) for theta ≤ 1, so a single stealth
+//     beacon NEVER trips TP-S1. Cumulative drift over k beacons (Eq 3.6) is
+//     what GAT + LSTM-AE must catch in full mode.
+//
+//   ABRUPT branch (drawn with prob 1 − θ_s):
+//     inc_step ∈ [ε_min_abrupt, ε_max_abrupt] → scaled by theta, designed so
+//     that at theta = 0.5 the floor ε_min_abrupt·theta exceeds s_max·T_b.
+//     Every abrupt beacon trips TP-S1 kinematic in LW mode → A1 detection
+//     rate ≈ (1 − θ_s) at baseline intensity.
+//
+//   Defaults (calibrated for theta=0.5 baseline, s_max=33.33 m/s, T_b=0.1 s):
+//   Paper §3.4.4 IEEE 802.11p: T_b = 100 ms → LW kinematic gate = s_max·T_b = 3.33 m.
+//
+//     epsilon_max_stealth  = 0.5   → max stealth step 0.5·1   = 0.5 m  < 3.33 m gate
+//     epsilon_min_abrupt   = 7.0   → min abrupt step 7.0·0.5  = 3.5 m  > 3.33 m gate
+//     epsilon_max_abrupt   = 12.0  → max abrupt step 12.0·1   = 12.0 m
+//     stealth_fraction_θ_s = 0.7   → ~70% stealth, ~30% abrupt → A1 catches ~30% via
+//                                    TP-S1 single-beacon + extra via TP-S4/S5 cumulative
+//     k_max                = 50    → accumulator reset every 50 beacons (~5 s at 10 Hz),
+//                                    approximating handover stitch (Eq 3.4 W_s).
+double epsilon_max_stealth           = 0.5;   // m per beacon (Eq 3.5 stealth bound, < gate)
+double epsilon_min_abrupt            = 7.0;   // m per beacon (above gate at theta=0.5)
+double epsilon_max_abrupt            = 12.0;  // m per beacon (abrupt ceiling)
+double stealth_fraction_theta_s      = 0.7;   // fraction of beacons drawn from stealth
+int    cumulative_drift_budget_k_max = 50;    // reset accumulator every k beacons
+
+// Per-vehicle bounded-random-walk state (Eq 3.6 accumulator)
+double drift_accum_x       [MAX_NODES] = {};  // cumulative x-drift since last reset
+double drift_accum_y       [MAX_NODES] = {};  // cumulative y-drift since last reset
+int    drift_beacon_count  [MAX_NODES] = {};  // k counter (resets at k_max)
+double drift_direction_x   [MAX_NODES] = {};  // unit vector for directional bias
+double drift_direction_y   [MAX_NODES] = {};
+bool   drift_direction_set [MAX_NODES] = {};  // initialised on first call per vid
 
 // Simulation area bounds
 double min_position_x = 0.0;

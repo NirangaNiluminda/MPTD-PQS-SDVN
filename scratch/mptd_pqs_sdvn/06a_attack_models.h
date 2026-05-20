@@ -214,6 +214,75 @@ void PoisonTrajectoryByType(Vector &position, Vector &velocity, Vector &accelera
     }
 }
 
+// ── SampleBoundedDrift — paper §3.4.3 Eq 3.5/3.6 bounded random walk ──────
+// Produces per-beacon position drift increment that respects the paper's
+// mobility-induced threat amplification model:
+//   Eq 3.5: ‖δ(t) − δ(t−T_b)‖ ≤ ε_max   (per-beacon bound)
+//   Eq 3.6: ‖δ(t₀ + k·T_b)‖ ≤ k · ε_max (cumulative budget)
+//
+// Hybrid mode (controlled by stealth_fraction_theta_s):
+//   - With prob θ_s        : stealthy increment ∈ [0, ε_max_stealth] (below kinematic gate)
+//   - With prob (1 − θ_s)  : abrupt   increment ∈ [ε_max_stealth, ε_max_abrupt] (above s_max·T_b)
+//
+// Direction is fixed per-vehicle at first call (uniform random angle) so the
+// drift is directional, not zero-mean noise. Accumulator resets every
+// cumulative_drift_budget_k_max beacons (mimics handover stitching boundary,
+// Eq 3.4 W_s(v) approximation).
+//
+// Returns: (drift_x, drift_y) cumulative drift to apply to honest position.
+// Out-params:
+//   is_abrupt    — true if this beacon used the abrupt branch (LW-detectable)
+//   inc_mag_step — per-beacon increment magnitude (Eq 3.5 quantity; the value
+//                  that determines whether single-beacon TP-S1 kinematic fires)
+void SampleBoundedDrift(int vid, double &drift_x, double &drift_y,
+                        bool &is_abrupt, double &inc_mag_step)
+{
+    if (vid < 0 || vid >= MAX_NODES) {
+        drift_x = drift_y = 0.0; is_abrupt = false; inc_mag_step = 0.0; return;
+    }
+
+    // Deterministic per-(vid, beacon_count) RNG → reproducible across runs
+    uint32_t seed = 12345u * (uint32_t)vid + (uint32_t)drift_beacon_count[vid] + 7919u;
+    std::mt19937 rng(seed);
+    std::uniform_real_distribution<double> uni01(0.0, 1.0);
+
+    // Initialise per-vehicle drift direction on first call
+    if (!drift_direction_set[vid]) {
+        double angle = 2.0 * M_PI * uni01(rng);
+        drift_direction_x[vid] = std::cos(angle);
+        drift_direction_y[vid] = std::sin(angle);
+        drift_direction_set[vid] = true;
+    }
+
+    // Reset accumulator at handover boundary (Eq 3.4 W_s(v) approximation)
+    if (drift_beacon_count[vid] >= cumulative_drift_budget_k_max) {
+        drift_accum_x[vid] = 0.0;
+        drift_accum_y[vid] = 0.0;
+        drift_beacon_count[vid] = 0;
+        double angle = 2.0 * M_PI * uni01(rng);
+        drift_direction_x[vid] = std::cos(angle);
+        drift_direction_y[vid] = std::sin(angle);
+    }
+
+    // Branch: stealth vs abrupt
+    double r = uni01(rng);
+    if (r < stealth_fraction_theta_s) {
+        inc_mag_step = uni01(rng) * epsilon_max_stealth;                                  // Eq 3.5 stealth
+        is_abrupt    = false;
+    } else {
+        inc_mag_step = epsilon_min_abrupt + uni01(rng) * (epsilon_max_abrupt - epsilon_min_abrupt);  // abrupt
+        is_abrupt    = true;
+    }
+
+    // Apply directional bias, accumulate (Eq 3.6 cumulative budget)
+    drift_accum_x[vid] += inc_mag_step * drift_direction_x[vid];
+    drift_accum_y[vid] += inc_mag_step * drift_direction_y[vid];
+    drift_beacon_count[vid]++;
+
+    drift_x = drift_accum_x[vid];
+    drift_y = drift_accum_y[vid];
+}
+
 // ── EnforceRealism — clamp poisoned values to physical limits (Algorithm 1, Line 23) ──
 // Ensures poisoned data doesn't trigger simple anomaly detectors that check
 // for physically impossible values. Attack 3 (TP-S3 Fabrication) bypasses

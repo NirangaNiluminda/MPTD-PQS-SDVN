@@ -97,6 +97,28 @@ void push_beacon(int vid, double px, double py, double sp,
     if (vs.count < BEACON_HISTORY) vs.count++;
 }
 
+// Pop the MOST RECENTLY pushed beacon from the circular buffer.
+// Used by the controller (HandleBeaconReceived) before re-running LW-DETECT
+// on a controller-poisoned beacon (attacks 5/7 = TP-S3 / MP-S4). The RSU has
+// already pushed the unmodified beacon during its own LW-DETECT pass; we pop
+// that entry so the re-push (with controller-modified kinematics) lands in the
+// same logical slot — avoiding double-counting in TP-DETECT velocity/drift checks.
+void pop_last_beacon(int vid) {
+    if (vid < 0 || vid >= total_size) return;
+    VehicleBeaconState &vs = vehicle_state[vid];
+    if (vs.count == 0) return;
+    // step head back one slot (wrap around)
+    vs.head = (vs.head + BEACON_HISTORY - 1) % BEACON_HISTORY;
+    vs.count--;
+    // zero the popped slot to avoid stale read on next push
+    vs.pos_x[vs.head]     = 0.0;
+    vs.pos_y[vs.head]     = 0.0;
+    vs.speed[vs.head]     = 0.0;
+    vs.heading[vs.head]   = 0.0;
+    vs.accel[vs.head]     = 0.0;
+    vs.timestamp[vs.head] = 0.0;
+}
+
 // ── MPTD-PQS: Per-RSU Sybil Identity Tracker (MP-S1) ─────────────────────
 // Tracks distinct vehicle IDs seen per RSU for identity density check.
 #define MAX_IDS_PER_RSU 64

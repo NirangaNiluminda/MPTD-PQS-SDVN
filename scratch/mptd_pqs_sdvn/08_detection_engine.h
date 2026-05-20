@@ -40,7 +40,8 @@ void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
                       double real_px, double real_py,
                       double fake_px, double fake_py,
                       double speed,   double heading, double accel,
-                      double drift_x, double drift_y, double disp_err);
+                      double drift_x, double drift_y, double disp_err,
+                      bool   is_abrupt = false, double step_scaled = 0.0);
 void log_rsu_relay(uint32_t vid, uint32_t rsu_id, double sim_t, bool is_poisoned,
                    double real_px, double real_py,
                    double recv_px, double recv_py,
@@ -528,6 +529,99 @@ bool run_lightweight_score(uint32_t tp_flags, uint32_t mp_flags)
 }
 
 // ============================================================
+// run_lw_detect_per_beacon() — Algorithm 1 (LW-DETECT) packaged
+// Paper §3.5.3, Fig 3.10.
+//
+// Runs the full lightweight per-beacon detection pipeline:
+//   1. push beacon into vehicle_state[] circular buffer
+//   2. run TP-DETECT (Alg 1)     → tp_flags  (bits 0..4 = TP-S1..S5)
+//   3. run SYB-DETECT (Alg 2)    → mp_flags  (bits 0..3 = MP-S1..S4)
+//   4. run MITM-DETECT (Alg 3)   → mp_flags |= bit 2 (MP-S3)
+//   5. run CP-DETECT (Alg 4)     → cp_flags
+//   6. composite score ψ_i(t) via SIG_WEIGHTS (Eq. 3.20)
+//   7. anomalous = ψ_i > ψ_th; detected = anomalous || (CP fired && attack==7)
+//
+// Architectural note (paper §3.5.3 / Fig 3.10): LW-DETECT runs at the RSU
+// per the paper's edge-detection mandate. handle_readone() calls this helper
+// after HMAC verification and after RSU-side attack injection (TP-S1 / MP-S1
+// if RSU is compromised). The result is stamped onto the BsmBeaconTag via
+// SetLwDetectionRan/SetLwAnomalous/SetLwPsi/SetSigViolated so the controller
+// can use it without re-running detection (attacks 1-4, 6).
+//
+// Controller (HandleBeaconReceived) re-invokes this helper ONLY for
+// attacks 5 (TP-S3) and 7 (MP-S4) where the controller itself poisons the
+// beacon — it pops the RSU-pushed vehicle_state entry first, then calls this
+// again so the modified kinematics are scored.
+// ============================================================
+struct LwDetectResult {
+    uint32_t tp_flags;      // bits 0..4 = TP-S1..S5
+    uint32_t mp_flags;      // bits 0..3 = MP-S1..S4 (after SYB ∪ MITM)
+    uint32_t cp_flags;      // CP-DETECT raw bits
+    uint32_t sig_violated;  // packed: tp | (mp<<5) | (cp<<9)
+    double   psi;           // ψ_i(t) composite (Eq. 3.20)
+    bool     anomalous;     // ψ_i > ψ_th
+    bool     detected;      // anomalous || (CP fired for attack 7) || B1 LTT
+};
+
+LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
+                                        BsmBeaconTag &tag,
+                                        uint32_t rsu_id)
+{
+    LwDetectResult r{};
+    r.tp_flags = r.mp_flags = r.cp_flags = r.sig_violated = 0;
+    r.psi = 0.0;
+    r.anomalous = false;
+    r.detected  = false;
+
+    // 1. Push new beacon into circular state buffer
+    push_beacon((int)vehicle_id,
+                tag.GetPosX(), tag.GetPosY(),
+                tag.GetSpeed(), tag.GetHeading(),
+                tag.GetAcceleration(), tag.GetTimestamp());
+
+    // 2. Run detection algorithms
+    // B1 ablation (mode=6): Ghaleb (2014) LTT — two rule checks only, no MPTD-PQS sigs
+    // All other modes: full MPTD-PQS pipeline (Algorithms 1–4)
+    g_save_restore_context = false;  // unused — kept for compilation
+    if (ablation_mode != 6) {
+        r.tp_flags  = run_tp_detect((int)vehicle_id, tag);              // Alg 1: TP-S1..S5
+        r.mp_flags  = run_syb_detect((int)vehicle_id, (int)rsu_id, tag);// Alg 2: MP-S1,S2,S4
+        uint32_t mitm = run_mitm_detect((int)vehicle_id, (int)rsu_id, tag); // Alg 3: MP-S3
+        r.mp_flags |= mitm;
+        r.cp_flags  = run_cp_detect(tag);                               // Alg 4: CP
+    }
+    g_save_restore_context = false;  // reset after detection to prevent leakage
+
+    // 3. Composite sig bitmask + lightweight score gate (Eq. 3.20)
+    r.sig_violated = r.tp_flags | (r.mp_flags << 5) | (r.cp_flags << 9);
+    r.anomalous    = run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4));
+
+    // 4. ψ_i(t) — same weights as run_lightweight_score (used for SC-Trust)
+    {
+        uint32_t all_f = r.tp_flags | (r.mp_flags << 5);
+        for (int k = 0; k < 9; k++)
+            if (all_f & (1u << k)) r.psi += SIG_WEIGHTS[k];
+    }
+
+    // 5. Detection decision
+    // CP-DETECT contributes to detection ONLY for attack_number==7 (MP-S4) —
+    // the controller globally poisons all beacons, so CP firing means THIS
+    // beacon is poisoned (100% certainty). For attack 5 (TP-S3), CP fires
+    // globally but the per-beacon attack_pct gate means kinematic detectors
+    // own per-beacon detection — including cp_flags here would create FPs.
+    bool cp_detected = (r.cp_flags != 0) && (attack_number == 7);
+    if (ablation_mode == 6) {
+        // B1: Ghaleb (2014) LTT baseline
+        r.detected = run_ltt_detect(vehicle_id, rsu_id, tag);
+    } else {
+        // MPTD-PQS: composite score gate (Eq. 3.20) + oracle CP-DETECT for attack 7
+        r.detected = r.anomalous || cp_detected;
+    }
+
+    return r;
+}
+
+// ============================================================
 // log_metrics_line() — [METRICS] per received beacon
 // ============================================================
 void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
@@ -869,93 +963,112 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         if (rsu_rep < 4) tdee_est_count[rsu_rep]++;
     }
 
-    // 1. Push new beacon into circular state buffer
-    push_beacon(vehicle_id,
-                tag.GetPosX(), tag.GetPosY(),
-                tag.GetSpeed(), tag.GetHeading(),
-                tag.GetAcceleration(), tag.GetTimestamp());
-
-    // 2. Run detection algorithms
-    // B1 ablation (mode=6): Ghaleb (2014) LTT — two rule checks only, no MPTD-PQS sigs
-    // All other modes: full MPTD-PQS pipeline (Algorithms 1–4)
+    // ── R1: LW-DETECT result dispatch (paper §3.5.3 Algorithm 1, Fig 3.10) ───
+    // The RSU (handle_readone) already ran Algorithm 1 LW-DETECT on this beacon
+    // and stamped the result onto the tag. Three execution paths:
     //
-    g_save_restore_context = false;  // unused — kept for compilation
+    //   A) Legacy fallback (!g_option_b_active OR !tag.GetLwDetectionRan()):
+    //      RSU path not used — run LW-DETECT here (inline, for the unmodified
+    //      legacy "no DSRC relay" mode).
+    //
+    //   B) Cached path (attacks 1-4, 6, and clean beacons):
+    //      The RSU's cached result is authoritative. The controller does NOT
+    //      modify this beacon, so no re-push / re-detection is needed. We reuse
+    //      tag.GetLwAnomalous() / tag.GetLwPsi() / tag.GetSigViolated().
+    //
+    //   C) Controller-modified path (attacks 5 = TP-S3, 7 = MP-S4):
+    //      The controller-side attack blocks above have just mutated tag's
+    //      position/speed/heading. The RSU pushed the UNMODIFIED beacon; we now
+    //      pop that entry and re-run LW-DETECT with the modified kinematics so
+    //      detection reflects the controller-injected poisoning.
+    //
+    // NOTE: cp_flags is internal to run_lw_detect_per_beacon's detection decision
+    // (combined into `detected` via the attack-7 oracle). We reconstruct the
+    // unpacked tp/mp/cp components from sig_violated when SC-Trust needs them.
+
+    uint32_t sig_violated = 0;
     uint32_t tp_flags = 0, mp_flags = 0, cp_flags = 0;
-    if (ablation_mode != 6) {
-        tp_flags   = run_tp_detect(vehicle_id, tag);          // Alg 1: TP-S1..S5
-        mp_flags   = run_syb_detect(vehicle_id, rsu_id, tag); // Alg 2: MP-S1,S2,S4
-        uint32_t mitm_flags = run_mitm_detect(vehicle_id, rsu_id, tag); // Alg 3: MP-S3
-        mp_flags  |= mitm_flags;
-        cp_flags   = run_cp_detect(tag);                      // Alg 4: CP
-    }
-    g_save_restore_context = false;  // reset after detection to prevent leakage
+    double   psi = 0.0;
+    bool     anomalous = false;
+    bool     detected  = false;
 
-    // Restore honest vehicle state to prevent contamination of the baseline reference.
-    // Without restore, a poisoned position/speed gets stored in vehicle_state and
-    // makes the NEXT honest beacon look like an impossible kinematic jump → FP.
+    bool controller_modified = (attack_number == 5 || attack_number == 7);
+
+    if (!tag.GetLwDetectionRan()) {
+        // Path A: RSU did not run LW-DETECT (legacy !g_option_b_active path).
+        // Run it here. Push happens inside the helper.
+        LwDetectResult ctrl_lw = run_lw_detect_per_beacon(vehicle_id, tag, rsu_id);
+        tp_flags     = ctrl_lw.tp_flags;
+        mp_flags     = ctrl_lw.mp_flags;
+        cp_flags     = ctrl_lw.cp_flags;
+        sig_violated = ctrl_lw.sig_violated;
+        psi          = ctrl_lw.psi;
+        anomalous    = ctrl_lw.anomalous;
+        detected     = ctrl_lw.detected;
+    } else if (controller_modified) {
+        // Path C: controller modified the beacon (attacks 5/7) — re-run LW-DETECT
+        // on the new kinematics. Pop the RSU-pushed unmodified entry first so
+        // velocity / drift checks see the modified beacon as the "current" sample.
+        pop_last_beacon((int)vehicle_id);
+        LwDetectResult ctrl_lw = run_lw_detect_per_beacon(vehicle_id, tag, rsu_id);
+        tp_flags     = ctrl_lw.tp_flags;
+        mp_flags     = ctrl_lw.mp_flags;
+        cp_flags     = ctrl_lw.cp_flags;
+        sig_violated = ctrl_lw.sig_violated;
+        psi          = ctrl_lw.psi;
+        anomalous    = ctrl_lw.anomalous;
+        detected     = ctrl_lw.detected;
+    } else {
+        // Path B: use RSU-cached result (attacks 1-4, 6, and clean beacons).
+        // No push, no detection — the RSU is authoritative per paper §3.5.3.
+        sig_violated = tag.GetSigViolated();
+        psi          = tag.GetLwPsi();
+        anomalous    = tag.GetLwAnomalous();
+        // Reconstruct unpacked component flags (used by SC-Trust sigmask + log)
+        tp_flags = sig_violated & 0x1F;
+        mp_flags = (sig_violated >> 5) & 0x0F;
+        cp_flags = (sig_violated >> 9);
+        // Detection decision matches helper's logic
+        bool cp_detected = (cp_flags != 0) && (attack_number == 7);
+        if (ablation_mode == 6) {
+            detected = run_ltt_detect(vehicle_id, rsu_id, tag);
+        } else {
+            detected = anomalous || cp_detected;
+        }
+    }
+
+    // Per paper Eq 3.13-3.14 (TP-S4): the reference position p̂_i(t) is computed
+    // from the *previously reported* beacon — "a ground-truth reference derived
+    // entirely from the vehicle's own prior beacons". The paper does NOT prescribe
+    // restoring an alternate baseline. Wiping the buffer prevents TP-S1/S4/S5 from
+    // ever firing (count<2 → run_tp_detect early-exits).
     //
-    // When to restore:
-    //   attack 4/6: restore if MP-S4 fired (stolen/impersonated ID contamination)
-    //   attack 5:   always restore — controller always injects fake pos/spd which
-    //               contaminates the TP-S1..S5 dead-reckoning residual for next round.
+    // The only case where restoring is paper-justified is stolen-ID contamination
+    // (attacks 4/6 with MP-S4 fired): a different attacker beacon uses the victim's
+    // vehicle_id, so the victim's vehicle_state[vid] is polluted by a third-party
+    // position. Restore here keeps per-vehicle state per-identity.
     if (save_state) {
-        bool should_restore = (mp_flags & (1u << 3));   // MP-S4 fired: attacks 4/6
-        if (attack_number == 1) should_restore = true;  // TP-S1: always restore (honest baseline)
-        if (attack_number == 5) should_restore = true;  // TP-S3: always restore (controller FP fix)
+        bool should_restore = (mp_flags & (1u << 3));   // MP-S4 fired: stolen-ID case only
         if (should_restore)
             vehicle_state[vehicle_id] = vs_backup;
     }
 
-    // Combine: sig_violated bitmask (bits 0-4 = TP-S1..S5, bits 5-8 = MP-S1..S4)
-    uint32_t sig_violated = tp_flags | (mp_flags << 5) | (cp_flags << 9);
-
-    // 3. Lightweight score gate
-    bool anomalous = run_lightweight_score(tp_flags, mp_flags | (cp_flags << 4));
-
-    // 4. Ground truth: is this beacon poisoned?
+    // Ground truth: is this beacon poisoned? (For metrics)
     bool is_poisoned = tag.GetIsPoisoned();
 
-    // 5. Update tag with detection results
+    // Update tag with final sig_violated (may differ from RSU cache if path C)
     tag.SetSigViolated(sig_violated);
 
-    // 6. Log [METRICS] line
+    // Log [METRICS] line
     log_metrics_line(attack_number, is_poisoned, vehicle_id, rsu_id, tag, sig_violated);
 
-    // 7. Forward clean/flagged beacon to blockchain (via 11_routing)
+    // Forward clean/flagged beacon to blockchain (via 11_routing)
     //    (Actual blockchain call is in 11_routing_blockchain_transmission.h)
     total_trajectories_stored_blockchain++;
 
-    // 8. Update confusion matrix + beacon CSV log (Stage 4)
-    // CP-DETECT (cp_flags) contributes to detection ONLY for attack_number==7 (MP-S4).
-    // For MP-S4, the controller poisons ALL beacons globally — so cp_flags firing means
-    // THIS beacon is poisoned (100% certainty, no per-beacon probability gate).
-    // For attack_number==5 (TP-S3), CP-DETECT fires globally but kinematic detectors
-    // handle per-beacon detection (only attack_pct% of beacons are actually modified),
-    // so including cp_flags there would create false positives for unmodified beacons.
-    bool cp_detected = (cp_flags != 0) && (attack_number == 7);
-    bool detected;
-    if (ablation_mode == 6) {
-        // B1: Ghaleb (2014) LTT — speed plausibility + cross-RSU reachability
-        detected = run_ltt_detect(vehicle_id, rsu_id, tag);
-    } else {
-        // MPTD-PQS: composite score gate (Eq. 3.20) + oracle CP-DETECT for attack 7.
-        // Paper decision: detected iff ψ_i(t) > psi_th  (anomalous)
-        // OR controller-plane oracle fires (attacks 5 & 7).
-        // Individual signature flags (tp_flags, mp_flags) contribute to ψ_i via
-        // run_lightweight_score() — they do NOT independently trigger detection.
-        // This matches the paper equation exactly; previously the code fired on
-        // ANY single flag which was more aggressive than the paper specifies.
-        detected = anomalous || cp_detected;
-    }
+    // Update confusion matrix + beacon CSV log
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
     if (tag.GetIsPoisoned()) parr_poisoned_total++;   // PARR denominator: total poisoned submissions
-    // ψ_i(t): weighted signature score (Eq. 3.20) — same weights as run_lightweight_score()
-    double psi = 0.0;
-    {
-        uint32_t all_f = tp_flags | (mp_flags << 5);
-        for (int k = 0; k < 9; k++)
-            if (all_f & (1u << k)) psi += SIG_WEIGHTS[k];
-    }
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
                       tp_flags | (mp_flags << 5), psi);
 
@@ -1013,8 +1126,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             consecutive_anomaly_count[vehicle_id] = 0;
         }
 
-        // Trust score update — full mode only; A5 ablation skips SC-Trust (RQ6)
-        if (!routing_test && ablation_mode != 5) {
+        // SC-Trust update — Algorithm 1 (LW-DETECT) line 5-6: only when ψ_i(t) > ψ_th.
+        // Gated by `anomalous` (lightweight composite score breach), NOT `detected`.
+        // CP-DETECT writes its own E_j(t) via a separate path per Figure 3.13.
+        // A5 ablation skips SC-Trust to isolate blockchain contribution (RQ6).
+        if (!routing_test && ablation_mode != 5 && anomalous) {
             double ts        = Simulator::Now().GetSeconds();
             uint32_t sigmask = tp_flags | (mp_flags << 5);
             CallSCTrust(vehicle_id, psi, sigmask, detected, ts);
@@ -1316,8 +1432,15 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             double real_hdg = tag.GetHeading();
             double real_acc = tag.GetAcceleration();
 
-            double drift_x  = poisoning_intensity_theta * max_position_deviation * sin(t * 0.7);
-            double drift_y  = poisoning_intensity_theta * max_position_deviation * cos(t * 0.5);
+            // Bounded random-walk drift per paper §3.4.3 Eq 3.5/3.6.
+            // Hybrid: ~θ_s stealth (below TP-S1 kinematic gate) + (1-θ_s) abrupt
+            // (above s_max·T_b → trips TP-S1 → LW detects). Returns CUMULATIVE drift.
+            // θ scales the bound: theta=1 → full ε_max, theta=0.5 → half, etc.
+            double drift_x_raw, drift_y_raw, inc_mag_step;
+            bool   is_abrupt;
+            SampleBoundedDrift((int)vid, drift_x_raw, drift_y_raw, is_abrupt, inc_mag_step);
+            double drift_x  = poisoning_intensity_theta * drift_x_raw;
+            double drift_y  = poisoning_intensity_theta * drift_y_raw;
             double fake_px  = real_px + drift_x;
             double fake_py  = real_py + drift_y;
             fake_px = (fake_px < min_position_x) ? min_position_x : (fake_px > max_position_x ? max_position_x : fake_px);
@@ -1332,20 +1455,29 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             tpe_sq_sum += disp_err * disp_err;   // TPE: injection magnitude (Option B path)
             tpe_cnt++;
 
-            bool det_likely = (disp_err > s_max * T_b);
-            cout << "\n[TP-S1-RSU" << rsu_idx << "] ═════════════════════════════════════" << endl;
+            // Per-beacon LW detectability: TP-S1 kinematic gate fires if step
+            // increment exceeds s_max·T_b. Scaled by theta to match drift scaling.
+            double step_scaled  = poisoning_intensity_theta * inc_mag_step;
+            bool   det_step_lw  = (step_scaled > s_max * T_b);
+            cout << "\n[TP-S1-RSU" << rsu_idx << "] "
+                 << (is_abrupt ? "[ABRUPT]" : "[STEALTH]")
+                 << " ═════════════════════════════════════" << endl;
             cout << "  t=" << std::fixed << std::setprecision(3) << t
-                 << "s  V=" << vid << "  theta=" << poisoning_intensity_theta << endl;
+                 << "s  V=" << vid << "  theta=" << poisoning_intensity_theta
+                 << "  branch=" << (is_abrupt ? "ABRUPT" : "STEALTH") << endl;
             cout << std::fixed << std::setprecision(4);
             cout << "  pos_x " << real_px << " → " << fake_px
-                 << "  (drift " << std::showpos << drift_x << std::noshowpos << " m)" << endl;
+                 << "  (cum_drift " << std::showpos << drift_x << std::noshowpos << " m)" << endl;
             cout << "  pos_y " << real_py << " → " << fake_py
-                 << "  (drift " << std::showpos << drift_y << std::noshowpos << " m)" << endl;
-            cout << "  disp_err=" << disp_err << " m  detect=" << (det_likely ? "LIKELY" : "below-threshold") << endl;
+                 << "  (cum_drift " << std::showpos << drift_y << std::noshowpos << " m)" << endl;
+            cout << "  step=" << step_scaled << " m  (gate=" << s_max*T_b << " m)"
+                 << "  cum_disp=" << disp_err << " m"
+                 << "  LW-fires-this-beacon=" << (det_step_lw ? "YES" : "no") << endl;
             cout << "[TP-S1-RSU" << rsu_idx << "] ═════════════════════════════════════\n" << endl;
 
             log_tp_s1_poison(vid, rsu_idx, t, real_px, real_py, fake_px, fake_py,
-                             real_spd, real_hdg, real_acc, drift_x, drift_y, disp_err);
+                             real_spd, real_hdg, real_acc, drift_x, drift_y, disp_err,
+                             is_abrupt, step_scaled);
         }
 
         // ── MP-S1: Compromised RSU steals identity and injects ghost beacons (paper §3.4.2) ──
@@ -1385,6 +1517,17 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                 double ghost_px = real_px + ghost_disp * std::cos(angle);
                 double ghost_py = real_py + ghost_disp * std::sin(angle);
                 uint32_t ghost_vid = GHOST_VID_BASE + rsu_idx * 100 + vid * 10 + gi;
+
+                // ── LOCAL ghost registration (R1: LW-DETECT moved to RSU) ──────
+                // The RSU must increment its OWN rsu_id_set[] count BEFORE running
+                // LW-DETECT on the real beacon below, so SYB-DETECT (run_syb_detect,
+                // MP-S1) sees count > density_limit at the RSU side and fires.
+                // The management-side ghost fast-path will also call this when each
+                // ghost packet arrives over CSMA, but register_vehicle_at_rsu()
+                // dedupes on (vehicle_id, window) so there is no double-counting.
+                register_vehicle_at_rsu((int)rsu_idx, ghost_vid, t);
+                if ((int)rsu_idx < total_size)
+                    rsu_id_set[rsu_idx].ghost_seen = true;
 
                 // Build ghost beacon packet
                 Ptr<Packet> ghost_pkt = Create<Packet>(0);
@@ -1429,6 +1572,66 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                  << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
                  << " t=" << t << endl;
         }
+
+        // ── LW-DETECT at RSU (paper §3.5.3 Algorithm 1, Fig 3.10) ────────────
+        // Per the paper architecture, lightweight detection runs at the RSU
+        // (edge). It executes AFTER:
+        //   • HMAC gate (Eq.3.37)
+        //   • RSU-side attack injection (TP-S1 / MP-S1 if RSU is compromised)
+        // and BEFORE the beacon is forwarded to the controller.
+        //
+        // The controller will use the cached result (m_lw_detection_ran=true)
+        // for attacks 1-4 and 6. For attacks 5 (TP-S3) and 7 (MP-S4) the
+        // controller itself modifies the beacon, then pops the RSU-pushed
+        // vehicle_state entry and re-runs this same helper on the modified
+        // tag (see HandleBeaconReceived).
+        //
+        // PBPO_LW: detection time is part of the RSU-side per-beacon lightweight
+        // budget per Eq.4.7 (lightweight mode). Accumulated into pbpo_lw_time_sum_ms.
+
+        // Save/restore guard for stolen-ID contamination (attacks 4/6 cached path
+        // case): the RSU's push of the poisoned/intercepted beacon would otherwise
+        // pollute vehicle_state[vid] as the baseline for the NEXT honest beacon.
+        // Restore happens only if MP-S4 (impossible velocity) fires — matching the
+        // paper-justified case in §3.5.3.
+        bool save_state_rsu = ((attack_number == 1) || (attack_number == 4) ||
+                               (attack_number == 5) || (attack_number == 6))
+                           && (vid < (uint32_t)total_size)
+                           && tag.GetIsPoisoned()
+                           && !sybil_mitm_nodes[vid];
+        VehicleBeaconState vs_backup_rsu;
+        if (save_state_rsu) vs_backup_rsu = vehicle_state[vid];
+
+        struct timespec t_det_start, t_det_end;
+        clock_gettime(CLOCK_MONOTONIC, &t_det_start);
+        LwDetectResult rsu_lw = run_lw_detect_per_beacon(vid, tag, rsu_idx);
+        clock_gettime(CLOCK_MONOTONIC, &t_det_end);
+        pbpo_lw_time_sum_ms += (t_det_end.tv_sec  - t_det_start.tv_sec)  * 1000.0
+                             + (t_det_end.tv_nsec - t_det_start.tv_nsec) / 1e6;
+        // NOTE: pbpo_lw_cnt was already incremented by the HMAC gate timer above;
+        // detection time accumulates into the SAME per-beacon sample so the mean
+        // reflects HMAC + LW-DETECT together (paper Eq.4.7 lightweight mode total).
+
+        if (save_state_rsu && (rsu_lw.mp_flags & (1u << 3))) {
+            // MP-S4 fired on the RSU push — restore pre-push state to prevent
+            // future detection on the same vid from comparing against the
+            // poisoned/intercepted baseline.
+            vehicle_state[vid] = vs_backup_rsu;
+        }
+
+        // Stamp cached LW-DETECT result onto the tag for the controller to consume
+        tag.SetLwDetectionRan(true);
+        tag.SetLwAnomalous   (rsu_lw.anomalous);
+        tag.SetLwPsi         (rsu_lw.psi);
+        tag.SetSigViolated   (rsu_lw.sig_violated);
+
+        cout << "[LW-DETECT-RSU" << rsu_idx << "] V" << vid
+             << " psi=" << std::fixed << std::setprecision(3) << rsu_lw.psi
+             << " th=" << psi_th
+             << " anomalous=" << (rsu_lw.anomalous ? "YES" : "no")
+             << " detected=" << (rsu_lw.detected ? "YES" : "no")
+             << " sig=0x" << std::hex << rsu_lw.sig_violated << std::dec
+             << endl;
 
         // Stamp RSU index into tag so management_node knows which RSU relayed this beacon
         tag.SetRsuId(rsu_idx);

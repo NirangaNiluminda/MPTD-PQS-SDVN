@@ -118,7 +118,8 @@ void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
                       double real_px, double real_py,
                       double fake_px, double fake_py,
                       double speed,   double heading, double accel,
-                      double drift_x, double drift_y, double disp_err)
+                      double drift_x, double drift_y, double disp_err,
+                      bool   is_abrupt, double step_scaled)
 {
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
@@ -132,7 +133,8 @@ void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
              << "real_pos_x,real_pos_y,"
              << "fake_pos_x,fake_pos_y,"
              << "drift_x,drift_y,disp_err_m,"
-             << "speed_ms,heading_rad,accel_ms2\n";
+             << "speed_ms,heading_rad,accel_ms2,"
+             << "is_abrupt,step_scaled_m\n";   // §3.4.3 Eq 3.5 hybrid-mix labels
         poison_first_call = false;
     } else {
         fout.open(path, std::ios::out | std::ios::app);
@@ -152,7 +154,9 @@ void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
          << disp_err       << ","
          << speed          << ","
          << heading        << ","
-         << accel          << "\n";
+         << accel          << ","
+         << (is_abrupt ? 1 : 0) << ","
+         << step_scaled    << "\n";
     fout.close();
 }
 

@@ -53,6 +53,20 @@ public:
     void SetHmacValid(bool v)           { m_hmac_valid = v; }
     bool GetHmacValid()           const { return m_hmac_valid; }
 
+    // ── LW-DETECT cached result (paper §3.5.3 Algorithm 1, Fig 3.10) ─────────
+    // RSU runs Algorithm 1 (LW-DETECT) locally per paper architecture and stamps
+    // the result onto the beacon tag before forwarding to the controller. The
+    // controller uses the cached result for attacks 1-4,6 (no controller-side
+    // modification of the beacon). For attacks 5 & 7 (controller poisons the
+    // beacon), the controller pops the RSU-pushed vehicle_state entry and re-runs
+    // LW-DETECT on the modified beacon — overwriting these cached fields.
+    void SetLwDetectionRan(bool v)     { m_lw_detection_ran = v; }
+    bool GetLwDetectionRan()    const  { return m_lw_detection_ran; }
+    void SetLwAnomalous(bool v)        { m_lw_anomalous = v; }
+    bool GetLwAnomalous()       const  { return m_lw_anomalous; }
+    void SetLwPsi(double v)            { m_lw_psi = v; }
+    double GetLwPsi()           const  { return m_lw_psi; }
+
     // Getters
     double   GetPosX()         const { return m_pos_x; }
     double   GetPosY()         const { return m_pos_y; }
@@ -82,6 +96,10 @@ private:
     uint8_t  m_hmac[8]      = {};    // truncated HMAC-SHA256 of beacon payload
     bool     m_hmac_set     = false; // true once vehicle has written HMAC
     bool     m_hmac_valid   = false; // set by RSU after verification
+    // LW-DETECT cached result (Algorithm 1, §3.5.3) — stamped at RSU
+    bool     m_lw_detection_ran = false; // true if RSU has already run LW-DETECT
+    bool     m_lw_anomalous     = false; // ψ_i(t) > ψ_th at RSU
+    double   m_lw_psi           = 0.0;   // ψ_i(t) composite score
 };
 
 NS_OBJECT_ENSURE_REGISTERED(BsmBeaconTag);
@@ -98,8 +116,11 @@ ns3::TypeId BsmBeaconTag::GetInstanceTypeId(void) const {
     return BsmBeaconTag::GetTypeId();
 }
 uint32_t BsmBeaconTag::GetSerializedSize(void) const {
-    // 6 doubles + 4 uint32 + 1 bool (poisoned) + 8 bytes HMAC + 2 bool (hmac_set, hmac_valid)
-    return 6 * sizeof(double) + 4 * sizeof(uint32_t) + sizeof(uint8_t) + 8 + 2;
+    // 6 doubles (kinematics) + 4 uint32 + 1 bool (poisoned) + 8 bytes HMAC
+    // + 2 bool (hmac_set, hmac_valid) + 1 bool (lw_detection_ran)
+    // + 1 bool (lw_anomalous) + 1 double (lw_psi)
+    return 6 * sizeof(double) + 4 * sizeof(uint32_t) + sizeof(uint8_t) + 8 + 2
+         + 2 /*lw bools*/ + sizeof(double) /*lw_psi*/;
 }
 void BsmBeaconTag::Serialize(ns3::TagBuffer i) const {
     i.WriteDouble(m_pos_x);
@@ -117,6 +138,10 @@ void BsmBeaconTag::Serialize(ns3::TagBuffer i) const {
     for (int b = 0; b < 8; b++) i.WriteU8(m_hmac[b]);
     i.WriteU8(m_hmac_set   ? 1 : 0);
     i.WriteU8(m_hmac_valid ? 1 : 0);
+    // LW-DETECT cached result (Algorithm 1, §3.5.3)
+    i.WriteU8(m_lw_detection_ran ? 1 : 0);
+    i.WriteU8(m_lw_anomalous     ? 1 : 0);
+    i.WriteDouble(m_lw_psi);
 }
 void BsmBeaconTag::Deserialize(ns3::TagBuffer i) {
     m_pos_x       = i.ReadDouble();
@@ -134,6 +159,10 @@ void BsmBeaconTag::Deserialize(ns3::TagBuffer i) {
     for (int b = 0; b < 8; b++) m_hmac[b] = i.ReadU8();
     m_hmac_set   = (i.ReadU8() != 0);
     m_hmac_valid = (i.ReadU8() != 0);
+    // LW-DETECT cached result (Algorithm 1, §3.5.3)
+    m_lw_detection_ran = (i.ReadU8() != 0);
+    m_lw_anomalous     = (i.ReadU8() != 0);
+    m_lw_psi           = i.ReadDouble();
 }
 void BsmBeaconTag::Print(std::ostream &os) const {
     os << "BSM[v=" << m_vehicle_id
