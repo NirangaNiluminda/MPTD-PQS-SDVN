@@ -1,18 +1,75 @@
-def build(bld):
-    obj = bld.create_ns3_program('mptd_pqs_sdvn',
-        ['core', 'network', 'wifi', 'lte', 'csma', 'internet',
-         'mobility', 'wave', 'applications', 'point-to-point',
-         'flow-monitor', 'netanim'])
-    obj.source = ['simulation.cc']
-    # No external crypto library needed: HMAC-SHA256 is implemented inline in
-    # 00_lkh_keys.h (pure C++ FIPS 180-4 + RFC 2104) — waf/ns-3.35 compatible.
-    # Stage 7: OpenFHE Post-Quantum Crypto (TRS + CKKS FHE)
-    # Uncomment when OpenFHE is installed:
-    #   sudo apt-get install -y libgmp-dev
-    #   git clone https://github.com/openfheorg/openfhe-development.git
-    #   cd openfhe-development && mkdir build && cd build
-    #   cmake .. && make -j4 && sudo make install
-    # Then replace FHECiphertext with Ciphertext<DCRTPoly> in 07_security.h
-    # and add the following lines:
-    # obj.uselib = 'OPENFHE'
-    # env.LIB_OPENFHE = ['OPENFHEbinfhe', 'OPENFHEcore', 'OPENFHEpke']
+# MPTD-PQS scratch wscript — extends the auto-created ns-3 scratch program
+# with the crypto-backend linkage required by R6.5 (OpenSSL TRS, OpenFHE BFV).
+#
+# Why this file exists:
+#   ns-3.35's top-level wscript auto-creates a cxxprogram for every scratch
+#   subdir but does NOT recurse into per-scratch wscripts. The MPTD-PQS R6.5
+#   patch in /home/niranga/ns-allinone-3.35/ns-3.35/wscript adds a
+#   `customize(bld, obj)` hook that calls into this file after the auto-
+#   create step, so we can append cxxflags / lib / includes without
+#   touching the global ns-3 build.
+#
+# Contract:
+#   - Define `customize(bld, obj)` — runs after the scratch obj is built.
+#   - `obj` is the cxx cxxprogram task gen with default ns-3 modules.
+#   - Use `obj.env.append_value('CXXFLAGS', ...)` for compile flags,
+#     `obj.env.append_value('LINKFLAGS', ...)` for link flags, and
+#     `obj.env.append_value('LIB', ...)` for -l libs. Per-task env mutation
+#     is the only path that survives waf's task lazy-binding in ns-3.35.
+
+import os
+
+def customize(bld, obj):
+    home = os.environ.get('HOME', '/home/niranga')
+    local_inc  = os.path.join(home, '.local', 'include')
+    local_lib  = os.path.join(home, '.local', 'lib')
+    openfhe_inc = os.path.join(local_inc, 'openfhe')
+
+    # ── Compile flags ──────────────────────────────────────────────────────
+    # OpenFHE 1.5.1 requires C++17 (uses if-constexpr, structured bindings,
+    # std::variant). ns-3.35 default is C++14; the override here applies
+    # only to our scratch target.
+    # OpenFHE source also uses OpenMP pragmas; -fopenmp pulls in libgomp.
+    # The OpenFHE include layout puts public headers under
+    # $HOME/.local/include/openfhe/ with subdirs core/, pke/, binfhe/,
+    # cereal/. The master header is openfhe/openfhe.h. We add multiple -I
+    # roots so internal "lattice/..." cross-includes resolve.
+    # ONNX Runtime C++ headers (R7d): onnxruntime_cxx_api.h is a single-
+    # header API that sits directly under $HOME/.local/include/ — no
+    # subdirectory needed, so `-I$HOME/.local/include` is enough.
+    obj.env.append_value('CXXFLAGS', [
+        '-std=c++17',
+        '-fopenmp',
+        '-Wno-error',                            # OpenFHE pulls warnings on -Werror
+        '-Wno-deprecated-declarations',          # OpenSSL EC_KEY in 06b1
+        '-I' + local_inc,                        # R7d: onnxruntime_cxx_api.h
+        '-I' + openfhe_inc,
+        '-I' + os.path.join(openfhe_inc, 'core'),
+        '-I' + os.path.join(openfhe_inc, 'pke'),
+        '-I' + os.path.join(openfhe_inc, 'binfhe'),
+        '-I' + os.path.join(openfhe_inc, 'cereal'),
+    ])
+
+    # ── Link flags ─────────────────────────────────────────────────────────
+    # -fopenmp at link time to pull libgomp.
+    # -L for the OpenFHE shared lib dir (also covers libonnxruntime.so since
+    #   both live under $HOME/.local/lib).
+    # -rpath bakes the runtime search path into the binary so we don't need
+    #   LD_LIBRARY_PATH=$HOME/.local/lib on every `waf --run`.
+    obj.env.append_value('LINKFLAGS', [
+        '-fopenmp',
+        '-L' + local_lib,
+        '-Wl,-rpath,' + local_lib,
+    ])
+
+    # ── Libraries ──────────────────────────────────────────────────────────
+    # OpenFHE: pke depends on core; both depend on binfhe for shared utils.
+    # OpenSSL: libcrypto provides EC_KEY, ECDSA_*, BN_*, SHA256, RAND.
+    # onnxruntime (R7d): C++ API for loading GAT + LSTM-AE .onnx models.
+    obj.env.append_value('LIB', [
+        'OPENFHEpke',
+        'OPENFHEcore',
+        'OPENFHEbinfhe',
+        'crypto',
+        'onnxruntime',
+    ])

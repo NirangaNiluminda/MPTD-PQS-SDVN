@@ -1050,12 +1050,30 @@ def add_scratch_programs(bld):
             if filename.startswith('.') or filename == 'CVS':
                 continue
             if os.path.isdir(os.path.join("scratch", filename)):
+                # MPTD-PQS R6.5: if the scratch dir ships its own wscript with
+                # a customize() hook (for extra includes / libs / cxxflags),
+                # delegate so the per-scratch wscript can add OpenFHE,
+                # OpenSSL etc. Without this, ns-3.35's default auto-loader
+                # ignores per-scratch wscripts entirely.
+                wscript_path = os.path.join("scratch", filename, "wscript")
                 obj = bld.create_ns3_program(filename, all_modules)
                 obj.path = obj.path.find_dir('scratch').find_dir(filename)
                 obj.source = obj.path.ant_glob('*.cc')
                 obj.target = filename
                 obj.name = obj.target
                 obj.install_path = None
+                if os.path.exists(wscript_path):
+                    try:
+                        scratch_mod = bld.path.find_node(wscript_path).read()
+                        # exec the wscript in a namespace exposing `bld` and `obj`
+                        ns = {'bld': bld, 'obj': obj, '__file__': wscript_path}
+                        exec(compile(scratch_mod, wscript_path, 'exec'), ns)
+                        if 'customize' in ns and callable(ns['customize']):
+                            ns['customize'](bld, obj)
+                    except Exception as e:
+                        import sys
+                        print("[scratch wscript] %s failed: %s" % (wscript_path, e),
+                              file=sys.stderr)
             elif filename.endswith(".cc"):
                 name = filename[:-len(".cc")]
                 obj = bld.create_ns3_program(name, all_modules)
