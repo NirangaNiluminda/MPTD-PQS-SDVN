@@ -20,6 +20,15 @@ mptd_pqs/**/*.pyc
 !mobility/
 !mobility/**
 
+# ── Hyperledger Fabric chaincode (Go) ─────────────────────────────────────────
+# imported May 2026 from NirangaNiluminda/mptd-pqs-blockchain → ns3 chaincode/
+# vendor/ is kept under tracking so chaincode builds hermetically inside the
+# CCAAS Docker image (Dockerfile assumes vendor/ is populated; no network at
+# container-build time). Regenerable via `cd chaincode && go mod vendor`.
+!chaincode/
+!chaincode/**
+chaincode/**/*.test
+
 # ── Root config / build files ─────────────────────────────────────────────────
 !.gitignore
 !wscript
