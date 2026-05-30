@@ -46,10 +46,21 @@ class GATDetector(nn.Module):
         # concat=True → output dim = hidden * heads = 128
         self.conv2 = GATConv(hidden * heads, 16, heads=1, concat=False, dropout=0.1)
         self.act   = nn.ELU()
+        # Learnable score head: linear projection of the raw z-score L2 norm
+        # into the sigmoid's "useful" range. Without these, the bare
+        # sigmoid(L2-norm-of-16-dim-z-score) saturates near 1.0 for ALL nodes
+        # because the L2 norm of a 16-dim unit-variance z-score is ~√16 ≈ 4
+        # by construction, regardless of anomaly status. With a learnable
+        # scale and bias the model can pick a discriminative operating point
+        # during training instead of being clamped at the saturated tail.
+        self.score_scale = nn.Parameter(torch.tensor(1.0))
+        self.score_bias  = nn.Parameter(torch.tensor(-4.0))  # init near sigmoid origin
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
         """
-        Returns S_i ∈ [0,1] per node: L2-norm of z-score of GAT embedding (Eq. 3.42).
+        Returns S_i ∈ [0,1] per node: sigmoid-mapped L2-norm of z-score of
+        the GAT embedding (paper Eq. 3.42, with a learnable affine to keep
+        the sigmoid out of its saturated tail).
         """
         emb = self.act(self.conv1(x, edge_index))   # (N, hidden*heads)
         emb = self.act(self.conv2(emb, edge_index)) # (N, 16) — x'_i
@@ -60,8 +71,10 @@ class GATDetector(nn.Module):
         z   = (emb - mu) / sig                      # (N, 16)
         s_i = z.norm(dim=1, keepdim=True)           # (N, 1) — L2 z-score norm
 
-        # Sigmoid to map [0,∞) → [0,1] for downstream score fusion
-        return torch.sigmoid(s_i)                   # (N, 1)
+        # Affine + sigmoid — learnable shift/scale keeps the output away from
+        # the saturated tail of sigmoid where gradients vanish.
+        logit = self.score_scale * s_i + self.score_bias
+        return torch.sigmoid(logit)                 # (N, 1)
 
 
 # ---------------------------------------------------------------------------
@@ -173,6 +186,16 @@ def score_snapshot(model: GATDetector, features: np.ndarray,
         # Backward compatibility: append tau_i = TAU_INIT
         tau_col  = np.full((len(features), 1), TAU_INIT, dtype=np.float32)
         features = np.hstack([features, tau_col])
+
+    # Snapshot-level z-score in the model head needs N≥2 (otherwise std()
+    # returns NaN, scores become NaN, downstream fusion breaks). On a
+    # 1-vehicle snapshot the spatial-anomaly signal is undefined: emit a
+    # below-threshold neutral score so the lone vehicle isn't auto-flagged
+    # by GAT, letting the temporal AE branch carry the decision.
+    # R7f.followup-1c: was 0.5 — equal to GAT_THRESH=0.5 in evaluate_all.py,
+    # so every 1-vehicle snapshot triggered A2 (FPR=1.0). Now 0.0.
+    if features.shape[0] < 2:
+        return np.zeros((features.shape[0],), dtype=np.float32)
 
     model.eval()
     data = snapshot_to_graph(features)
