@@ -1,0 +1,2 @@
+attack_number,attack_pct,maxspeed_kmh,ablation_mode,cm_TP,cm_FP,cm_TN,cm_FN,MCC,FPR,PARR,CDER,ctrl_decisions_total,ctrl_decisions_wrong,TDEE,TPE,PBPO_LW_ms,PBPO_Full_ms,total_received,total_poisoned,total_stored
+1,5,50,1,0,0,808,0,0,0,0,0,808,0,-1,0.0330043,0.0186448,0.0746641,808,0,808
