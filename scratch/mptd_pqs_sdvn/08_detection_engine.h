@@ -2337,7 +2337,63 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             if (!routing_test && ablation_mode != 5 && rsu_lw.anomalous) {
                 double ts = Simulator::Now().GetSeconds();
                 uint32_t sigmask = rsu_lw.tp_flags | (rsu_lw.mp_flags << 5);
+
+                // ── Legacy single-RSU SCTrustUpdate path ─────────────────────
+                // Kept live during the Eq 3.56 migration window so the existing
+                // chaincode tests, audit logs, and downstream metrics that
+                // depend on SCTrustUpdate output continue to work. This call
+                // will be removed in a follow-on task once SCTrustFinalizeEpoch
+                // aggregation has been validated end-to-end.
                 CallSCTrust(vid, rsu_lw.psi, sigmask, rsu_lw.detected, ts);
+
+                // ── Paper-aligned Eq 3.56 RSU evidence tuple (TASK ①-I) ──────
+                // E_j(t) = (vehicleID, ψ_j^(i)(t), epoch, h(b_i(t)), σ_j^sub)
+                //
+                // Paper invariant #1 (RSU→Blockchain direct) — this call is
+                // submitted by the RSU itself with NO controller relay. The
+                // chaincode side (SCTrustSubmitEvidence in
+                // chaincode/chaincode/smartcontract.go) buffers the witness;
+                // SCTrustFinalizeEpoch later aggregates them per Eq 3.55:
+                //   τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - (1/|R|)·Σ ψ_j^(i)(t))
+                //
+                // BeaconTag carries scalar (speed, heading, accel). Project to
+                // (vx, vy) deterministically so every RSU witnessing the same
+                // DSRC broadcast computes the SAME canonical blob → SAME CID,
+                // which is what SCTrustFinalizeEpoch needs to recognise
+                // witnesses-of-the-same-beacon.
+                //
+                // σ_j^sub PLACEHOLDER: empty string for now — the chaincode
+                // accepts it as opaque bytes (verification is the
+                // LatticeTrsBackend migration's job, phase R11). Real
+                // per-RSU TRS partial-sig plumbing through ITrsBackend lands
+                // in TASK ①-J.
+                {
+                    const double speed   = tag.GetSpeed();
+                    const double heading = tag.GetHeading();
+                    const double accel   = tag.GetAcceleration();
+                    const double vx = speed * std::cos(heading);
+                    const double vy = speed * std::sin(heading);
+                    const double ax = accel * std::cos(heading);
+                    const double ay = accel * std::sin(heading);
+
+                    std::string h_b = mptd_beacon_hash(
+                        std::to_string(vid),
+                        std::to_string(rsu_idx),
+                        tag.GetPosX(), tag.GetPosY(), 0.0,
+                        vx, vy, 0.0,
+                        ax, ay, 0.0,
+                        tag.GetTimestamp());
+
+                    std::string epoch = mptd_epoch_from_ts(ts);
+
+                    // σ_j^sub placeholder — see comment above; chaincode
+                    // does not enforce signature verification at this stage.
+                    std::string sigma_sub_hex = "";
+
+                    CallSCTrustSubmitEvidence(
+                        vid, rsu_idx, epoch,
+                        rsu_lw.psi, h_b, sigma_sub_hex);
+                }
             }
         }
 
