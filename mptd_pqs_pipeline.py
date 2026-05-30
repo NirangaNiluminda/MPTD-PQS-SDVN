@@ -29,6 +29,8 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional
 
+from mptd_pqs.sharma_b3_detector import SharmaB3Detector, extract_features_from_ns3
+
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
 
@@ -43,7 +45,8 @@ from mptd_pqs.metrics_calculator import MetricsCalculator, MetricsResult, Confus
 from mptd_pqs.metrics_visualization import plot_all, plot_ablation, plot_baseline_comparison
 
 
-SIM_DIR     = "/home/niranga/ns-allinone-3.35/ns-3.35"
+# Default paths (can be overridden via CLI)
+SIM_DIR     = os.path.dirname(os.path.abspath(__file__))  # Current directory
 NS3_BINARY  = os.path.join(SIM_DIR, "build/scratch/lda_attack_scenario1")
 LIB_PATH    = os.path.join(SIM_DIR, "build/lib")
 SIM_TIME    = 15
@@ -251,12 +254,15 @@ def main():
                         help="Skip running simulations (use existing output files)")
     parser.add_argument("--attack-pcts", nargs="+", type=int,
                         default=ATTACK_PCTS, help="Attack percentages to evaluate")
-    parser.add_argument("--output-dir", default=SIM_DIR,
-                        help="Directory for output charts and JSON")
+    parser.add_argument("--output-dir", default="results",
+                        help="Directory for output charts and JSON (default: results/)")
     parser.add_argument("--variant", default="FULL",
                         choices=["FULL", "A1", "A2", "A3", "A4", "A5"],
                         help="Detection variant")
     args = parser.parse_args()
+    
+    # Ensure output directory exists
+    os.makedirs(args.output_dir, exist_ok=True)
 
     print("=" * 60)
     print("  MPTD-PQS Evaluation Pipeline")
@@ -310,6 +316,9 @@ def main():
     with open(json_out, 'w') as f:
         json.dump(all_data, f, indent=2)
     print(f"\nResults saved: {json_out}")
+    
+
+
 
     # ── Visualizations ─────────────────────────────────────────────────────────
     print("\nGenerating charts...")
@@ -326,6 +335,11 @@ def main():
             results_by_pct[ref_pct],
             output_path=os.path.join(args.output_dir, "mptd_pqs_baseline.png")
         )
+
+    # Add your code here
+    feat_df = extract_features_from_ns3("analytics/results/rsu_relay_log.csv")
+    det = SharmaB3Detector(seed=42, with_plausibility=True)
+    b3_results = det.run(feat_df)
 
     print("\n" + "=" * 60)
     print("  MPTD-PQS Pipeline Complete")
