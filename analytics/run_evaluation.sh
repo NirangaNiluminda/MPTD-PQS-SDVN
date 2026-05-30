@@ -31,8 +31,11 @@ ML_DIR="$ANALYTICS/ml"
 RESULTS="$ANALYTICS/results/sweep"
 LOG_DIR="$ANALYTICS/results/logs"
 BEACON_CSV="$ANALYTICS/results/beacon_log.csv"
+# R7f.followup-3: preserve each run's beacon_log.csv so re-evaluation
+# (e.g., after tuning Python thresholds) doesn't require re-running NS-3.
+BEACON_ARCHIVE="$RESULTS/beacon_logs"
 
-mkdir -p "$RESULTS" "$LOG_DIR"
+mkdir -p "$RESULTS" "$LOG_DIR" "$BEACON_ARCHIVE"
 
 # ---------------------------------------------------------------------------
 # Sweep parameters
@@ -88,12 +91,17 @@ run_ns3() {
     # NS-3 has a pre-existing LTE SIGSEGV at t≈0.93s (Stage 6 known issue).
     # The DSRC detection phase starts at t=6.7s so beacon_log.csv is still
     # produced before the crash.  We use || true so the script continues.
+    # --skip_blockchain=true: this sweep evaluates the AI detection layer
+    # post-hoc from beacon_log.csv. Hyperledger Fabric is not running, and
+    # paper invariant #3 means lightweight detection runs without blockchain
+    # anyway; the alert-path SC-Trust calls would only add timeouts here.
     python3 waf --run "mptd_pqs_sdvn \
         --attack_number=${A} \
         --attack_percentage=${P} \
         --maxspeed=${S} \
         --simTime=${SIM_TIME} \
-        --routing_test=false" \
+        --routing_test=false \
+        --skip_blockchain=true" \
         > "$LOG" 2>&1 || true
 
     # Verify beacon_log was written
@@ -109,11 +117,19 @@ evaluate_run() {
     local A="$1" P="$2" S="$3"
     local OUT="$RESULTS/run_a${A}_p${P}_s${S}.csv"
     local SL; SL=$(speed_label "$S")
+    local METRICS_CSV="$RESULTS/metrics_a${A}_p${P}_s${S}_m1.csv"
+    # R7f.followup-3: archive this run's beacon_log so post-hoc re-evaluation
+    # (e.g., threshold retuning, new variants) doesn't require resimulating.
+    local BEACON_ARCH_CSV="$BEACON_ARCHIVE/beacon_a${A}_p${P}_s${S}.csv"
 
     echo "  [eval] attack=$A pct=$P speed=$SL ($S km/h) → $OUT"
     if $DRY_RUN; then
         echo "  [dry-run] skipping evaluate_all.py"
         return 0
+    fi
+
+    if [ -s "$BEACON_CSV" ]; then
+        cp -f "$BEACON_CSV" "$BEACON_ARCH_CSV"
     fi
 
     python3 "$ML_DIR/evaluate_all.py" \
@@ -122,6 +138,7 @@ evaluate_run() {
         --speed         "$S" \
         --speed_label   "$SL" \
         --beacon_csv    "$BEACON_CSV" \
+        --metrics_csv   "$METRICS_CSV" \
         --output        "$OUT"
 }
 
