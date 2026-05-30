@@ -45,10 +45,18 @@
 //   06c: Blockchain API (Store*/Call* REST calls) — depends on 06b TRS/FHE types
 //   06a: Attack models (PoisonTrajectory*, declare_*) — depends on 06c Store* calls
 #include "06b_pq_crypto.h"
+#include "06b1_trs_backend.h"   // R6.5: ITrsBackend + ClassicalTrsBackend (OpenSSL EC)
+#include "06b2_fhe_backend.h"   // R6.5: BfvBackend (OpenFHE BFV)
+#include "06b3_crypto_selftest.h" // R6.5: TRS + BFV round-trip self-tests (env-gated)
 #include "06c_blockchain_api.h"
+#include "06d_ai_inference.h"   // R7d: ONNX Runtime GAT + LSTM-AE wrapper
 #include "06a_attack_models.h"
 // 08_lldp_handlers.h REMOVED - legacy LLDP state machine (replaced by 08_detection_engine.h)
 #include "07_socket_layer.h"
+#include "09b_mobility_provider.h"   // R7a: IMobilityProvider + Hardcoded/FCD backends
+                                     //      (must precede 08 — TPE predictor in
+                                     //      08_detection_engine.h uses g_mobility_provider
+                                     //      for GT side-channel, Eq.4.6, R7e.4)
 #include "08b_baseline_ltt.h"   // B1: Ghaleb (2014) LTT baseline (ablation_mode=6)
 #include "08_detection_engine.h"
 #include "09_vehicle_beacon_tx.h"

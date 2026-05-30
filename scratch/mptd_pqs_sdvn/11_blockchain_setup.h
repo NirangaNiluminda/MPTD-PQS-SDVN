@@ -84,6 +84,41 @@ void initialize_server()
     std::cout << "Server started" << endl;
 }
 
+// ── initialize_crypto_backends() — R6.5: TRS (OpenSSL EC) + FHE (OpenFHE BFV) ─
+// Idempotent. Call once at sim start before any CP-DETECT or FHE aggregate
+// path runs. Failure prints a diagnostic and lets the sim continue (CP-DETECT
+// gate (a) fails closed if g_trs_backend is null on a non-empty σ; gate (b) is
+// unaffected; FHE aggregates are only consumed by R9 which isn't wired yet).
+void initialize_crypto_backends()
+{
+    // TRS: ring size n=4, threshold t=3 (matches 3-RSU + 1-ctrl peer setup).
+    if (init_trs_backend(/*n=*/4, /*t=*/3)) {
+        std::cout << "[CRYPTO/TRS] " << g_trs_backend->scheme_name()
+                  << " ready (n=" << g_trs_ring_n
+                  << " t=" << g_trs_ring_t
+                  << " pk=" << g_trs_backend->expected_pk_size() << "B"
+                  << " sig=" << g_trs_backend->expected_sig_size() << "B)\n";
+    } else {
+        std::cerr << "[CRYPTO/TRS] init FAILED — CP-DETECT σ_TRS path disabled\n";
+    }
+
+    // FHE: BFV-RNS, plaintext modulus 65537, mult depth 1 (sum-only).
+    if (init_fhe_backend(/*ptmod=*/65537, /*depth=*/1)) {
+        std::cout << "[CRYPTO/FHE] " << g_fhe_backend->scheme_name()
+                  << " ready (ring_dim=" << g_fhe_backend->ring_dim()
+                  << " ptmod=" << g_fhe_backend->plaintext_modulus() << ")\n";
+    } else {
+        std::cerr << "[CRYPTO/FHE] init FAILED"
+                  << (g_fhe_backend ? (": " + g_fhe_backend->last_error()) : "")
+                  << " — R9 FHE aggregate channel will be disabled\n";
+    }
+
+    // R6.5-C-8: optional self-test (env MPTD_CRYPTO_SELFTEST=1).
+    // Off by default; one-shot run that prints PASS/FAIL summary and
+    // continues — never aborts the sim even on failure.
+    crypto_selftest_run();
+}
+
 // ── assign_controllers() — assign node→controller + RSU malicious flags ──────
 void assign_controllers()
 {

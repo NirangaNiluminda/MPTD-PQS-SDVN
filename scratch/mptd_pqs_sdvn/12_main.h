@@ -57,9 +57,25 @@ int main(int argc, char *argv[])
                   "(0=original ghost-ID mode, >0=behavioural detection via MP-S3 KL)",
                   sybil_registration_pct);
     cmd.AddValue ("ablation_mode",
-                  "Ablation variant: 1=A1 LW-only, 2=A2 GAT-stub, 3=A3 AE-stub, "
-                  "4=A4 no-PQ, 5=A5 no-blockchain (default=1)",
+                  "Ablation variant: 0=Full, 1=A1 LW-only, 2=A2 GAT-only, 3=A3 AE-only, "
+                  "4=A4 no-PQ, 5=A5 no-blockchain, 6=B1 Ghaleb-LTT baseline (default=1)",
                   ablation_mode);
+    cmd.AddValue ("enable_gat",
+                  "R7f: force GAT spatial detector on(1)/off(0); -1=follow ablation_mode",
+                  g_enable_gat_cli);
+    cmd.AddValue ("enable_lstm_ae",
+                  "R7f: force LSTM-AE temporal detector on(1)/off(0); -1=follow ablation_mode",
+                  g_enable_lstm_ae_cli);
+    cmd.AddValue ("skip_blockchain",
+                  "R7g.3: skip Hyperledger Fabric + REST API bring-up "
+                  "(for training-data sweeps without a working Fabric env); "
+                  "default=false",
+                  skip_blockchain);
+    cmd.AddValue ("mobility_source",
+                  "Mobility provider: 0=hardcoded 16-veh ConstantVelocity (default, "
+                  "fast smoke tests), 1=sumo_trace (Ns2MobilityHelper on .tcl from "
+                  "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
+                  g_mobility_source);
     cmd.Parse (argc, argv);
 
     // ── Apply ablation mode overrides ─────────────────────────────────────────
@@ -68,17 +84,60 @@ int main(int argc, char *argv[])
         use_pq_crypto = false;
         std::cout << "[ABLATION] Mode A4: PQ crypto (TRS+FHE) DISABLED" << std::endl;
     }
-    // A2/A3: GAT and AE not yet implemented — behave identically to A1 for now
-    if (ablation_mode == 2 || ablation_mode == 3) {
-        std::cout << "[ABLATION] Mode A" << ablation_mode
-                  << ": AI component stub — running as A1 (lightweight) until"
-                  << " GAT/AE implemented" << std::endl;
-    }
     if (ablation_mode == 5) {
         std::cout << "[ABLATION] Mode A5: Blockchain SC calls DISABLED" << std::endl;
     }
+
+    // ── R7f: derive AI-component toggles from ablation_mode (paper §4.1.1) ───
+    // Default (CLI not set, cli == -1) follows the ablation table:
+    //   A1 → no AI (lightweight only)
+    //   A2 → GAT only
+    //   A3 → LSTM-AE only
+    //   A4/A5/Full → both AI components on
+    //   B1 → no AI (LTT baseline doesn't use the MPTD-PQS AI stack)
+    bool ab_gat_default = true;
+    bool ab_ae_default  = true;
+    switch (ablation_mode) {
+        case 1: ab_gat_default = false; ab_ae_default = false; break;   // A1
+        case 2: ab_gat_default = true;  ab_ae_default = false; break;   // A2
+        case 3: ab_gat_default = false; ab_ae_default = true;  break;   // A3
+        case 6: ab_gat_default = false; ab_ae_default = false; break;   // B1
+        case 4: case 5: case 0: default: /* both true */          break;
+    }
+    g_enable_gat     = (g_enable_gat_cli     >= 0) ? (g_enable_gat_cli     != 0) : ab_gat_default;
+    g_enable_lstm_ae = (g_enable_lstm_ae_cli >= 0) ? (g_enable_lstm_ae_cli != 0) : ab_ae_default;
+    // Mirror toggles into the fusion parameter block so fuse_scores() can
+    // renormalise λ-weights for A2/A3 (R7f, paper Eq 3.46 / §4.1.1).
+    g_fusion.use_gat = g_enable_gat;
+    g_fusion.use_ae  = g_enable_lstm_ae;
     std::cout << "[ABLATION] Active mode: A" << ablation_mode
-              << "  use_pq_crypto=" << (use_pq_crypto ? "YES" : "NO") << std::endl;
+              << "  use_pq_crypto=" << (use_pq_crypto ? "YES" : "NO")
+              << "  enable_gat="    << (g_enable_gat     ? "YES" : "NO")
+              << "  enable_lstm_ae="<< (g_enable_lstm_ae ? "YES" : "NO")
+              << std::endl;
+
+    // ── R7d: Initialize ONNX Runtime AI inference engine ──────────────────────
+    // Loads GAT + LSTM-AE .onnx models trained by analytics/ml/train.py.
+    // R7f: empty path skips loading the corresponding session, so has_gat()
+    // / has_lstm_ae() return false and the call sites in 08_detection_engine.h
+    // bypass that component. Fusion (06d_ai_inference.h) renormalises the
+    // surviving λ weights so Φ_th = 0.5 keeps its meaning across A2/A3/Full.
+    {
+        const std::string gat_path     = g_enable_gat
+                                         ? NS3_ROOT "/analytics/ml/models/gat_model.onnx"
+                                         : std::string();
+        const std::string lstm_ae_path = g_enable_lstm_ae
+                                         ? NS3_ROOT "/analytics/ml/models/lstm_ae_model.onnx"
+                                         : std::string();
+        const std::string scaler_path  = NS3_ROOT "/analytics/ml/models/scaler.json";
+        const std::string theta_path   = NS3_ROOT "/analytics/ml/models/theta_ae.txt";
+        const bool ai_ok = g_ai_engine.init(gat_path, lstm_ae_path,
+                                            scaler_path, theta_path);
+        std::cout << "[AI-INIT] engine ready=" << (ai_ok ? "YES" : "NO")
+                  << " gat=" << (g_ai_engine.has_gat() ? "YES" : "NO")
+                  << " lstm_ae=" << (g_ai_engine.has_lstm_ae() ? "YES" : "NO")
+                  << " theta_ae=" << g_ai_engine.theta_ae() << std::endl;
+    }
 
     if (routing_test == true)
     {
@@ -118,87 +177,53 @@ int main(int argc, char *argv[])
   
   controller_Node.Create(1);
   management_Node.Create(1);
-  // NOTE: backup_controller_Node is created AFTER RSU_Nodes (see below) so that
-  // vehicle node IDs remain at nid=2..17 and vid=nid-2 stays correct (0..15).
-  // Creating backup here would shift all vehicle nids by 1, breaking vid indexing.
-  if (routing_test == false)
+  // R4.b: backup_controller_Node removed. Paper architecture has no backup
+  // controller; CP-DETECT (Alg 7, §3.5.5) via RSU consensus replaces it in R6.
+  // Cloud/ITS Server (paper Fig 3.9) — placeholder only. Receives σ_TRS-gated
+  // FHE-encrypted aggregates from the RSU cluster (invariant #5). R9 wires the
+  // real FHE channel; until then this node has no networking and no app.
+  cloud_Node.Create(1);
+  // R7f.followup-1b (2026-05-29): IMobilityProvider was previously installed
+  // ONLY in the routing_test=true branch. The routing_test=false branch (the
+  // sweep path) relied on the legacy vehicle_mobility.Install at line ~706,
+  // which I removed because it overwrote the provider in routing_test=true.
+  // Now both branches use IMobilityProvider directly — single source of truth.
+  if (N_Vehicles > 0)
   {
-  	  if(N_Vehicles > 0)
-  	{ 
-  		Vehicle_Nodes.Create(N_Vehicles); 
-  	}
-  }
-  
-  else
-  {
-  
-  	    Vehicle_Nodes.Create(N_Vehicles);
-	    MobilityHelper custom_mobility;
-	    Ptr<ListPositionAllocator> positionAlloc = CreateObject<ListPositionAllocator>();
-	    // Road at y=570/590; RSUs just above at y=480:
-	    //   RSU0=(250,480)  RSU1=(750,480)  RSU2=(1250,480)  RSU3=(1750,480)
-	    // V2I gap ≈ 90-110 m — realistic and visually the clusters sit under each RSU
-	    // Mgmt=(1000,50)  Controller=(850,50)
-	    positionAlloc->Add(Vector(210.0,  570.0, 0.0)); // V0  near RSU0
-	    positionAlloc->Add(Vector(250.0,  590.0, 0.0)); // V1  near RSU0
-	    positionAlloc->Add(Vector(280.0,  570.0, 0.0)); // V2  near RSU0
-	    positionAlloc->Add(Vector(290.0,  590.0, 0.0)); // V3  near RSU0
-	    positionAlloc->Add(Vector(710.0,  570.0, 0.0)); // V4  near RSU1
-	    positionAlloc->Add(Vector(750.0,  590.0, 0.0)); // V5  near RSU1
-	    positionAlloc->Add(Vector(780.0,  570.0, 0.0)); // V6  near RSU1
-	    positionAlloc->Add(Vector(790.0,  590.0, 0.0)); // V7  near RSU1
-	    positionAlloc->Add(Vector(1210.0, 570.0, 0.0)); // V8  near RSU2
-	    positionAlloc->Add(Vector(1250.0, 590.0, 0.0)); // V9  near RSU2
-	    positionAlloc->Add(Vector(1280.0, 570.0, 0.0)); // V10 near RSU2
-	    positionAlloc->Add(Vector(1290.0, 590.0, 0.0)); // V11 near RSU2
-	    positionAlloc->Add(Vector(1710.0, 570.0, 0.0)); // V12 near RSU3
-	    positionAlloc->Add(Vector(1750.0, 590.0, 0.0)); // V13 near RSU3
-	    positionAlloc->Add(Vector(1780.0, 570.0, 0.0)); // V14 near RSU3
-	    positionAlloc->Add(Vector(1790.0, 590.0, 0.0)); // V15 near RSU3
-	    /*
-	    positionAlloc->Add(Vector(0.0, -x*3, 0.0)); // Custom position for Node 3
-	    positionAlloc->Add(Vector(0.0, -x*4, 0.0)); // Custom position for Node 4
-	    positionAlloc->Add(Vector(x, -x*4, 0.0)); // Custom position for Node 5 
-	    positionAlloc->Add(Vector(2*x, -x*4, 0.0)); // Custom position for Node 6
-	    positionAlloc->Add(Vector(3*x, -x*4, 0.0)); // Custom position for Node 7
-	    positionAlloc->Add(Vector(3*x, -x*3, 0.0)); // Custom position for Node 8
-	    positionAlloc->Add(Vector(3*x, -x*2, 0.0)); // Custom position for Node 9
-	    positionAlloc->Add(Vector(3*x, -x, 0.0)); // Custom position for Node 10
-	    positionAlloc->Add(Vector(3*x, 0.0, 0.0)); // Custom position for Node 11
-	    positionAlloc->Add(Vector(x, 0.0, 0.0)); // Custom position for Node 12
-	    positionAlloc->Add(Vector(2*x, 0.0, 0.0)); // Custom position for Node 13
-	    positionAlloc->Add(Vector(0.0, x, 0.0)); // Custom position for Node 14
-	    positionAlloc->Add(Vector(0.0, x*2, 0.0)); // Custom position for Node 15
-	    positionAlloc->Add(Vector(x, x*2, 0.0)); // Custom position for Node 16
-	    positionAlloc->Add(Vector(x*2, x*2, 0.0)); // Custom position for Node 17
-	    positionAlloc->Add(Vector(x*3, x*2, 0.0)); // Custom position for Node 18
-	    positionAlloc->Add(Vector(x*3, x, 0.0)); // Custom position for Node 19
-	    positionAlloc->Add(Vector(x, x, 0.0)); // Custom position for Node 20
-	    positionAlloc->Add(Vector(2*x, x, 0.0)); // Custom position for Node 21
-	    */
-	    custom_mobility.SetPositionAllocator(positionAlloc);
-	    custom_mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
-	    custom_mobility.Install(Vehicle_Nodes);
-	    //custom_mobility.Install(RSU_Nodes);
+      Vehicle_Nodes.Create(N_Vehicles);
+      // R7e.4: record first vehicle NodeID so detectors can convert
+      // raw BsmBeaconTag.vehicle_id → local vehicle index for
+      // IMobilityProvider::get_gt_position() (Eq.4.6).
+      g_first_vehicle_node_id = Vehicle_Nodes.Get(0)->GetId();
 
-	  // Set custom velocity and acceleration for each node
-	  
-	    // Vehicles move along the road at realistic urban speed (10 m/s ≈ 36 km/h).
-	    // RSU zones are 500 m apart → a vehicle crosses one zone in ~50 s.
-	    // With simTime=60 s, V0-V7 will visibly handover from RSU0→RSU1 / RSU1→RSU2.
-	    // V12-V15 move in the opposite direction (−x) to show bidirectional traffic.
-	    double routing_speeds[16] = {
-	        10.0, 9.0, 11.0, 8.0,   // V0-V3  → right, RSU0 zone → RSU1
-	        10.0, 9.0, 11.0, 8.0,   // V4-V7  → right, RSU1 zone → RSU2
-	        10.0, 9.0, 11.0, 8.0,   // V8-V11 → right, RSU2 zone → RSU3
-	       -10.0,-9.0,-11.0,-8.0    // V12-V15← left,  RSU3 zone → RSU2 (oncoming)
-	    };
-	    for (uint32_t i = 0; i < Vehicle_Nodes.GetN(); i++)
-	    {
-	    	Ptr<ConstantVelocityMobilityModel> cvmm = DynamicCast <ConstantVelocityMobilityModel> (Vehicle_Nodes.Get(i)->GetObject<MobilityModel>());
-	    	cvmm->SetVelocity(Vector(routing_speeds[i], 0.0, 0.0));
-	    }
-	  
+      // R7a: vehicle mobility install is delegated to the IMobilityProvider
+      // abstraction (see 09b_mobility_provider.h). Selected via
+      // --mobility_source CLI arg:
+      //   0 (default) = HardcodedMobilityProvider — 16-vehicle ConstantVelocity
+      //                 scenario at y≈580 paired with RSUs at y=480 (V2I ≈100m).
+      //   1           = FcdTraceMobilityProvider — Ns2MobilityHelper on .tcl
+      //                 exported from SUMO via traceExporter.py (paper-conformant).
+      std::string trace_path;
+      if (g_mobility_source == MOBILITY_SRC_SUMO_TRACE) {
+          trace_path = default_sumo_trace_path(mobility_scenario, maxspeed);
+          if (trace_path.empty()) {
+              std::cerr << "[MOBILITY] no .tcl found for scenario="
+                        << mobility_scenario << " speed=" << maxspeed
+                        << " km/h — falling back to HARDCODED.\n"
+                        << "  To use SUMO traces: generate via\n"
+                        << "    sumo --fcd-output fcd.xml && "
+                        << "traceExporter.py --fcd-input=fcd.xml "
+                        << "--ns2mobility-output=$NS3_ROOT/mobility/"
+                        << "mobility_<scenario>_<speed>.tcl\n";
+              g_mobility_source = MOBILITY_SRC_HARDCODED;
+          }
+      }
+      g_mobility_provider = create_mobility_provider(g_mobility_source, trace_path);
+      std::cout << "[MOBILITY] provider=" << g_mobility_provider->provider_name()
+                << " sumo_derived="
+                << (g_mobility_provider->is_sumo_derived() ? "YES" : "NO")
+                << "  (TDEE/TPE paper-conformance requires sumo_derived=YES)\n";
+      g_mobility_provider->install(Vehicle_Nodes);
   }
   
 
@@ -212,13 +237,14 @@ int main(int argc, char *argv[])
   	g_num_active_rsus   = N_RSUs;
   }
 
-  // ── Backup SDN controller — created AFTER vehicles and RSUs ─────────────────
-  // Placement here preserves nid assignment:
-  //   nid=0: controller | nid=1: management | nid=2..17: vehicles | nid=18..21: RSUs
-  //   nid=22: backup_controller  ← safe, vid=nid-2 still gives 0..15 for vehicles
-  // When primary controller is detected malicious (attacks 5/7), backup is promoted.
-  backup_controller_Node.Create(1);
-  
+  // R4.b: backup_controller_Node creation removed. NodeID layout (current):
+  //   nid=0: controller | nid=1: management | nid=2: cloud (Fig 3.9 placeholder)
+  //   nid=3..(2+N_Vehicles): vehicles | nid=(3+N_Vehicles)..(2+N_Vehicles+N_RSUs): RSUs
+  // (Older `nid - 2 = vehicle_index` convention is OFF-BY-ONE since cloud_Node
+  // was added — use g_first_vehicle_node_id for new code, see 04_state_globals.h.)
+  // Paper has no backup controller; CP-DETECT via RSU consensus (R6) replaces it.
+
+
   //configuring the CSMA interface    
   CsmaHelper csma;
   csma.SetChannelAttribute ("DataRate", StringValue ("1000Mbps"));
@@ -235,24 +261,20 @@ int main(int argc, char *argv[])
 	  csma_nodes.Add(RSU_Nodes);
 	  csma_nodes.Add(controller_Node);
 	  csma_nodes.Add(management_Node);
-	  // Backup controller joins the same CSMA backhaul as the primary — it is
-	  // pre-connected so no topology change is needed at switch-over time.
-	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management, backup_controller
-	  // → management stays at index N_RSUs+1 (index unchanged from before).
-	  csma_nodes.Add(backup_controller_Node);
+	  // R4.b: backup_controller_Node no longer joins the CSMA backhaul.
+	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
+	  //   → management index = N_RSUs + 1 (unchanged from prior layout)
 	  csmaDevices = csma.Install (csma_nodes);
   	  address.SetBase ("10.1.1.0", "255.255.255.0");
   	  stack.Install (csma_nodes);
   	  csmaInterfaces = address.Assign (csmaDevices);
-  	  // ── Option B: management_node is the 3rd-last entry in csma_nodes ─────────
-  	  // Order: RSU0..RSU(N_RSUs-1), controller, management, backup_controller
-  	  //   → management index = N_RSUs + 1 (unchanged)
-  	  //   → backup_controller index = N_RSUs + 2
+  	  // ── Option B: management_node is the 2nd-last entry in csma_nodes ─────────
+  	  // Order: RSU0..RSU(N_RSUs-1), controller, management
+  	  //   → management index = N_RSUs + 1 (last entry after R4.b removed backup)
   	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + 1);
   	  cout << "[OPT-B] management CSMA IP  = " << g_management_csma_ip << endl;
-  	  cout << "[OPT-B] backup ctrl CSMA IP = " << csmaInterfaces.GetAddress(N_RSUs + 2) << endl;
   	  // ── Store RSU CSMA IPs for management → RSU downlink (port 8888) ──────────────
-  	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management, backup_controller
+  	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
   	  // RSU r is at csmaInterfaces index r → IPs 10.1.1.1 .. 10.1.1.4
   	  for (uint32_t r = 0; r < N_RSUs && r < 4; r++) {
   	      g_rsu_csma_ip[r] = csmaInterfaces.GetAddress(r);
@@ -662,23 +684,36 @@ int main(int argc, char *argv[])
   	delta_y = 400;
   	//delta_x = 1600/5;
   	delta_x = 400;
+	  	// R7f.followup-1b (2026-05-29): align urban RSU layout with the
+	  	// HardcodedMobilityProvider's expected positions (250/750/1250/1750, y=480),
+	  	// matching the routing_test=true branch below. Previous layout placed
+	  	// RSUs at y=1200 while vehicles (from IMobilityProvider) live at y≈580
+	  	// → 620 m gap, far beyond DSRC range → only ~3 vehicles ever reached
+	  	// an RSU and emitted beacons. RSU0=(250,480) RSU1=(750,480)
+	  	// RSU2=(1250,480) RSU3=(1750,480), V2I gap ≈ 100 m (urban-realistic).
 	  	if (N_RSUs < 13)
-	  	{		
-	  		RSU_mobility.SetPositionAllocator ("ns3::GridPositionAllocator","MinX", DoubleValue (750.0),"MinY", DoubleValue (1200.0),"DeltaX", DoubleValue (delta_x),"DeltaY", DoubleValue (delta_y),"GridWidth", UintegerValue (7),"LayoutType", StringValue ("RowFirst"));
-	  		vehicle_mobility.SetPositionAllocator ("ns3::GridPositionAllocator","MinX", DoubleValue (650.0),"MinY", DoubleValue (1000.0), "DeltaX", DoubleValue (delta_x/2),"DeltaY", DoubleValue (delta_y/2),"GridWidth", UintegerValue (5),"LayoutType", StringValue ("RowFirst"));
-	  		
+	  	{
+	  		RSU_mobility.SetPositionAllocator ("ns3::GridPositionAllocator",
+	  			"MinX",      DoubleValue (250.0),
+	  			"MinY",      DoubleValue (480.0),
+	  			"DeltaX",    DoubleValue (500.0),
+	  			"DeltaY",    DoubleValue (0.0),
+	  			"GridWidth", UintegerValue (4),
+	  			"LayoutType",StringValue ("RowFirst"));
 	  	}
 	  	else
 	  	{
 	  		RSU_mobility.SetPositionAllocator ("ns3::GridPositionAllocator","MinX", DoubleValue (750.0),"MinY", DoubleValue (900.0),"DeltaX", DoubleValue (delta_x),"DeltaY", DoubleValue (delta_y),"GridWidth", UintegerValue (7),"LayoutType", StringValue ("RowFirst"));
-	  		vehicle_mobility.SetPositionAllocator ("ns3::GridPositionAllocator","MinX", DoubleValue (650.0),"MinY", DoubleValue (1000.0), "DeltaX", DoubleValue (delta_x/2),"DeltaY", DoubleValue (delta_y),"GridWidth", UintegerValue (14),"LayoutType", StringValue ("RowFirst"));
 	  	}
   }
-  if(routing_test == false)
-  {
-  	vehicle_mobility.Install(Vehicle_Nodes);
-  	vehicle_mobility.Install(RSU_Nodes);
-  }
+  // R7f.followup-1b (2026-05-29): legacy `vehicle_mobility.Install(Vehicle_Nodes)`
+  // here was a pre-R7a relic that OVERWROTE the IMobilityProvider's install at
+  // line ~231 with a stationary grid layout. Removed so the abstraction works.
+  // The companion `vehicle_mobility.Install(RSU_Nodes)` was also wrong — RSU
+  // mobility is installed at line ~763 via RSU_mobility. Net effect of removal:
+  // (a) HardcodedMobilityProvider's 16-vehicle ±8–11 m/s scenario is preserved;
+  // (b) FcdTraceMobilityProvider (--mobility_source=1) drives positions from
+  // the SUMO .tcl trace; both paths now satisfy paper Eq 4.5/4.6 GT.
   
  
   
@@ -757,8 +792,12 @@ int main(int argc, char *argv[])
 	  MobilityHelper other_stationary_mobility;
 	  other_stationary_mobility.SetMobilityModel ("ns3::ConstantVelocityMobilityModel");
 	  other_stationary_mobility.Install(controller_Node);
-	  other_stationary_mobility.Install(backup_controller_Node);
+	  // R4.b: backup_controller_Node mobility removed (node no longer created).
 	  other_stationary_mobility.Install(management_Node);
+	  // cloud_Node (Fig 3.9 Cloud/ITS Server placeholder) — stationary, off to the
+	  // far edge to visually indicate it sits outside both mode boundaries. R9
+	  // will install the FHE-encrypted aggregate channel here.
+	  other_stationary_mobility.Install(cloud_Node);
 	  if (N_Vehicles > 0)
 	  {
 	  	other_stationary_mobility.Install(other_stationary_LTE_nodes);
@@ -798,12 +837,9 @@ int main(int argc, char *argv[])
 	   mdl_controller->SetPosition(Vector(con_base_posx, con_base_posy, 0));
 	   mdl_controller->SetVelocity(Vector(0, 0, 0));//centralized controller placement
 
-	   // Backup controller: placed 150 m to the left of primary in the same row.
-	   // routing_test layout: primary at (850,50) → backup at (700,50).
-	   // Other scenarios shift by the same offset relative to con_base_posx.
-	   Ptr<ConstantVelocityMobilityModel> mdl_backup = DynamicCast <ConstantVelocityMobilityModel> (backup_controller_Node.Get(0)->GetObject<MobilityModel>());
-	   mdl_backup->SetPosition(Vector(con_base_posx - 150, con_base_posy, 0));
-	   mdl_backup->SetVelocity(Vector(0, 0, 0));
+	   // R4.b: backup_controller_Node mobility removed (node no longer created).
+	   // Paper has no backup; CP-DETECT (Alg 7) provides controller-misbehavior
+	   // fallback via RSU peer consensus instead. See invariant #2.
 
 	  //setting the position of management node
 	  //int man_base_posx = rand()%3000;
@@ -812,6 +848,15 @@ int main(int argc, char *argv[])
 	   Ptr<ConstantVelocityMobilityModel> mdl_management = DynamicCast <ConstantVelocityMobilityModel> (management_Node.Get(0)->GetObject<MobilityModel>());
 	   mdl_management->SetPosition(Vector(man_base_posx, man_base_posy, 0));
 	   mdl_management->SetVelocity(Vector(0, 0, 0));//centralized management server placement
+
+	   // cloud_Node (Fig 3.9 Cloud/ITS Server placeholder): offset from
+	   // management by +200 in both axes so it visually sits outside the
+	   // controller/management cluster, indicating its "outside both mode
+	   // boundaries" position in Fig 3.9. R9 may relocate this once the FHE
+	   // backhaul topology is finalised.
+	   Ptr<ConstantVelocityMobilityModel> mdl_cloud = DynamicCast <ConstantVelocityMobilityModel> (cloud_Node.Get(0)->GetObject<MobilityModel>());
+	   mdl_cloud->SetPosition(Vector(man_base_posx + 200, man_base_posy + 200, 0));
+	   mdl_cloud->SetVelocity(Vector(0, 0, 0));// Cloud/ITS Server is stationary
    }
   
   Ipv4StaticRoutingHelper ipv4routinghelper_con;
@@ -1599,18 +1644,29 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 			              << " err=" << std::abs(fhe_decrypt_scalar(pq_ct) - 15.0) << "\n";
 			}
 
+			// R6.5: initialize TRS (OpenSSL EC P-256) + FHE (OpenFHE BFV)
+			// backends BEFORE any sim event runs. CP-DETECT depends on
+			// g_trs_backend being non-null when σ_TRS verify is invoked.
+			initialize_crypto_backends();
+
 			double t_assign = t0 + 0.001 * (time(NULL) % 1000);
 			Simulator::Schedule(Seconds(t_assign), assign_controllers);
 			test_boolean();			
 			
 			if(routing_algorithm == 4)
 			{
-				initialize_blockchain();
+				if (skip_blockchain) {
+					std::cout << "[BLOCKCHAIN] skip_blockchain=true — Fabric init bypassed "
+					             "(R7g.3 training-sweep mode). Detection + CSV logging "
+					             "still active." << std::endl;
+				} else {
+					initialize_blockchain();
+				}
 				if (!routing_test) { assign_basic_keys(); } // Skip heavy crypto setup during routing_test
 				if (routing_test) { generate_adjacency_matrix(); } // Initialize adjacency matrix for routing_test
 				//call_blockchain();
-				initialize_server();
-				
+				if (!skip_blockchain) { initialize_server(); }
+
 			}
 			
 			//Simulator::Schedule (Seconds (7.400), reset_packet_timestamps);
@@ -1991,14 +2047,19 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
       }
       anim.UpdateNodeSize(controller_Node.Get(0)->GetId(), 35.0, 35.0);
 
-      // ── Backup controller: CYAN = STANDBY (switches to BLUE when activated) ──
-      // g_backup_controller_active is set by detection engine once primary is revoked.
-      // At simulation start it is always false → always shown as STANDBY here.
-      anim.UpdateNodeColor(backup_controller_Node.Get(0), 0, 210, 210); // CYAN = standby
-      anim.UpdateNodeSize(backup_controller_Node.Get(0)->GetId(), 35.0, 35.0);
-      anim.UpdateNodeDescription(backup_controller_Node.Get(0),
-          ctrl_malicious ? "BACKUP CTRL\n[STANDBY]\n← ready to switch"
-                         : "BACKUP CTRL\n[STANDBY]");
+      // R4.b: backup_controller_Node coloring removed (node no longer created).
+      // Paper has no backup; CP-DETECT (Alg 7) provides controller-misbehavior
+      // fallback via RSU peer consensus instead. See invariant #2.
+
+      // ── Cloud/ITS Server (paper Fig 3.9) — CYAN placeholder ────────────────
+      // Sits outside both lightweight and full mode boundaries; receives
+      // σ_TRS-gated FHE-encrypted aggregates from the RSU cluster (invariant #5).
+      // No behaviour wired yet — phase R9 will activate the FHE channel.
+      anim.UpdateNodeColor(cloud_Node.Get(0), 150, 200, 255);  // light cyan
+      anim.UpdateNodeSize(cloud_Node.Get(0)->GetId(), 35.0, 35.0);
+      anim.UpdateNodeDescription(cloud_Node.Get(0),
+          routing_test ? "CLOUD / ITS SERVER\n(FHE aggregate sink — R9)"
+                       : "CLOUD / ITS SERVER");
   }
 
   // ── RSU nodes — RED if compromised, YELLOW if clean ────────────────────────

@@ -45,6 +45,15 @@ double simTime              = 15.0;
 int    mobility_scenario    = 0;   // 0=urban, 1=non-urban, 2=highway
 int    maxspeed             = 60;  // km/h max vehicle speed
 
+// ── R7a: Mobility source selector (--mobility_source CLI arg) ─────────────
+// 0 = hardcoded 16-vehicle ConstantVelocity scenario (default, fast smoke tests,
+//     NOT paper-conformant — TDEE/TPE values are not SUMO-derived).
+// 1 = sumo_trace: Ns2MobilityHelper consumes a .tcl file exported from SUMO
+//     via traceExporter.py (paper §4.1.3 + Eq 4.5/4.6 conformant).
+// 2 = sumo_live: RESERVED for future live TraCI bridge (R7a-B, not implemented).
+// See 09b_mobility_provider.h for the IMobilityProvider abstraction.
+int g_mobility_source = 0;  // MOBILITY_SRC_HARDCODED
+
 // ── RSU Compromise Seed (TP-S1 / MP-S1 random selection) ──────────────────
 // 0 = different random RSUs each run  (uses system clock)
 // N = fixed seed N → same RSUs compromised every run (reproducible)
@@ -92,23 +101,69 @@ const char* attack_scenario_name[] = {
     "MP-S4:ControlPlane-MobilityPatternPoisoning"         // 7
 };
 
+// ── R7b: Attacker class enum (paper §4.1.2 MCC slicing) ───────────────────
+// The paper requires MCC/FPR to be reported "by attack variant × 4 attacker
+// classes" (Eq 4.1). Each beacon is tagged with the class of entity producing
+// the poisoned data, so eval scripts can group rows accordingly.
+enum AttackerClass {
+    ATTACKER_NONE                 = 0,   // clean beacon (is_poisoned=false)
+    ATTACKER_MALICIOUS_VEHICLE    = 1,   // TP-S2 (2), MP-S2 (4)
+    ATTACKER_COMPROMISED_RSU      = 2,   // TP-S1 (1), MP-S1 (3)
+    ATTACKER_MITM                 = 3,   // MP-S3 (6)
+    ATTACKER_MALICIOUS_CONTROLLER = 4,   // TP-S3 (5), MP-S4 (7)
+};
+
+// Map attack_number (1..7) to the entity class responsible for the poisoning.
+// Returns ATTACKER_NONE for invalid attack_number — caller should only invoke
+// when is_poisoned==true. Mirror this in any new attack model added.
+inline int attacker_class_for(int attack_num)
+{
+    switch (attack_num) {
+        case 1: return ATTACKER_COMPROMISED_RSU;       // TP-S1
+        case 2: return ATTACKER_MALICIOUS_VEHICLE;     // TP-S2
+        case 3: return ATTACKER_COMPROMISED_RSU;       // MP-S1
+        case 4: return ATTACKER_MALICIOUS_VEHICLE;     // MP-S2
+        case 5: return ATTACKER_MALICIOUS_CONTROLLER;  // TP-S3
+        case 6: return ATTACKER_MITM;                  // MP-S3
+        case 7: return ATTACKER_MALICIOUS_CONTROLLER;  // MP-S4
+        default: return ATTACKER_NONE;
+    }
+}
+
 bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 
-// ── Controller-Switch Mitigation Flag ─────────────────────────────────────────
-// Set to true by detection engine when primary controller is confirmed malicious.
-// Future: routes beacon flow to backup_controller_Node and updates NetAnim colours.
-bool g_backup_controller_active = false;
+// ── R4.b: backup-controller flag removed (paper has no backup controller) ──
+// The paper specifies CP-DETECT (Algorithm 7, §3.5.5) — when ≥f+1 RSUs disagree
+// with the controller's submission, the controller is excluded from consensus
+// and the RSU rule-based fallback takes over. There is no "backup controller"
+// in the paper architecture. The flag and node were a non-paper implementation
+// artifact; both removed in R4.b. CP-DETECT itself lands in phase R6.
 
 // ── Ablation study selector (paper §4.1, mind.md §11) ─────────────────────
 // Controls which MPTD-PQS components are active for ablation comparison.
 // Pass via --ablation_mode=N on the command line.
 //   1 = A1  Lightweight only : Rules + HMAC, no GAT, no AE, no TRS/FHE  ← DEFAULT
-//   2 = A2  GAT only         : Spatial detection stub (GAT not yet implemented → same as A1)
-//   3 = A3  AE only          : Temporal AE stub (AE not yet implemented  → same as A1)
-//   4 = A4  Full, no PQ      : Rules + HMAC, TRS/FHE disabled (use_pq_crypto=false)
-//   5 = A5  Full, no BC      : Rules + HMAC, blockchain SC calls skipped
+//   2 = A2  GAT only         : Rules + HMAC + GAT spatial (no LSTM-AE)
+//   3 = A3  AE only          : Rules + HMAC + LSTM-AE temporal (no GAT)
+//   4 = A4  Full, no PQ      : Rules + HMAC + GAT + AE, TRS/FHE disabled (use_pq_crypto=false)
+//   5 = A5  Full, no BC      : Rules + HMAC + GAT + AE, blockchain SC calls skipped
 //   6 = B1  Ghaleb (2014)    : LTT baseline — speed plausibility + cross-RSU reachability only
+//   0 = Full (no ablation)   : every component active
 int ablation_mode = 1;
+
+// ── R7f: AI component toggles (paper §4.1.1 A2/A3 ablation) ────────────────
+// Independently enable the GAT spatial detector and the LSTM-AE temporal detector.
+// Defaults are derived from `ablation_mode` in 12_main.h after cmd.Parse():
+//   A1 → both false (lightweight only)
+//   A2 → gat=true,  ae=false
+//   A3 → gat=false, ae=true
+//   A4/A5/Full → both true
+// Explicit --enable_gat / --enable_lstm_ae CLI args override the ablation defaults
+// (use values 0/1; default -1 means "follow ablation_mode").
+int g_enable_gat_cli      = -1;   // -1 = follow ablation_mode, 0/1 = explicit
+int g_enable_lstm_ae_cli  = -1;   // -1 = follow ablation_mode, 0/1 = explicit
+bool g_enable_gat         = true; // effective value after dispatch (R7f)
+bool g_enable_lstm_ae     = true; // effective value after dispatch (R7f)
 
 // ── Stage 7: Post-Quantum Crypto flag ──────────────────────────────────────
 // Forced false automatically when ablation_mode == 4 (set in 12_main.h after cmd.Parse).
@@ -276,6 +331,27 @@ uint32_t ctrl_decisions_wrong = 0;
 double   pbpo_lw_time_sum_ms = 0.0;
 uint32_t pbpo_lw_cnt         = 0;
 
+// ── CP-DETECT (paper §3.5.5 / Algorithm 7 / Eq 3.59) accumulators ──────────
+// Detects compromised SDN controller via RSU peer consensus.
+// Algorithm 7 has two gates:
+//   (a) TRS-verify gate (lines 2–6): controller-submitted aggregate must carry
+//       a valid σ_TRS; if invalid → immediate CTRL_COMPROMISED alert.
+//       Implementation note: real TRS verification arrives in phase R8; until
+//       then the gate is a no-op stub returning valid=true (g_cp_detect_trs_fails
+//       therefore stays 0 in current code — flag is reserved for R8 wiring).
+//   (b) Conflict-detection gate (lines 7–15 / Eq 3.59): if ≥ f+1 RSU peers
+//       disagree with the controller's binary decision for the same vehicle in
+//       the same epoch, set flag_c = 1, emit CTRL_COMPROMISED, exclude
+//       controller from consensus for the rest of the window, and fall back
+//       to RSU rule-based decisions. f = 1 in the 3-RSU + 1-controller setup
+//       (BFT bound n ≥ 3f+1), so the conflict threshold is 2 RSU disagreements.
+// Honors invariant #2 (controller is a non-authoritative peer).
+uint32_t g_cp_detect_alerts_total      = 0;  // total CTRL_COMPROMISED alerts emitted
+uint32_t g_cp_detect_trs_fails         = 0;  // TRS-verify gate failures (R8-active)
+uint32_t g_cp_detect_conflict_fires    = 0;  // Eq 3.59 conflict-gate firings
+uint32_t g_cp_detect_epochs_evaluated  = 0;  // number of controller decisions audited
+bool     g_flag_c_active               = false;  // RSU fallback mode currently active
+
 // ── Send-side speed/time history — separate from receive-side vehicle_state ──
 // Used only in send_LTE_metadata_uplink_alone() to compute accel at send time.
 // Indexed by vid = nid - 2 (0..N_Vehicles-1), never written by receive side.
@@ -330,6 +406,12 @@ bool GetBooleanWithProbability(double probabilityPercent, int nodeID) {
 #define max_realistic_acceleration  a_max
 // ── Attack flag variables (active — used by 06a_attack_models.h) ─────────────
 int routing_algorithm = 0;
+// R7g.3: skip Hyperledger Fabric + REST API bring-up during training-data
+// sweeps. When true, initialize_blockchain()/initialize_server() are no-ops;
+// detection, attack injection, and beacon CSV logging still run normally so
+// the master training CSV can be built without a working Fabric environment.
+// Defaults to false (production behaviour preserved).
+bool skip_blockchain                           = false;
 bool beacon_suppression_nodes[total_size]     = {};  // reserved: beacon vanishing/drop attack
 bool heading_spoof_nodes[total_size]          = {};  // TP-S2: heading/velocity exaggeration
 bool rsu_fabrication_nodes[total_size]        = {};  // reserved: RSU fabrication
@@ -337,7 +419,11 @@ bool rsu_fabrication_nodes[total_size]        = {};  // reserved: RSU fabricatio
 // ── Temporary: legacy constants needed by 05_utils.h/08/11 ───────────────
 // These will be removed progressively in Stages 4 and 6 when 08_lldp_handlers.h
 // and 11_routing_blockchain_transmission.h are rewritten.
-#define max 40               // array size for neighbor tables in 05_utils.h
+#define MPTD_MAX_NEIGHBORS 40  // array size for neighbor tables in 05_utils.h
+// NOTE: Was previously `#define max 40` — renamed in R6.5 because the bare
+// macro `max` shadows OpenFHE / std::max identifiers and broke compilation
+// once 06b2_fhe_backend.h pulled in <openfhe.h>. Identifiers containing
+// "max" as a substring (s_max, k_max, B_max, etc.) are unaffected.
 const int flows = 1;         // flow count — only 05_utils struct arrays use this
 uint32_t large = 50000;      // sentinel value used in clear_data_at_nodes()
 // max1..max25 removed in Stage 9 — no references found after Stage 2 cleanup

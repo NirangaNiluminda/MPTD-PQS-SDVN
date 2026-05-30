@@ -34,10 +34,16 @@ long lte_total_packet_size   = 0;
 ApplicationContainer apps;
 ApplicationContainer RSU_apps;
 NodeContainer controller_Node;         // primary SDN controller (Node index 0)
-NodeContainer backup_controller_Node;  // standby controller — activated when primary is revoked
+// R4.b: backup_controller_Node removed — paper uses CP-DETECT (Alg 7) via RSU
+// consensus instead of a backup controller. CP-DETECT itself lands in phase R6.
 NodeContainer management_Node;
 NodeContainer Vehicle_Nodes;
 NodeContainer RSU_Nodes;
+// Cloud/ITS Server placeholder for paper Fig 3.9 conformance (sits outside both
+// the lightweight and full mode boundaries; receives FHE-encrypted aggregates
+// gated by σ_TRS per invariant #5). No behaviour, no networking, no application
+// until phase R9 wires the FHE channel; until then this is a netanim-only stub.
+NodeContainer cloud_Node;
 
 // ── PoisonTrajectory — generic field modification (Algorithm 1, Line 22) ──────
 // Applies sinusoidal deviation to all trajectory fields simultaneously.

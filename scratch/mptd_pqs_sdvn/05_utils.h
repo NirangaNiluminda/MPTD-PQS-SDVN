@@ -77,27 +77,27 @@ std::string extractValue(const std::string& json, const std::string& key) {
 
 // ── Neighbor set struct (nested inside data_at_nodes) ─────────────────────────
 struct set_of_neighbors {
-    uint32_t neighbors[max];
+    uint32_t neighbors[MPTD_MAX_NEIGHBORS];
 };
 
 // ── Per-node beacon receive buffer (cleared in 12_main.h init loop) ──────────
 struct data_at_nodes {
-    Time     timestamp[max];
-    Vector   acceleration[max];
-    Vector   velocity[max];
-    Vector   position[max];
-    uint32_t nodeid[max];
-    uint32_t portid[max];
-    uint8_t  HMAC[max][64];
-    struct set_of_neighbors neighbor_set[max];
-    bool     neighbors_changed[max];
+    Time     timestamp[MPTD_MAX_NEIGHBORS];
+    Vector   acceleration[MPTD_MAX_NEIGHBORS];
+    Vector   velocity[MPTD_MAX_NEIGHBORS];
+    Vector   position[MPTD_MAX_NEIGHBORS];
+    uint32_t nodeid[MPTD_MAX_NEIGHBORS];
+    uint32_t portid[MPTD_MAX_NEIGHBORS];
+    uint8_t  HMAC[MPTD_MAX_NEIGHBORS][64];
+    struct set_of_neighbors neighbor_set[MPTD_MAX_NEIGHBORS];
+    bool     neighbors_changed[MPTD_MAX_NEIGHBORS];
 };
 
 struct data_at_nodes data_at_nodes_inst[total_size+2];
 
 void clear_data_at_nodes(struct data_at_nodes *nd1)
 {
-    for (uint32_t i = 0; i < max; i++) {
+    for (uint32_t i = 0; i < MPTD_MAX_NEIGHBORS; i++) {
         nd1->timestamp[i]    = Simulator::Now();
         nd1->acceleration[i] = Vector(0, 0, 0);
         nd1->velocity[i]     = Vector(0, 0, 0);
@@ -105,7 +105,7 @@ void clear_data_at_nodes(struct data_at_nodes *nd1)
         nd1->nodeid[i]       = large;
         nd1->portid[i]       = large;
         memset(nd1->HMAC[i], 0, 64);
-        for (uint32_t j = 0; j < max; j++)
+        for (uint32_t j = 0; j < MPTD_MAX_NEIGHBORS; j++)
             nd1->neighbor_set[i].neighbors[j] = large;
         nd1->neighbors_changed[i] = false;
     }
