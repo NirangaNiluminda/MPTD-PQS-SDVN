@@ -66,10 +66,15 @@ def customize(bld, obj):
     # OpenFHE: pke depends on core; both depend on binfhe for shared utils.
     # OpenSSL: libcrypto provides EC_KEY, ECDSA_*, BN_*, SHA256, RAND.
     # onnxruntime (R7d): C++ API for loading GAT + LSTM-AE .onnx models.
+    # curl (TASK ①-E): kubo HTTP API client for IPFS off-chain raw-beacon
+    #   storage. Used by mptd_ipfs_add() in 06c_blockchain_api.h to pin
+    #   raw beacon bytes and obtain the CID that becomes h(b_i(t)) in
+    #   Eq 3.56 — replacing the FNV-1a placeholder.
     obj.env.append_value('LIB', [
         'OPENFHEpke',
         'OPENFHEcore',
         'OPENFHEbinfhe',
         'crypto',
         'onnxruntime',
+        'curl',
     ])

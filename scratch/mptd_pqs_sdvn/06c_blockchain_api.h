@@ -49,6 +49,10 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdint>
+#include <cstdlib>     // getenv — IPFS endpoint override
+#include <mutex>       // once-flag for libcurl global init + warn-once
+#include <atomic>      // ipfs_disabled latch
+#include <curl/curl.h> // TASK ①-E: kubo HTTP API client for h(b_i(t)) CID
 
 // R7g.3 / R8.5: Single guard macro for every chaincode helper. When
 // `skip_blockchain` is set (training-sweep mode), the fabric_invoke call is
@@ -131,13 +135,156 @@ static inline std::string mptd_fabric_invoke_sync(
     return execCmd(cmd);
 }
 
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  IPFS off-chain raw-beacon channel (TASK ①-E)                            ║
+// ║                                                                          ║
+// ║  Paper Eq 3.56 — Evidence tuple E_j(t) carries h(b_i(t)) on chain so the ║
+// ║  raw beacon b_i(t) (full kinematics blob) stays OFF chain. The off-chain ║
+// ║  store is IPFS: the canonical multihash CID of the pinned beacon doubles ║
+// ║  as both the commitment and the retrieval handle. CIDv0 is base58-       ║
+// ║  encoded SHA-256 (cryptographic), strictly stronger than the prior       ║
+// ║  FNV-1a 64-bit placeholder.                                              ║
+// ║                                                                          ║
+// ║  Endpoint is the local kubo daemon (default http://127.0.0.1:5002);      ║
+// ║  override at runtime via env var MPTD_IPFS_API. Daemon failures fall     ║
+// ║  back to FNV-1a so simulations stay runnable when IPFS is down — but a   ║
+// ║  one-line warning is emitted and ipfs_disabled latches true to skip      ║
+// ║  further attempts in the same run.                                       ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+// One-time libcurl global init (curl_global_init is NOT thread-safe; must run
+// once before any easy/mime handle creation). The atomic latch protects us
+// from per-beacon overhead of std::call_once on the hot path after init.
+static std::atomic<bool> g_curl_inited{false};
+static std::mutex        g_curl_init_mu;
+static std::atomic<bool> g_ipfs_disabled{false};   // sticky on first failure
+static std::once_flag    g_ipfs_warn_once;
+
+static inline void mptd_curl_global_init_once() {
+    if (g_curl_inited.load(std::memory_order_acquire)) return;
+    std::lock_guard<std::mutex> lk(g_curl_init_mu);
+    if (g_curl_inited.load(std::memory_order_relaxed)) return;
+    curl_global_init(CURL_GLOBAL_DEFAULT);
+    g_curl_inited.store(true, std::memory_order_release);
+}
+
+// ── IPFS endpoint resolver (env override; default = local kubo) ──────────────
+// Cached after first lookup so getenv isn't called per beacon.
+static inline const std::string& mptd_ipfs_endpoint() {
+    static std::string ep = []() {
+        const char* e = std::getenv("MPTD_IPFS_API");
+        if (e && *e) return std::string(e);
+        return std::string("http://127.0.0.1:5002");
+    }();
+    return ep;
+}
+
+// libcurl write callback — append response body into the std::string userp
+static size_t mptd_curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userp) {
+    std::string* buf = static_cast<std::string*>(userp);
+    buf->append(ptr, size * nmemb);
+    return size * nmemb;
+}
+
+// Minimal JSON-string field extractor — no full parser dependency.
+// Looks for `"key":"<value>"` and returns the value (no escape unwinding —
+// IPFS CIDs are base58 / base32 with no JSON-special chars).
+static inline bool mptd_json_field(const std::string& json,
+                                   const std::string& key,
+                                   std::string& out)
+{
+    std::string needle = "\"" + key + "\":\"";
+    size_t p = json.find(needle);
+    if (p == std::string::npos) return false;
+    p += needle.size();
+    size_t q = json.find('"', p);
+    if (q == std::string::npos) return false;
+    out.assign(json, p, q - p);
+    return true;
+}
+
+// ── mptd_ipfs_add: pin a payload, return the CID ─────────────────────────────
+// POST /api/v0/add?pin=true&quieter=true with multipart/form-data.
+// Response (quieter=true): {"Name":"...","Hash":"Qm...","Size":"..."}.
+// Returns true + CID on success; false otherwise (caller falls back).
+// Times out fast (1.5 s total) so a stalled daemon cannot block the beacon
+// alert path indefinitely.
+static inline bool mptd_ipfs_add(const std::string& payload,
+                                 std::string& out_cid)
+{
+    if (g_ipfs_disabled.load(std::memory_order_acquire)) return false;
+    mptd_curl_global_init_once();
+
+    CURL* curl = curl_easy_init();
+    if (!curl) return false;
+
+    std::string url = mptd_ipfs_endpoint() + "/api/v0/add?pin=true&quieter=true";
+    std::string resp;
+
+    curl_mime* mime = curl_mime_init(curl);
+    curl_mimepart* part = curl_mime_addpart(mime);
+    curl_mime_name(part, "file");
+    curl_mime_filename(part, "beacon");
+    curl_mime_type(part, "application/octet-stream");
+    curl_mime_data(part, payload.data(), payload.size());
+
+    curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
+    curl_easy_setopt(curl, CURLOPT_POST, 1L);
+    curl_easy_setopt(curl, CURLOPT_MIMEPOST, mime);
+    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, mptd_curl_write_cb);
+    curl_easy_setopt(curl, CURLOPT_WRITEDATA, &resp);
+    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);     // safe in multi-threaded sim
+    curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 1500L); // hard ceiling
+    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 500L);
+
+    CURLcode rc = curl_easy_perform(curl);
+    long http_code = 0;
+    if (rc == CURLE_OK) {
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+    }
+
+    curl_mime_free(mime);
+    curl_easy_cleanup(curl);
+
+    if (rc != CURLE_OK || http_code != 200) {
+        std::call_once(g_ipfs_warn_once, [&]() {
+            std::cerr << "[IPFS] add failed (curl=" << rc
+                      << " http=" << http_code
+                      << " ep=" << mptd_ipfs_endpoint()
+                      << ") — falling back to FNV-1a for h(b_i(t)). "
+                      << "Start daemon with `ipfs daemon` and re-run to use real CIDs."
+                      << std::endl;
+        });
+        g_ipfs_disabled.store(true, std::memory_order_release);
+        return false;
+    }
+
+    std::string cid;
+    if (!mptd_json_field(resp, "Hash", cid) || cid.empty()) {
+        std::call_once(g_ipfs_warn_once, [&]() {
+            std::cerr << "[IPFS] add returned no Hash field: "
+                      << resp.substr(0, 200) << std::endl;
+        });
+        g_ipfs_disabled.store(true, std::memory_order_release);
+        return false;
+    }
+    out_cid.swap(cid);
+    return true;
+}
+
 // ── Beacon hash h(b_i(t)) — Eq 3.56 commitment ───────────────────────────────
-// Deterministic 64-bit FNV-1a over the concatenated kinematic fields. Kept
-// short (16 hex chars) so the on-chain payload stays small; the canonical
-// PQ-secure hash (SHA-256 or Falcon-side hash) will replace this when the
-// IPFS off-chain channel lands in TASK ①-E (then the hash becomes the IPFS
-// CID for raw beacon retrieval). For now we only need determinism: two RSUs
-// that receive the same beacon must produce the same hash.
+// Pins the canonical beacon blob to IPFS and returns the CIDv0 (a base58
+// SHA-256 multihash). The CID is BOTH the commitment that lives on chain in
+// E_j(t) AND the retrieval handle that lets any verifier `ipfs cat <CID>`
+// to recover the raw bytes. If IPFS is unreachable, falls back to a
+// deterministic 64-bit FNV-1a (16-hex-char) so the sim stays runnable but
+// loses cryptographic strength. The warn-once message tells the operator to
+// start `ipfs daemon` to upgrade to real CIDs.
+//
+// Determinism: two RSUs that observe the same beacon produce IDENTICAL
+// canonical blobs (same vehicleID, same kinematics rounded to 6 decimals,
+// same timestamp) → identical CIDs / FNV digests. This is required for
+// SCTrustFinalizeEpoch to aggregate witnesses on the same beacon.
 static inline std::string mptd_beacon_hash(
     const std::string& vehicleID, const std::string& rsuID,
     double posX, double posY, double posZ,
@@ -145,14 +292,28 @@ static inline std::string mptd_beacon_hash(
     double accX, double accY, double accZ,
     double timestamp)
 {
+    // Canonical blob — must NOT include rsuID since the CID is over the
+    // beacon content (b_i(t)), not the witness who saw it. Two RSUs hearing
+    // the same broadcast must produce the same h(b_i(t)). rsuID is carried
+    // in the surrounding E_j(t) tuple, not in h(b_i(t)).
     std::ostringstream blob;
-    blob << vehicleID << '|' << rsuID << '|'
+    blob << vehicleID << '|'
          << std::fixed << std::setprecision(6)
          << posX << ',' << posY << ',' << posZ << '|'
          << velX << ',' << velY << ',' << velZ << '|'
          << accX << ',' << accY << ',' << accZ << '|'
          << timestamp;
-    const std::string& s = blob.str();
+    const std::string s = blob.str();
+    (void)rsuID; // intentionally unused — see canonicalization note above
+
+    // Preferred path: IPFS CID
+    std::string cid;
+    if (mptd_ipfs_add(s, cid)) {
+        return cid;
+    }
+
+    // Fallback: deterministic FNV-1a (preserves sim runnability when
+    // daemon is down; ipfs_disabled latched so we don't re-try per beacon).
     uint64_t h = 1469598103934665603ULL;
     for (unsigned char c : s) {
         h ^= (uint64_t)c;
