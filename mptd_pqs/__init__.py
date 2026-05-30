@@ -8,8 +8,13 @@ Modules:
   gat_detector          - Controller-side: Graph Attention Network spatial anomaly
   temporal_autoencoder  - Controller-side: LSTM AE with mobility-constrained loss
   fusion                - Combined score Φᵢ(t) = λ₁ψᵢ + λ₂Sᵢ + λ₃(εᵢ/θ_ae)
-  blockchain_sim        - SC-Trust EMA + SC-Revoke BFT simulation
   metrics_calculator    - MCC, FPR, PARR, CDER, TDEE, TPE, PBPO
+
+Note: the in-memory `blockchain_sim` module was deleted in Phase R8.5
+(2026-05-30). SC-Trust / SC-Revoke / CP-DETECT now run on the real
+Hyperledger Fabric chaincode at chaincode/chaincode/smartcontract.go
+(Eq 3.55/3.58/3.59), invoked from NS-3 RSU code in
+scratch/mptd_pqs_sdvn/06c_blockchain_api.h.
   metrics_visualization - 8-panel chart + ablation comparison
 """
 # mptd_pqs/__init__.py

@@ -8,7 +8,11 @@ Reads NS-3 simulation output files and runs the complete detection pipeline:
   3. Run GAT spatial anomaly detector
   4. Run LSTM Temporal Autoencoder
   5. Fuse scores → Φᵢ(t)
-  6. Run blockchain trust/revocation simulation
+  6. (Removed) Blockchain trust/revocation simulation — the real Hyperledger
+     Fabric chaincode at chaincode/chaincode/smartcontract.go (Eq 3.55/3.58/
+     3.59) now handles SC-Trust/SC-Revoke/CP-DETECT directly from the NS-3
+     RSU code (see scratch/mptd_pqs_sdvn/06c_blockchain_api.h). The Python
+     pipeline computes on-chain record counts from `points` directly.
   7. Compute all 7 metrics (MCC, FPR, PARR, CDER, TDEE, TPE, PBPO)
   8. Generate visualizations
   9. Save JSON results
@@ -40,7 +44,13 @@ from mptd_pqs.lightweight_detector import (
 from mptd_pqs.gat_detector import GATDetector, VehicleState
 from mptd_pqs.temporal_autoencoder import TemporalAEDetector
 from mptd_pqs.fusion import FusionEngine, run_ablation
-from mptd_pqs.blockchain_sim import BlockchainSim
+# mptd_pqs.blockchain_sim deleted Phase R8.5 / 2026-05-30: the in-memory
+# BlockchainSim was a pre-Fabric placeholder. The real Hyperledger Fabric
+# chaincode (chaincode/chaincode/smartcontract.go) now owns SC-Trust /
+# SC-Revoke / CP-DETECT per Eq 3.55/3.58/3.59, called from the NS-3 RSU code
+# in scratch/mptd_pqs_sdvn/06c_blockchain_api.h via fabric_invoke.sh. The
+# Python pipeline no longer simulates the chain — it just consumes the
+# fusion-engine outputs and computes metrics.
 from mptd_pqs.metrics_calculator import MetricsCalculator, MetricsResult, ConfusionMatrix
 from mptd_pqs.metrics_visualization import plot_all, plot_ablation, plot_baseline_comparison
 
@@ -152,7 +162,6 @@ def run_pipeline_for_pct(points: List[TrajectoryPoint], summary: dict,
 
     # ── Phase 5: Fusion ───────────────────────────────────────────────────────
     engine = FusionEngine(variant=variant)
-    blockchain = BlockchainSim()
 
     deviations = []
     for lw, pt in zip(lw_results, points):
@@ -169,24 +178,22 @@ def run_pipeline_for_pct(points: List[TrajectoryPoint], summary: dict,
             ground_truth_poisoned=pt.is_poisoned,
         )
 
-        # ── Phase 6: Blockchain trust update ──────────────────────────────────
-        event_score = 0.0 if (fusion_r.flagged and pt.is_poisoned) else 1.0
-        blockchain.update_trust(pt.rsu_id, event_score=event_score,
-                                timestamp=pt.timestamp)
-        blockchain.store_trajectory(
-            pt.vehicle_id, pt.rsu_id, pt.timestamp,
-            pt.pos_x, pt.pos_y, pt.vel_x, pt.vel_y,
-            pt.acc_x, pt.acc_y, is_poisoned=pt.is_poisoned,
-        )
+        # Phase 6 (blockchain trust/revocation) is owned by the real chaincode
+        # at chaincode/chaincode/smartcontract.go; the NS-3 RSU code calls it
+        # synchronously per beacon via scratch/mptd_pqs_sdvn/06c_blockchain_api.h.
+        # No simulation needed here — see Phase 7 for on-chain count derivation.
 
         # Deviation: for TP points, pos_x holds the deviation value
         if pt.is_poisoned:
             deviations.append(pt.pos_x)
 
     # ── Phase 7: Metrics ──────────────────────────────────────────────────────
-    bc_stats = blockchain.stats()
-    n_poisoned_on_chain = bc_stats["poisoned_records"]
-    n_total_on_chain    = bc_stats["total_records"]
+    # On-chain counts derived from the same beacon set the RSU code would
+    # submit to chaincode (every received beacon → one StoreTrajectory call;
+    # poisoned flag mirrors the ground-truth label). This matches what the
+    # legacy in-memory BlockchainSim returned, without needing the simulator.
+    n_total_on_chain    = len(points)
+    n_poisoned_on_chain = sum(1 for p in points if p.is_poisoned)
 
     n_total = summary.get("total_received", len(points))
     n_poisoned_injected = summary.get("total_poisoned", sum(1 for p in points if p.is_poisoned))
