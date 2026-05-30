@@ -39,6 +39,7 @@
 #include <fstream>
 #include <cmath>
 #include <sstream>
+#include <unordered_set>
 #include <sys/stat.h>
 #include <sys/types.h>
 
@@ -51,6 +52,19 @@ uint32_t cm_TP = 0;
 uint32_t cm_FP = 0;
 uint32_t cm_TN = 0;
 uint32_t cm_FN = 0;
+
+// ── R7a: TDEE estimator state (Eq 4.5) ────────────────────────────────────────
+// ρ̂(t) = number of distinct vehicle IDs whose beacons were *accepted* by an RSU
+// (i.e. passed detection, so they reach the controller and inflate its density
+// estimate). Inserted from log_beacon_to_csv() when detected==false.
+//
+// Under Sybil attacks (MP-S1/S2) that bypass detection, ghost vids land in this
+// set → ρ̂ > N_Vehicles → TDEE > 0. Under TP attacks (S1/S2/S5) detection
+// doesn't generally add or remove vids → ρ̂ ≈ N_Vehicles → TDEE ≈ 0 (correct
+// per paper, TP attacks corrupt trajectory not density).
+//
+// Reset implicitly per process — first sim run starts with empty set.
+std::unordered_set<uint32_t> g_ctrl_seen_vids;
 
 // ── Helper: create directory (no-op if exists) ────────────────────────────────
 static void ensure_analytics_dir(const char *path)
@@ -71,7 +85,17 @@ void update_confusion_matrix(bool is_poisoned, bool detected)
 // ── Per-beacon CSV log ─────────────────────────────────────────────────────────
 // Appends one row per beacon for downstream ML pipeline training/evaluation.
 // Columns: sim_time, vehicle_id, rsu_id, pos_x, pos_y, speed, heading, accel,
-//          is_poisoned, detected, sig_mask, psi_score, attack_number, attack_pct
+//          is_poisoned, detected, sig_mask, psi_score, attack_number, attack_pct,
+//          attacker_class, gt_pos_x, gt_pos_y, gt_speed
+//
+// R7b additions:
+//   attacker_class — paper §4.1.2 MCC slicing (0=NONE, 1=MAL_VEH, 2=COMP_RSU,
+//                    3=MITM, 4=MAL_CTRL); derived from is_poisoned + attack_number
+//   gt_pos_x/y     — ns-3 MobilityModel position (SUMO ground truth when
+//                    mobility_source=sumo_trace; provider-defined otherwise)
+//   gt_speed       — ns-3 MobilityModel speed magnitude (sqrt(vx²+vy²+vz²))
+// Eval scripts compute displacement error = sqrt((pos_x-gt_pos_x)² + (pos_y-gt_pos_y)²)
+// → TPE training labels + LSTM-AE reconstruction targets.
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi)
 {
@@ -87,10 +111,27 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     if (beacon_first_call) {
         fout.open(path, std::ios::out | std::ios::trunc);
         fout << "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
-             << "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct\n";
+             << "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct,"
+             << "attacker_class,gt_pos_x,gt_pos_y,gt_speed\n";
         beacon_first_call = false;
     } else {
         fout.open(path, std::ios::out | std::ios::app);
+    }
+
+    // R7b: derive attacker_class — only meaningful for poisoned beacons.
+    const int aclass = tag.GetIsPoisoned()
+                     ? attacker_class_for((int)tag.GetAttackType())
+                     : ATTACKER_NONE;
+
+    // R7b: read ground-truth pose from mobility provider (== ns-3 MobilityModel).
+    // Falls back to reported pose if provider is absent (shouldn't happen post-R7a).
+    double gt_x = tag.GetPosX(), gt_y = tag.GetPosY(), gt_spd = tag.GetSpeed();
+    if (g_mobility_provider) {
+        Vector p = g_mobility_provider->get_gt_position(vid);
+        Vector v = g_mobility_provider->get_gt_velocity(vid);
+        gt_x   = p.x;
+        gt_y   = p.y;
+        gt_spd = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
     }
 
     fout << tag.GetTimestamp()      << ","
@@ -106,8 +147,16 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
          << sig_mask                << ","
          << psi                     << ","
          << attack_number           << ","
-         << attack_percentage       << "\n";
+         << attack_percentage       << ","
+         << aclass                  << ","
+         << gt_x                    << ","
+         << gt_y                    << ","
+         << gt_spd                  << "\n";
     fout.close();
+
+    // R7a: feed TDEE estimator. A beacon that PASSES detection (detected==false)
+    // reaches the controller and contributes to its density estimate ρ̂(t).
+    if (!detected) g_ctrl_seen_vids.insert(vid);
 }
 
 // ── TP-S1 Before/After Poison Log ─────────────────────────────────────────────
@@ -494,33 +543,53 @@ double compute_CDER()
 
 // TDEE: Traffic Density Estimation Error (Eq. 4.5, dimensionless)
 // Paper Eq. 4.5: TDEE = |ρ̂(t) − ρ_gt(t)| / ρ_gt(t)
-//   ρ_gt(t)  = SUMO ground-truth vehicle density per cell at time t
-//   ρ̂(t)     = controller's estimated density from received beacons
+//   ρ_gt(t)  = SUMO ground-truth vehicle density at time t (from provider)
+//   ρ̂(t)    = controller's estimated density from accepted beacons
+//             (g_ctrl_seen_vids tracked in log_beacon_to_csv())
 //
-// NOT computable from NS-3 alone: requires SUMO to provide ρ_gt(t).
-// The previous proxy (RSU beacon-count comparison) was a simulation assumption —
-// beacon counts at the RSU are not equivalent to SUMO ground-truth density.
-// Returns -1 to signal "unavailable — integrate SUMO for real TDEE".
-// Applicable metric for MP attacks {3,4,6,7} per paper §4.1.2.
+// R7a implementation:
+//   ρ_gt = N_Vehicles (count of real vehicles — provider gives the same value
+//          since the mobility model IS the source of truth for vehicle count)
+//   ρ̂    = |g_ctrl_seen_vids| (distinct vids whose beacons passed detection)
+//
+// Returns -1 only if the active mobility provider is NOT SUMO-derived
+// (paper §4.1.3 requires SUMO ground truth). For sumo_trace runs the value is
+// paper-conformant; for hardcoded runs it's reported as -1 to avoid
+// misinterpretation of non-conformant values.
+//
+// Applicable metric for MP attacks {3,4,6,7} per paper §4.1.2 — Sybil attacks
+// inflate ρ̂ above N_Vehicles; TP attacks generally leave ρ̂ ≈ N_Vehicles.
 double compute_TDEE()
 {
-    return -1.0;  // requires SUMO ρ_gt(t) — not available in NS-3 standalone
+    if (!g_mobility_provider || !g_mobility_provider->is_sumo_derived()) {
+        return -1.0;  // not paper-conformant under hardcoded mobility
+    }
+    const double rho_gt = (double)N_Vehicles;
+    if (rho_gt < 1e-9) return 0.0;
+    const double rho_hat = (double)g_ctrl_seen_vids.size();
+    return std::fabs(rho_hat - rho_gt) / rho_gt;
 }
 
 // TPE: Trajectory Poisoning Exposure (Eq. 4.6)
-// Paper Eq. 4.6: TPE = RMSE( p̂_ctrl(t) − p_sumo(t) )
-//   p̂_ctrl(t) = controller's predicted vehicle position (Kalman/DR internal state)
-//   p_sumo(t)  = SUMO ground-truth vehicle position at time t
+// Paper Eq. 4.6: TPE = mean Euclidean displacement( p̂_ctrl(t) − p_sumo(t) )
+//   p̂_ctrl(t) = controller's predicted vehicle position (here: dead-reckoning predictor
+//               using the most-recent *beacon-reported* (x, y, speed, heading); the
+//               beacon may be poisoned, which is exactly what TPE is supposed to expose)
+//   p_sumo(t)  = SUMO ground-truth vehicle position at time t, fetched from
+//               IMobilityProvider::get_gt_position() (live when --mobility_source=sumo_trace,
+//               degenerate when hardcoded since GT==internal estimate)
 //
-// NOT computable from NS-3 alone: requires SUMO ground-truth positions AND an internal
-// controller prediction model (Kalman filter or dead-reckoning state estimator).
-// The previous proxy (injection RMSE = |poisoned_pos − real_pos|) measures attack
-// magnitude, not controller prediction residual — these are conceptually different.
-// Returns -1 to signal "unavailable — integrate SUMO + controller state for real TPE".
-// Applicable metric for TP attacks {1,2,5} per paper §4.1.2.
+// Accumulators (tpe_disp_sum / tpe_disp_cnt) are updated in 08_detection_engine.h at
+// HandleBeaconReceived(): for each beacon after the first we extrapolate
+//   p̂(t_now) = p_prev + v_prev·dt
+// from the previous observation, then accumulate the Euclidean residual against the
+// SUMO ground truth at t_now. Returns -1 only if no samples have been collected yet
+// (e.g. simulation aborted before the second beacon for any vehicle).
+// Applicable for TP attacks {1,2,5} per paper §4.1.2.
 double compute_TPE()
 {
-    return -1.0;  // requires SUMO ground truth + controller predictor — not available in NS-3
+    if (tpe_disp_cnt == 0) return -1.0;
+    return tpe_disp_sum / (double)tpe_disp_cnt;
 }
 
 // PBPO_Full: Per-Beacon Processing Overhead — full controller-side pipeline (ms)
@@ -562,6 +631,13 @@ void print_mptd_metrics()
     std::cout << "  PARR = " << compute_PARR()
               << "  (TRS blockchain rejection; "
               << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned revoked)" << std::endl;
+    // R8.4: per-beacon TRS verify outcomes (Paper §3.5.4 Algorithm 6).
+    // Distinct from PARR (which is REVOKE_THRESHOLD-driven, post-3-strikes).
+    // These counters reflect the real Shamir-Schnorr partial_sign+aggregate+verify chain
+    // booked into the PBPO_Full window per evidence message m_j (Eq. 3.46).
+    std::cout << "  TRS-verify: " << g_trs_verified_count << " ok / "
+              << g_trs_rejected_count << " fail  (Paper §3.5.4 Eq.3.47–3.49, per-beacon σ_j+aggregate)"
+              << std::endl;
     // CDER: show source (control-plane decisions or fallback)
     if (ctrl_decisions_total > 0)
         std::cout << "  CDER = " << compute_CDER()
@@ -571,16 +647,41 @@ void print_mptd_metrics()
     else
         std::cout << "  CDER = " << compute_CDER()
                   << "  (beacon-level (FP+FN)/total fallback, Eq.4.4, lower=better)" << std::endl;
-    // TDEE & TPE: both require SUMO — not computable from NS-3 alone
-    std::cout << "  TDEE = -1  (requires SUMO ρ_gt(t), Eq.4.5"
-              << "; applicable for MP attacks {3,4,6,7})" << std::endl;
-    std::cout << "  TPE  = -1  (requires SUMO + ctrl predictor, Eq.4.6"
-              << "; applicable for TP attacks {1,2,5})" << std::endl;
+    // TDEE: live when --mobility_source=sumo_trace; otherwise -1 per paper conformance.
+    // TPE:  live dead-reckoning predictor (08_detection_engine.h) vs SUMO ground truth.
+    {
+        const double tdee = compute_TDEE();
+        const bool   sumo = g_mobility_provider && g_mobility_provider->is_sumo_derived();
+        std::cout << "  TDEE = " << tdee << "  ("
+                  << (sumo ? "SUMO-derived, |ρ̂−ρ_gt|/ρ_gt" : "not sumo_derived → -1")
+                  << ", Eq.4.5; ρ̂=" << g_ctrl_seen_vids.size()
+                  << " ρ_gt=" << N_Vehicles << ")" << std::endl;
+    }
+    {
+        const double tpe  = compute_TPE();
+        const bool   sumo = g_mobility_provider && g_mobility_provider->is_sumo_derived();
+        std::cout << "  TPE  = " << tpe << "  ("
+                  << tpe_disp_cnt << " samples, dead-reckoning vs "
+                  << (sumo ? "SUMO ground-truth" : "internal GT (degenerate — use --mobility_source=sumo_trace)")
+                  << ", Eq.4.6; applicable for TP attacks {1,2,5})" << std::endl;
+    }
     // PBPO: separate lightweight (RSU) and full (controller) modes
     std::cout << "  PBPO_LW   = " << compute_PBPO_LW()
               << " ms (" << pbpo_lw_cnt << " beacons, RSU HMAC gate, Eq.4.7 LW)" << std::endl;
     std::cout << "  PBPO_Full = " << compute_PBPO()
               << " ms (" << pbpo_cnt << " beacons, controller pipeline, Eq.4.7 Full)" << std::endl;
+    // R4.c: IPFS off-chain windows + on-chain hash anchors (paper §3.5.3 Eq 3.56)
+    std::cout << "  IPFS      = " << ipfs_upload_count
+              << " windows off-chain, " << ipfs_hash_chain_count
+              << " hashes on-chain (paper §3.5.3 Eq 3.56, RSU→BC direct)" << std::endl;
+    // R6: CP-DETECT (paper §3.5.5 / Algorithm 7 / Eq 3.59) — controller peer-consensus audit
+    std::cout << "  CP-DETECT = " << g_cp_detect_alerts_total
+              << " CTRL_COMPROMISED alerts ("
+              << g_cp_detect_conflict_fires << " conflict, "
+              << g_cp_detect_trs_fails << " TRS-fail) over "
+              << g_cp_detect_epochs_evaluated << " audited epochs,"
+              << " flag_c=" << (g_flag_c_active ? "1" : "0")
+              << " (paper §3.5.5 Algorithm 7, Eq 3.59)" << std::endl;
     std::cout << "──────────────────────────────────────────────────────" << std::endl;
 }
 
@@ -591,7 +692,10 @@ void print_mptd_metrics()
 //   S = maxspeed km/h (20,50,100)
 // Scheduled from 12_main.h after Simulator::Run().
 //
-// TDEE and TPE columns are -1 (require SUMO integration — see compute_TDEE/TPE).
+// TDEE column is -1 unless --mobility_source=sumo_trace (paper conformance — see compute_TDEE).
+// TPE  column is live dead-reckoning residual vs the active mobility provider (see compute_TPE);
+//   the residual is meaningful only when GT differs from the beacon-reported state, i.e.
+//   under --mobility_source=sumo_trace OR when poisoning attacks rewrite the beacon.
 // CDER uses control-plane decision counters when Option B is active (Eq.4.4).
 // PBPO_LW = RSU HMAC gate overhead; PBPO_Full = controller detection pipeline.
 void write_mptd_results_csv()
@@ -617,7 +721,8 @@ void write_mptd_results_csv()
          << "CDER,ctrl_decisions_total,ctrl_decisions_wrong,"
          << "TDEE,TPE,"
          << "PBPO_LW_ms,PBPO_Full_ms,"
-         << "total_received,total_poisoned,total_stored\n";
+         << "total_received,total_poisoned,total_stored,"
+         << "trs_verified_count,trs_rejected_count\n";   // R8.4: per-beacon σ_j outcomes
 
     // Values
     fout << attack_number              << ","
@@ -634,13 +739,15 @@ void write_mptd_results_csv()
          << compute_CDER()             << ","
          << ctrl_decisions_total       << ","
          << ctrl_decisions_wrong       << ","
-         << compute_TDEE()             << ","   // -1 (requires SUMO)
-         << compute_TPE()              << ","   // -1 (requires SUMO)
+         << compute_TDEE()             << ","   // -1 unless --mobility_source=sumo_trace
+         << compute_TPE()              << ","   // live: dead-reckoning residual (R7e.4)
          << compute_PBPO_LW()          << ","
          << compute_PBPO()             << ","
          << total_trajectories_received          << ","
          << total_trajectories_poisoned          << ","
-         << total_trajectories_stored_blockchain << "\n";
+         << total_trajectories_stored_blockchain << ","
+         << g_trs_verified_count                 << ","   // R8.4
+         << g_trs_rejected_count                 << "\n"; // R8.4
     fout.close();
 
     // Also print to stdout and note the file written

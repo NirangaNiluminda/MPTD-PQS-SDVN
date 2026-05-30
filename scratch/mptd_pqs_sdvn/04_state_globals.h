@@ -148,6 +148,12 @@ Ipv4Address g_management_csma_ip;            // management_node CSMA IP (10.1.1.
 Ipv4Address g_rsu_dsrc_ip[4];                // RSU DSRC IPs from dsrc_interfaces (3.x.x.x)
 Ipv4Address g_rsu_csma_ip[4];               // RSU CSMA IPs for management → RSU downlink (10.1.1.x)
 uint32_t    g_first_rsu_node_id = 0;         // NS-3 NodeID of RSU_Nodes.Get(0)
+uint32_t    g_first_vehicle_node_id = 0;     // NS-3 NodeID of Vehicle_Nodes.Get(0)
+                                             //   (R7e.4: needed to convert raw NodeID
+                                             //   carried in BsmBeaconTag back to the
+                                             //   local vehicle index 0..N_Vehicles-1
+                                             //   used by IMobilityProvider::get_gt_position
+                                             //   and the per-vehicle state arrays)
 uint32_t    g_num_active_rsus   = 0;         // = N_RSUs when routing_test=true
 bool        g_option_b_active   = false;     // set true by 12_main.h when relay is ready
 Ptr<Socket>  g_mgmt_downlink_socket;         // management node's downlink send socket (set in StartApplication)
@@ -177,6 +183,277 @@ bool register_vehicle_at_rsu(int rsu_id, uint32_t vehicle_id, double now) {
     if (rs.count < MAX_IDS_PER_RSU)
         rs.ids[rs.count++] = vehicle_id;
     return true;
+}
+
+// ── R3: Controller-side window aggregator (paper §3.5.3 Algorithm 1, Full mode) ─
+// The controller is a NON-AUTHORITATIVE peer per architectural invariant #2.
+// After R1 (LW-DETECT moved to RSU) and R2 (DSRC downlink emitted by RSU
+// directly), the controller no longer drives the per-beacon decision pipeline.
+// What remains here is aggregation/statistics + a window buffer for the
+// not-yet-implemented Full-mode GAT + LSTM-AE pipeline (paper §3.5.3).
+//
+// Paper §3.5.3 describes a windowed approach where beacons are batched into
+// W = L · T_b windows (L beacons per RSU per window). For now we store:
+//   • per-RSU beacon count and anomaly count within the current window
+//   • per-RSU running ψ sum for window-mean overlay metrics
+//   • per-RSU window start time and a monotonic epoch counter
+//
+// When GAT/LSTM-AE land (Phase R7+), try_controller_window_rollover() will
+// dispatch the accumulated kinematics to the spatial graph (GAT) and temporal
+// autoencoder (LSTM-AE) modules; for now the rollover is a logging-only stub
+// that proves the cadence is right.
+#define WINDOW_L_BEACONS 10   // L: beacons per window (paper §3.5.3, Algorithm 1)
+// W = L · T_b → with T_b=0.1 s this gives a 1.0 s window cadence.
+
+struct ControllerWindow {
+    uint32_t beacon_count;       // beacons aggregated in current window
+    uint32_t anomalous_count;    // beacons with cached LW-DETECT anomalous=true
+    uint32_t poisoned_count;     // beacons with ground-truth IsPoisoned=true
+    double   psi_sum;            // running ψ accumulator for window mean
+    double   window_start;       // current window start time (s)
+    uint32_t window_epoch;       // monotonic window counter (rollovers seen)
+};
+
+// Indexed by RSU cell id 0..3 (only the 4 routing-test RSUs are populated).
+ControllerWindow ctrl_window[4] = {};
+
+// ── R4.c: IPFS Off-Chain Beacon Store (paper §3.5.3 Eq 3.56, Fig 3.9) ─────────
+// RSUs accumulate L beacons per window, compute a cryptographic hash of the
+// window, and "store" the {window, hash} off-chain in IPFS. The hash is then
+// stored on-chain (RSU → blockchain direct per invariant #1). The Controller
+// retrieves the window from IPFS using the hash to run GAT spatial + LSTM-AE
+// temporal anomaly detection in Full mode (paper §3.5.3, pending phase R7+).
+//
+// Paper text (§3.5.3 around Fig 3.9):
+//   "Beacon windows are stored off-chain in the IPFS Off-Chain Beacon Store
+//    together with their cryptographic hashes, decoupling real-time RSU
+//    processing from controller-side deep learning analysis."
+//
+// Simulation stub: no real IPFS daemon; we log [IPFS-STORE-RSUx] and
+// [IPFS-HASH-CHAIN-RSUx] lines and increment counters. The hash is a
+// deterministic FNV-1a digest of the concatenated beacon kinematics —
+// same simulation-stub pattern used for the TRS aggregate hash in
+// 06b_pq_crypto.h. Swap to OpenSSL EVP_sha3_256 for published runs.
+
+#define IPFS_WINDOW_L 10   // L beacons per IPFS window (paper §3.5.3 Algorithm 1)
+
+struct RsuBeaconWindow {
+    uint32_t vid       [IPFS_WINDOW_L];
+    double   pos_x     [IPFS_WINDOW_L];
+    double   pos_y     [IPFS_WINDOW_L];
+    double   speed     [IPFS_WINDOW_L];
+    double   heading   [IPFS_WINDOW_L];
+    double   accel     [IPFS_WINDOW_L];
+    double   timestamp [IPFS_WINDOW_L];
+    bool     anomalous [IPFS_WINDOW_L]; // cached LW-DETECT result per beacon
+    uint32_t beacon_count;              // filled slots in current window
+    double   window_start;              // first beacon time of current window
+    uint32_t window_epoch;              // monotonic window counter
+};
+
+RsuBeaconWindow rsu_window[4] = {};
+
+// ── R7e: Per-vehicle LSTM-AE ring buffer + ψ cache (paper §3.5.3 Eq 3.43–3.46) ─
+// Full-mode temporal anomaly detection runs LSTM-AE over a 20-beacon sliding
+// window per vehicle (gat_detector.py/lstm_ae.py WINDOW_SIZE=20). At every
+// beacon the RSU-side handle_readone pushes the current kinematics into this
+// ring; when ≥ 20 samples are present we can reconstruct + score.
+//
+// last_psi[vid] caches the most recent lightweight composite score ψ_i(t)
+// (paper Eq 3.20) so the controller-side fusion step (Eq 3.46) can mix it with
+// the per-window GAT spatial score and the LSTM-AE temporal score.
+//
+// Indexed by vehicle id (vid = nid - 2, range [0..total_size)) to match the
+// pattern used by vehicle_state[] / pre_registered_sybil[] above.
+#define LSTM_RING_SIZE 20    // matches WINDOW_SIZE in lstm_ae.py
+struct VehicleLstmRing {
+    float    pos_x   [LSTM_RING_SIZE];
+    float    pos_y   [LSTM_RING_SIZE];
+    float    speed   [LSTM_RING_SIZE];
+    float    heading [LSTM_RING_SIZE];
+    float    accel   [LSTM_RING_SIZE];
+    uint32_t count     = 0;      // total samples ever pushed (filled+wrapped)
+    uint32_t head      = 0;      // next write index (wraps at LSTM_RING_SIZE)
+};
+
+VehicleLstmRing vehicle_lstm_ring[total_size] = {};
+double          last_psi_per_vehicle[total_size] = {};
+
+// ── R7e.4: Controller TPE predictor state (paper Eq 4.6) ──────────────────────
+// TPE = mean Euclidean displacement between controller's PREDICTED position
+// p̂_ctrl(t) and SUMO ground-truth p_sumo(t). The predictor here is a
+// dead-reckoning linear extrapolation from the controller's last *observed*
+// (beacon-reported) kinematics:
+//   p̂(t_new) = p(t_prev) + v(t_prev) · (t_new − t_prev)
+// where v is decomposed via heading: v_x = speed·cos(h), v_y = speed·sin(h).
+//
+// Why this is honest TPE per paper §4.1.2:
+//   • The input to the predictor is the BEACON-REPORTED state (possibly
+//     poisoned), so for TP attacks {1,2,5} the predictor is biased exactly as
+//     the controller's view would be biased in deployment.
+//   • The comparison target is the MOBILITY-MODEL position read via
+//     g_mobility_provider->get_gt_position() — for sumo_trace mode this is
+//     genuine SUMO ground truth; for hardcoded mode it's the unpoisoned
+//     hand-placed scenario state (still a valid GT for the sim, though paper
+//     conformance asks for sumo_trace).
+//
+// State per vehicle: last observed (px, py, speed, heading, t).
+// has_obs guards the very first beacon (no prior to extrapolate from).
+struct TpeObs {
+    double px = 0.0;
+    double py = 0.0;
+    double speed = 0.0;
+    double heading = 0.0;
+    double t = -1.0;
+    bool   has_obs = false;
+};
+TpeObs   tpe_last_obs[total_size] = {};
+double   tpe_disp_sum  = 0.0;   // Σ √((p̂_x−gt_x)² + (p̂_y−gt_y)²)
+uint64_t tpe_disp_cnt  = 0;     // # comparisons accumulated
+
+// Push a 5-feature sample into vehicle vid's ring. Returns true when ring has
+// at least LSTM_RING_SIZE samples (i.e., a full window is available).
+static inline bool lstm_ring_push(uint32_t vid,
+                                  float px, float py, float sp,
+                                  float hd, float ac) {
+    if (vid >= (uint32_t)total_size) return false;
+    VehicleLstmRing &r = vehicle_lstm_ring[vid];
+    const uint32_t i = r.head;
+    r.pos_x  [i] = px;
+    r.pos_y  [i] = py;
+    r.speed  [i] = sp;
+    r.heading[i] = hd;
+    r.accel  [i] = ac;
+    r.head = (r.head + 1) % LSTM_RING_SIZE;
+    r.count++;
+    return r.count >= LSTM_RING_SIZE;
+}
+
+// Copy the ring into a row-major (LSTM_RING_SIZE × 5) buffer in chronological
+// order so the LSTM-AE sees the oldest sample first. Returns false if ring is
+// not yet full.
+static inline bool lstm_ring_dump(uint32_t vid, float *out_buf) {
+    if (vid >= (uint32_t)total_size) return false;
+    const VehicleLstmRing &r = vehicle_lstm_ring[vid];
+    if (r.count < LSTM_RING_SIZE) return false;
+    // Oldest sample is at index head (wraps around) once count >= size.
+    for (uint32_t k = 0; k < LSTM_RING_SIZE; ++k) {
+        const uint32_t idx = (r.head + k) % LSTM_RING_SIZE;
+        out_buf[k * 5 + 0] = r.pos_x  [idx];
+        out_buf[k * 5 + 1] = r.pos_y  [idx];
+        out_buf[k * 5 + 2] = r.speed  [idx];
+        out_buf[k * 5 + 3] = r.heading[idx];
+        out_buf[k * 5 + 4] = r.accel  [idx];
+    }
+    return true;
+}
+
+// R7d: "Last flushed window" snapshot per RSU. rsu_window[rsu_id] resets to
+// beacon_count=0 immediately after IPFS flush, but the controller-side
+// HandleBeaconReceived() callback (08_detection_engine.h CTRL-WIN block) needs
+// the just-flushed kinematics to run Full-mode GAT spatial inference. The
+// snapshot lives until the next flush overwrites it, so the controller can
+// always read the most recent complete L-beacon window for any RSU.
+// epoch_valid=0 means "no flush yet for this RSU" — controller skips GAT then.
+RsuBeaconWindow rsu_last_window[4] = {};
+bool             rsu_last_window_valid[4] = {false, false, false, false};
+
+// Statistics surfaced in the end-of-run metrics block (10_metrics_csv.h).
+uint32_t ipfs_upload_count     = 0;  // total windows flushed to IPFS off-chain
+uint32_t ipfs_hash_chain_count = 0;  // total hashes anchored on-chain
+
+// Deterministic FNV-1a digest of the window — paper says "cryptographic hash",
+// we use FNV-1a as the SHA3-256 stand-in (same pattern as 06b_pq_crypto.h
+// TRS aggregate hash). For final published runs, swap to OpenSSL EVP_sha3_256.
+static std::string ipfs_window_hash(const RsuBeaconWindow &w, uint32_t rsu_id) {
+    uint32_t h = 2166136261u;
+    auto mix = [&](uint64_t v) {
+        for (int b = 0; b < 8; b++) {
+            h ^= (uint8_t)((v >> (b * 8)) & 0xFF);
+            h *= 16777619u;
+        }
+    };
+    mix((uint64_t)rsu_id);
+    mix((uint64_t)w.window_epoch);
+    for (uint32_t i = 0; i < w.beacon_count; i++) {
+        mix((uint64_t)w.vid[i]);
+        mix((uint64_t)(w.pos_x[i]     * 1000.0));
+        mix((uint64_t)(w.pos_y[i]     * 1000.0));
+        mix((uint64_t)(w.speed[i]     * 1000.0));
+        mix((uint64_t)(w.heading[i]   * 1000.0));
+        mix((uint64_t)(w.accel[i]     * 1000.0));
+        mix((uint64_t)(w.timestamp[i] * 1.0e6));
+        mix((uint64_t)(w.anomalous[i] ? 1 : 0));
+    }
+    char buf[24];
+    std::snprintf(buf, sizeof(buf), "ipfs_%08x", h);
+    return std::string(buf);
+}
+
+// Push one beacon into RSU rsu_id's window buffer. When L beacons accumulate
+// the window is flushed: hash computed, "IPFS upload" logged, on-chain hash
+// anchored (RSU → blockchain direct per invariant #1), and the buffer reset.
+// A5 ablation (ablation_mode==5) skips the on-chain anchor since blockchain
+// is disabled in that variant — the off-chain store still runs so downstream
+// GAT/LSTM-AE retrieval semantics (R7+) remain testable.
+void ipfs_push_and_maybe_flush(uint32_t rsu_id, uint32_t vid,
+                               double px, double py, double sp,
+                               double hd, double ac, double ts,
+                               bool anomalous_flag) {
+    if (rsu_id >= 4) return;
+    RsuBeaconWindow &w = rsu_window[rsu_id];
+    if (w.beacon_count == 0) w.window_start = ts;
+    if (w.beacon_count < IPFS_WINDOW_L) {
+        uint32_t i = w.beacon_count;
+        w.vid[i]       = vid;
+        w.pos_x[i]     = px;
+        w.pos_y[i]     = py;
+        w.speed[i]     = sp;
+        w.heading[i]   = hd;
+        w.accel[i]     = ac;
+        w.timestamp[i] = ts;
+        w.anomalous[i] = anomalous_flag;
+        w.beacon_count++;
+    }
+    if (w.beacon_count >= IPFS_WINDOW_L) {
+        std::string hash = ipfs_window_hash(w, rsu_id);
+        uint32_t anomalous_in_win = 0;
+        for (uint32_t i = 0; i < w.beacon_count; i++)
+            if (w.anomalous[i]) anomalous_in_win++;
+
+        // Off-chain IPFS store — paper §3.5.3 Eq 3.56, Fig 3.9 (RSU→IPFS arrow).
+        std::cout << "[IPFS-STORE-RSU" << rsu_id << "] epoch=" << w.window_epoch
+                  << " beacons=" << w.beacon_count
+                  << " anomalous=" << anomalous_in_win
+                  << " hash=" << hash
+                  << " t_start=" << std::fixed << std::setprecision(3) << w.window_start
+                  << " t_end="   << std::fixed << std::setprecision(3) << ts
+                  << " (Fig 3.9 RSU→IPFS, controller retrieves for GAT/LSTM-AE R7+)"
+                  << std::endl;
+        ipfs_upload_count++;
+
+        // On-chain hash anchor — paper §3.5.3 Fig 3.9 (RSU→Blockchain arrow,
+        // invariant #1: RSU → blockchain DIRECT, no controller relay).
+        // A5 ablation: skip blockchain to isolate BC contribution (RQ6).
+        if (ablation_mode != 5) {
+            std::cout << "[IPFS-HASH-CHAIN-RSU" << rsu_id << "] epoch=" << w.window_epoch
+                      << " hash=" << hash
+                      << " (paper invariant #1: RSU→BC direct)"
+                      << std::endl;
+            ipfs_hash_chain_count++;
+        }
+
+        // R7d: snapshot the just-flushed window so the controller-side
+        // GAT/LSTM-AE pipeline (08_detection_engine.h CTRL-WIN block) can read
+        // it even though we're about to zero `w`. The copy is a struct
+        // assignment — kinematics arrays are POD so this is one memcpy.
+        rsu_last_window[rsu_id]       = w;
+        rsu_last_window_valid[rsu_id] = true;
+
+        // Reset window buffer for next L beacons.
+        w.beacon_count = 0;
+        w.window_epoch++;
+    }
 }
 
 #endif // NS3_UDP_ARQ_APPLICATION_H
