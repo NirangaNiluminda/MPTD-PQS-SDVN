@@ -22,9 +22,10 @@
 
 #include <cmath>
 #include <sstream>
-#include <deque>    // CP-DETECT per-vehicle rolling RSU view window (Eq 3.59)
-#include <map>      // CP-DETECT per-vehicle window keyed by vehicle id
-#include <time.h>   // clock_gettime for PBPO timing
+#include <deque>          // CP-DETECT per-vehicle rolling RSU view window (Eq 3.59)
+#include <map>            // CP-DETECT per-vehicle window keyed by vehicle id
+#include <unordered_set>  // TASK ①-K: SCTrustFinalizeEpoch (vid,epoch) dedup
+#include <time.h>         // clock_gettime for PBPO timing
 
 // ── Internal forward declarations ────────────────────────────────────────────
 static uint32_t nearest_rsu_for_position(double px, double py); // defined later in this file
@@ -2393,6 +2394,33 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     CallSCTrustSubmitEvidence(
                         vid, rsu_idx, epoch,
                         rsu_lw.psi, h_b, sigma_sub_hex);
+
+                    // ── Schedule Eq 3.55 finalization 1 s after submission ──
+                    // SCTrustFinalizeEpoch aggregates all RSU witnesses of
+                    // vehicle vid in this epoch. We delay 1 s (sim time) to
+                    // give other RSU witnesses time to submit before the
+                    // chaincode computes (1/|R|)·Σ ψ_j^(i)(t).
+                    //
+                    // Dedup: each (vid, epoch) pair gets EXACTLY ONE finalize
+                    // scheduled across all RSUs / beacons. Without dedup, every
+                    // beacon would re-schedule a finalize; the chaincode is
+                    // idempotent on (vid, epoch) but the duplicate orderer
+                    // round-trips would tank PBPO and saturate the gateway.
+                    //
+                    // Static set is process-local — fine since the sim runs in
+                    // one process. Cleared on next sim run (re-static-init).
+                    static std::unordered_set<std::string> g_finalize_scheduled;
+                    static std::mutex                       g_finalize_mu;
+                    std::string key = std::to_string(vid) + "|" + epoch;
+                    bool first;
+                    {
+                        std::lock_guard<std::mutex> lk(g_finalize_mu);
+                        first = g_finalize_scheduled.insert(key).second;
+                    }
+                    if (first) {
+                        Simulator::Schedule(Seconds(1.0),
+                            &CallSCTrustFinalizeEpochAsync, vid, epoch);
+                    }
                 }
             }
         }

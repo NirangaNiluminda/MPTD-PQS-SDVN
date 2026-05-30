@@ -436,6 +436,24 @@ inline std::string CallSCTrustFinalizeEpoch(
     return mptd_fabric_invoke_sync("invoke", "SCTrustFinalizeEpoch", args);
 }
 
+// ── CallSCTrustFinalizeEpochAsync — fire-and-forget variant ──────────────────
+// Same chaincode function as CallSCTrustFinalizeEpoch but discards the
+// returned ConsecutiveLowEpochs payload. Used when finalize is scheduled
+// from inside a sim simulation tick (NS-3 Simulator::Schedule) — blocking on
+// the orderer round-trip would stall the simulation. The chaincode side is
+// idempotent over (vehicleID, epoch) so re-firing is harmless if multiple
+// schedulers happen to converge. Designed to be bindable directly to
+// Simulator::Schedule via ns3::MakeBoundCallback.
+inline void CallSCTrustFinalizeEpochAsync(
+    uint32_t vehicleID, std::string epoch)
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    std::vector<std::string> args = {
+        std::to_string(vehicleID), epoch
+    };
+    mptd_fabric_invoke_async("SCTrustFinalizeEpoch", args);
+}
+
 // ── CallCPDetectCheck — Eq 3.59 controller/RSU mismatch detection ────────────
 // Compares controller Φ vs each RSU's ψ against ψ_th; flags the controller
 // when ≥ f+1 RSUs disagree with its anomaly call. Returns raw payload
