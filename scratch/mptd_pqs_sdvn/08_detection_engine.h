@@ -204,10 +204,35 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     if (dtheta > omega_max * dt)
         violated |= (1 << 1);
 
-    // TP-S3: acceleration bound
-    // |a_i(t)| > a_max
-    if (std::fabs(vs.accel[curr]) > a_max)
-        violated |= (1 << 2);
+    // TP-S3: acceleration bound  (paper Eq 3.12)
+    //   |a_i(t)| > a_max
+    //
+    // Two evaluation paths combined with OR — both are "the acceleration the
+    // beacon implies", just sourced differently:
+    //
+    //   (a) Reported accel field a_i(t)
+    //       — direct check on the BSM acceleration field. Honest vehicles
+    //       transmit physically derived accel ≤ a_max; an attacker that lies
+    //       about a_i directly (e.g. writes 50 m/s²) trips this path.
+    //
+    //   (b) Implied accel from reported speed delta a_impl = Δs / Δt
+    //       — paper text: "implied speed change violates road friction and
+    //       vehicle dynamic limits". Catches attacks that DO NOT touch a_i
+    //       but instead manipulate s_i(t) — TP-S2 flooding (attack 2, ×2 vel),
+    //       MitM relay (attack 6, target 33–66 m/s), MP-S3 enhanced sybil
+    //       (attack 3 w/ reg_pct, target 33–66 m/s), and any controller-side
+    //       speed poisoning (attack 5/7). Without this path TP-S3 was 0/67766
+    //       across the May-2026 sweep because PoisonTrajectoryByType never
+    //       writes the acceleration vector and the MitM injector caps fake_acc
+    //       at 0.42·a_max by design (see 09_vehicle_beacon_tx.h §step ③).
+    //
+    // Both paths use the same a_max threshold (4 m/s² road-friction limit).
+    {
+        double a_reported = std::fabs(vs.accel[curr]);
+        double a_implied  = std::fabs(vs.speed[curr] - vs.speed[prev]) / dt;
+        if (a_reported > a_max || a_implied > a_max)
+            violated |= (1 << 2);
+    }
 
     // TP-S4: dead-reckoning residual
     // r_i(t) = ||p̂_i(t) - p_i(t)||, p̂ = p(t-1) + v(t-1)*dt
@@ -294,22 +319,87 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     if ((count_exceeded || ghost_seen_flag) && tag.GetIsPoisoned())
         violated |= (1 << 0);
 
-    // MP-S2: synchronized beacon timing (Eq. 3.17)
-    // Detects Sybil colluders sharing a common clock: |t_i − t_j| < τ_sync = 1ms.
-    // Only compare vehicles in the same RSU cell (within R_max_comm of the beacon's
-    // reported position) to avoid spurious matches from vehicles in distant cells.
-    // Honest vehicles are staggered by T_b/N ≈ 6.25ms > τ_sync=1ms → FP=0.
-    for (int other = 0; other < total_size; other++) {
-        if (other == vid || vehicle_state[other].count == 0) continue;
-        int h = (vehicle_state[other].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
-        // Cell-scope guard: only consider vehicles within the same RSU coverage area
-        double cell_dx = vehicle_state[other].pos_x[h] - tag.GetPosX();
-        double cell_dy = vehicle_state[other].pos_y[h] - tag.GetPosY();
-        if (std::sqrt(cell_dx*cell_dx + cell_dy*cell_dy) >= R_max_comm) continue;
-        double t_other = vehicle_state[other].timestamp[h];
-        if (std::fabs(t_other - tag.GetTimestamp()) < tau_sync) {
-            violated |= (1 << 1);
-            break;
+    // MP-S2: synchronized beacon timing  (paper Eq 3.17)
+    //   (1/K) Σ_{k=1..K} 1[|t_a^(k) − t_b^(k)| < τ_sync] > ρ_sync
+    //
+    // Eq 3.17 is NOT a single-timestamp check — it's a per-identity-pair
+    // co-occurrence rate over the last K beacons of each identity. Sybil
+    // identities sourced from one attacker clock will land within τ_sync of
+    // each other a high FRACTION of the time; honest pairs occasionally
+    // coincide but the fraction over K stays low. The previous single-pair
+    // version was 0/67766 across the May-2026 sweep because random honest
+    // collisions within 1 ms are rare and stolen-beacon staggers exceeded τ_sync.
+    //
+    // Implementation:
+    //   For each candidate identity b in the same RSU cell, pair the current
+    //   vehicle vid's last K timestamps with b's history by nearest-time
+    //   match. Count the pairs whose delta is < τ_sync. If count/K > ρ_sync
+    //   and K reached MP_S2_K_MIN, flag.
+    //
+    //   K_MIN: lower bound that suppresses cold-start FP (need real evidence).
+    //   K_MAX: capped by BEACON_HISTORY=20.
+    //
+    // Cell-scope guard remains — honest cross-cell vehicles never paired.
+    {
+        const int    MP_S2_K_MIN = 3;            // need ≥3 paired beacons
+        const int    MP_S2_K_MAX = (BEACON_HISTORY < 8) ? BEACON_HISTORY : 8;
+        const double NEAR_T_MAX  = 0.050;        // ignore pairs > 50 ms apart
+                                                  // (clearly different identities,
+                                                  // pairing would be meaningless)
+
+        // a = vid (current beacon's vehicle), b = other
+        VehicleBeaconState &va = vehicle_state[vid];
+        if (va.count >= MP_S2_K_MIN) {
+            for (int other = 0; other < total_size; other++) {
+                if (other == vid || vehicle_state[other].count < MP_S2_K_MIN)
+                    continue;
+                VehicleBeaconState &vb = vehicle_state[other];
+
+                // Cell-scope guard: most-recent positions must be co-located
+                int ha = (va.head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+                int hb = (vb.head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+                double cdx = vb.pos_x[hb] - va.pos_x[ha];
+                double cdy = vb.pos_y[hb] - va.pos_y[ha];
+                if (std::sqrt(cdx*cdx + cdy*cdy) >= R_max_comm) continue;
+
+                int K = (va.count < vb.count) ? va.count : vb.count;
+                if (K > MP_S2_K_MAX) K = MP_S2_K_MAX;
+
+                int sync_hits = 0;
+                int sync_total = 0;
+                for (int k = 0; k < K; k++) {
+                    int ia = (va.head - 1 - k + BEACON_HISTORY) % BEACON_HISTORY;
+                    double ta = va.timestamp[ia];
+                    if (ta <= 0.0) continue;
+                    // Find b's beacon nearest in time to ta
+                    double best_dt = NEAR_T_MAX;
+                    bool   found   = false;
+                    for (int kk = 0; kk < vb.count && kk < BEACON_HISTORY; kk++) {
+                        int ib = (vb.head - 1 - kk + BEACON_HISTORY) % BEACON_HISTORY;
+                        double tb = vb.timestamp[ib];
+                        if (tb <= 0.0) continue;
+                        double d = std::fabs(ta - tb);
+                        if (d < best_dt) { best_dt = d; found = true; }
+                    }
+                    if (!found) continue;
+                    sync_total++;
+                    if (best_dt < tau_sync) sync_hits++;
+                }
+
+                if (sync_total >= MP_S2_K_MIN) {
+                    double frac = (double)sync_hits / (double)sync_total;
+                    if (frac > rho_sync) {
+                        violated |= (1 << 1);
+                        cout << "[MP-S2-SYNC] V" << vid << " ↔ V" << other
+                             << " sync_frac=" << std::fixed << std::setprecision(2)
+                             << frac << " (>" << rho_sync << ")"
+                             << " K=" << sync_total
+                             << " τ_sync=" << (tau_sync * 1000.0) << "ms"
+                             << " → Eq 3.17 fired" << endl;
+                        break;
+                    }
+                }
+            }
         }
     }
 
