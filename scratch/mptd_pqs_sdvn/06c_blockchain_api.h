@@ -18,6 +18,11 @@
 //   CallSCRevoke()                       — SC-Revoke immutable record
 // ============================================================
 
+// R7g.3: Single guard macro for every REST helper. When skip_blockchain is set
+// (training-sweep mode), the curl call is bypassed — the sim still produces a
+// full beacon CSV; only the ledger writes are skipped.
+#define MPTD_BLOCKCHAIN_GUARD() do { if (skip_blockchain) return; } while (0)
+
 // ── StoreAttackConfigToBlockchain — store global attack flags to ledger ───────
 // Called by declare_attack_states() to record the active attack type.
 void StoreAttackConfigToBlockchain(
@@ -25,6 +30,7 @@ void StoreAttackConfigToBlockchain(
     bool tpVehicle, bool headingSpoof, bool rsuFab, bool sybilMitm, bool beaconSup,
     bool ctrlMalAssumption)
 {
+    MPTD_BLOCKCHAIN_GUARD();
     std::string body =
         "{\"attackNumber\":\""    + std::to_string(attackNum) + "\","
         "\"tpVehicle\":\""        + (tpVehicle      ? "true" : "false") + "\","
@@ -50,6 +56,7 @@ void StoreNodeAttackStateToBlockchain(
     bool isLocMal, bool isFloodMal, bool isFabMal,
     bool isMIMMal, bool isVanMal, bool isTrajMal)
 {
+    MPTD_BLOCKCHAIN_GUARD();
     std::string body =
         "{\"nodeIndex\":\""        + std::to_string(nodeIdx) + "\","
         "\"attackPercentage\":\""  + std::to_string(atkPct)  + "\","
@@ -75,6 +82,7 @@ void StoreNodeAttackStateToBlockchain(
 void StoreControllerAssignmentToBlockchain(
     uint32_t nodeIdx, uint32_t ctrlID, uint32_t consID, bool isTrajPoisoner)
 {
+    MPTD_BLOCKCHAIN_GUARD();
     std::string body =
         "{\"nodeIndex\":\""      + std::to_string(nodeIdx)  + "\","
         "\"controllerID\":\""   + std::to_string(ctrlID)   + "\","
@@ -94,11 +102,82 @@ void StoreControllerAssignmentToBlockchain(
 
 // ── StoreTrajectoryToBlockchain — record real + poisoned trajectory ───────────
 // Paper §3.3.4: Each beacon reception is stored on Fabric ledger.
-// When use_pq_crypto=true: also runs TRS signing (§3.3.2) + FHE encryption (§3.3.3).
+// When use_pq_crypto=true: runs real TRS signing (§3.5.4 Eq. 3.46–3.49) +
+// FHE encryption (§3.5.4 Eq. 3.61). Per Invariant 5, TRS verification gates
+// the submission — a failed σ_TRS verify bails out before the curl POST and
+// the trajectory_stored counter is NOT incremented.
+//
+// R8.4 (2026-05-29): Replaced the legacy generate_trs_aggregate string-hash
+// stub with the real evidence_sign_and_verify pipeline (paper Algorithm 6).
+// PARR is now empirically observable via g_trs_verified_count /
+// g_trs_rejected_count instead of formula-approximated in evaluate_all.py.
 void StoreTrajectoryToBlockchain(std::string vehicleID, std::string rsuID,
     Vector position, Vector velocity, Vector acceleration,
     double timestamp, bool isPoisoned)
 {
+    // R8.4: TRS verification runs whenever use_pq_crypto, REGARDLESS of
+    // skip_blockchain. Sweep mode (skip_blockchain=true) still needs the
+    // crypto cost on the PBPO clock and σ_TRS verify/reject counts on the
+    // PARR clock — only the Fabric REST call is the part we skip. The
+    // explicit skip_blockchain check is moved below, after the TRS gate.
+
+    // ── PQ TRS gate (Invariant 5: TRS-then-FHE-then-submit) ──────────────────
+    if (use_pq_crypto) {
+        // Build m_j evidence (paper Eq. 3.46). Per-beacon mode: vehicle_set = {vid}.
+        uint32_t rsu_idx = 0;
+        if (rsuID.size() > 3) {
+            try { rsu_idx = (uint32_t)std::stoi(rsuID.substr(3)); } catch (...) {}
+        }
+        uint32_t vid = 0;
+        try { vid = (uint32_t)std::stoi(vehicleID); } catch (...) {}
+
+        EvidenceMessage m_j;
+        m_j.rsu_id      = rsu_idx;
+        m_j.timestamp   = timestamp;
+        m_j.agg_pos_x   = position.x;
+        m_j.agg_pos_y   = position.y;
+        m_j.agg_vel_x   = velocity.x;
+        m_j.agg_vel_y   = velocity.y;
+        m_j.agg_accel_x = acceleration.x;
+        m_j.agg_accel_y = acceleration.y;
+        m_j.vehicle_set.push_back(vid);
+
+        // Real TRS chain: partial_sign × t → aggregate → verify_threshold
+        // (paper Eq. 3.47–3.49). evidence_sign_and_verify lives in
+        // 06b1_trs_backend.h.
+        std::vector<uint8_t>  sigma_trs;
+        std::vector<uint32_t> signers;
+        bool verified = evidence_sign_and_verify(m_j, sigma_trs, signers);
+        if (verified) g_trs_verified_count++;
+        else          g_trs_rejected_count++;
+
+        std::cout << "[TRS] Vehicle=" << vehicleID
+                  << " RSU=" << rsuID
+                  << " signers=" << signers.size()
+                  << " sigma_bytes=" << sigma_trs.size()
+                  << " verified=" << (verified ? "YES" : "NO") << "\n";
+
+        if (!verified) {
+            // Invariant 5: σ_TRS verification gates submission. Reject early.
+            std::cout << "[TRS-REJECT] vehicle=" << vehicleID
+                      << " t=" << timestamp
+                      << " — σ_TRS verify failed; skipping chain submit\n";
+            return;
+        }
+
+        // FHE: encrypt speed scalar AFTER TRS verify (paper Eq. 3.61).
+        double spd = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
+        FHECiphertext ct = fhe_encrypt_scalar(spd);
+        std::cout << "[FHE] Vehicle=" << vehicleID
+                  << " speed_enc=" << ct.noisy_value
+                  << " (plaintext≈" << spd << ")\n";
+    }
+
+    // ── Submit to Fabric ledger (gated on TRS verify above) ──────────────────
+    // Sweep mode (--skip_blockchain=true) stops here: PARR/PBPO already booked
+    // above, no need to pay the curl roundtrip when there's no Fabric anyway.
+    if (skip_blockchain) return;
+
     std::string curlCmd =
         "curl -s -X POST http://localhost:3000/api/trajectory "
         "-H \"Content-Type: application/json\" "
@@ -124,36 +203,13 @@ void StoreTrajectoryToBlockchain(std::string vehicleID, std::string rsuID,
 
     system(curlCmd.c_str());
     total_trajectories_stored_blockchain++;
-
-    // ── PQ signing + encrypted speed aggregate (Paper §3.3.2-3.3.3) ──────────
-    if (use_pq_crypto) {
-        // TRS: RSU signs the trajectory aggregate hash (Eq. 3.58-3.60)
-        uint32_t rsu_idx = 0;
-        if (rsuID.size() > 3) {
-            try { rsu_idx = (uint32_t)std::stoi(rsuID.substr(3)); } catch (...) {}
-        }
-        double spd = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
-        TRSSignature sig = generate_trs_aggregate(
-            rsu_idx, position.x, position.y, spd, 0.0, timestamp);
-        verify_trs(sig);
-        std::cout << "[TRS] Vehicle=" << vehicleID
-                  << " RSU=" << rsuID
-                  << " signers=" << sig.signers.size()
-                  << " verified=" << (sig.verified ? "YES" : "NO")
-                  << " hash=" << sig.aggregate_hash << "\n";
-
-        // FHE: encrypt speed scalar (Eq. 3.61)
-        FHECiphertext ct = fhe_encrypt_scalar(spd);
-        std::cout << "[FHE] Vehicle=" << vehicleID
-                  << " speed_enc=" << ct.noisy_value
-                  << " (plaintext≈" << spd << ")\n";
-    }
 }
 
 // ── StoreControlDecisionToBlockchain — record SDN control packet decision ────
 void StoreControlDecisionToBlockchain(std::string controllerID, std::string decision,
     double timestamp, std::string basedOnData)
 {
+    MPTD_BLOCKCHAIN_GUARD();
     std::string curlCmd =
         "curl -s -X POST http://localhost:3000/api/control "
         "-H \"Content-Type: application/json\" "
@@ -169,6 +225,7 @@ void StoreControlDecisionToBlockchain(std::string controllerID, std::string deci
 // ── FlagMaliciousOnBlockchain — write immutable malicious flag for an entity ─
 void FlagMaliciousOnBlockchain(std::string entityID, std::string reason)
 {
+    MPTD_BLOCKCHAIN_GUARD();
     std::string curlCmd =
         "curl -s -X POST http://localhost:3000/api/flag "
         "-H \"Content-Type: application/json\" "
@@ -185,6 +242,7 @@ void FlagMaliciousOnBlockchain(std::string entityID, std::string reason)
 void CallSCTrust(uint32_t vehicleID, double phiScore, uint32_t sigMask,
                  bool isAnomaly, double timestamp)
 {
+    MPTD_BLOCKCHAIN_GUARD();
     std::string body =
         "{\"vehicleID\":\""  + std::to_string(vehicleID)          + "\","
         "\"phiScore\":\""    + std::to_string(phiScore)            + "\","
@@ -208,6 +266,7 @@ void CallSCTrust(uint32_t vehicleID, double phiScore, uint32_t sigMask,
 void CallSCRevoke(uint32_t vehicleID, const std::string &reason,
                   uint32_t rsuID, double timestamp)
 {
+    MPTD_BLOCKCHAIN_GUARD();
     std::string body =
         "{\"vehicleID\":\""  + std::to_string(vehicleID)  + "\","
         "\"reason\":\""      + reason                      + "\","

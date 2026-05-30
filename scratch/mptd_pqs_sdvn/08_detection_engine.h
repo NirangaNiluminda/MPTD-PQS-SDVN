@@ -6,14 +6,15 @@
 // Replaces 08_lldp_handlers.h (17K lines of legacy LLDP code).
 //
 // Contents:
-//   HandleBeaconReceived()     - main entry: BSM beacon at RSU
-//   run_tp_detect()            - TP-DETECT (Algorithm 1, §3.4.4)
-//   run_syb_detect()           - SYB-DETECT (Algorithm 2, §3.4.4)
-//   run_mitm_detect()          - MITM-DETECT (Algorithm 3)
-//   run_cp_detect()            - CP-DETECT (Algorithm 4)
-//   log_metrics_line()         - [METRICS] / [MRTPA_SUMMARY] output
+//   HandleBeaconReceived()         - main entry: BSM beacon at RSU
+//   run_tp_detect()                - TP-DETECT (Algorithm 1, §3.4.4)
+//   run_syb_detect()               - SYB-DETECT (Algorithm 2, §3.4.4)
+//   run_mitm_detect()              - MITM-DETECT (Algorithm 3)
+//   run_cp_detect()                - per-beacon cp_flags oracle (LW pipeline)
+//   run_cp_detect_per_epoch()      - CP-DETECT (Algorithm 7, §3.5.5, Eq 3.59)
+//   log_metrics_line()             - [METRICS] / [MRTPA_SUMMARY] output
 //
-// Paper: §3.4.4, Algorithms 1–4
+// Paper: §3.4.4 Algorithms 1–3 (LW signatures), §3.5.5 Algorithm 7 (CP-DETECT)
 // ============================================================
 
 #ifndef MPTD_PQS_BEACON_HANDLERS_H
@@ -21,6 +22,8 @@
 
 #include <cmath>
 #include <sstream>
+#include <deque>    // CP-DETECT per-vehicle rolling RSU view window (Eq 3.59)
+#include <map>      // CP-DETECT per-vehicle window keyed by vehicle id
 #include <time.h>   // clock_gettime for PBPO timing
 
 // ── Internal forward declarations ────────────────────────────────────────────
@@ -466,15 +469,20 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 
 uint32_t run_cp_detect(BsmBeaconTag &tag)
 {
+    // ⚠ SCOPE NOTE (R6 audit): this is the PER-BEACON cp_flags oracle used to
+    // populate LwDetectResult.cp_flags inside run_lw_detect_per_beacon(). It is
+    // NOT the paper's Algorithm 7 (CP-DETECT) — that lives in
+    // run_cp_detect_per_epoch() below, which performs epoch-level RSU peer-
+    // consensus checking on the controller's emitted decisions per Eq 3.59.
+    //
+    // This function returns a binary "is the controller currently configured
+    // as malicious?" oracle used by attack 5/7 traces to mark the cp_flags bit
+    // for downstream confusion-matrix accounting. Kept as a sim crutch until
+    // the LW-DETECT cp_flags channel is replaced by real CP-DETECT outputs
+    // (planned: R6 epoch-level Algorithm 7 supersedes this).
+    //
     // TP-S3 (attack_number=5): controller-level trajectory poisoning.
     // MP-S4 (attack_number=7): controller-malicious global model poisoning.
-    //
-    // Paper Algorithm 4 (CP-DETECT) describes cross-verifying control-plane data
-    // against independent RSU consensus to detect a compromised controller.
-    // Implementation simplification: uses the oracle flag controller_malicious_assumption
-    // (set true when the attack scenario involves a malicious controller).
-    // This is equivalent to a perfect cross-verification in simulation context —
-    // in a real deployment, CP-DETECT would need an independent quorum-based check.
     //
     // Note: cp_flags are used in the confusion matrix ONLY for attack 7 (MP-S4):
     //   cp_detected = (cp_flags != 0) && (attack_number == 7)
@@ -484,6 +492,189 @@ uint32_t run_cp_detect(BsmBeaconTag &tag)
         (attack_number == 5 || attack_number == 7))
         return 1;
     return 0;
+}
+
+// ============================================================
+// CP-DETECT (paper §3.5.5 / Algorithm 7 / Eq 3.59) — Epoch-level controller
+// peer-consensus audit. Honors invariants #2 (controller is a non-authoritative
+// peer) and #6 (distributed trust, no centralized bottleneck).
+//
+// Algorithm 7 (paper page 66) has two gates:
+//   (a) lines 2–6  — TRS-verify gate: controller's submitted aggregate must
+//       carry a valid threshold ring signature σ_TRS. Invalid σ_TRS ⇒ direct
+//       CTRL_COMPROMISED. R6 ships a no-op stub returning valid=true; real
+//       TRS verification lands with σ_TRS infrastructure in R8.
+//   (b) lines 7–15 — Conflict-detection gate (Eq 3.59): the controller's
+//       binary decision is audited per-beacon against the RSU peer's
+//       authoritative LW-DETECT view of the same beacon. Per-beacon
+//       disagreement events are accumulated into a per-vehicle rolling
+//       window of size K = 3. If ≥ f+1 disagreements occur within the
+//       window, set flag_c = 1, emit CTRL_COMPROMISED, exclude controller
+//       from consensus, and fall back to RSU rule-based decisions.
+//       f = 1 in the 3-RSU + 1-controller-peer setup (BFT bound n ≥ 3f+1)
+//       ⇒ conflict threshold = 2 disagreements per window.
+//
+// Sim-only note: in NS-3 each beacon hits exactly one RSU (no overlapping
+// radio coverage). The paper's "RSU peer consensus" is preserved by treating
+// the temporally adjacent RSU views as the consensus group — each beacon's
+// authoritative RSU view is the peer for that epoch, and the disagreement
+// window captures persistent controller divergence rather than spatial
+// quorum. An honest controller (attack 1) shadows its RSU's cached LW result
+// so disagreements stay at 0; a malicious controller (attacks 5/7) emits
+// WRONG_ROUTING against clean RSU views ⇒ every beacon is a disagreement and
+// the window fills in ≤ K = 3 beacons.
+// ============================================================
+struct CpDetectVehicleWindow {
+    // Rolling per-beacon disagreement events for one vehicle.
+    // Each entry corresponds to ONE controller decision that was audited.
+    std::deque<bool>     disagreed;       // (rsu_anom != ctrl_anom) for the beacon
+    std::deque<bool>     rsu_anom_hist;   // RSU view at decision time (audit log)
+    std::deque<bool>     ctrl_anom_hist;  // controller view at decision time (audit log)
+    std::deque<double>   psi_hist;        // RSU's ψ_i(t) at decision time
+    std::deque<uint32_t> rsu_ids;         // which RSU produced the view
+};
+static std::map<uint32_t, CpDetectVehicleWindow> g_cp_detect_windows;
+static constexpr size_t CP_DETECT_WINDOW_K   = 3;  // = f + 1 + 1 (one slack)
+static constexpr size_t CP_DETECT_F          = 1;  // BFT byzantine bound
+static constexpr size_t CP_DETECT_THRESHOLD  = CP_DETECT_F + 1;  // Eq 3.59: f+1 = 2
+
+// TRS-verify gate (Algorithm 7 lines 2–6).
+//
+// R6.5 contract:
+//   - sigma_trs == nullptr || sigma_len == 0 → return true (pre-R8 mode where
+//     the controller-as-peer path has not yet attached a σ_TRS to its
+//     submission). Lets the conflict-detection gate (b) run in isolation.
+//   - otherwise → real ECDSA verify against the RSU ring via g_trs_backend.
+//     ClassicalTrsBackend::verify_threshold currently accepts σ if ANY ring
+//     pk validates (single-signer fallback). R8 swaps in ClassicalTrsBackend
+//     internals for true t-of-n combining; the call site below stays identical.
+//
+// `message` here is the canonical audit string. For R6.5 we synthesize from
+// (vehicle_id, rsu_id, alert_type, epoch) — R8 will replace with the actual
+// submission payload bytes the controller signed.
+static inline bool cp_detect_verify_trs(const uint8_t *sigma_trs,
+                                        size_t         sigma_len,
+                                        uint32_t       vehicle_id = 0,
+                                        uint32_t       rsu_id     = 0,
+                                        uint8_t        alert_type = 0)
+{
+    if (sigma_trs == nullptr || sigma_len == 0) {
+        // R6.5 path: no σ_TRS produced yet — Algorithm 7 gate (a) is a no-op
+        // and gate (b) handles all detections in current builds.
+        return true;
+    }
+    if (!g_trs_backend || g_trs_ring_pks.empty()) {
+        // Defensive: TRS backend not initialized → fail closed. This is a
+        // configuration bug; CP-DETECT should not be invoked before
+        // init_trs_backend() runs in 11_blockchain_setup.h.
+        std::cerr << "[CP-DETECT/TRS] backend not ready — failing σ closed\n";
+        return false;
+    }
+    std::vector<uint8_t> msg;
+    msg.reserve(16);
+    msg.push_back((uint8_t)(vehicle_id      & 0xFF));
+    msg.push_back((uint8_t)((vehicle_id>>8) & 0xFF));
+    msg.push_back((uint8_t)((vehicle_id>>16)& 0xFF));
+    msg.push_back((uint8_t)((vehicle_id>>24)& 0xFF));
+    msg.push_back((uint8_t)(rsu_id          & 0xFF));
+    msg.push_back((uint8_t)((rsu_id>>8)     & 0xFF));
+    msg.push_back((uint8_t)((rsu_id>>16)    & 0xFF));
+    msg.push_back((uint8_t)((rsu_id>>24)    & 0xFF));
+    msg.push_back(alert_type);
+    // (R8: append epoch + RSU peer view bytes per Algorithm 7 line 3.)
+    std::vector<uint8_t> sigma(sigma_trs, sigma_trs + sigma_len);
+    return g_trs_backend->verify_threshold(msg, sigma, g_trs_ring_pks);
+}
+
+// Algorithm 7 main entry. Called from the controller emission path after the
+// controller has decided alert_type for (vehicle_id, rsu_id) in the current
+// epoch. Returns true if a CTRL_COMPROMISED alert was emitted.
+//
+// Parameters:
+//   rsu_anomalous       — RSU's cached LW anomalous flag for THIS beacon
+//                         (from tag.GetLwAnomalous()). This is the peer view
+//                         the controller's decision is audited against.
+//   controller_anomalous — derived from alert_type (1=ATTACK_DETECTED or
+//                         2=WRONG_ROUTING ⇒ true; 0=CLEAN_ROUTING ⇒ false).
+//   rsu_psi             — RSU's ψ_i(t) for the beacon (audit log only).
+//   sigma_trs/sigma_len — R6 callers pass nullptr/0; R8 will pass the real
+//                         controller-as-peer σ_TRS attached to the submission.
+static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
+                                    uint32_t       rsu_id,
+                                    uint8_t        alert_type,
+                                    bool           controller_anomalous,
+                                    bool           rsu_anomalous,
+                                    double         rsu_psi,
+                                    const uint8_t *sigma_trs = nullptr,
+                                    size_t         sigma_len = 0)
+{
+    g_cp_detect_epochs_evaluated++;
+
+    // ── Gate (a): TRS-verify (Algorithm 7 lines 2–6) ─────────────────────────
+    // R6.5: sigma_trs is nullptr/0 from all current callers → returns true.
+    // R8 will start passing a real σ_TRS produced by the controller-as-peer
+    // submission path; the call shape doesn't change.
+    if (!cp_detect_verify_trs(sigma_trs, sigma_len,
+                              vehicle_id, rsu_id, alert_type)) {
+        g_cp_detect_trs_fails++;
+        g_cp_detect_alerts_total++;
+        g_flag_c_active = true;
+        std::cout << "[ALERT_CP-TRS] V" << vehicle_id
+                  << " RSU" << rsu_id
+                  << " controller σ_TRS verification FAILED → CTRL_COMPROMISED,"
+                  << " flag_c=1 (Algorithm 7 lines 2-6)" << std::endl;
+        return true;
+    }
+
+    // ── Gate (b): conflict detection (Algorithm 7 lines 7–15, Eq 3.59) ───────
+    // Push this beacon's (RSU view, controller view) disagreement into the
+    // per-vehicle window, then check the running disagreement count.
+    bool disagreed_now = (rsu_anomalous != controller_anomalous);
+    auto &w = g_cp_detect_windows[vehicle_id];
+    w.disagreed.push_back(disagreed_now);
+    w.rsu_anom_hist.push_back(rsu_anomalous);
+    w.ctrl_anom_hist.push_back(controller_anomalous);
+    w.psi_hist.push_back(rsu_psi);
+    w.rsu_ids.push_back(rsu_id);
+    while (w.disagreed.size() > CP_DETECT_WINDOW_K) {
+        w.disagreed.pop_front();
+        w.rsu_anom_hist.pop_front();
+        w.ctrl_anom_hist.pop_front();
+        w.psi_hist.pop_front();
+        w.rsu_ids.pop_front();
+    }
+
+    size_t disagreement_count = 0;
+    for (bool d : w.disagreed) if (d) disagreement_count++;
+
+    if (disagreement_count >= CP_DETECT_THRESHOLD) {
+        g_cp_detect_conflict_fires++;
+        g_cp_detect_alerts_total++;
+        g_flag_c_active = true;
+
+        // Build a compact audit dump of the window.
+        std::ostringstream peer_dump;
+        for (size_t k = 0; k < w.disagreed.size(); k++) {
+            if (k) peer_dump << ",";
+            peer_dump << "RSU" << w.rsu_ids[k]
+                      << "(ψ=" << std::fixed << std::setprecision(2) << w.psi_hist[k]
+                      << ",rsu=" << (w.rsu_anom_hist[k] ? "ANOM" : "CLEAN")
+                      << ",ctrl=" << (w.ctrl_anom_hist[k] ? "ANOM" : "CLEAN")
+                      << "," << (w.disagreed[k] ? "DIFF" : "SAME") << ")";
+        }
+        std::cout << "[ALERT_CP-CONFLICT] V" << vehicle_id
+                  << " RSU" << rsu_id
+                  << " ctrl_says=" << (controller_anomalous ? "ANOMALOUS" : "CLEAN")
+                  << " rsu_says=" << (rsu_anomalous ? "ANOMALOUS" : "CLEAN")
+                  << " alert_type=" << (int)alert_type
+                  << " disagreements=" << disagreement_count
+                  << "/" << w.disagreed.size()
+                  << " (≥" << CP_DETECT_THRESHOLD << ") → flag_c=1, CTRL_COMPROMISED"
+                  << "  window=[" << peer_dump.str() << "]"
+                  << "  (paper Eq 3.59)" << std::endl;
+        return true;
+    }
+    return false;
 }
 
 // ============================================================
@@ -604,18 +795,20 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     }
 
     // 5. Detection decision
-    // CP-DETECT contributes to detection ONLY for attack_number==7 (MP-S4) —
-    // the controller globally poisons all beacons, so CP firing means THIS
-    // beacon is poisoned (100% certainty). For attack 5 (TP-S3), CP fires
-    // globally but the per-beacon attack_pct gate means kinematic detectors
-    // own per-beacon detection — including cp_flags here would create FPs.
-    bool cp_detected = (r.cp_flags != 0) && (attack_number == 7);
+    // CP-DETECT is a SYSTEM-LEVEL signal (Alg 7, Eq. 3.43) — it fires globally when
+    // the controller is suspected malicious, and is the input to CDER (Eq. 4.4),
+    // NOT a per-beacon detection signal. After R7f.followup-1 both attack 5 (TP-S3)
+    // and attack 7 (MP-S4) use per-beacon attack_pct gating, so per-beacon detection
+    // must come from kinematic signatures (TP-S1..S5, MP-S1..S4). Including cp_flags
+    // here would mark every attack-{5,7} beacon as detected — generating FPs on the
+    // ~(1-attack_pct)% of beacons that were NOT modified by the controller, which
+    // collapses MCC to zero (same failure mode this follow-up was created to fix).
     if (ablation_mode == 6) {
         // B1: Ghaleb (2014) LTT baseline
         r.detected = run_ltt_detect(vehicle_id, rsu_id, tag);
     } else {
-        // MPTD-PQS: composite score gate (Eq. 3.20) + oracle CP-DETECT for attack 7
-        r.detected = r.anomalous || cp_detected;
+        // MPTD-PQS: composite score gate (Eq. 3.20) — kinematic-signature only.
+        r.detected = r.anomalous;
     }
 
     return r;
@@ -675,8 +868,31 @@ void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
 // Professor's term: this is the management-side processing triggered AFTER
 //   handle_readone (RSU) forwards the beacon via send_rsu_dataunicast_alone.
 // Called from handle_readone() once beacon arrives at management_node:7777.
-// Runs all MPTD-PQS detection algorithms (TP-S1..S5, MP-S1..S4).
-// ============================================================
+//
+// ──────────────────────────────────────────────────────────────────────────
+// R3 NOTE — Controller's restricted role (paper invariant #2)
+// ──────────────────────────────────────────────────────────────────────────
+// After R1 + R2 the controller is a NON-AUTHORITATIVE peer:
+//   • LW-DETECT runs at the RSU (R1, paper §3.5.3 Algorithm 1, Fig 3.10)
+//   • DSRC safety alerts are emitted by the RSU directly (R2, paper Fig 3.1
+//     Step 6/7) — no controller round-trip on the normal path
+//   • This handler now exists to:
+//       (a) aggregate per-beacon kinematics into the Full-mode window buffer
+//           (ctrl_window[]) for the future GAT + LSTM-AE pipeline,
+//       (b) host the controller-as-attacker injection blocks for attacks
+//           5/7 (paper Fig 3.3 / Fig 3.7 where the controller IS the
+//           attacker by definition),
+//       (c) host provisional SC-Trust / SC-Revoke calls which will move
+//           RSU-direct in phase R4 (paper invariant #1: RSU → blockchain
+//           is direct), and
+//       (d) preserve PARR / TDEE / per-beacon CSV aggregation.
+//
+// What this handler MUST NOT do (would re-violate invariant #2):
+//   • Re-run LW-DETECT and override the RSU's decision on the normal path
+//   • Emit per-beacon DSRC alerts on the normal path (RSU owns that via R2)
+//   • Treat its own opinion as authoritative when ≥f+1 RSUs disagree
+//     (CP-DETECT, paper §3.5.5 Algorithm 7, will be added in R6)
+// ──────────────────────────────────────────────────────────────────────────
 void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id)
 {
     double now = Simulator::Now().GetSeconds();
@@ -831,10 +1047,20 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // ── MP-S4: Controller-level global mobility model poisoning (attack_number==7) ──
     // Paper §3.4.2 (Figure 3.7): The SDVN controller itself is malicious and corrupts
     // its GLOBAL mobility pattern model despite receiving correct data from honest
-    // vehicles and RSUs. Unlike TP-S3 (individual trajectory), MP-S4 applies a
-    // systematic speed distribution shift to ALL vehicles — no attack_pct gate.
-    // This triggers the MP-S3 KL-divergence signature (Eq. 3.18) globally.
-    if (attack_number == 7 && controller_malicious_assumption)
+    // vehicles and RSUs. Paper-faithful semantics: the controller corrupts a fraction
+    // (attack_percentage) of beacons it forwards — modelling a stealthy adversary
+    // that selectively poisons the global model to evade detection while still
+    // accumulating bias over time. The same gate is used by TP-S3 (attack_number==5)
+    // on line ~1099 below — keeping both controller attacks symmetric.
+    //
+    // R7f.followup-1 fix (2026-05-29): previously this block had NO gate, so every
+    // single beacon flowing through HandleBeaconReceived was marked is_poisoned=true.
+    // Result: TN=0 → MCC denominator collapses → MCC≡0 for all variants, regardless
+    // of detector quality. The gate restores a valid clean/poisoned ground-truth
+    // partition so MCC (Eq. 4.1) is well-defined. CDER (Eq. 4.4) remains the primary
+    // metric for MP-S4 since it is fundamentally a control-plane attack.
+    if (attack_number == 7 && controller_malicious_assumption &&
+        GetBooleanWithProbability(attack_percentage, vehicle_id))
     {
         double real_spd = tag.GetSpeed();
         double real_hdg = tag.GetHeading();
@@ -894,7 +1120,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         double fake_py  = real_py  + poisoning_intensity_theta * max_position_deviation
                                    * std::cos(t_cp * 0.9);
         double fake_spd = real_spd * (1.0 + poisoning_intensity_theta * std::sin(t_cp * 2.3));
-        // Clamp to simulation area (avoid std::max/std::min — #define max 40 conflicts)
+        // Clamp to simulation area (kept as ternary for legibility; std::max
+        // is now safe after R6.5 renamed the global `max` macro to MPTD_MAX_NEIGHBORS).
         fake_px  = (fake_px  < min_position_x) ? min_position_x : (fake_px  > max_position_x ? max_position_x : fake_px);
         fake_py  = (fake_py  < min_position_y) ? min_position_y : (fake_py  > max_position_y ? max_position_y : fake_py);
         fake_spd = (fake_spd < 0.0)            ? 0.0            : (fake_spd > s_max * 1.5     ? s_max * 1.5    : fake_spd);
@@ -988,6 +1215,9 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 
     uint32_t sig_violated = 0;
     uint32_t tp_flags = 0, mp_flags = 0, cp_flags = 0;
+    (void)cp_flags;   // R7f.followup-1: cp_flags is unpacked for SC-Trust sigmask
+                      // bookkeeping only; per-beacon detection no longer uses it
+                      // (CDER tracks CP-DETECT effectiveness instead).
     double   psi = 0.0;
     bool     anomalous = false;
     bool     detected  = false;
@@ -1028,12 +1258,13 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tp_flags = sig_violated & 0x1F;
         mp_flags = (sig_violated >> 5) & 0x0F;
         cp_flags = (sig_violated >> 9);
-        // Detection decision matches helper's logic
-        bool cp_detected = (cp_flags != 0) && (attack_number == 7);
+        // Detection decision matches helper's logic (R7f.followup-1: cp_flags is a
+        // system-level signal for CDER, not per-beacon evidence — see line ~803 helper
+        // for the full rationale.  Kinematic signatures own per-beacon detection.)
         if (ablation_mode == 6) {
             detected = run_ltt_detect(vehicle_id, rsu_id, tag);
         } else {
-            detected = anomalous || cp_detected;
+            detected = anomalous;
         }
     }
 
@@ -1059,12 +1290,238 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // Update tag with final sig_violated (may differ from RSU cache if path C)
     tag.SetSigViolated(sig_violated);
 
+    // ── R7e.4: TPE predictor (paper Eq 4.6, controller-side) ───────────────────
+    // For each beacon the controller observes, dead-reckon the *predicted*
+    // position from the PREVIOUSLY observed beacon's kinematics:
+    //   p̂(t_new) = p_prev + v_prev · (t_new − t_prev)
+    // then compare to SUMO/MobilityModel ground truth via g_mobility_provider.
+    // Accumulates Σ |p̂ − p_gt| and a counter for use by compute_TPE() (Eq 4.6).
+    //
+    // Why this lives here (controller-side) and not at the RSU:
+    //   Paper §3.5.3 makes prediction a controller responsibility (Full mode);
+    //   the RSU only authoritatively forwards/rejects beacons. The predictor's
+    //   bias under TP attacks is exactly what TPE is supposed to surface, so
+    //   feeding the (possibly poisoned) beacon-reported state into the
+    //   predictor is correct — it mirrors what the deployed controller sees.
+    //
+    // Indexing: BsmBeaconTag.vehicle_id is the raw NS-3 NodeID; IMobilityProvider
+    // and tpe_last_obs both use the LOCAL vehicle index 0..N_Vehicles-1. Convert
+    // via g_first_vehicle_node_id (see 04_state_globals.h, 12_main.h). Without
+    // this conversion (prior bug) prediction-for-V_A was compared against GT-of-V_B,
+    // which produced ~300 m baseline displacement instead of ~0 m.
+    if (g_mobility_provider && vehicle_id >= g_first_vehicle_node_id) {
+        const uint32_t vid_local = vehicle_id - g_first_vehicle_node_id;
+        if (vid_local < (uint32_t)total_size) {
+            TpeObs &prev = tpe_last_obs[vid_local];
+            if (prev.has_obs && now > prev.t) {
+                const double dt    = now - prev.t;
+                const double vx    = prev.speed * std::cos(prev.heading);
+                const double vy    = prev.speed * std::sin(prev.heading);
+                const double pred_x = prev.px + vx * dt;
+                const double pred_y = prev.py + vy * dt;
+                const Vector gt = g_mobility_provider->get_gt_position(vid_local);
+                const double dx = pred_x - gt.x;
+                const double dy = pred_y - gt.y;
+                tpe_disp_sum += std::sqrt(dx*dx + dy*dy);
+                tpe_disp_cnt++;
+            }
+            prev.px      = tag.GetPosX();
+            prev.py      = tag.GetPosY();
+            prev.speed   = tag.GetSpeed();
+            prev.heading = tag.GetHeading();
+            prev.t       = now;
+            prev.has_obs = true;
+        }
+    }
+
+    // ── R3: Push cached LW result into controller window aggregator ────────────
+    // Per invariant #2 the controller does NOT make per-beacon decisions; it
+    // batches kinematics into per-RSU windows of size L (paper §3.5.3,
+    // W = L · T_b) for the future Full-mode GAT + LSTM-AE pipeline. This is a
+    // stats-only push — the authoritative control decision is owned by the RSU
+    // (R2). The rollover hook is currently a no-op log stub (R7+ will replace
+    // the log with the actual GAT + LSTM-AE invocation).
+    if (rsu_id < 4) {
+        ControllerWindow &cw = ctrl_window[rsu_id];
+        if (cw.beacon_count == 0) cw.window_start = now;
+        cw.beacon_count++;
+        if (anomalous)           cw.anomalous_count++;
+        if (is_poisoned)         cw.poisoned_count++;
+        cw.psi_sum += psi;
+        // Window rollover: every L beacons OR every W = L · T_b seconds elapsed.
+        bool by_count = (cw.beacon_count >= (uint32_t)WINDOW_L_BEACONS);
+        bool by_time  = (now - cw.window_start >= WINDOW_L_BEACONS * T_b);
+        if (by_count || by_time) {
+            cout << "[CTRL-WIN-" << rsu_id << "] epoch=" << cw.window_epoch
+                 << " beacons=" << cw.beacon_count
+                 << " anomalous=" << cw.anomalous_count
+                 << " poisoned=" << cw.poisoned_count
+                 << " mean_psi=" << std::fixed << std::setprecision(4)
+                 << (cw.beacon_count ? cw.psi_sum / cw.beacon_count : 0.0)
+                 << " t_close=" << std::setprecision(3) << now
+                 << " W=" << WINDOW_L_BEACONS * T_b << "s" << endl;
+
+            // ── R7d: Full-mode GAT spatial scoring (paper §3.5.3 Eq 3.38–3.42) ──
+            // The RSU-side ipfs_push_and_maybe_flush() runs in handle_readone
+            // BEFORE this controller-side block sees the same beacon, so by
+            // now rsu_window[rsu_id].beacon_count has been reset. We read from
+            // rsu_last_window[rsu_id] — the snapshot taken at the moment of
+            // the most recent flush. Per paper Fig 3.10/3.11 this fires only
+            // at window close — invariant #3 (LW skip-on-pass) is preserved
+            // because the lightweight RSU path never touches this branch.
+            //
+            // LSTM-AE temporal scoring needs a per-vehicle 20-beacon sliding
+            // ring buffer that we do NOT yet maintain — R7e adds that ring and
+            // wires score_lstm_ae() into the same window-close hook.
+            if (g_ai_engine.ready() && rsu_id < 4 && rsu_last_window_valid[rsu_id]) {
+                const RsuBeaconWindow &rw = rsu_last_window[rsu_id];
+                const int N = (int)rw.beacon_count;
+                if (N > 0) {
+                    // ── 1. GAT spatial scores (one per row of the L-beacon window) ──
+                    std::vector<float> feats5(N * 5);
+                    for (int i = 0; i < N; ++i) {
+                        feats5[i*5 + 0] = (float)rw.pos_x[i];
+                        feats5[i*5 + 1] = (float)rw.pos_y[i];
+                        feats5[i*5 + 2] = (float)rw.speed[i];
+                        feats5[i*5 + 3] = (float)rw.heading[i];
+                        feats5[i*5 + 4] = (float)rw.accel[i];
+                    }
+                    std::vector<float> gat_scores;
+                    bool gat_ok = false;
+                    if (g_ai_engine.has_gat()) {
+                        gat_ok = g_ai_engine.score_gat(
+                            feats5.data(), N, nullptr, gat_scores);
+                    }
+                    if (gat_ok) {
+                        double smin = gat_scores[0], smax = gat_scores[0], smean = 0.0;
+                        for (float s : gat_scores) {
+                            if (s < smin) smin = s;
+                            if (s > smax) smax = s;
+                            smean += s;
+                        }
+                        smean /= (double)gat_scores.size();
+                        cout << "[GAT-SCORE-RSU" << rsu_id << "] epoch="
+                             << cw.window_epoch << " N=" << N
+                             << " min=" << std::fixed << std::setprecision(4) << smin
+                             << " mean=" << smean << " max=" << smax
+                             << " (paper §3.5.3 Eq 3.42)" << endl;
+                    } else if (g_ai_engine.has_gat()) {
+                        // GAT enabled but inference failed — degrade to zeros so
+                        // fusion still runs (ψ + ε will carry the decision).
+                        gat_scores.assign(N, 0.0f);
+                    }
+
+                    // ── 2. Fusion (paper Eq 3.46) per vehicle in window ────────────
+                    // For each beacon row in this RSU's last window:
+                    //   ψ_i    = cached LW-DETECT score from RSU handle_readone
+                    //   S_i    = gat_scores[i] (rolled-up sigmoid output)
+                    //   ε_i    = LSTM-AE recon MSE on the vehicle's 20-beacon ring,
+                    //            normalised by θ_ae inside fuse_scores()
+                    //   Φ_i    = λ₁ψ + λ₂S + λ₃·min(ε/θ_ae,1) ; flag if Φ > 0.5
+                    // R7d's GAT-only log is preserved above; this adds per-vehicle
+                    // fusion lines. ψ_total / Φ_total counters surface in metrics.
+                    const float theta_ae = g_ai_engine.theta_ae();
+                    int        fused_count = 0;
+                    int        full_flag_count = 0;
+                    double     phi_sum = 0.0;
+                    double     phi_max = 0.0;
+                    for (int i = 0; i < N; ++i) {
+                        const uint32_t vid_i = rw.vid[i];
+                        if (vid_i >= (uint32_t)total_size) continue;
+                        const float psi_i = (float)last_psi_per_vehicle[vid_i];
+                        const float gat_i = gat_ok ? gat_scores[i] : 0.0f;
+                        float ae_err = 0.0f;
+                        if (g_ai_engine.has_lstm_ae()) {
+                            float ring_buf[LSTM_RING_SIZE * 5];
+                            if (lstm_ring_dump(vid_i, ring_buf)) {
+                                (void)g_ai_engine.score_lstm_ae(ring_buf, ae_err);
+                            }
+                        }
+                        const FusionScore fs = fuse_scores(
+                            psi_i, gat_i, ae_err, theta_ae);
+                        fused_count++;
+                        if (fs.anomalous) full_flag_count++;
+                        phi_sum += fs.phi;
+                        if (fs.phi > phi_max) phi_max = fs.phi;
+                        cout << "[FUSION-RSU" << rsu_id << "] epoch="
+                             << cw.window_epoch
+                             << " vid=" << vid_i
+                             << " psi="     << std::fixed << std::setprecision(3) << psi_i
+                             << " S="       << gat_i
+                             << " ae_norm=" << fs.ae_norm
+                             << " phi="     << fs.phi
+                             << " full_anom=" << (fs.anomalous ? "YES" : "no")
+                             << " (Eq 3.46)" << endl;
+                    }
+                    if (fused_count > 0) {
+                        cout << "[FUSION-WIN-RSU" << rsu_id << "] epoch="
+                             << cw.window_epoch
+                             << " fused=" << fused_count
+                             << " full_anom=" << full_flag_count
+                             << " mean_phi=" << std::fixed << std::setprecision(4)
+                             << (phi_sum / fused_count)
+                             << " max_phi="  << phi_max
+                             << " theta_ae=" << theta_ae
+                             << " (paper §3.5.3 Eq 3.46, Φ_th=0.5)" << endl;
+                    }
+                }
+            }
+            // ── End R7d/R7e ─────────────────────────────────────────────────────
+
+            cw.beacon_count    = 0;
+            cw.anomalous_count = 0;
+            cw.poisoned_count  = 0;
+            cw.psi_sum         = 0.0;
+            cw.window_start    = now;
+            cw.window_epoch++;
+        }
+    }
+
     // Log [METRICS] line
     log_metrics_line(attack_number, is_poisoned, vehicle_id, rsu_id, tag, sig_violated);
 
     // Forward clean/flagged beacon to blockchain (via 11_routing)
     //    (Actual blockchain call is in 11_routing_blockchain_transmission.h)
     total_trajectories_stored_blockchain++;
+
+    // ── R8.4: Real TRS partial_sign + aggregate + verify_threshold ──────────
+    // Paper §3.5.4 Algorithm 6 (PQ-TRS-SIGN), Eq. 3.46–3.49.
+    //
+    // Wires the ITrsBackend pipeline into the per-beacon RSU detection hot
+    // path so the (a) σ_TRS verification really gates trajectory acceptance
+    // (paper Invariant 5), and (b) the partial_sign/aggregate/verify cost
+    // gets booked to PBPO_Full (answering RQ5 TRS-vs-ECDSA latency).
+    //
+    // Sim-only deviation: the t partial signatures come from the first t
+    // entries in g_trs_ring_sks rather than being delivered over a real DSRC
+    // inter-RSU channel. The crypto chain itself is real; only the σ_j
+    // transport is shortcut. Lives inside the PBPO timing window (started
+    // at line ~960 via clock_gettime). Without RSU-key-compromise
+    // simulation the verify always passes, so g_trs_rejected_count stays at
+    // zero — the chain still exercises the real partial/aggregate/verify
+    // code paths, which is what we need for PBPO + paper conformance.
+    if (use_pq_crypto && g_trs_ready) {
+        EvidenceMessage m_j;
+        m_j.rsu_id      = rsu_id;
+        m_j.timestamp   = tag.GetTimestamp();
+        m_j.agg_pos_x   = tag.GetPosX();
+        m_j.agg_pos_y   = tag.GetPosY();
+        // BSM stores polar (speed, heading) — reconstruct vx, vy for m_j.
+        const double s_polar = tag.GetSpeed();
+        const double h_polar = tag.GetHeading();
+        m_j.agg_vel_x   = s_polar * std::cos(h_polar);
+        m_j.agg_vel_y   = s_polar * std::sin(h_polar);
+        // BSM stores scalar acceleration magnitude (no per-axis split).
+        m_j.agg_accel_x = tag.GetAcceleration();
+        m_j.agg_accel_y = 0.0;
+        m_j.vehicle_set.push_back(vehicle_id);
+
+        std::vector<uint8_t>  sigma_trs;
+        std::vector<uint32_t> signers;
+        bool verified = evidence_sign_and_verify(m_j, sigma_trs, signers);
+        if (verified) g_trs_verified_count++;
+        else          g_trs_rejected_count++;
+    }
 
     // Update confusion matrix + beacon CSV log
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
@@ -1083,92 +1540,88 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     pbpo_time_sum_ms += elapsed_ms;
     pbpo_cnt++;
 
-    // 10. PARR tracking + SC-Trust + SC-Revoke (Stage 6)
+    // ── R4.a: SC-Trust + SC-Revoke moved RSU-side (paper invariant #1) ────────
+    // CallSCTrust / CallSCRevoke / consecutive_anomaly_count[] / parr_trs_rejected
+    // now live in handle_readone() — see the "R4.a: SC-Trust + SC-Revoke at RSU"
+    // block above. Per paper invariant #1 the RSU is the authoritative submitter
+    // to the blockchain (no controller relay); the controller's role here is now
+    // limited to (a) aggregating parr_poisoned_total below, (b) hosting the
+    // controller-attack injection blocks for attacks 5/7, and (c) running the
+    // R3 window aggregator for the future GAT + LSTM-AE pipeline.
     //
-    // Consecutive anomaly counter runs in ALL modes (including routing_test)
-    // so that PARR is always computed from revoke events, not skipped in test mode.
-    // Smart contract calls (CallSCTrust, CallSCRevoke) still require full mode.
-    if (vehicle_id < (uint32_t)(total_size + 2))
-    {
-        if (detected)
-        {
-            consecutive_anomaly_count[vehicle_id]++;
-            if (consecutive_anomaly_count[vehicle_id] >= REVOKE_THRESHOLD)
-            {
-                // TRS voted REJECT: vehicle has ≥ REVOKE_THRESHOLD consecutive anomaly detections.
-                // Increment PARR numerator when the revoked vehicle actually sent poisoned data.
-                if (tag.GetIsPoisoned())
-                    parr_trs_rejected++;   // PARR numerator (Eq. 4.3)
-                consecutive_anomaly_count[vehicle_id] = 0; // reset after TRS reject
-
-                double ts = Simulator::Now().GetSeconds();
-
-                // ── LKH Rekey: transmit real NS-3 rekey packets to all remaining vehicles ──
-                // Paper §3.5.2, Eq.3.34: N_rekey = log₂|V_j| messages sent.
-                // send_lkh_rekey_to_vehicles() calls lkh_rekey_on_revoke() then sends
-                // unicast RekeyTag UDP packets (port 5555) to each non-revoked vehicle.
-                // This is REAL NS-3 packet transmission — not a counter.
-                if (rsu_id < 4) {
-                    cout << "[LKH-REVOKE] V" << (vehicle_id - 2)
-                         << " revoked after " << REVOKE_THRESHOLD << " anomalies"
-                         << " → triggering group rekey (Eq.3.34)" << endl;
-                    send_lkh_rekey_to_vehicles(vehicle_id, rsu_id, ts);
-                }
-
-                // A5 ablation: skip blockchain SC-Revoke to measure BC contribution (RQ6)
-                if (!routing_test && ablation_mode != 5) {
-                    CallSCRevoke(vehicle_id, "3_consecutive_anomalies", rsu_id, ts);
-                }
-            }
-        }
-        else
-        {
-            consecutive_anomaly_count[vehicle_id] = 0;
-        }
-
-        // SC-Trust update — Algorithm 1 (LW-DETECT) line 5-6: only when ψ_i(t) > ψ_th.
-        // Gated by `anomalous` (lightweight composite score breach), NOT `detected`.
-        // CP-DETECT writes its own E_j(t) via a separate path per Figure 3.13.
-        // A5 ablation skips SC-Trust to isolate blockchain contribution (RQ6).
-        if (!routing_test && ablation_mode != 5 && anomalous) {
-            double ts        = Simulator::Now().GetSeconds();
-            uint32_t sigmask = tp_flags | (mp_flags << 5);
-            CallSCTrust(vehicle_id, psi, sigmask, detected, ts);
-        }
-    }
+    // For the controller-attack paths (attacks 5/7) the RSU's rsu_lw is honest
+    // (data plane is clean) so no SC call fires there — controller misbehavior
+    // will be caught by CP-DETECT (Algorithm 7) in phase R6.
 
     (void)now;
 
-    // ── Step 11: Downlink control response (Steps 6-8 in paper Figures 3.1-3.7) ──────
-    // After detection, management sends a control packet back down through the RSU to
-    // the vehicle(s) — completing the uplink→detect→downlink SDVN control loop.
+    // ── Step 11: Downlink control response — controller emission path ────────────
+    // R5 refactor (paper Fig 3.1 Step 5-7): controller emission now covers BOTH
+    // the controller-as-attacker scenarios (5/7) AND the RSU-as-attacker /
+    // controller-as-deceived scenario (1). The R2 fast-path RSU-direct DSRC alert
+    // is gated off for attack 1 so the controller is the authoritative emission
+    // point per paper Fig 3.1.
     //
-    // Professor's terms:
-    //   centralized_dsrc_data_unicast   → targeted response to one vehicle (attacks 1-4,6)
-    //   centralized_dsrc_data_broadcast → sent to ALL vehicles (attacks 5 & 7)
+    // Three live attack scenarios:
+    //   • attack 1 (TP-S1, paper Fig 3.1 Step 5-7): RSU compromises beacons; controller
+    //     learns from corrupted input. Honest controller's decision is a function of
+    //     the (RSU-side) LW result on the POISONED data:
+    //       – LW caught attack (detected=true)  → ATTACK_DETECTED, correct safety call
+    //       – LW missed attack (detected=false) → CLEAN_ROUTING, controller DECEIVED
+    //         (paper Step 7: "safety warnings ... suppressed or replaced with
+    //          misleading control instructions")
+    //   • attacks 5/7 (paper Fig 3.3 / Fig 3.7): controller IS the attacker — it
+    //     deliberately injects alert_type=2 (WRONG_ROUTING) regardless of LW state.
     //
-    // For attacks 5 & 7 (controller malicious): downlink IS the attack — the compromised
-    // controller deliberately sends alert_type=2 (WRONG_ROUTING) to all vehicles,
-    // misdirecting their routing decisions (Figures 3.3 and 3.7, Steps 7-8).
-    // For honest attacks 1-4,6: downlink delivers alert_type=1 (ATTACK_DETECTED) or
-    // alert_type=0 (CLEAN_ROUTING) as a corrective safety broadcast.
-    if (g_option_b_active && rsu_id < 4 && g_mgmt_downlink_socket) {
-        uint8_t alert_type;
-        bool    bcast;
+    // In all three cases the RSU at handle_downlink_at_rsu() is honest and relays
+    // whatever the controller said. For attacks 2/3/4/6 the R2 fast-path is the
+    // single CDER decision (this block is skipped entirely).
+    //
+    // CDER (Eq.4.4) stays well-defined: exactly one control decision per beacon —
+    // R2 fast-path for {2,3,4,6,clean}; controller-here for {1,5,7}.
+    if (g_option_b_active && rsu_id < 4 && g_mgmt_downlink_socket &&
+        (attack_number == 1 || attack_number == 5 || attack_number == 7)) {
+        bool malicious_ctrl = (attack_number == 5 || attack_number == 7);
 
-        if (attack_number == 5 || attack_number == 7) {
-            // Controller malicious: sends WRONG routing instructions to all vehicles
-            alert_type = 2;    // WRONG_ROUTING
-            bcast      = true; // broadcast to all — entire network receives wrong data
+        uint8_t  alert_type;
+        double   spd_advice;
+        uint32_t target_vid;
+        bool     bcast;
+
+        if (malicious_ctrl) {
+            // Malicious controller (attacks 5/7): hardcoded WRONG_ROUTING, broadcast.
+            alert_type = 2;                                  // WRONG_ROUTING
+            spd_advice = detected ? (s_max * 0.5) : s_max;
+            target_vid = 0;                                  // 0 = all vehicles (broadcast)
+            bcast      = true;
         } else {
-            alert_type = detected ? 1 : 0;  // ATTACK_DETECTED or CLEAN_ROUTING
-            bcast      = false;             // unicast to the specific flagged vehicle
+            // attack_number == 1: honest controller, decision = f(cached LW result).
+            // Paper Fig 3.1 Step 5-7: LW miss on RSU-poisoned data → deceived controller.
+            alert_type = detected ? 1 : 0;                   // ATTACK_DETECTED or CLEAN_ROUTING
+            spd_advice = detected ? (s_max * 0.5) : s_max;
+            target_vid = vehicle_id;                         // unicast: this vehicle's beacon
+            bcast      = false;
+        }
+
+        // ── A1-STEP5: Controller ingests RSU-poisoned beacon into its mobility view ──
+        // Paper Fig 3.1 §3.4.1 page 25: "Based on this corrupted input, the controller
+        // learns an incorrect trajectory model and is deceived into believing that the
+        // traffic situation is safe." (Stub: full GAT/LSTM-AE learning lands in R7+;
+        // this marker records the controller's per-beacon exposure to corrupted state.)
+        if (attack_number == 1 && is_poisoned) {
+            cout << "[A1-STEP5] Controller learning from RSU" << rsu_id
+                 << "-poisoned V" << vehicle_id
+                 << " pos(" << std::fixed << std::setprecision(2)
+                 << tag.GetPosX() << "," << tag.GetPosY() << ")"
+                 << " spd=" << tag.GetSpeed()
+                 << "  LW=" << (detected ? "CAUGHT" : "MISSED")
+                 << "  (paper Fig 3.1 Step 5)" << endl;
         }
 
         DownlinkControlTag dl_tag;
-        dl_tag.SetVehicleId   (bcast ? 0 : vehicle_id);  // 0 = all vehicles
+        dl_tag.SetVehicleId   (target_vid);
         dl_tag.SetAlertType   (alert_type);
-        dl_tag.SetSpeedAdvice (detected ? (s_max * 0.5) : s_max);  // 50% advisory if attack
+        dl_tag.SetSpeedAdvice (spd_advice);
         dl_tag.SetTimestamp   (Simulator::Now().GetSeconds());
         dl_tag.SetRsuId       (rsu_id);
 
@@ -1182,40 +1635,79 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                       InetSocketAddress(g_rsu_csma_ip[rsu_id], 8888));
 
         const char* alert_str = (alert_type == 0) ? "CLEAN_ROUTING" :
-                                (alert_type == 1) ? "ATTACK_DETECTED" : "WRONG_ROUTING";
-        const char* dl_fn = bcast ? "centralized_dsrc_data_broadcast"
-                                  : "centralized_dsrc_data_unicast";
+                                (alert_type == 1) ? "ATTACK_DETECTED" :
+                                                    "WRONG_ROUTING";
+        const char* dl_fn     = bcast ? "centralized_dsrc_data_broadcast"
+                                      : "centralized_dsrc_data_unicast";
         if (err >= 0) {
-            // CDER: track correctness of this downlink control decision (Eq.4.4)
-            // Each sent DownlinkControlTag is one control-plane decision.
-            // Wrong decisions (incorrect control-plane output):
-            //   alert_type=2 WRONG_ROUTING  → always wrong (malicious controller)
-            //   alert_type=0 CLEAN_ROUTING  on a poisoned beacon → FN at decision level
-            //   alert_type=1 ATTACK_DETECTED on a clean beacon   → FP at decision level
+            // CDER (Eq.4.4): exactly one control decision per beacon.
             ctrl_decisions_total++;
-            bool wrong_ctrl = (alert_type == 2) ||                  // malicious controller
-                              (alert_type == 0 &&  is_poisoned) ||  // missed attack (FN)
-                              (alert_type == 1 && !is_poisoned);    // false alarm (FP)
-            if (wrong_ctrl) ctrl_decisions_wrong++;
+            bool wrong;
+            if (malicious_ctrl) {
+                // Attacks 5/7: malicious controller's WRONG_ROUTING is always wrong.
+                wrong = true;
+            } else {
+                // Attack 1: honest controller — wrong iff (detected ⊻ is_poisoned)
+                //   FP: detected=true,  is_poisoned=false → ATTACK_DETECTED on clean
+                //   FN: detected=false, is_poisoned=true  → CLEAN_ROUTING on poisoned (DECEIVED)
+                wrong = (detected ? !is_poisoned : is_poisoned);
+            }
+            if (wrong) ctrl_decisions_wrong++;
 
-            // A6-STEP7: vehicle receives control decision derived from poisoned model
-            if (attack_number == 6) {
-                cout << "[A6-STEP7] V" << (bcast ? 0U : vehicle_id)
-                     << " ← control decision based on MitM-corrupted model"
-                     << " alert=" << alert_str
-                     << "  [" << dl_fn << "]" << endl;
-            } else if (attack_number == 7) {
-                // A7-STEP5-TX: Malicious controller sends WRONG_ROUTING to all vehicles
+            // ── R6: CP-DETECT (paper Algorithm 7 / Eq 3.59) ─────────────────
+            // Audit the controller's just-emitted decision against the RSU's
+            // authoritative LW-DETECT view for the SAME beacon (cached on the
+            // tag by handle_readone). Honors invariant #2: the controller is a
+            // non-authoritative peer; ≥ f+1=2 per-beacon disagreements within
+            // the rolling window ⇒ flag_c=1 and CTRL_COMPROMISED alert.
+            //   Attack 1 (honest-but-deceived controller): the controller
+            //     shadows its RSU's cached anomalous flag, so per-beacon
+            //     disagreement = 0 and CP-DETECT does not fire — even when
+            //     LW misses (FN) or trips (FP) on poisoned data the RSU and
+            //     controller report the SAME thing, so they agree.
+            //   Attacks 5/7 (malicious controller): controller broadcasts
+            //     WRONG_ROUTING regardless of RSU view, while RSU-side LW
+            //     sees clean data → per-beacon disagreement = 1 every time,
+            //     window fills to threshold within K=3 beacons.
+            // sigma_trs is nullptr/0 in R6; R8 will supply the real σ_TRS.
+            bool controller_anomalous = (alert_type != 0);
+            bool   rsu_anomalous_cached = tag.GetLwAnomalous();
+            double rsu_psi_cached       = tag.GetLwPsi();
+            (void)run_cp_detect_per_epoch(vehicle_id, rsu_id, alert_type,
+                                          controller_anomalous,
+                                          rsu_anomalous_cached,
+                                          rsu_psi_cached,
+                                          nullptr, 0);
+
+            if (attack_number == 7) {
+                // A7-STEP5-TX: Malicious controller sends WRONG_ROUTING to all vehicles.
                 // Paper Fig 3.7: Controller generates incorrect control packets from
                 // poisoned model and sends them back to RSU via control plane.
                 cout << "[A7-STEP5-TX] Controller → RSU" << rsu_id
                      << " WRONG_ROUTING control packet (poisoned model output)"
                      << " vid=" << (bcast ? 0U : vehicle_id)
                      << "  [" << dl_fn << "]" << endl;
+            } else if (attack_number == 5) {
+                // attack_number == 5 (TP-S3, controller trajectory poisoning)
+                cout << "[A5-CTL-TX] Controller → RSU" << rsu_id
+                     << " " << alert_str
+                     << " (paper Fig 3.3 Step 5-7)"
+                     << "  [" << dl_fn << "]" << endl;
             } else {
-                cout << "[DL-MGT-TX] → RSU" << rsu_id
-                     << " vid=" << (bcast ? 0U : vehicle_id)
-                     << " alert=" << alert_str
+                // attack_number == 1: honest-but-deceived controller emission.
+                // ── A1-STEP6: Controller generates control decision from (poisoned) view ──
+                // Paper Fig 3.1 §3.4.1 page 25: "the controller generates incorrect
+                // control decisions and control packets (Step 5)." The "deceived" tag
+                // marks the precise FN case where the honest controller's decision is
+                // wrong because the underlying LW detection missed the attack.
+                bool deceived = (is_poisoned && !detected);
+                cout << "[A1-STEP6] Controller → RSU" << rsu_id
+                     << " " << alert_str
+                     << " vid=" << vehicle_id
+                     << " spd_adv=" << spd_advice << " m/s"
+                     << "  LW=" << (detected ? "caught" : "missed")
+                     << (deceived ? " → DECEIVED" : "")
+                     << "  (paper Fig 3.1 Step 6)"
                      << "  [" << dl_fn << "]" << endl;
             }
         }
@@ -1227,14 +1719,25 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 // Professor's terms: centralized_dsrc_data_broadcast (vid=0 → all vehicles)
 //                    centralized_dsrc_data_unicast   (vid>0 → specific vehicle)
 //
-// Sequence (Steps 6-8 in paper Figures 3.1-3.7):
-//   Management → g_mgmt_downlink_socket → RSU CSMA:8888  [DL-MGT-TX]
+// R2 refactor (paper Fig 3.1 Step 6/7): normal LW-mode downlinks for attacks
+// {2,3,4,6,clean} are emitted by the RSU directly in handle_readone() (no CSMA
+// hop). This management → RSU handler fires for the three controller-owned
+// emission scenarios:
+//   • attacks 5/7 (controller-as-attacker, Fig 3.3 / Fig 3.7): malicious
+//     controller injects alert_type=2 (WRONG_ROUTING) — broadcast.
+//   • attack 1 (RSU-as-attacker, Fig 3.1 Step 5-7, added in R5): honest-but-
+//     deceived controller emits alert_type=1 (ATTACK_DETECTED) when LW caught
+//     the attack, or alert_type=0 (CLEAN_ROUTING) when LW missed — unicast.
+//
+// Sequence (paper Fig 3.1 / Fig 3.3 / Fig 3.7):
+//   Management → g_mgmt_downlink_socket → RSU CSMA:8888    [DL-MGT-TX]
 //   RSU receives here                                      [DL-RSU-RX]
 //   RSU re-broadcasts DownlinkControlTag → DSRC:9999       [DL-RSU-FWD]
-//   Vehicle receives in HandleReadTwo()                     [DL-VEH-RX]
+//   For attack 1: paper-step marker                        [A1-STEP7]
+//   Vehicle receives in HandleReadTwo()                    [DL-VEH-RX]
 //
-// alert_type=0 CLEAN_ROUTING   — honest network, forward normal speed advice
-// alert_type=1 ATTACK_DETECTED — anomaly found, broadcast safety alert
+// alert_type=0 CLEAN_ROUTING   — attack 1 deceived-controller emission (R5)
+// alert_type=1 ATTACK_DETECTED — attack 1 controller emission when LW caught (R5)
 // alert_type=2 WRONG_ROUTING   — controller malicious (attacks 5 & 7)
 // ============================================================
 void SimpleUdpApplication::handle_downlink_at_rsu(Ptr<Socket> socket)
@@ -1270,12 +1773,26 @@ void SimpleUdpApplication::handle_downlink_at_rsu(Ptr<Socket> socket)
                           InetSocketAddress(Ipv4Address("3.255.255.255"), 9999));
             const char* dl_fn = (vid == 0) ? "centralized_dsrc_data_broadcast"
                                            : "centralized_dsrc_data_unicast";
-            if (err >= 0)
+            if (err >= 0) {
                 cout << "[DL-RSU" << rsu_idx << "-FWD] → V"
                      << (vid == 0 ? "ALL" : std::to_string(vid - 2))
                      << " :9999  [" << dl_fn << "]" << endl;
-            else
+                // ── A1-STEP7: Controller's (potentially wrong) control packet delivered ──
+                // Paper Fig 3.1 §3.4.1 page 25: "safety critical warning messages that
+                // should be sent to vehicles are either suppressed or replaced with
+                // misleading control instructions." For attack 1 the controller is the
+                // origin of this packet (R5: A1-STEP6); the RSU is honest and just relays
+                // it onto DSRC. The vehicle plane now carries whatever the (deceived or
+                // accurate) controller decided — completing the Fig 3.1 5→6→7 chain.
+                if (attack_number == 1) {
+                    cout << "[A1-STEP7] RSU" << rsu_idx << " delivered controller's "
+                         << alert_str << " to V"
+                         << (vid == 0 ? "ALL" : std::to_string(vid - 2))
+                         << " via DSRC  (paper Fig 3.1 Step 7)" << endl;
+                }
+            } else {
                 cout << "[DL-RSU" << rsu_idx << "-FWD-ERR] failed fwd vid=" << vid << endl;
+            }
         }
     }
 }
@@ -1633,6 +2150,12 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
              << " sig=0x" << std::hex << rsu_lw.sig_violated << std::dec
              << endl;
 
+        // R6: CP-DETECT (Algorithm 7) audit is performed at the controller
+        // emission site (HandleBeaconReceived R5 block) — it reads the RSU's
+        // cached LW flags directly from the tag (SetLwAnomalous/SetLwPsi just
+        // above) and compares them against the controller's binary decision
+        // per-beacon. No separate RSU-side recording is needed.
+
         // Stamp RSU index into tag so management_node knows which RSU relayed this beacon
         tag.SetRsuId(rsu_idx);
 
@@ -1644,6 +2167,141 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                       real_px, real_py,
                       tag.GetPosX(), tag.GetPosY(),
                       tag.GetSpeed(), tag.GetHeading(), tag.GetAcceleration());
+
+        // ── R4.c: Push beacon into RSU's IPFS window buffer ───────────────────
+        // Paper §3.5.3 Eq 3.56, Fig 3.9: RSU accumulates L=10 beacons, hashes
+        // the window, "uploads" to IPFS off-chain, and anchors hash on-chain
+        // (RSU → BC direct per invariant #1). Controller later retrieves the
+        // window from IPFS to run GAT + LSTM-AE in Full mode (pending R7+).
+        // Uses the POST-LW-DETECT kinematic tag fields so the stored window
+        // reflects exactly what the RSU's authoritative path saw.
+        if (rsu_idx < 4) {
+            ipfs_push_and_maybe_flush(rsu_idx, vid,
+                                      tag.GetPosX(), tag.GetPosY(),
+                                      tag.GetSpeed(), tag.GetHeading(),
+                                      tag.GetAcceleration(), t,
+                                      rsu_lw.anomalous);
+        }
+
+        // ── R7e: Cache ψ + push to per-vehicle LSTM-AE ring buffer ────────────
+        // The controller-side fusion step (paper Eq 3.46) needs three inputs
+        // per vehicle: ψ_i (cached here), S_i (computed at window close from
+        // GAT), and ε_i/θ_ae (computed at window close from this ring). We
+        // record both at the RSU because the kinematics on this path are
+        // exactly what the LW-DETECT authority saw — no double-counting of
+        // attacker-flipped values from a different code path.
+        if (vid < (uint32_t)total_size) {
+            last_psi_per_vehicle[vid] = rsu_lw.psi;
+            lstm_ring_push(vid,
+                           (float)tag.GetPosX(), (float)tag.GetPosY(),
+                           (float)tag.GetSpeed(), (float)tag.GetHeading(),
+                           (float)tag.GetAcceleration());
+        }
+
+        // ── R4.a: SC-Trust + SC-Revoke at RSU (paper invariant #1, §3.5.5) ────
+        // Per paper invariant #1, RSU → blockchain is DIRECT — these smart-contract
+        // calls must originate at the RSU, not the controller. Algorithm 1 line 5-6
+        // gates SC-Trust on the lightweight composite-score breach (ψ > ψ_th, i.e.
+        // rsu_lw.anomalous). SC-Revoke fires when the consecutive-anomaly counter
+        // reaches REVOKE_THRESHOLD (TRS "reject" vote per Eq.3.34).
+        //
+        // For attacks 5/7 (controller-as-attacker) the RSU's view is HONEST — the
+        // data plane is clean and no SC call fires here. That is correct: SC-Trust
+        // tracks VEHICLE trust; controller misbehavior is caught by CP-DETECT
+        // (Algorithm 7, paper §3.5.5) which lands in phase R6.
+        //
+        // CDER for attacks 5/7 still ticks via the controller-attack downlink path
+        // in HandleBeaconReceived (R2). PARR denominator (parr_poisoned_total) is
+        // still aggregated at the controller; the numerator (parr_trs_rejected)
+        // moves here with the revoke event.
+        if (vid < (uint32_t)(total_size + 2)) {
+            if (rsu_lw.detected) {
+                consecutive_anomaly_count[vid]++;
+                if (consecutive_anomaly_count[vid] >= REVOKE_THRESHOLD) {
+                    if (tag.GetIsPoisoned()) parr_trs_rejected++; // PARR numerator (Eq.4.3)
+                    consecutive_anomaly_count[vid] = 0;           // reset after TRS reject
+
+                    double ts = Simulator::Now().GetSeconds();
+
+                    // LKH rekey (Eq.3.34): N_rekey = log₂|V_j| unicasts to remaining vehicles
+                    if (rsu_idx < 4) {
+                        cout << "[LKH-REVOKE-RSU" << rsu_idx << "] V" << (vid - 2)
+                             << " revoked after " << REVOKE_THRESHOLD << " anomalies"
+                             << " → triggering group rekey (Eq.3.34)" << endl;
+                        send_lkh_rekey_to_vehicles(vid, rsu_idx, ts);
+                    }
+
+                    // A5 ablation: skip blockchain SC-Revoke to isolate BC contribution (RQ6)
+                    if (!routing_test && ablation_mode != 5) {
+                        CallSCRevoke(vid, "3_consecutive_anomalies", rsu_idx, ts);
+                    }
+                }
+            } else {
+                consecutive_anomaly_count[vid] = 0;
+            }
+
+            // SC-Trust: per-beacon ψ submission when composite score breaches threshold.
+            // Algorithm 1 line 5-6 says "if ψ_i(t) > ψ_th" → gated on rsu_lw.anomalous
+            // (NOT rsu_lw.detected which also folds in the CP-DETECT oracle).
+            // A5 ablation skips SC-Trust for the blockchain-isolation comparison (RQ6).
+            if (!routing_test && ablation_mode != 5 && rsu_lw.anomalous) {
+                double ts = Simulator::Now().GetSeconds();
+                uint32_t sigmask = rsu_lw.tp_flags | (rsu_lw.mp_flags << 5);
+                CallSCTrust(vid, rsu_lw.psi, sigmask, rsu_lw.detected, ts);
+            }
+        }
+
+        // ── R2: RSU-direct DSRC downlink (paper Fig 3.1 Step 6/7) ────────────
+        // The RSU is the authoritative LW-DETECT source per §3.5.3 Algorithm 1
+        // and emits the safety alert directly to vehicles on DSRC — no controller
+        // round-trip, no CSMA hop. m_send_socket is already bound on the RSU's
+        // DSRC interface with broadcast enabled.
+        //
+        // Skip for three scenarios where the controller owns the emission instead:
+        //   • attacks 5/7 (controller-as-attacker, paper Fig 3.3 / Fig 3.7): the
+        //     malicious controller injects WRONG_ROUTING into the vehicle plane
+        //     via CSMA → RSU → DSRC, so the RSU's honest LW result is irrelevant.
+        //   • attack 1 (RSU-as-attacker, paper Fig 3.1 Step 5-7, added in R5):
+        //     paper attributes the decision emission to the controller (honest but
+        //     deceived by the RSU-poisoned cached LW result). The compromised RSU
+        //     is the attacker here — it would not honestly self-alert anyway — so
+        //     the controller's CSMA → RSU → DSRC chain realises paper Step 6/7.
+        // In all three cases the controller-side block in HandleBeaconReceived
+        // (Step 11) emits the alert. CDER stays well-defined per Eq.4.4: exactly
+        // one control decision per beacon (R2 fast-path OR controller-here, never both).
+        if (g_option_b_active && m_send_socket &&
+            attack_number != 1 && attack_number != 5 && attack_number != 7) {
+            DownlinkControlTag dl_tag;
+            dl_tag.SetVehicleId   (vid);                                     // unicast target
+            dl_tag.SetAlertType   (rsu_lw.detected ? 1 : 0);                 // ATTACK_DETECTED or CLEAN_ROUTING
+            dl_tag.SetSpeedAdvice (rsu_lw.detected ? (s_max * 0.5) : s_max); // 50% advisory if attack
+            dl_tag.SetTimestamp   (t);
+            dl_tag.SetRsuId       (rsu_idx);
+
+            Ptr<Packet> dl_pkt = Create<Packet>(0);
+            dl_pkt->AddPacketTag(dl_tag);
+
+            int dl_err = m_send_socket->SendTo(
+                             dl_pkt, 0,
+                             InetSocketAddress(Ipv4Address("3.255.255.255"), 9999));
+
+            const char* alert_str = rsu_lw.detected ? "ATTACK_DETECTED" : "CLEAN_ROUTING";
+            if (dl_err >= 0) {
+                // CDER (Eq.4.4) — RSU-direct emission counts as one control decision.
+                // wrong iff (detected ⊻ is_poisoned): FP when CLEAN flagged, FN when ATTACK missed.
+                ctrl_decisions_total++;
+                bool is_poisoned_now = tag.GetIsPoisoned();
+                bool wrong = (rsu_lw.detected ? !is_poisoned_now : is_poisoned_now);
+                if (wrong) ctrl_decisions_wrong++;
+
+                cout << "[DL-RSU" << rsu_idx << "-DIRECT] → V" << vid
+                     << " :9999 alert=" << alert_str
+                     << " spd_adv=" << (rsu_lw.detected ? s_max * 0.5 : s_max) << " m/s"
+                     << " (paper Fig 3.1 Step 6/7)" << endl;
+            } else {
+                cout << "[DL-RSU" << rsu_idx << "-DIRECT-ERR] failed vid=" << vid << endl;
+            }
+        }
 
         // ── send_rsu_dataunicast_alone: RSU forwards its own received beacon to management ──
         // Professor's term: send_rsu_dataunicast_alone
@@ -1797,8 +2455,9 @@ static uint32_t best_rsu_for_position(double px, double py,
         if (d > R_max_comm) continue;   // out of range — skip
         any_in_range = true;
 
-        // d_norm ∈ (0,1]: avoid div/0 when vehicle sits on RSU antenna
-        // Note: std::max avoided — #define max 40 in 02_config_globals.h
+        // d_norm ∈ (0,1]: avoid div/0 when vehicle sits on RSU antenna.
+        // (Pre-R6.5 note: std::max avoided due to #define max 40 — that macro
+        // is now MPTD_MAX_NEIGHBORS so std::max is safe; left as ternary.)
         double d_raw   = d / R_max_comm;
         double d_norm  = (d_raw > 1e-6) ? d_raw : 1e-6;
 
