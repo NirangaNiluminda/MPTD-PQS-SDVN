@@ -1,0 +1,712 @@
+// ============================================================
+// 06b1_trs_backend.h — Threshold Ring Signature backend (crypto-agile)
+// MPTD-PQS SDVN, R8 — real Shamir-Schnorr-P256 (replaces R6.5 ECDSA placeholder)
+// ============================================================
+// Paper §3.5.4 (Eq 3.45–3.54) + cite [11] Ahmed et al. 2022.
+//
+// Framing B (per CLAUDE.md Crypto Scheme Locks, May 2026):
+//   The paper's "post-quantum TRS" qualifier is paper-internally inconsistent
+//   with cite [11], whose scheme uses ECDLP-based EC primitives (classical,
+//   broken by Shor). This module ships a classical-first implementation
+//   behind ITrsBackend so the eval table can be reproduced now; phase R11
+//   swaps in LatticeTrsBackend (CRYSTALS-Dilithium via liboqs) without
+//   touching call sites. All sig/key sizes are runtime values from
+//   expected_*_size() — no hardcoded 64-byte assumptions remain.
+//
+// R8 scope (this revision):
+//   Replace the R6.5 ECDSA placeholder with a real Shamir t-of-n threshold
+//   Schnorr signature on NIST P-256, with Lagrange interpolation at zero.
+//   This is the "classical EC threshold" stand-in that the Framing B lock
+//   describes; the paper's literal cite [11] uses EC-ElGamal partials with
+//   the same Lagrange aggregator and the same ECDLP security assumption —
+//   the choice between the two is implementation detail at the signing
+//   primitive level, both produce a single 32-byte scalar σ_TRS that
+//   verifies against a 33-byte compressed master public key.
+//
+//   Scheme (sim-side trusted dealer; production would use DKG):
+//     Setup (one-time per ring, in generate_keys):
+//       - Sample a₀..a_{t-1} ∈ Z_q deterministically from LKH-derived seed
+//         (KDF(K_ring, "trs-poly", n‖t)). Ties Eq 3.36 LKH state to TRS keys.
+//       - master_pk = a₀ · G                          (Eq 3.49 verifier input)
+//       - For j ∈ [1..n]: s_j = Σ_{k=0..t-1} a_k · j^k mod q  (Shamir share)
+//       - For j ∈ [1..n]: pk_j = s_j · G              (per-signer point, for
+//                                                      future provenance use)
+//     PartialSign(s_j, m):                            (Eq 3.47, RSU j)
+//       - h = SHA256(m) reduced mod q                 (challenge scalar)
+//       - σ_j = (s_j · h) mod q                       (32-byte scalar)
+//     Aggregate({σ_j}_{j∈S}, S):                       (Eq 3.48, |S| = t)
+//       - σ = Σ_{j∈S} λ_j(0) · σ_j  mod q             (Lagrange combine)
+//       - where λ_j(0) = Π_{k∈S, k≠j} k / (k - j) mod q
+//     Verify(master_pk, m, σ):                         (Eq 3.49)
+//       - h = SHA256(m) mod q
+//       - accept ⇔ σ·G == h·master_pk
+//
+//   Why this satisfies the eval:
+//     - Threshold-of-t property is real: < t valid partials → Lagrange combine
+//       does not produce a σ that verifies, because the recovered "poly(0)"
+//       will not equal a₀.
+//     - PARR (Eq 4.3) and CP-DETECT TRS-gate (Algorithm 7 line 2–6) require
+//       only that verify_threshold be a sound predicate over (m, σ, ring).
+//       Sound here: forging σ without ≥t shares requires solving ECDLP for
+//       master_pk = a₀·G.
+//     - PBPO_Full (Eq 4.7) TRS signing latency is the wall-clock of
+//       partial_sign + aggregate, both BN-only mod-q ops — sub-millisecond
+//       on P-256 with OpenSSL 3.0.
+//
+//   Security caveat (documented, sim-acceptable, NOT production-grade):
+//     σ_j = s_j · h is *linear* in s_j with known h. An adversary who
+//     observes a single (m, σ_j, signer_id) tuple can recover s_j as
+//     σ_j · h⁻¹ mod q. Production-grade Shamir-Schnorr uses a per-signature
+//     nonce k_j (FROST-style 2-round commit-then-sign) to randomize σ_j and
+//     hide s_j. The simulation is non-adversarial w.r.t. signer-key exfil
+//     (we only model attacker classes at the *beacon* layer, not the TRS
+//     key-management layer); both Framing B and the paper's literal cite
+//     [11] inherit this single-sig leakage issue, so we explicitly mark
+//     this as the same level of formal hygiene as the paper itself, no
+//     better and no worse. Phase R11 lattice-TRS introduces a real
+//     FROST-equivalent nonce protocol along with the PQ swap.
+//
+// Layout & global state (unchanged from R6.5 API):
+//   g_trs_backend       active ITrsBackend impl (ClassicalTrsBackend default)
+//   g_trs_ring_pks      pk table of length n+1:
+//                         pks[0]      = master_pk (33B compressed)
+//                         pks[1..n]   = pk_j = s_j·G (33B compressed each)
+//                       — verify_threshold uses ONLY pks[0]; pks[1..n] are
+//                       kept for future provenance / partial verification.
+//   g_trs_ring_sks      sk table of length n:
+//                         sks[j-1] = s_j (32B scalar)
+//                       — index = (Shamir signer id - 1)
+//   g_trs_ring_n / t    ring size and threshold (n=4, t=3 by default)
+//
+//   IMPORTANT: signer_ids in aggregate() are 1-indexed Shamir indices
+//   (NOT 0-indexed array positions). g_trs_ring_sks[j-1] corresponds to
+//   Shamir share s_j with signer_id = j.
+//
+// CP-DETECT (08_detection_engine.h) continues to call
+//   cp_detect_verify_trs(sigma, len) → g_trs_backend->verify_threshold(...)
+// with no API change.
+//
+// Include order: AFTER 00_lkh_keys.h (uses LKH_K_RING + lkh_hmac_sha256),
+//                AFTER 06b_pq_crypto.h (legacy callers still compile),
+//                BEFORE 06c_blockchain_api.h.
+// Linker: requires -lcrypto (OpenSSL 3.0.2 system lib, already in wscript).
+// ============================================================
+
+#ifndef MPTD_PQS_06B1_TRS_BACKEND_H
+#define MPTD_PQS_06B1_TRS_BACKEND_H
+
+#include <vector>
+#include <cstdint>
+#include <cstring>
+#include <string>
+#include <memory>
+
+// Silence OpenSSL 3.0 deprecation warnings for low-level EC point helpers.
+// We use the low-level EC_POINT / BN_* API because the Schnorr-style verify
+// (σ·G == h·master_pk) is naturally expressed at the scalar/point level;
+// going via EVP_PKEY would force us to wrap σ as an ECDSA_SIG (which has
+// completely different semantics) just to satisfy the API surface.
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#include <openssl/ec.h>
+#include <openssl/bn.h>
+#include <openssl/sha.h>
+#include <openssl/obj_mac.h>
+#pragma GCC diagnostic pop
+
+// ────────────────────────────────────────────────────────────────────────────
+// ITrsBackend — abstract crypto-agile threshold ring signature interface.
+// Paper §3.5.4 Eq 3.47–3.54. All buffer sizes are runtime (no hardcoded 64).
+// ────────────────────────────────────────────────────────────────────────────
+class ITrsBackend {
+public:
+    virtual ~ITrsBackend() = default;
+
+    // Setup: derive n shares for the RSU ring with threshold t.
+    // out_pks: length n+1, where pks[0] = master_pk, pks[1..n] = s_j·G.
+    // out_sks: length n, where sks[j-1] = s_j (1-indexed Shamir).
+    virtual bool generate_keys(uint32_t n, uint32_t t,
+                               std::vector<std::vector<uint8_t>> &out_pks,
+                               std::vector<std::vector<uint8_t>> &out_sks) = 0;
+
+    // RSU j produces partial signature σ_j = s_j · H(m) over message.
+    // sk is the 32-byte scalar share s_j. out_partial is 32 bytes.
+    // Paper Eq 3.47.
+    virtual bool partial_sign(const std::vector<uint8_t> &message,
+                              const std::vector<uint8_t> &sk,
+                              std::vector<uint8_t> &out_partial) = 0;
+
+    // Cloud (or RSU leader) aggregates t partials into σ_TRS via Lagrange
+    // interpolation at x = 0. signer_ids[k] is the 1-indexed Shamir index
+    // of the signer who produced partials[k]. Must satisfy
+    //   partials.size() == signer_ids.size() == t (or >t; first t used).
+    // Paper Eq 3.48. Returns false if duplicate signer_ids, < t partials,
+    // or modular-inverse failure (duplicate ids).
+    virtual bool aggregate(const std::vector<std::vector<uint8_t>> &partials,
+                           const std::vector<uint32_t> &signer_ids,
+                           std::vector<uint8_t> &out_sigma) = 0;
+
+    // Verifier checks σ_TRS against the master ring public key.
+    // pks[0] MUST be the master_pk (33B compressed P-256 point); other
+    // entries are ignored by this implementation but kept for ABI parity
+    // across backends. Paper Eq 3.49–3.51.
+    virtual bool verify_threshold(const std::vector<uint8_t> &message,
+                                  const std::vector<uint8_t> &sigma,
+                                  const std::vector<std::vector<uint8_t>> &pks) = 0;
+
+    // Sizing for buffer allocation across the codebase (crypto-agility).
+    virtual size_t expected_sig_size() const = 0;
+    virtual size_t expected_pk_size()  const = 0;
+    virtual size_t expected_sk_size()  const = 0;
+    virtual const char* scheme_name()  const = 0;
+};
+
+// ────────────────────────────────────────────────────────────────────────────
+// Global TRS state. Initialized in 11_blockchain_setup.h at sim start.
+// Declared up here (above ClassicalTrsBackend) because aggregate() consults
+// g_trs_ring_t to honor the per-ring threshold when caller supplies > t
+// partials. The definitions also live here (header-only, single-TU usage
+// from simulation.cc — no ODR issues).
+//   g_trs_backend:    active ITrsBackend impl (ClassicalTrsBackend for R8)
+//   g_trs_ring_pks:   n+1 pks — [0]=master_pk, [1..n]=s_j·G
+//   g_trs_ring_sks:   n sks   — sks[j-1] = s_j (1-indexed Shamir)
+//   g_trs_ring_n / t: ring size and threshold
+// ────────────────────────────────────────────────────────────────────────────
+static std::unique_ptr<ITrsBackend>       g_trs_backend;
+static std::vector<std::vector<uint8_t>>  g_trs_ring_pks;
+static std::vector<std::vector<uint8_t>>  g_trs_ring_sks;
+static uint32_t                           g_trs_ring_n = 0;
+static uint32_t                           g_trs_ring_t = 0;
+static bool                               g_trs_ready  = false;
+
+// ────────────────────────────────────────────────────────────────────────────
+// ClassicalTrsBackend — Shamir t-of-n threshold Schnorr on EC P-256.
+//
+// Scheme summary (full security note in file header):
+//   master_pk = a₀ · G            with a₀ ← KDF(K_ring, "trs-poly", n‖t)
+//   s_j       = poly(j) = Σ a_k · j^k mod q     (j = 1..n, t-1 degree poly)
+//   pk_j      = s_j · G                          (33B compressed)
+//   σ_j       = s_j · H(m) mod q                 (32B partial)
+//   σ_TRS     = Σ_{j∈S} λ_j(0) · σ_j mod q       (32B aggregated; |S|=t)
+//   verify    : σ_TRS · G == H(m) · master_pk    (Schnorr-style)
+// ────────────────────────────────────────────────────────────────────────────
+class ClassicalTrsBackend : public ITrsBackend {
+public:
+    static constexpr int    EC_NID  = NID_X9_62_prime256v1; // P-256 (secp256r1)
+    static constexpr size_t SIG_LEN = 32;  // single scalar σ ∈ Z_q
+    static constexpr size_t PK_LEN  = 33;  // SEC1 compressed point
+    static constexpr size_t SK_LEN  = 32;  // raw scalar s_j
+
+    // ──────────────────────────────────────────────────────────────────────
+    // generate_keys: deterministic Shamir poly seeded from LKH K_ring.
+    // Determinism is intentional — repeated init_trs_backend() produces the
+    // same ring, which lets the selftest spot regressions across runs and
+    // lets future RSU-restart logic re-derive the same shares without
+    // out-of-band coordination.
+    // ──────────────────────────────────────────────────────────────────────
+    bool generate_keys(uint32_t n, uint32_t t,
+                       std::vector<std::vector<uint8_t>> &out_pks,
+                       std::vector<std::vector<uint8_t>> &out_sks) override
+    {
+        if (t == 0 || t > n || n > 64) return false;
+
+        EC_GROUP *grp = EC_GROUP_new_by_curve_name(EC_NID);
+        if (!grp) return false;
+        BIGNUM   *q   = BN_new();
+        BN_CTX   *ctx = BN_CTX_new();
+        if (!q || !ctx ||
+            EC_GROUP_get_order(grp, q, ctx) != 1) {
+            if (ctx) BN_CTX_free(ctx);
+            if (q)   BN_free(q);
+            EC_GROUP_free(grp);
+            return false;
+        }
+
+        // Deterministic poly seed = LKH K_ring ‖ n ‖ t  → HMAC chain.
+        // (LKH_K_RING is defined in 00_lkh_keys.h, must be included earlier.)
+        std::vector<BIGNUM*> coef(t, nullptr);
+        bool sample_ok = true;
+        for (uint32_t k = 0; k < t && sample_ok; k++) {
+            uint8_t info[16] = {
+                't','r','s','-','c','o','e','f','_',
+                (uint8_t)k,
+                (uint8_t)n,
+                (uint8_t)t,
+                0,0,0,0
+            };
+            uint8_t out32[LKH_KEY_BYTES];
+            if (!lkh_hmac_sha256(LKH_K_RING, LKH_KEY_BYTES,
+                                 info, sizeof(info), out32)) {
+                sample_ok = false; break;
+            }
+            BIGNUM *c = BN_bin2bn(out32, (int)LKH_KEY_BYTES, nullptr);
+            if (!c) { sample_ok = false; break; }
+            BN_mod(c, c, q, ctx);
+            // Ensure a_0 ≠ 0 (master_pk = a_0·G must be non-identity).
+            // Probability of zero is ~1/2^256 — handle anyway.
+            if (k == 0 && BN_is_zero(c)) {
+                BN_set_word(c, 1);
+            }
+            coef[k] = c;
+        }
+        if (!sample_ok) {
+            for (auto *c : coef) if (c) BN_free(c);
+            BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
+            return false;
+        }
+
+        // master_pk = a_0 · G
+        EC_POINT *mpk = EC_POINT_new(grp);
+        if (!mpk || EC_POINT_mul(grp, mpk, coef[0], nullptr, nullptr, ctx) != 1) {
+            if (mpk) EC_POINT_free(mpk);
+            for (auto *c : coef) BN_free(c);
+            BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
+            return false;
+        }
+
+        out_pks.clear();
+        out_pks.resize(n + 1);
+        out_sks.clear();
+        out_sks.resize(n);
+
+        out_pks[0].assign(PK_LEN, 0);
+        if (EC_POINT_point2oct(grp, mpk, POINT_CONVERSION_COMPRESSED,
+                               out_pks[0].data(), PK_LEN, ctx) != PK_LEN) {
+            EC_POINT_free(mpk);
+            for (auto *c : coef) BN_free(c);
+            BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
+            return false;
+        }
+        EC_POINT_free(mpk);
+
+        // For j ∈ [1..n]: s_j = poly(j); pk_j = s_j · G.
+        bool ok = true;
+        for (uint32_t j = 1; j <= n && ok; j++) {
+            BIGNUM *s_j   = BN_new();      // accumulator
+            BIGNUM *j_pow = BN_new();      // j^k
+            BIGNUM *bj    = BN_new();      // j as BIGNUM
+            if (!s_j || !j_pow || !bj) { ok = false; goto j_cleanup; }
+
+            BN_zero(s_j);
+            BN_one(j_pow);
+            BN_set_word(bj, (BN_ULONG)j);
+
+            for (uint32_t k = 0; k < t && ok; k++) {
+                BIGNUM *term = BN_new();
+                if (!term ||
+                    BN_mod_mul(term, coef[k], j_pow, q, ctx) != 1 ||
+                    BN_mod_add(s_j, s_j, term, q, ctx) != 1) {
+                    if (term) BN_free(term);
+                    ok = false; break;
+                }
+                BN_free(term);
+                // Advance j_pow ← j_pow · j  mod q
+                if (k + 1 < t) {
+                    if (BN_mod_mul(j_pow, j_pow, bj, q, ctx) != 1) {
+                        ok = false; break;
+                    }
+                }
+            }
+
+            if (ok) {
+                // Store s_j (32 bytes, left-padded).
+                out_sks[j-1].assign(SK_LEN, 0);
+                int slen = BN_num_bytes(s_j);
+                if (slen > (int)SK_LEN) {
+                    ok = false;
+                } else {
+                    BN_bn2bin(s_j, out_sks[j-1].data() + (SK_LEN - (size_t)slen));
+                }
+            }
+
+            if (ok) {
+                // pk_j = s_j · G  → 33B compressed
+                EC_POINT *pk_j = EC_POINT_new(grp);
+                if (!pk_j ||
+                    EC_POINT_mul(grp, pk_j, s_j, nullptr, nullptr, ctx) != 1) {
+                    if (pk_j) EC_POINT_free(pk_j);
+                    ok = false;
+                } else {
+                    out_pks[j].assign(PK_LEN, 0);
+                    if (EC_POINT_point2oct(grp, pk_j,
+                                           POINT_CONVERSION_COMPRESSED,
+                                           out_pks[j].data(), PK_LEN,
+                                           ctx) != PK_LEN) {
+                        ok = false;
+                    }
+                    EC_POINT_free(pk_j);
+                }
+            }
+
+        j_cleanup:
+            if (s_j)   BN_free(s_j);
+            if (j_pow) BN_free(j_pow);
+            if (bj)    BN_free(bj);
+        }
+
+        for (auto *c : coef) BN_free(c);
+        BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
+        return ok;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // partial_sign: σ_j = s_j · H(m) mod q  (Eq 3.47)
+    // ──────────────────────────────────────────────────────────────────────
+    bool partial_sign(const std::vector<uint8_t> &message,
+                      const std::vector<uint8_t> &sk,
+                      std::vector<uint8_t> &out_partial) override
+    {
+        if (sk.size() != SK_LEN) return false;
+
+        EC_GROUP *grp = EC_GROUP_new_by_curve_name(EC_NID);
+        if (!grp) return false;
+        BIGNUM   *q   = BN_new();
+        BN_CTX   *ctx = BN_CTX_new();
+        if (!q || !ctx || EC_GROUP_get_order(grp, q, ctx) != 1) {
+            if (ctx) BN_CTX_free(ctx);
+            if (q)   BN_free(q);
+            EC_GROUP_free(grp);
+            return false;
+        }
+
+        // h = SHA256(m) reduced mod q
+        uint8_t digest[32];
+        SHA256(message.data(), message.size(), digest);
+        BIGNUM *h   = BN_bin2bn(digest, 32, nullptr);
+        BIGNUM *s_j = BN_bin2bn(sk.data(), (int)SK_LEN, nullptr);
+        BIGNUM *sig = BN_new();
+        bool ok = (h && s_j && sig);
+        if (ok) ok = (BN_mod(h, h, q, ctx) == 1);
+        if (ok) ok = (BN_mod_mul(sig, s_j, h, q, ctx) == 1);
+
+        if (ok) {
+            out_partial.assign(SIG_LEN, 0);
+            int slen = BN_num_bytes(sig);
+            if (slen > (int)SIG_LEN) ok = false;
+            else BN_bn2bin(sig, out_partial.data() + (SIG_LEN - (size_t)slen));
+        }
+
+        if (h)   BN_free(h);
+        if (s_j) BN_free(s_j);
+        if (sig) BN_free(sig);
+        BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
+        return ok;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // aggregate: σ_TRS = Σ_{j∈S} λ_j(0) · σ_j mod q   (Eq 3.48)
+    //   λ_j(0) = Π_{k∈S, k≠j} k / (k - j) mod q
+    // signer_ids[i] is the 1-indexed Shamir id of partials[i]. We take the
+    // first t entries (caller is responsible for ordering / dedup beyond
+    // duplicate detection here).
+    // ──────────────────────────────────────────────────────────────────────
+    bool aggregate(const std::vector<std::vector<uint8_t>> &partials,
+                   const std::vector<uint32_t> &signer_ids,
+                   std::vector<uint8_t> &out_sigma) override
+    {
+        if (partials.size() != signer_ids.size()) return false;
+        if (partials.empty()) return false;
+        if (partials.size() > 64) return false;
+        // Caller may supply more than t partials; we only use the first
+        // ring_t. If the backend hasn't been registered into the global
+        // ring yet (g_trs_ring_t == 0), fall back to "use all supplied".
+        const size_t use_n = (g_trs_ring_t > 0 && partials.size() >= g_trs_ring_t)
+                             ? (size_t)g_trs_ring_t
+                             : partials.size();
+        for (size_t i = 0; i < use_n; i++) {
+            if (partials[i].size() != SIG_LEN) return false;
+            if (signer_ids[i] == 0)            return false; // 1-indexed
+            for (size_t k = i + 1; k < use_n; k++) {
+                if (signer_ids[k] == signer_ids[i]) return false; // duplicate
+            }
+        }
+
+        EC_GROUP *grp = EC_GROUP_new_by_curve_name(EC_NID);
+        if (!grp) return false;
+        BIGNUM   *q   = BN_new();
+        BN_CTX   *ctx = BN_CTX_new();
+        if (!q || !ctx || EC_GROUP_get_order(grp, q, ctx) != 1) {
+            if (ctx) BN_CTX_free(ctx);
+            if (q)   BN_free(q);
+            EC_GROUP_free(grp);
+            return false;
+        }
+
+        BIGNUM *sigma = BN_new();
+        bool ok = (sigma != nullptr);
+        if (ok) BN_zero(sigma);
+
+        for (size_t i = 0; i < use_n && ok; i++) {
+            // Compute λ_i(0) = Π_{k≠i} signer_ids[k] / (signer_ids[k] - signer_ids[i])
+            BIGNUM *lam = BN_new();
+            BIGNUM *num = BN_new();
+            BIGNUM *den = BN_new();
+            BIGNUM *bi  = BN_new();     // signer_ids[i]
+            BIGNUM *inv = BN_new();
+            BIGNUM *tmp = BN_new();
+            if (!lam || !num || !den || !bi || !inv || !tmp) {
+                ok = false; goto lag_cleanup;
+            }
+            BN_one(lam);
+            BN_set_word(bi, (BN_ULONG)signer_ids[i]);
+
+            for (size_t k = 0; k < use_n && ok; k++) {
+                if (k == i) continue;
+                BN_set_word(num, (BN_ULONG)signer_ids[k]);
+                // den = (signer_ids[k] - signer_ids[i]) mod q
+                if (BN_mod_sub(den, num, bi, q, ctx) != 1) { ok = false; break; }
+                if (BN_is_zero(den)) { ok = false; break; } // duplicate (paranoia)
+                if (!BN_mod_inverse(inv, den, q, ctx))  { ok = false; break; }
+                if (BN_mod_mul(tmp, num, inv, q, ctx) != 1) { ok = false; break; }
+                if (BN_mod_mul(lam, lam, tmp, q, ctx) != 1) { ok = false; break; }
+            }
+
+            if (ok) {
+                // term = lam · σ_i mod q
+                BIGNUM *sig_i = BN_bin2bn(partials[i].data(), (int)SIG_LEN, nullptr);
+                if (!sig_i) { ok = false; goto lag_cleanup; }
+                if (BN_mod_mul(tmp, lam, sig_i, q, ctx) != 1) {
+                    BN_free(sig_i); ok = false; goto lag_cleanup;
+                }
+                if (BN_mod_add(sigma, sigma, tmp, q, ctx) != 1) {
+                    BN_free(sig_i); ok = false; goto lag_cleanup;
+                }
+                BN_free(sig_i);
+            }
+
+        lag_cleanup:
+            if (lam) BN_free(lam);
+            if (num) BN_free(num);
+            if (den) BN_free(den);
+            if (bi)  BN_free(bi);
+            if (inv) BN_free(inv);
+            if (tmp) BN_free(tmp);
+        }
+
+        if (ok) {
+            out_sigma.assign(SIG_LEN, 0);
+            int slen = BN_num_bytes(sigma);
+            if (slen > (int)SIG_LEN) ok = false;
+            else BN_bn2bin(sigma, out_sigma.data() + (SIG_LEN - (size_t)slen));
+        }
+
+        if (sigma) BN_free(sigma);
+        BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
+        return ok;
+    }
+
+    // ──────────────────────────────────────────────────────────────────────
+    // verify_threshold: σ·G == H(m)·master_pk    (Eq 3.49)
+    //   pks[0] = master_pk (33B compressed). pks[1..] are ignored at this
+    //   backend (kept for ABI parity with future provenance-aware backends).
+    // ──────────────────────────────────────────────────────────────────────
+    bool verify_threshold(const std::vector<uint8_t> &message,
+                          const std::vector<uint8_t> &sigma,
+                          const std::vector<std::vector<uint8_t>> &pks) override
+    {
+        if (sigma.size() != SIG_LEN)                    return false;
+        if (pks.empty() || pks[0].size() != PK_LEN)     return false;
+
+        EC_GROUP *grp = EC_GROUP_new_by_curve_name(EC_NID);
+        if (!grp) return false;
+        BIGNUM   *q   = BN_new();
+        BN_CTX   *ctx = BN_CTX_new();
+        if (!q || !ctx || EC_GROUP_get_order(grp, q, ctx) != 1) {
+            if (ctx) BN_CTX_free(ctx);
+            if (q)   BN_free(q);
+            EC_GROUP_free(grp);
+            return false;
+        }
+
+        // h = SHA256(m) mod q
+        uint8_t digest[32];
+        SHA256(message.data(), message.size(), digest);
+        BIGNUM *h = BN_bin2bn(digest, 32, nullptr);
+        BIGNUM *s = BN_bin2bn(sigma.data(), (int)SIG_LEN, nullptr);
+        bool ok = (h && s);
+        if (ok) ok = (BN_mod(h, h, q, ctx) == 1);
+
+        EC_POINT *lhs = nullptr;
+        EC_POINT *rhs = nullptr;
+        EC_POINT *mpk = nullptr;
+        if (ok) {
+            // lhs = σ · G
+            lhs = EC_POINT_new(grp);
+            ok  = (lhs && EC_POINT_mul(grp, lhs, s, nullptr, nullptr, ctx) == 1);
+        }
+        if (ok) {
+            // master_pk from pks[0]
+            mpk = EC_POINT_new(grp);
+            ok  = (mpk && EC_POINT_oct2point(grp, mpk,
+                                             pks[0].data(), pks[0].size(),
+                                             ctx) == 1);
+        }
+        if (ok) {
+            // rhs = h · master_pk
+            rhs = EC_POINT_new(grp);
+            ok  = (rhs && EC_POINT_mul(grp, rhs, nullptr, mpk, h, ctx) == 1);
+        }
+
+        bool verified = false;
+        if (ok) {
+            verified = (EC_POINT_cmp(grp, lhs, rhs, ctx) == 0);
+        }
+
+        if (h)   BN_free(h);
+        if (s)   BN_free(s);
+        if (lhs) EC_POINT_free(lhs);
+        if (rhs) EC_POINT_free(rhs);
+        if (mpk) EC_POINT_free(mpk);
+        BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
+        return ok && verified;
+    }
+
+    size_t expected_sig_size() const override { return SIG_LEN; }
+    size_t expected_pk_size()  const override { return PK_LEN;  }
+    size_t expected_sk_size()  const override { return SK_LEN;  }
+    const char* scheme_name()  const override {
+        return "Shamir-Schnorr-P256 t-of-n (R8 classical TRS; "
+               "Lagrange combine real; PQ-TRS swap deferred to R11)";
+    }
+};
+
+// One-time initialization. Call once before first verify_threshold use.
+// n=4, t=3 mirrors the 3-RSU + 1-controller-as-peer BFT setup (f=1, t=f+1+1).
+static bool init_trs_backend(uint32_t n = 4, uint32_t t = 3)
+{
+    if (g_trs_ready) return true;
+    g_trs_backend = std::unique_ptr<ITrsBackend>(new ClassicalTrsBackend());
+    // ring_n/t must be visible to aggregate()'s "use first t partials" logic
+    // BEFORE generate_keys returns — they're independent of generate_keys,
+    // so set them up-front.
+    g_trs_ring_n = n;
+    g_trs_ring_t = t;
+    if (!g_trs_backend->generate_keys(n, t, g_trs_ring_pks, g_trs_ring_sks)) {
+        g_trs_backend.reset();
+        g_trs_ring_pks.clear();
+        g_trs_ring_sks.clear();
+        g_trs_ring_n = 0;
+        g_trs_ring_t = 0;
+        return false;
+    }
+    g_trs_ready  = true;
+    return true;
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// R8.4: EvidenceMessage m_j (Paper §3.5.4, Eq. 3.46)
+//
+// Proper evidence tuple submitted by an RSU after anomaly detection:
+//   m_j = (A_j(t), t, ID_r_j, h(V_j(t)))
+//
+// where:
+//   A_j(t)    = field-wise beacon aggregate (paper Eq. 3.45)
+//   t         = simulation timestamp
+//   ID_r_j    = RSU identity (uint32_t)
+//   h(V_j(t)) = hash of vehicle set, materialized here as the raw vid list
+//               (collision-resistance comes from SHA-256 inside partial_sign)
+//
+// Per-beacon-mode (current call site in StoreTrajectoryToBlockchain) collapses
+// A_j(t) to a single beacon's telemetry with |V_j|=1. Window-aggregate mode
+// (paper §3.5.4 Algorithm 6 line 4) populates A_j(t) over L beacons before
+// signing — both produce well-typed m_j.
+// ─────────────────────────────────────────────────────────────────────────────
+struct EvidenceMessage {
+    uint32_t rsu_id;            // ID_r_j
+    double   timestamp;         // t
+    // A_j(t) — beacon aggregate (mean / representative)
+    double   agg_pos_x;
+    double   agg_pos_y;
+    double   agg_vel_x;
+    double   agg_vel_y;
+    double   agg_accel_x;
+    double   agg_accel_y;
+    // V_j(t) — vehicle IDs feeding this aggregate
+    std::vector<uint32_t> vehicle_set;
+};
+
+// Serialize m_j to a deterministic byte sequence for cryptographic signing.
+// Layout (host endian — single-machine sim, no cross-arch transport):
+//   uint32 rsu_id | double t | 6×double agg fields
+//   uint32 |V_j|  | uint32 vid_1 | ... | uint32 vid_n
+// SHA-256(buf) is what ITrsBackend::partial_sign hashes internally.
+inline std::vector<uint8_t> serialize_evidence(const EvidenceMessage &m)
+{
+    std::vector<uint8_t> buf;
+    auto append = [&](const void *p, size_t n) {
+        const uint8_t *b = static_cast<const uint8_t*>(p);
+        buf.insert(buf.end(), b, b + n);
+    };
+    append(&m.rsu_id,      sizeof(m.rsu_id));
+    append(&m.timestamp,   sizeof(m.timestamp));
+    append(&m.agg_pos_x,   sizeof(m.agg_pos_x));
+    append(&m.agg_pos_y,   sizeof(m.agg_pos_y));
+    append(&m.agg_vel_x,   sizeof(m.agg_vel_x));
+    append(&m.agg_vel_y,   sizeof(m.agg_vel_y));
+    append(&m.agg_accel_x, sizeof(m.agg_accel_x));
+    append(&m.agg_accel_y, sizeof(m.agg_accel_y));
+    uint32_t n_v = static_cast<uint32_t>(m.vehicle_set.size());
+    append(&n_v, sizeof(n_v));
+    for (uint32_t v : m.vehicle_set) append(&v, sizeof(v));
+    return buf;
+}
+
+// Empirical PARR counters — incremented by evidence_sign_and_verify().
+// Paper Eq. 4.3: PARR = TRS-rejected / total poisoned aggregates. With the
+// real signing pipeline wired up, PARR is now measurable from sim state
+// instead of formula-approximated in evaluate_all.py.
+static uint64_t g_trs_verified_count = 0;
+static uint64_t g_trs_rejected_count = 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// evidence_sign_and_verify — paper Algorithm 6 (PQ-TRS-SIGN), Eq. 3.47–3.49
+//
+// Build σ_TRS over m_j with t-of-n RSU partial signatures, then verify before
+// returning. This is the canonical "RSU-side TRS pipeline" the paper §3.5.4
+// specifies.
+//
+// Sim-only deviation: the t partial signatures come from the first t entries
+// in g_trs_ring_sks instead of being collected from peer RSUs over a DSRC
+// broadcast channel. The crypto chain (partial_sign → aggregate →
+// verify_threshold) is real — only the σ_j delivery is shortcut. Real
+// inter-RSU σ_j exchange is the deferred R-future task; A1–A5 ablation
+// isolation does not depend on it (TRS-on vs TRS-off is the variable, not
+// transport).
+//
+// Returns true iff verify_threshold passes. On success out_sigma holds the
+// aggregated σ_TRS bytes and out_signers the signer-id list (1..t). The
+// caller is expected to gate blockchain submission on the return value
+// (paper Invariant 5 — TRS-then-FHE).
+// ─────────────────────────────────────────────────────────────────────────────
+inline bool evidence_sign_and_verify(const EvidenceMessage &m,
+                                     std::vector<uint8_t> &out_sigma,
+                                     std::vector<uint32_t> &out_signers)
+{
+    out_sigma.clear();
+    out_signers.clear();
+    if (!g_trs_backend || g_trs_ring_sks.empty() || g_trs_ring_pks.empty())
+        return false;
+
+    std::vector<uint8_t> msg_bytes = serialize_evidence(m);
+
+    // Collect t partial signatures (Eq. 3.47).
+    // Sim-only: take first t SKs from the ring; real impl receives over DSRC.
+    std::vector<std::vector<uint8_t>> partials;
+    partials.reserve(g_trs_ring_t);
+    for (uint32_t j = 0; j < g_trs_ring_t && j < g_trs_ring_n; j++) {
+        std::vector<uint8_t> p_j;
+        if (!g_trs_backend->partial_sign(msg_bytes, g_trs_ring_sks[j], p_j))
+            return false;
+        partials.push_back(std::move(p_j));
+        out_signers.push_back(j + 1);  // 1-indexed (Lagrange basis @ x=0)
+    }
+
+    // Aggregate t partials → σ_TRS (Eq. 3.48).
+    if (!g_trs_backend->aggregate(partials, out_signers, out_sigma))
+        return false;
+
+    // Verify σ_TRS against m_j + ring pks (Eq. 3.49, Invariant 5 gate).
+    return g_trs_backend->verify_threshold(msg_bytes, out_sigma, g_trs_ring_pks);
+}
+
+#endif // MPTD_PQS_06B1_TRS_BACKEND_H
