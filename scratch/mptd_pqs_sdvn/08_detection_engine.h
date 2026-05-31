@@ -2496,8 +2496,21 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // ITrsBackend per-RSU signature into the vote args.
                     bool revoked = false;
                     if (!routing_test && ablation_mode != 5) {
+                        // σ_j for the vote (TASK ①-J): bind to
+                        //   m_j = "<vid>|REVOKE|<ts:.6f>|<reason>"
+                        // using the same canonical helper. The chaincode
+                        // already accepts the signature opaquely; this
+                        // gives downstream verifiers a real Eq 3.47
+                        // partial that can be aggregated into a σ_TRS
+                        // proving the BFT vote was endorsed by the RSU
+                        // ring (paper §3.5.5 + §3.5.4 chain).
+                        std::vector<uint8_t> vote_msg = mptd_evidence_message(
+                            vid, "REVOKE", ts, "3_consecutive_anomalies");
+                        std::string vote_sig_hex =
+                            mptd_trs_partial_sign_hex(rsu_idx, vote_msg);
                         std::string vote_payload = CallSCRevokeVote(
-                            vid, rsu_idx, "3_consecutive_anomalies", "", ts);
+                            vid, rsu_idx, "3_consecutive_anomalies",
+                            vote_sig_hex, ts);
                         // Payload shape: {"voted":true,"votes":N,"threshold":T,"revoked":bool}
                         revoked = (vote_payload.find("\"revoked\":true")
                                    != std::string::npos);
@@ -2585,9 +2598,20 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 
                     std::string epoch = mptd_epoch_from_ts(ts);
 
-                    // σ_j^sub placeholder — see comment above; chaincode
-                    // does not enforce signature verification at this stage.
-                    std::string sigma_sub_hex = "";
+                    // ── σ_j^sub via ITrsBackend::partial_sign (TASK ①-J) ───
+                    // RSU r_j produces σ_j = s_j · H(m_j) (paper Eq 3.47) over
+                    // the canonical evidence bytes
+                    //   m_j = "<vid>|<epoch>|<ψ:.6f>|<h_b>"
+                    // hex-encoded for the chaincode string arg. Empty hex on
+                    // failure (g_trs_backend not initialised, A4 ablation,
+                    // or rsu_idx out of ring) — chaincode accepts opaquely
+                    // either way. Real σ_TRS aggregation across t partials
+                    // is done at the cloud per Eq 3.48 (evidence_sign_and_verify
+                    // in 06b1_trs_backend.h handles that pipeline).
+                    std::vector<uint8_t> sub_msg =
+                        mptd_evidence_message(vid, epoch, rsu_lw.psi, h_b);
+                    std::string sigma_sub_hex =
+                        mptd_trs_partial_sign_hex(rsu_idx, sub_msg);
 
                     CallSCTrustSubmitEvidence(
                         vid, rsu_idx, epoch,

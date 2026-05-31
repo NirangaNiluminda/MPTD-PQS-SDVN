@@ -709,4 +709,44 @@ inline bool evidence_sign_and_verify(const EvidenceMessage &m,
     return g_trs_backend->verify_threshold(msg_bytes, out_sigma, g_trs_ring_pks);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// mptd_trs_partial_sign_hex — TASK ①-J: thin σ_j helper for chaincode tuples.
+//
+// RSU r_j produces σ_j = s_j · H(m) (Eq 3.47) over arbitrary canonical message
+// bytes, hex-encoded for chaincode string args (SCTrustSubmitEvidence,
+// SCRevokeVote). Returns empty string on any failure so the caller falls back
+// to empty σ — the chaincode already accepts opaquely (see TASK ①-I commit
+// 99b7f03 and TASK ①-N commit 479c3eb).
+//
+// Indexing: rsu_idx is 0-indexed NS-3 RSU id; g_trs_ring_sks[rsu_idx] is the
+// 0-indexed share array (where index k maps to 1-indexed Shamir share s_{k+1}).
+//
+// No-op gracefully when:
+//   - g_trs_backend is null (e.g. A4 ablation use_pq_crypto=false)
+//   - rsu_idx is out of range (controller-side σ_c has no ring key — paper
+//     §3.5.5 wording allows σ_c^sub to be a separate controller-keyed signature;
+//     that key plumbing is a separate task)
+//   - partial_sign itself fails
+//
+// This is single-RSU σ_j only. For full σ_TRS aggregation (t partials →
+// aggregate → verify_threshold) use evidence_sign_and_verify above.
+// ─────────────────────────────────────────────────────────────────────────────
+static inline std::string mptd_trs_partial_sign_hex(
+    uint32_t rsu_idx, const std::vector<uint8_t> &message)
+{
+    if (!g_trs_backend) return "";
+    if (rsu_idx >= g_trs_ring_sks.size()) return "";
+    std::vector<uint8_t> partial;
+    if (!g_trs_backend->partial_sign(message, g_trs_ring_sks[rsu_idx], partial))
+        return "";
+    static const char* hex = "0123456789abcdef";
+    std::string out;
+    out.reserve(partial.size() * 2);
+    for (uint8_t b : partial) {
+        out.push_back(hex[(b >> 4) & 0xf]);
+        out.push_back(hex[b & 0xf]);
+    }
+    return out;
+}
+
 #endif // MPTD_PQS_06B1_TRS_BACKEND_H

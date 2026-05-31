@@ -343,6 +343,35 @@ static inline std::string mptd_hex(const std::vector<uint8_t>& bytes) {
     return s.str();
 }
 
+// ── mptd_evidence_message — canonical bytes for σ_j over an evidence tuple ───
+// TASK ①-J: deterministic byte serialization for ITrsBackend::partial_sign,
+// matching the on-chain E_j(t) tuple (paper Eq 3.56) without the σ itself:
+//
+//   m_j = "<vid>|<epoch>|<score>|<beacon_hash>"
+//
+// `score` is the per-RSU anomaly composite ψ_j^(i)(t) (Eq 3.20) — formatted
+// at fixed 6-decimal precision so float→string is deterministic across
+// witnesses. `beacon_hash` is the IPFS CID h(b_i(t)) from mptd_beacon_hash
+// (TASK ①-E commit 232d15a) — content-addressable, so all RSU witnesses of
+// the same beacon produce the same message bytes (required for σ_j → σ_TRS
+// aggregation per Eq 3.48).
+//
+// Variant: when the helper is reused for SCRevokeVote, the caller passes
+// score = ts (vote timestamp) and beacon_hash = reason (e.g.
+// "3_consecutive_anomalies"). The chaincode side stores it as opaque
+// signature bytes today; verification lives downstream.
+static inline std::vector<uint8_t> mptd_evidence_message(
+    uint32_t vid, const std::string &epoch,
+    double score, const std::string &beacon_hash)
+{
+    std::ostringstream s;
+    s << vid << "|" << epoch << "|"
+      << std::fixed << std::setprecision(6) << score
+      << "|" << beacon_hash;
+    std::string str = s.str();
+    return std::vector<uint8_t>(str.begin(), str.end());
+}
+
 // ╔══════════════════════════════════════════════════════════════════════════╗
 // ║  Paper-aligned helpers (§3.5.5 Eq 3.55 / 3.56 / 3.57 / 3.58 / 3.59)       ║
 // ║                                                                          ║
