@@ -172,6 +172,13 @@ type request struct {
 	Action   string   `json:"action"`   // "invoke" | "query"
 	Function string   `json:"function"` // chaincode function name
 	Args     []string `json:"args"`     // string args (Args[0] is implicitly fn)
+
+	// FireAndForget — when true on an invoke, daemon writes {"ok":true}
+	// immediately and submits in a detached goroutine. The caller can close
+	// the connection and continue without waiting for the ~1s commit. Used
+	// by the NS-3 lightweight beacon path (paper Invariant 3, T_b=100 ms)
+	// so SUBM writes never stall the per-beacon loop.
+	FireAndForget bool `json:"fire_and_forget,omitempty"`
 }
 
 type response struct {
@@ -214,6 +221,19 @@ func handleConn(c net.Conn, contract *client.Contract) {
 
 	switch req.Action {
 	case "invoke":
+		if req.FireAndForget {
+			// ACK first so the NS-3 caller unblocks immediately, then submit
+			// in a detached goroutine. The submit error (if any) is logged
+			// here — the caller has already moved on, by design.
+			writeOk(wr, "")
+			wr.Flush()
+			go func(fn string, args []string) {
+				if _, err := contract.SubmitTransaction(fn, args...); err != nil {
+					log.Printf("[fabric-gw] fire-and-forget submit %s: %v", fn, err)
+				}
+			}(req.Function, append([]string(nil), req.Args...))
+			return
+		}
 		payload, err := contract.SubmitTransaction(req.Function, req.Args...)
 		if err != nil {
 			writeErr(wr, fmt.Sprintf("submit %s: %v", req.Function, err))
