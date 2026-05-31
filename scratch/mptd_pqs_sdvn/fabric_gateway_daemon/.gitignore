@@ -1,0 +1,2 @@
+# Built binary — rebuild with `go build` after `go mod tidy`.
+fabric_gateway_daemon
