@@ -1026,15 +1026,27 @@ type RevokeVote struct {
 
 // ControllerFlag — CP-DETECT result (Eq 3.59) when ≥ f+1 RSUs disagree.
 // Key: CFLAG_<controllerID>_<vehicleID>_<epoch>
+//
+// ConflictCount = explicit conflicts (RSU submitted SUBM, ψ disagreed with Φ)
+//               + implicit conflicts (RSU did NOT submit SUBM but controller
+//                 said anomalous — missing SUBM means RSU saw ψ ≤ ψ_th, which
+//                 is the NS-3 RSU gating contract from TASK ①-I).
+// NumRSUs       = explicit witness count (RSUs that submitted SUBM).
+// ImplicitCleanVotes = cfg.NumRSUs - NumRSUs (RSUs the controller decision
+//                 ranges over that did not submit). Only contributes to
+//                 ConflictCount when the controller submission is anomalous
+//                 (cAnom=true); when the controller agrees the vehicle is
+//                 clean, missing SUBMs are implicit agreement, not conflict.
 type ControllerFlag struct {
-	ID            string `json:"ID"`
-	ControllerID  string `json:"ControllerID"`
-	VehicleID     string `json:"VehicleID"`
-	Epoch         string `json:"Epoch"`
-	ConflictCount int    `json:"ConflictCount"`
-	NumRSUs       int    `json:"NumRSUs"`
-	ThresholdFP1  int    `json:"ThresholdFP1"` // f+1 used at evaluation time
-	FlaggedAt     string `json:"FlaggedAt"`
+	ID                 string `json:"ID"`
+	ControllerID       string `json:"ControllerID"`
+	VehicleID          string `json:"VehicleID"`
+	Epoch              string `json:"Epoch"`
+	ConflictCount      int    `json:"ConflictCount"`
+	NumRSUs            int    `json:"NumRSUs"`
+	ImplicitCleanVotes int    `json:"ImplicitCleanVotes"`
+	ThresholdFP1       int    `json:"ThresholdFP1"` // f+1 used at evaluation time
+	FlaggedAt          string `json:"FlaggedAt"`
 }
 
 // fByzantine returns Byzantine-tolerance f given the total RSU count.
@@ -1327,21 +1339,41 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		}
 	}
 
+	// ── Implicit clean-vote handling (KNOWN GAP fix, post-TASK ①-M) ─────────
+	// NS-3 RSU code (TASK ①-I) only writes SUBM when rsu_lw.anomalous == true,
+	// so any RSU that does NOT appear in seenRSU is implicitly reporting
+	// ψ_j^{(i)} ≤ ψ_th (clean). When the controller's Φ_i > ψ_th (cAnom=true)
+	// and all witnesses said clean, that is the textbook controller-deceit
+	// pattern Eq 3.59 is meant to catch — but the previous implementation
+	// returned nil when len(seenRSU)==0, missing it entirely.
+	//
+	// Fix: treat (cfg.NumRSUs - len(seenRSU)) as implicit clean votes; each
+	// counts as a conflict iff cAnom=true (XOR semantics). When cAnom=false,
+	// implicit clean = implicit agreement, no conflict added.
+	implicitCleanVotes := cfg.NumRSUs - len(seenRSU)
+	if implicitCleanVotes < 0 {
+		implicitCleanVotes = 0
+	}
+	if cAnom && implicitCleanVotes > 0 {
+		conflict += implicitCleanVotes
+	}
+
 	f := fByzantine(cfg.NumRSUs)
 	fP1 := f + 1
-	if conflict < fP1 || len(seenRSU) == 0 {
-		return nil, nil // not enough RSUs disagree
+	if conflict < fP1 {
+		return nil, nil // not enough explicit+implicit conflicts to flag
 	}
 
 	flag := ControllerFlag{
-		ID:            fmt.Sprintf("CFLAG_%s_%s_%s", cs.ControllerID, vehicleID, epoch),
-		ControllerID:  cs.ControllerID,
-		VehicleID:     vehicleID,
-		Epoch:         epoch,
-		ConflictCount: conflict,
-		NumRSUs:       len(seenRSU),
-		ThresholdFP1:  fP1,
-		FlaggedAt:     time.Now().Format(time.RFC3339),
+		ID:                 fmt.Sprintf("CFLAG_%s_%s_%s", cs.ControllerID, vehicleID, epoch),
+		ControllerID:       cs.ControllerID,
+		VehicleID:          vehicleID,
+		Epoch:              epoch,
+		ConflictCount:      conflict,
+		NumRSUs:            len(seenRSU),
+		ImplicitCleanVotes: implicitCleanVotes,
+		ThresholdFP1:       fP1,
+		FlaggedAt:          time.Now().Format(time.RFC3339),
 	}
 	j, err := json.Marshal(flag)
 	if err != nil {
