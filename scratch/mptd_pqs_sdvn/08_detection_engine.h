@@ -1516,6 +1516,16 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                     int        full_flag_count = 0;
                     double     phi_sum = 0.0;
                     double     phi_max = 0.0;
+
+                    // ── Per-window dedup for Eq 3.57 CSUBM (TASK ①-L) ─────────
+                    // Multiple beacons from the same vehicle in one L-beacon
+                    // window collapse to ONE controller submission per
+                    // (vid, epoch). The chaincode side is idempotent on
+                    // CSUBM_<vid>_<epoch> but every duplicate submit costs an
+                    // async orderer round-trip — keep it cheap. Scope is local
+                    // to this window only; a fresh window starts a new set.
+                    std::unordered_set<std::string> csubm_seen;
+
                     for (int i = 0; i < N; ++i) {
                         const uint32_t vid_i = rw.vid[i];
                         if (vid_i >= (uint32_t)total_size) continue;
@@ -1543,6 +1553,87 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                              << " phi="     << fs.phi
                              << " full_anom=" << (fs.anomalous ? "YES" : "no")
                              << " (Eq 3.46)" << endl;
+
+                        // ── Paper-aligned Eq 3.57 controller evidence (TASK ①-L) ──
+                        // E_c(t) = (vehicleID, Φ_i(t), epoch, h(X_i(t)), σ_c^sub)
+                        //
+                        // Submitted UNCONDITIONALLY on every fused row (not
+                        // gated on fs.anomalous). Eq 3.59 (CP-DETECT) compares
+                        // the controller's binary verdict against each RSU's
+                        // verdict via XOR on (Φ > ψ_th)/(ψ_j > ψ_th); the
+                        // chaincode does its own threshold check on the raw Φ
+                        // value, so submitting Φ regardless of anomaly is
+                        // correct. More importantly, gating on fs.anomalous
+                        // would HIDE the malicious-controller attack pattern
+                        // — a compromised controller that lies "clean" on
+                        // genuine anomalies would never submit, and CPDetectCheck
+                        // returns nil when no CSUBM exists, defeating Eq 3.59.
+                        //
+                        // Paper invariant #2 (controller as untrusted peer):
+                        // this is the controller's UNTRUSTED submission. The
+                        // RSU consensus (CallSCTrustSubmitEvidence at line
+                        // ~2394 in handle_readone) remains authoritative.
+                        //
+                        // Epoch derivation: mptd_epoch_from_ts(rw.timestamp[i])
+                        // matches the RSU-side epoch derivation EXACTLY
+                        // (handle_readone uses mptd_epoch_from_ts(ts) where ts
+                        // = beacon arrival time). This guarantees CSUBM_<vid>_<E>
+                        // and SUBM_<vid>_<E>_<rsu> share the same epoch key so
+                        // CPDetectCheck can join them.
+                        //
+                        // h(X_i(t)) derivation: same canonical-blob form as the
+                        // RSU side (vy/ax/ay projected from speed×heading), with
+                        // rsuID omitted from the blob so the CID is content-
+                        // addressable across witnesses. The controller sees the
+                        // same kinematics, so this hash matches its RSU
+                        // counterpart on the same beacon.
+                        //
+                        // σ_c^sub PLACEHOLDER: empty string. TASK ①-J swaps in
+                        // a real controller-keyed signature; chaincode accepts
+                        // it opaquely today.
+                        //
+                        // A5 ablation (no blockchain) and routing_test mode
+                        // both skip — matches the RSU-side guards.
+                        if (!routing_test && ablation_mode != 5) {
+                            const double speed_i   = rw.speed[i];
+                            const double heading_i = rw.heading[i];
+                            const double accel_i   = rw.accel[i];
+                            const double vx = speed_i * std::cos(heading_i);
+                            const double vy = speed_i * std::sin(heading_i);
+                            const double ax = accel_i * std::cos(heading_i);
+                            const double ay = accel_i * std::sin(heading_i);
+
+                            std::string ctrl_epoch =
+                                mptd_epoch_from_ts(rw.timestamp[i]);
+                            std::string dedup_key =
+                                std::to_string(vid_i) + "|" + ctrl_epoch;
+                            if (csubm_seen.insert(dedup_key).second) {
+                                std::string h_X = mptd_beacon_hash(
+                                    std::to_string(vid_i),
+                                    "C",  // controller-view tag (RSU side uses rsu_idx;
+                                          // the canonical blob omits this field, so it
+                                          // is for documentary use only and does not
+                                          // affect the CID)
+                                    rw.pos_x[i], rw.pos_y[i], 0.0,
+                                    vx, vy, 0.0,
+                                    ax, ay, 0.0,
+                                    rw.timestamp[i]);
+
+                                // Single-controller sim: controllerID = 0. The
+                                // paper's Fig 3.9 has exactly one SDN controller,
+                                // and our sim mirrors that; if multi-controller
+                                // support lands later this becomes a per-thread
+                                // identifier read from a config global.
+                                const uint32_t controllerID = 0;
+
+                                // σ_c^sub placeholder; see comment above.
+                                std::string sigma_c_sub_hex = "";
+
+                                CallSCControllerSubmitEvidence(
+                                    vid_i, controllerID, ctrl_epoch,
+                                    (double)fs.phi, h_X, sigma_c_sub_hex);
+                            }
+                        }
                     }
                     if (fused_count > 0) {
                         cout << "[FUSION-WIN-RSU" << rsu_id << "] epoch="
