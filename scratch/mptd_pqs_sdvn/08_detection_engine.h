@@ -2462,17 +2462,67 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 
                     double ts = Simulator::Now().GetSeconds();
 
-                    // LKH rekey (Eq.3.34): N_rekey = log₂|V_j| unicasts to remaining vehicles
-                    if (rsu_idx < 4) {
-                        cout << "[LKH-REVOKE-RSU" << rsu_idx << "] V" << (vid - 2)
-                             << " revoked after " << REVOKE_THRESHOLD << " anomalies"
-                             << " → triggering group rekey (Eq.3.34)" << endl;
-                        send_lkh_rekey_to_vehicles(vid, rsu_idx, ts);
+                    // ── Eq 3.58 SC-Revoke BFT (TASK ①-N) ──────────────────────
+                    // Paper §3.5.5 Eq 3.58: revocation requires ≥ 2f+1 distinct
+                    // RSU votes (with NumRSUs=4, f=1 → threshold=3). Replaces
+                    // the legacy single-RSU CallSCRevoke that immediately
+                    // committed SCREVOKE on the first RSU to hit
+                    // REVOKE_THRESHOLD — violating BFT consensus invariant 6.
+                    //
+                    // Flow per RSU:
+                    //   1. RSU r_j casts SCRevokeVote (sync — needs the
+                    //      revoked-quorum bit back to decide whether to rekey).
+                    //   2. Chaincode stores VOTE_<vid>_<rsuID> (idempotent
+                    //      per RSU) and counts distinct votes.
+                    //   3. When count ≥ 2f+1, chaincode commits
+                    //      SCREVOKE_<vid>_<ts> + emits "SCRevoke" event AND
+                    //      returns "revoked":true in the payload.
+                    //   4. Only when revoked=true does THIS RSU fire LKH rekey
+                    //      locally. Other RSUs learn from the "SCRevoke"
+                    //      Fabric event — wiring that listener is a separate
+                    //      task (Fabric Gateway C++ gRPC client).
+                    //
+                    // Latency tradeoff: CallSCRevokeVote is sync (~1-2s
+                    // orderer round-trip per call). Acceptable because revoke
+                    // is a rare event (3 consecutive anomalies on the same
+                    // RSU↔vehicle path); not in the beacon-rate hot path.
+                    //
+                    // A5 ablation / routing_test fallback: no chaincode
+                    // available → fall back to per-RSU unilateral revoke,
+                    // matching the legacy behaviour. This is the "no BC"
+                    // baseline used by RQ6 (BC isolation comparison).
+                    //
+                    // σ_j placeholder (empty string) until TASK ①-J plumbs
+                    // ITrsBackend per-RSU signature into the vote args.
+                    bool revoked = false;
+                    if (!routing_test && ablation_mode != 5) {
+                        std::string vote_payload = CallSCRevokeVote(
+                            vid, rsu_idx, "3_consecutive_anomalies", "", ts);
+                        // Payload shape: {"voted":true,"votes":N,"threshold":T,"revoked":bool}
+                        revoked = (vote_payload.find("\"revoked\":true")
+                                   != std::string::npos);
+                        cout << "[SC-REVOKE-VOTE-RSU" << rsu_idx << "] V" << (vid - 2)
+                             << " ts=" << std::fixed << std::setprecision(3) << ts
+                             << " payload=" << vote_payload
+                             << " (paper §3.5.5 Eq 3.58 BFT 2f+1)" << endl;
+                    } else {
+                        // A5 / routing_test: no BC consensus — local revoke
+                        revoked = true;
+                        cout << "[SC-REVOKE-LOCAL-RSU" << rsu_idx << "] V" << (vid - 2)
+                             << " ts=" << std::fixed << std::setprecision(3) << ts
+                             << " (no-BC fallback; ablation_mode=" << ablation_mode
+                             << " routing_test=" << (routing_test ? "true" : "false")
+                             << ")" << endl;
                     }
 
-                    // A5 ablation: skip blockchain SC-Revoke to isolate BC contribution (RQ6)
-                    if (!routing_test && ablation_mode != 5) {
-                        CallSCRevoke(vid, "3_consecutive_anomalies", rsu_idx, ts);
+                    // LKH rekey (Eq.3.34): N_rekey = log₂|V_j| unicasts to
+                    // remaining vehicles. Fires only when BFT quorum was hit
+                    // (Eq 3.58) OR the no-BC fallback authorized local revoke.
+                    if (revoked && rsu_idx < 4) {
+                        cout << "[LKH-REVOKE-RSU" << rsu_idx << "] V" << (vid - 2)
+                             << " revoked (Eq.3.58 BFT) → group rekey (Eq.3.34)"
+                             << endl;
+                        send_lkh_rekey_to_vehicles(vid, rsu_idx, ts);
                     }
                 }
             } else {
