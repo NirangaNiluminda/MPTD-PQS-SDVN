@@ -1632,6 +1632,63 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 CallSCControllerSubmitEvidence(
                                     vid_i, controllerID, ctrl_epoch,
                                     (double)fs.phi, h_X, sigma_c_sub_hex);
+
+                                // ── Schedule Eq 3.59 CP-DETECT (TASK ①-M) ────────
+                                // CPDetectCheck reads BOTH the just-written
+                                // CSUBM_<vid>_<epoch> AND the per-RSU SUBM_*
+                                // records for the same epoch, then XORs each
+                                // RSU's anomaly verdict against the controller's
+                                // — if ≥ f+1 RSUs disagree, the controller is
+                                // flagged (CFLAG_ record + "CPDetectFlag" event).
+                                //
+                                // Why 0.5 s delay:
+                                //   - CSUBM and SUBM are both written via the
+                                //     fire-and-forget async path; we need their
+                                //     orderer round-trips to complete before
+                                //     CPDetectCheck reads them. 0.5 s is well
+                                //     above the typical ~50-200 ms commit time.
+                                //   - This sits BEFORE the SCTrustFinalizeEpoch
+                                //     +1.0 s schedule (TASK ①-K) because
+                                //     CPDetectCheck is independent of the τ_i(t)
+                                //     EMA update — it just needs raw SUBM/CSUBM.
+                                //
+                                // File-scope dedup g_cpdetect_scheduled:
+                                //   In a 4-RSU sim, the same vehicle is fused
+                                //   by every RSU that hears its beacons; without
+                                //   dedup, CP-DETECT would fire 4× per (vid,
+                                //   epoch). The chaincode side is idempotent on
+                                //   CFLAG_<ctrlID>_<vid>_<epoch> so duplicates
+                                //   are harmless to consistency, but each spawns
+                                //   an orderer round-trip — keep it to one call.
+                                //   Set is process-local; cleared on next run.
+                                //
+                                // KNOWN GAP (TASK ①-M-followup): when ALL RSUs
+                                // see the same vehicle as CLEAN (rsu_lw.anomalous
+                                // false → no SUBM written per TASK ①-I gating),
+                                // CPDetectCheck on chain returns nil because
+                                // len(seenRSU)==0, so a malicious controller
+                                // that hallucinates an anomaly on clean traffic
+                                // is currently undetected. Two fix paths:
+                                //  (a) RSU submits SUBM per beacon regardless of
+                                //      anomaly (paper-strict but high volume), or
+                                //  (b) chaincode treats len(seenRSU)==0 as
+                                //      unanimous "no anomaly" and counts it as
+                                //      cfg.NumRSUs implicit conflicts when the
+                                //      controller said anomaly. Deferred — both
+                                //      paths need separate eval impact analysis.
+                                static std::unordered_set<std::string> g_cpdetect_scheduled;
+                                static std::mutex                       g_cpdetect_mu;
+                                std::string cp_key =
+                                    std::to_string(vid_i) + "|" + ctrl_epoch;
+                                bool cp_first;
+                                {
+                                    std::lock_guard<std::mutex> lk(g_cpdetect_mu);
+                                    cp_first = g_cpdetect_scheduled.insert(cp_key).second;
+                                }
+                                if (cp_first) {
+                                    Simulator::Schedule(Seconds(0.5),
+                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch);
+                                }
                             }
                         }
                     }

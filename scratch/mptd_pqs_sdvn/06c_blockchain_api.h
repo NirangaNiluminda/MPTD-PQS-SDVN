@@ -468,6 +468,26 @@ inline std::string CallCPDetectCheck(
     return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args);
 }
 
+// ── CallCPDetectCheckAsync — fire-and-forget variant ─────────────────────────
+// Same chaincode function as CallCPDetectCheck but discards the returned
+// ControllerFlag payload. Used when CP-DETECT is scheduled from inside a sim
+// simulation tick (NS-3 Simulator::Schedule) — blocking on the orderer
+// round-trip would stall the simulation, and the side-effect we actually
+// depend on (CFLAG_ record + "CPDetectFlag" event) is committed regardless
+// of whether anyone reads the return value. The chaincode side is idempotent
+// over (vehicleID, epoch) — re-firing just overwrites CFLAG with identical
+// content. Designed to be bindable directly to Simulator::Schedule via
+// ns3::MakeBoundCallback.
+inline void CallCPDetectCheckAsync(
+    uint32_t vehicleID, std::string epoch)
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    std::vector<std::string> args = {
+        std::to_string(vehicleID), epoch
+    };
+    mptd_fabric_invoke_async("CPDetectCheck", args);
+}
+
 // ── CallSCRevokeVote — Eq 3.58 BFT 2f+1 RSU vote ─────────────────────────────
 // One call per RSU that wishes to vote for revoking `vehicleID`. The
 // chaincode commits the immutable SCREVOKE_ record + emits "SCRevoke" event
