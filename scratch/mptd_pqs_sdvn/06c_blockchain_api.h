@@ -50,9 +50,20 @@
 #include <iomanip>
 #include <cstdint>
 #include <cstdlib>     // getenv — IPFS endpoint override
+#include <cstring>     // memcpy for sockaddr_un.sun_path (Phase 1B socket client)
+#include <cstdio>      // snprintf for \uXXXX JSON escape
 #include <mutex>       // once-flag for libcurl global init + warn-once
 #include <atomic>      // ipfs_disabled latch
 #include <curl/curl.h> // TASK ①-E: kubo HTTP API client for h(b_i(t)) CID
+
+// Phase 1B (TASK ①-O): NS-3 → Fabric Gateway daemon over AF_UNIX. Replaces the
+// per-call fork+exec of `fabric_invoke.sh` with a single-line JSON write to a
+// long-lived Go daemon that holds a persistent gRPC Gateway connection to the
+// peer. Falls back to the legacy shell shim when the socket is absent so the
+// simulation stays runnable on machines where the daemon hasn't been started.
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <unistd.h>
 
 // R7g.3 / R8.5: Single guard macro for every chaincode helper. When
 // `skip_blockchain` is set (training-sweep mode), the fabric_invoke call is
@@ -106,14 +117,269 @@ static inline std::string mptd_build_fabric_cmd(
     return cmd;
 }
 
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  Fabric Gateway daemon socket transport (TASK ①-O, Phase 1B)             ║
+// ║                                                                          ║
+// ║  Replaces the per-call `system("fabric_invoke.sh …")` round-trip with a  ║
+// ║  one-line JSON exchange over /tmp/mptd_fabric.sock. Wire protocol:       ║
+// ║                                                                          ║
+// ║    REQ  → {"action":"invoke|query","function":"Fn","args":["a","b"],     ║
+// ║            "fire_and_forget":true}\n                                     ║
+// ║    RESP ← {"ok":true,"payload":"…"}\n   or  {"ok":false,"error":"…"}\n   ║
+// ║                                                                          ║
+// ║  When `fire_and_forget` is set on an invoke, the daemon ACKs immediately ║
+// ║  and submits in a detached goroutine — used by the RSU beacon path so    ║
+// ║  Fabric commit latency doesn't blow the paper's T_b = 100 ms budget      ║
+// ║  (Invariant 3).                                                          ║
+// ║                                                                          ║
+// ║  Transport selection (env `MPTD_FABRIC_TRANSPORT`):                      ║
+// ║    auto   (default) → try socket; fall back to shell on any failure.     ║
+// ║    socket           → socket only (no fallback; surfaces daemon issues). ║
+// ║    shell            → legacy shell shim only (the pre-Phase-1B path).    ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+enum class MptdFabricTransport { Auto, Socket, Shell };
+
+static inline MptdFabricTransport mptd_fabric_transport_mode() {
+    static MptdFabricTransport m = []() {
+        const char* e = std::getenv("MPTD_FABRIC_TRANSPORT");
+        if (!e || !*e) return MptdFabricTransport::Auto;
+        std::string s(e);
+        if (s == "socket") return MptdFabricTransport::Socket;
+        if (s == "shell")  return MptdFabricTransport::Shell;
+        return MptdFabricTransport::Auto;
+    }();
+    return m;
+}
+
+// Daemon socket path — overridable via env (must match FABRIC_GW_SOCKET in the
+// daemon). Cached after first lookup.
+static inline const std::string& mptd_fabric_socket_path() {
+    static std::string sp = []() {
+        const char* e = std::getenv("FABRIC_GW_SOCKET");
+        if (e && *e) return std::string(e);
+        return std::string("/tmp/mptd_fabric.sock");
+    }();
+    return sp;
+}
+
+// Minimal JSON-string escape sufficient for chaincode args (printable ASCII
+// plus hex blobs, vehicle IDs, etc). Handles the seven mandatory escapes plus
+// control-char \uXXXX fallback. NOT full RFC 8259 — we never emit UTF-8 high
+// codepoints because every arg the chaincode receives is ASCII.
+static inline std::string mptd_jesc(const std::string& s) {
+    std::string out;
+    out.reserve(s.size() + 8);
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\u%04x",
+                                  static_cast<unsigned int>(c));
+                    out += buf;
+                } else {
+                    out.push_back(static_cast<char>(c));
+                }
+        }
+    }
+    return out;
+}
+
+// Build the wire-protocol line (JSON object + trailing '\n').
+static inline std::string mptd_build_socket_request(
+    const std::string& action,
+    const std::string& fn,
+    const std::vector<std::string>& args,
+    bool fire_and_forget)
+{
+    std::string out;
+    out.reserve(64 + fn.size() + args.size() * 32);
+    out += "{\"action\":\"";
+    out += action;
+    out += "\",\"function\":\"";
+    out += mptd_jesc(fn);
+    out += "\",\"args\":[";
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (i) out += ',';
+        out += '"';
+        out += mptd_jesc(args[i]);
+        out += '"';
+    }
+    out += ']';
+    if (fire_and_forget) out += ",\"fire_and_forget\":true";
+    out += "}\n";
+    return out;
+}
+
+// Decode the daemon's "payload" field, unescaping the JSON-string body so the
+// chaincode bytes (often themselves JSON: {"flagged":true,...}) round-trip
+// unchanged. Returns false if the field is missing or unterminated.
+static inline bool mptd_decode_payload_field(const std::string& resp,
+                                             const char*        key,
+                                             std::string&       out)
+{
+    out.clear();
+    std::string needle = std::string("\"") + key + "\":\"";
+    size_t p = resp.find(needle);
+    if (p == std::string::npos) return false;
+    p += needle.size();
+    while (p < resp.size()) {
+        char c = resp[p++];
+        if (c == '"') return true;
+        if (c == '\\' && p < resp.size()) {
+            char esc = resp[p++];
+            switch (esc) {
+                case '"':  out.push_back('"');  break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/');  break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                case 'u': {
+                    if (p + 4 > resp.size()) return false;
+                    unsigned int cp = 0;
+                    for (int i = 0; i < 4; ++i) {
+                        char h = resp[p++];
+                        cp <<= 4;
+                        if      (h >= '0' && h <= '9') cp |=  (h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |=  (h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |=  (h - 'A' + 10);
+                        else return false;
+                    }
+                    if (cp < 0x80) out.push_back(static_cast<char>(cp));
+                    // Higher codepoints: silently drop — chaincode emits ASCII only.
+                    break;
+                }
+                default: out.push_back(esc); break;
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return false; // unterminated string
+}
+
+// Round-trip one request over the daemon socket. Returns true on a successful
+// {"ok":true,...} response (payload unescaped into payload_out); false on any
+// I/O / parse failure OR a daemon-side error response. Caller decides whether
+// to fall back to the shell shim.
+//
+// `fire_and_forget` semantics: daemon writes the ACK before queuing the submit,
+// so on success the chaincode commit is only guaranteed to *start*, not to
+// complete by the time this returns. Use sync (false) when the caller needs
+// the return payload.
+static inline bool mptd_fabric_call_socket(
+    const std::string& action,
+    const std::string& fn,
+    const std::vector<std::string>& args,
+    bool fire_and_forget,
+    std::string& payload_out)
+{
+    payload_out.clear();
+
+    int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+
+    struct sockaddr_un addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    const std::string& sp = mptd_fabric_socket_path();
+    if (sp.size() + 1 > sizeof(addr.sun_path)) {
+        ::close(fd);
+        return false;
+    }
+    std::memcpy(addr.sun_path, sp.data(), sp.size());
+
+    if (::connect(fd, reinterpret_cast<struct sockaddr*>(&addr),
+                  sizeof(addr)) < 0) {
+        // ENOENT (daemon not running) is the common case — let auto mode fall
+        // back to shell silently. Other errnos hit the same path; they're rare
+        // enough to live with one shell-shim invocation on the first miss.
+        ::close(fd);
+        return false;
+    }
+
+    // 30 s budget covers worst-case Fabric commit (~1–2 s in practice) plus
+    // headroom for endorsement retries. Matches the daemon's per-conn deadline.
+    struct timeval tv;
+    tv.tv_sec  = 30;
+    tv.tv_usec = 0;
+    ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    // Send the request line
+    std::string req = mptd_build_socket_request(action, fn, args,
+                                                fire_and_forget);
+    const char* buf       = req.data();
+    size_t      remaining = req.size();
+    while (remaining > 0) {
+        ssize_t n = ::send(fd, buf, remaining, MSG_NOSIGNAL);
+        if (n <= 0) { ::close(fd); return false; }
+        buf       += n;
+        remaining -= static_cast<size_t>(n);
+    }
+    // Half-close the write side so the daemon's bufio.Reader can flush the
+    // final byte even if it sized its read at exactly the request length.
+    ::shutdown(fd, SHUT_WR);
+
+    // Read response until newline or peer close
+    std::string resp;
+    resp.reserve(256);
+    char rbuf[2048];
+    while (true) {
+        ssize_t n = ::recv(fd, rbuf, sizeof(rbuf), 0);
+        if (n < 0) { ::close(fd); return false; }
+        if (n == 0) break;
+        resp.append(rbuf, static_cast<size_t>(n));
+        if (!resp.empty() && resp.back() == '\n') break;
+    }
+    ::close(fd);
+
+    if (resp.find("\"ok\":true") == std::string::npos) {
+        // Surface daemon-side error for visibility — but still return false so
+        // auto-mode can fall back to shell on transient daemon hiccups.
+        std::string err;
+        if (mptd_decode_payload_field(resp, "error", err)) {
+            std::cerr << "[fabric-gw] " << fn << " err: " << err << '\n';
+        }
+        return false;
+    }
+    // Payload is optional (FNF and many invokes return empty)
+    mptd_decode_payload_field(resp, "payload", payload_out);
+    return true;
+}
+
 // ── Async fabric_invoke (fire-and-forget, returns immediately) ────────────────
 // Used for hot-path RSU writes where the simulation cannot block on the
 // orderer round-trip (paper Invariant 3: the lightweight beacon path must
-// stay under T_b = 100 ms). The chaincode call is detached via `&`; stdout
-// and stderr are redirected to /dev/null so the popen pipe doesn't block.
+// stay under T_b = 100 ms). With the Phase-1B daemon up (auto/socket mode)
+// this is a ~50 ms socket round-trip; with the legacy shell shim it forks
+// a peer-CLI subprocess and detaches via `&`.
 static inline void mptd_fabric_invoke_async(
     const std::string& fn, const std::vector<std::string>& args)
 {
+    if (mptd_fabric_transport_mode() != MptdFabricTransport::Shell) {
+        std::string ignored;
+        if (mptd_fabric_call_socket("invoke", fn, args,
+                                    /*fire_and_forget=*/true, ignored)) {
+            return; // daemon ACKed; submit runs in its goroutine
+        }
+        if (mptd_fabric_transport_mode() == MptdFabricTransport::Socket) {
+            // socket-only mode: do NOT fall back; the operator wants visibility
+            // into daemon failures, so swallow rather than mask with the shim.
+            return;
+        }
+    }
     std::string cmd = mptd_build_fabric_cmd("invoke", fn, args);
     cmd += " > /dev/null 2>&1 &";
     int rc = system(cmd.c_str());
@@ -130,6 +396,16 @@ static inline std::string mptd_fabric_invoke_sync(
     const std::string& fn,
     const std::vector<std::string>& args)
 {
+    if (mptd_fabric_transport_mode() != MptdFabricTransport::Shell) {
+        std::string payload;
+        if (mptd_fabric_call_socket(action, fn, args,
+                                    /*fire_and_forget=*/false, payload)) {
+            return payload;
+        }
+        if (mptd_fabric_transport_mode() == MptdFabricTransport::Socket) {
+            return std::string(); // socket-only mode: surface the failure
+        }
+    }
     std::string cmd = mptd_build_fabric_cmd(action, fn, args);
     cmd += " 2>/dev/null";
     return execCmd(cmd);
