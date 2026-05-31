@@ -351,10 +351,29 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 		// reflects the 5ms stagger and tdiff > 0 in the MP-S4 transit-impossibility
 		// check (d/tdiff > s_max).  Using Now() here (same as the real vehicle's
 		// beacon) would give tdiff=0 → guard fails → MP-S4 never fires on stolen beacon.
-		fake_tag.SetTimestamp(Simulator::Now().GetSeconds() + 0.005 * (stolen_count + 1));
+		double fake_ts = Simulator::Now().GetSeconds() + 0.005 * (stolen_count + 1);
+		fake_tag.SetTimestamp(fake_ts);
 		fake_tag.SetIsPoisoned(true);               // impersonation beacon = poisoned
 		fake_tag.SetAttackType(4);
 		fake_tag.SetSigViolated(0);
+
+		// ── §3.4.2 stolen-identity threat: attacker possesses K_victim (Eq.3.37) ──
+		// Paper §3.4.2 explicitly enumerates "stolen or learned identities" as the
+		// MP-S2 capability — so the attacker can compute a valid HMAC over the
+		// stolen ID using the victim's session key K_victim. Without this, the
+		// beacon is trivially rejected at the RSU HMAC gate (Eq.3.37) and never
+		// reaches the behavioral SYB-DETECT / MP-S4 ghost-transit check (Eq.3.19),
+		// which violates paper §3.5.1 "cryptography alone cannot mitigate". We
+		// stamp using the victim's v_idx so the RSU recomputes the same MAC →
+		// beacon passes HMAC gate → MP-S4 catches it via impossible displacement.
+		int victim_v_idx = lkh_veh_idx(other_nid);
+		if (victim_v_idx >= 0 && victim_v_idx < LKH_MAX_VEH) {
+			uint8_t fake_mac[LKH_HMAC_TRUNC];
+			lkh_compute_beacon_hmac(victim_v_idx,
+			                        tx_px, tx_py, tx_spd, tx_hdg, tx_acc,
+			                        fake_ts, other_nid, fake_mac);
+			fake_tag.SetHmac(fake_mac);
+		}
 
 		Ptr<Packet> fake_pkt = Create<Packet>(0);
 		fake_pkt->AddPacketTag(fake_tag);
