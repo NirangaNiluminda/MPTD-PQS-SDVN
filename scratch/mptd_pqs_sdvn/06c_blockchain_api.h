@@ -63,6 +63,8 @@
 // simulation stays runnable on machines where the daemon hasn't been started.
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/stat.h>  // fstat (Phase 1C-b event drainer)
+#include <fcntl.h>     // open + O_RDONLY (Phase 1C-b event drainer)
 #include <unistd.h>
 
 // R7g.3 / R8.5: Single guard macro for every chaincode helper. When
@@ -356,6 +358,171 @@ static inline bool mptd_fabric_call_socket(
     }
     // Payload is optional (FNF and many invokes return empty)
     mptd_decode_payload_field(resp, "payload", payload_out);
+    return true;
+}
+
+// ╔══════════════════════════════════════════════════════════════════════════╗
+// ║  Fabric chaincode-event drainer (TASK ①-P, Phase 1C-b)                   ║
+// ║                                                                          ║
+// ║  The daemon (Phase 1C-a) tails the gateway's ChaincodeEvents stream into ║
+// ║  /tmp/mptd_fabric_events.jsonl (one JSON line per event). This reader    ║
+// ║  drains *new* lines since the last call and returns them as structured   ║
+// ║  events the RSU code can dispatch on. Stateful: keeps the file FD + last ║
+// ║  read offset across calls, so on each invocation we only re-read deltas. ║
+// ║                                                                          ║
+// ║  Used by the cross-RSU LKH rekey path in 08_detection_engine.h to close  ║
+// ║  the Eq 3.58 known gap (only the voting RSU rekeyed today; remote RSUs   ║
+// ║  miss the revocation without the event channel).                         ║
+// ╚══════════════════════════════════════════════════════════════════════════╝
+
+struct MptdFabricEvent {
+    std::string name;       // "SCRevoke" | "TrustLow" | "CPDetectFlag"
+    std::string tx;         // chaincode tx id (truncatable hex)
+    uint64_t    blk = 0;    // commit block number
+    std::string payload;    // raw chaincode-emitted JSON payload
+    uint32_t    vehicle_id = 0;   // parsed from payload "vehicleID":"<N>" (0 if absent)
+};
+
+// Events path — overridable; must match FABRIC_GW_EVENTS_PATH on the daemon.
+static inline const std::string& mptd_fabric_events_path() {
+    static std::string ep = []() {
+        const char* e = std::getenv("FABRIC_GW_EVENTS_PATH");
+        if (e && *e) return std::string(e);
+        return std::string("/tmp/mptd_fabric_events.jsonl");
+    }();
+    return ep;
+}
+
+// Pull one JSON-string field from a single response/event line. Walks escapes
+// so the value comes out unescaped (same convention as mptd_decode_payload_field
+// above, but operating on a single line instead of the wire response wrapper).
+static inline bool mptd_jsonl_field(const std::string& line,
+                                    const std::string& key,
+                                    std::string&       out)
+{
+    out.clear();
+    std::string needle = "\"" + key + "\":\"";
+    size_t p = line.find(needle);
+    if (p == std::string::npos) return false;
+    p += needle.size();
+    while (p < line.size()) {
+        char c = line[p++];
+        if (c == '"') return true;
+        if (c == '\\' && p < line.size()) {
+            char esc = line[p++];
+            switch (esc) {
+                case '"':  out.push_back('"');  break;
+                case '\\': out.push_back('\\'); break;
+                case '/':  out.push_back('/');  break;
+                case 'b':  out.push_back('\b'); break;
+                case 'f':  out.push_back('\f'); break;
+                case 'n':  out.push_back('\n'); break;
+                case 'r':  out.push_back('\r'); break;
+                case 't':  out.push_back('\t'); break;
+                default:   out.push_back(esc); break;
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return false;
+}
+
+// Numeric JSON field extractor — finds `"key":<number>` (no quotes, integer).
+static inline bool mptd_jsonl_uint_field(const std::string& line,
+                                         const std::string& key,
+                                         uint64_t&          out)
+{
+    std::string needle = "\"" + key + "\":";
+    size_t p = line.find(needle);
+    if (p == std::string::npos) return false;
+    p += needle.size();
+    // skip leading whitespace (defensive — the daemon emits compact JSON)
+    while (p < line.size() && (line[p] == ' ' || line[p] == '\t')) ++p;
+    uint64_t v = 0;
+    bool any = false;
+    while (p < line.size() && line[p] >= '0' && line[p] <= '9') {
+        v = v * 10 + static_cast<uint64_t>(line[p] - '0');
+        ++p;
+        any = true;
+    }
+    if (!any) return false;
+    out = v;
+    return true;
+}
+
+// Drain any new events from the JSONL file. Returns true on a clean read
+// (even if zero events were appended); false on I/O error (file missing,
+// permission, etc — caller should log and continue).
+//
+// Idempotent and cheap when the file hasn't grown: lseek+empty-read costs
+// microseconds, safe to call from a 1 Hz Simulator schedule.
+static inline bool mptd_fabric_drain_events(std::vector<MptdFabricEvent>& out)
+{
+    static int      ev_fd = -1;
+    static off_t    ev_off = 0;
+    static std::string carry; // partial line tail across reads
+
+    if (ev_fd < 0) {
+        ev_fd = ::open(mptd_fabric_events_path().c_str(), O_RDONLY);
+        if (ev_fd < 0) {
+            // Not an error — daemon may not be up yet. Caller retries next tick.
+            return false;
+        }
+        ev_off = 0;
+    }
+
+    // Seek to where we left off, in case some other process truncated the file
+    // between calls. If the file is shorter than our offset, the daemon was
+    // restarted (truncate-on-startup) — reset and re-read from the top.
+    struct stat st;
+    if (::fstat(ev_fd, &st) == 0 && static_cast<off_t>(st.st_size) < ev_off) {
+        ev_off = 0;
+        carry.clear();
+    }
+    if (::lseek(ev_fd, ev_off, SEEK_SET) < 0) return false;
+
+    char buf[4096];
+    std::string chunk;
+    while (true) {
+        ssize_t n = ::read(ev_fd, buf, sizeof(buf));
+        if (n < 0)  return false;
+        if (n == 0) break; // EOF
+        chunk.append(buf, static_cast<size_t>(n));
+        ev_off += n;
+    }
+    if (chunk.empty()) return true; // no new bytes
+
+    std::string all = carry + chunk;
+    carry.clear();
+
+    size_t start = 0;
+    while (true) {
+        size_t nl = all.find('\n', start);
+        if (nl == std::string::npos) {
+            // Save the trailing partial line for the next call.
+            carry.assign(all, start, all.size() - start);
+            break;
+        }
+        std::string line = all.substr(start, nl - start);
+        start = nl + 1;
+        if (line.empty()) continue;
+
+        MptdFabricEvent ev;
+        mptd_jsonl_field(line, "name",    ev.name);
+        mptd_jsonl_field(line, "tx",      ev.tx);
+        mptd_jsonl_field(line, "payload", ev.payload);
+        uint64_t blk = 0;
+        if (mptd_jsonl_uint_field(line, "blk", blk)) ev.blk = blk;
+        // Best-effort vehicleID extraction from the payload (chaincode wraps
+        // it as "vehicleID":"<N>" for SCRevoke / TrustLow / CPDetectFlag).
+        std::string vidStr;
+        if (mptd_jsonl_field(ev.payload, "vehicleID", vidStr) && !vidStr.empty()) {
+            try { ev.vehicle_id = static_cast<uint32_t>(std::stoul(vidStr)); }
+            catch (...) { ev.vehicle_id = 0; }
+        }
+        out.push_back(std::move(ev));
+    }
     return true;
 }
 

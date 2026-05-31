@@ -173,6 +173,117 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
 }
 
 // ============================================================
+// Cross-RSU SCRevoke broadcaster (TASK ①-P, Phase 1C-b)
+//
+// Paper: §3.5.5 Eq 3.58 SC-Revoke + §3.5.2 Eq 3.34 LKH rekey.
+//
+// The voting RSU rekeys inline as soon as SCRevokeVote returns revoked=true
+// (CallSCRevokeVote handler in this file). The OTHER 3 RSUs need to learn
+// about the revocation through the chaincode's emitted "SCRevoke" event,
+// which the gateway daemon (Phase 1C-a) tails into a JSONL file. This
+// drainer reads that file on a 1 Hz tick and dispatches a per-RSU rekey for
+// every remote RSU that hasn't already rekeyed this (rsu_idx, vid) pair.
+//
+// Dedup: g_lkh_rekey_seen is a (vid<<32 | rsu_idx) set. Both the inline path
+// and the event drainer insert into it before calling send_lkh_rekey_to_vehicles
+// — so the voting RSU never double-rekeys when it sees its own event back.
+// ============================================================
+
+static std::unordered_set<uint64_t> g_lkh_rekey_seen;
+
+static inline uint64_t mptd_lkh_dedup_key(uint32_t vid, uint32_t rsu_id) {
+    return (static_cast<uint64_t>(vid) << 32) | static_cast<uint64_t>(rsu_id);
+}
+
+// Idempotent rekey wrapper — returns true if this (vid, rsu_id) pair triggered
+// a fresh rekey, false if it was already done. Both the inline path and the
+// event drainer should go through this so dedup is enforced in one place.
+static bool send_lkh_rekey_if_new(uint32_t vid, uint32_t rsu_id, double sim_time)
+{
+    if (!g_lkh_rekey_seen.insert(mptd_lkh_dedup_key(vid, rsu_id)).second) {
+        return false;
+    }
+    send_lkh_rekey_to_vehicles(vid, rsu_id, sim_time);
+    return true;
+}
+
+// One-shot drainer: read any new chaincode events from the daemon's JSONL log
+// and dispatch SCRevoke to all 4 RSUs (dedup'd). Reschedules itself.
+//
+// Failure modes are silent-but-logged: a missing JSONL file (daemon down) is
+// fine — we just keep trying every second; the drainer is harmless when there
+// is no event activity (a stat + 0-byte read).
+static void mptd_drain_and_dispatch_fabric_events()
+{
+    std::vector<MptdFabricEvent> events;
+    if (mptd_fabric_drain_events(events)) {
+        double now = Simulator::Now().GetSeconds();
+        for (const auto& ev : events) {
+            if (ev.name != "SCRevoke") {
+                // TrustLow / CPDetectFlag are observed only — no rekey trigger.
+                // Surface them at debug volume so the operator can correlate
+                // chain events with NS-3 timeline.
+                std::cout << "[FABRIC-EVT] " << ev.name
+                          << " vid=" << ev.vehicle_id
+                          << " blk=" << ev.blk
+                          << " t=" << now << std::endl;
+                continue;
+            }
+            if (ev.vehicle_id == 0) {
+                std::cout << "[FABRIC-EVT] SCRevoke with no parseable vehicleID,"
+                          << " skipping: " << ev.payload << std::endl;
+                continue;
+            }
+            int dispatched = 0;
+            for (uint32_t rsu_id = 0; rsu_id < 4; ++rsu_id) {
+                if (send_lkh_rekey_if_new(ev.vehicle_id, rsu_id, now)) {
+                    ++dispatched;
+                }
+            }
+            std::cout << "[FABRIC-EVT] SCRevoke vid=" << ev.vehicle_id
+                      << " blk=" << ev.blk
+                      << " → " << dispatched << " new RSU rekeys "
+                      << "(remainder already rekeyed inline) t=" << now
+                      << " (paper §3.5.5 Eq 3.58 cross-RSU broadcast)"
+                      << std::endl;
+        }
+    }
+    // Re-arm at 1 Hz; cheap when the JSONL hasn't grown.
+    Simulator::Schedule(Seconds(1.0), &mptd_drain_and_dispatch_fabric_events);
+}
+
+// Arm the drainer once per simulation. Idempotent — safe to call from
+// multiple paths (we use the very first revocation as a trigger so no extra
+// startup wiring is needed). The first tick fires at +0.5 s to make sure
+// the daemon has had time to write the chaincode event before we look for it.
+//
+// MPTD_FABRIC_EVT_FORCE_ARM=1 in the environment also bootstraps the drainer
+// from CallSCInitNetworkConfig — useful for synthetic-event verification of
+// the cross-RSU broadcast path when the sim is too short to trip 2f+1 BFT
+// naturally (the canonical TASK ① 10 s run only ever scores 1 vote per
+// vehicle because RSU coverage is non-overlapping at that vehicle count).
+static void mptd_arm_event_drainer_once()
+{
+    static std::once_flag armed;
+    std::call_once(armed, []() {
+        Simulator::Schedule(Seconds(0.5),
+                            &mptd_drain_and_dispatch_fabric_events);
+        std::cout << "[FABRIC-EVT] drainer armed @1Hz starting +0.5s "
+                  << "(paper §3.5.5 cross-RSU SCRevoke broadcast)" << std::endl;
+    });
+}
+
+// Hook for the SC-Init bootstrap to force-arm the drainer when verifying the
+// cross-RSU path with a pre-seeded JSONL file. Wired from CallSCInitNetworkConfig.
+static inline void mptd_arm_event_drainer_if_env()
+{
+    const char* e = std::getenv("MPTD_FABRIC_EVT_FORCE_ARM");
+    if (e && *e && *e != '0') {
+        mptd_arm_event_drainer_once();
+    }
+}
+
+// ============================================================
 // TP-DETECT — Algorithm 1 (§3.4.4)
 // Returns bitmask of violated signatures (bit 0 = TP-S1 ... bit 4 = TP-S5)
 // ============================================================
@@ -987,6 +1098,13 @@ void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
 void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id)
 {
     double now = Simulator::Now().GetSeconds();
+
+    // Phase 1C-b — env-gated force-arm of the chaincode-event drainer.
+    // Without this, the drainer only arms after the first inline revocation
+    // (cheap & self-contained), but synthetic-event verification of the
+    // cross-RSU broadcast path (where no real BFT vote ever fires) needs an
+    // explicit bootstrap. MPTD_FABRIC_EVT_FORCE_ARM=1 turns it on.
+    mptd_arm_event_drainer_if_env();
 
     // ── Ghost packet fast-path (MP-S1 Attack 3) ──────────────────────────────────
     // Ghost vehicle IDs are >= GHOST_VID_BASE (10000), far above real vehicle IDs (2–17).
@@ -2535,7 +2653,14 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                         cout << "[LKH-REVOKE-RSU" << rsu_idx << "] V" << (vid - 2)
                              << " revoked (Eq.3.58 BFT) → group rekey (Eq.3.34)"
                              << endl;
-                        send_lkh_rekey_to_vehicles(vid, rsu_idx, ts);
+                        // Phase 1C-b: route through dedup wrapper so the event
+                        // drainer (which fires on the same SCRevoke event a
+                        // moment later) doesn't double-rekey this RSU's tree.
+                        send_lkh_rekey_if_new(vid, rsu_idx, ts);
+                        // Arm the cross-RSU drainer on first revocation activity
+                        // so remote RSUs catch the SCRevoke chaincode event and
+                        // rekey their own trees (Phase 1C-b broadcast path).
+                        mptd_arm_event_drainer_once();
                     }
                 }
             } else {

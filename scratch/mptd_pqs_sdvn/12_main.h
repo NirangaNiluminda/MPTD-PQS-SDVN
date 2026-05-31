@@ -2192,6 +2192,13 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // and BEFORE Simulator::Run() so all vehicles have valid K_i for HMAC on first beacon.
   lkh_init_all((int)N_Vehicles, (int)N_RSUs);
 
+  // ── Phase 1C-b: unconditional drainer arm when MPTD_FABRIC_EVT_FORCE_ARM=1 ──
+  // The beacon-path hook only fires if a beacon actually arrives; a synthetic-
+  // event verification run with simTime≈5 s never reaches HandleBeaconReceived.
+  // Wiring the env-gated arm here guarantees the +0.5s drainer tick regardless
+  // of attack/percentage selection. Paper §3.5.5 Eq 3.58 cross-RSU broadcast.
+  mptd_arm_event_drainer_if_env();
+
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
   Simulator::Destroy();
