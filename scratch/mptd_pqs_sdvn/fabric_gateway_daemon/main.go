@@ -79,6 +79,14 @@ type config struct {
 	gatewayPeer   string
 	channelName   string
 	chaincodeName string
+
+	// Phase 1C — chaincode-event subscription. The daemon tails Fabric events
+	// matching `eventsAllow` into `eventsPath` (append-only JSONL). NS-3 reads
+	// this file to drive cross-RSU LKH rekey on SCRevoke without each RSU
+	// needing its own gateway client (Invariant 1 preserved: the daemon is
+	// process-local, no controller relay).
+	eventsPath  string
+	eventsAllow []string
 }
 
 func envOr(k, def string) string {
@@ -91,6 +99,15 @@ func envOr(k, def string) string {
 func loadConfig() config {
 	crypto := envOr("FABRIC_GW_CRYPTO_PATH",
 		"/home/niranga/fabric-samples/test-network/organizations/peerOrganizations/org1.example.com")
+	// Allowlist is comma-separated; defaults cover every event the chaincode
+	// currently emits. Override via FABRIC_GW_EVENTS_ALLOW="SCRevoke" etc.
+	allowRaw := envOr("FABRIC_GW_EVENTS_ALLOW", "SCRevoke,TrustLow,CPDetectFlag")
+	allow := []string{}
+	for _, s := range splitCSV(allowRaw) {
+		if s != "" {
+			allow = append(allow, s)
+		}
+	}
 	return config{
 		socketPath:    envOr("FABRIC_GW_SOCKET", "/tmp/mptd_fabric.sock"),
 		mspID:         envOr("FABRIC_GW_MSP_ID", "Org1MSP"),
@@ -102,7 +119,32 @@ func loadConfig() config {
 		gatewayPeer:   envOr("FABRIC_GW_PEER", "peer0.org1.example.com"),
 		channelName:   envOr("FABRIC_GW_CHANNEL", "mychannel"),
 		chaincodeName: envOr("FABRIC_GW_CHAINCODE", "trajectory"),
+		eventsPath:    envOr("FABRIC_GW_EVENTS_PATH", "/tmp/mptd_fabric_events.jsonl"),
+		eventsAllow:   allow,
 	}
+}
+
+// splitCSV is a tiny strings.Split substitute that trims spaces — avoids
+// pulling in the strings package for one call.
+func splitCSV(s string) []string {
+	out := []string{}
+	start := 0
+	for i := 0; i <= len(s); i++ {
+		if i == len(s) || s[i] == ',' {
+			tok := s[start:i]
+			// trim ASCII spaces
+			lo, hi := 0, len(tok)
+			for lo < hi && (tok[lo] == ' ' || tok[lo] == '\t') {
+				lo++
+			}
+			for hi > lo && (tok[hi-1] == ' ' || tok[hi-1] == '\t') {
+				hi--
+			}
+			out = append(out, tok[lo:hi])
+			start = i + 1
+		}
+	}
+	return out
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -260,6 +302,124 @@ func writeErr(w *bufio.Writer, msg string) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Phase 1C — chaincode event subscriber
+//
+// Paper §3.5.5 Eq 3.58: when ≥2f+1 RSU votes commit on SCRevokeVote, the
+// chaincode emits "SCRevoke". All RSUs in the network need to learn about
+// this so they can rekey their LKH ring (Eq 3.21–3.25). Without an event
+// channel, only the *voting* RSUs see the revocation — remote RSUs keep the
+// stale key and the attacker can still talk to them. TASK1_DELIVERABLE.md
+// flags this as Known Gap #1.
+//
+// We tail the gateway's ChaincodeEvents stream into a JSONL file. NS-3 RSU
+// code polls the file on a Simulator schedule (cheap — append-only seq scan)
+// and dispatches to per-RSU LKH rekey. The file approach (vs streaming
+// socket) keeps the C++ side trivial and survives daemon restarts without
+// reconnection state — the NS-3 reader just keeps a file offset.
+//
+// Event-record wire format (one JSON line per accepted event):
+//   {"ts":"2026-05-31T10:00:00.123Z","name":"SCRevoke",
+//    "tx":"abc123…","blk":42,"payload":"{\"vehicleID\":\"5\",…}"}
+//
+// The file is truncated on daemon startup — each sim run gets a fresh log.
+// ─────────────────────────────────────────────────────────────────────────────
+
+type eventRecord struct {
+	Ts      string `json:"ts"`
+	Name    string `json:"name"`
+	Tx      string `json:"tx"`
+	Blk     uint64 `json:"blk"`
+	Payload string `json:"payload"`
+}
+
+func runEventListener(ctx context.Context, network *client.Network,
+	chaincodeName, outPath string, allow []string) {
+
+	allowSet := make(map[string]struct{}, len(allow))
+	for _, n := range allow {
+		allowSet[n] = struct{}{}
+	}
+	allowAll := len(allowSet) == 0
+
+	// Truncate-on-startup: each daemon run = fresh event log, so NS-3 readers
+	// start at offset 0 with no risk of replaying stale revocations.
+	f, err := os.OpenFile(outPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		log.Printf("[fabric-gw] events: open %s: %v (listener disabled)", outPath, err)
+		return
+	}
+	defer f.Close()
+	log.Printf("[fabric-gw] events: writing %s allow=%v", outPath, allow)
+
+	// Reconnect loop: ChaincodeEvents returns a channel that closes on stream
+	// error; we retry with bounded backoff so peer restarts during a long sim
+	// don't kill the listener permanently. No checkpointing yet — start from
+	// "now" each retry, which is correct for our LKH-rekey use case (a missed
+	// revocation is repaired when the RSU next sees a beacon from the vehicle).
+	backoff := time.Second
+	for {
+		if ctx.Err() != nil {
+			return
+		}
+		events, err := network.ChaincodeEvents(ctx, chaincodeName)
+		if err != nil {
+			log.Printf("[fabric-gw] events: subscribe %s: %v (retry in %s)",
+				chaincodeName, err, backoff)
+			select {
+			case <-time.After(backoff):
+			case <-ctx.Done():
+				return
+			}
+			if backoff < 30*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = time.Second // reset on successful subscribe
+
+		for ev := range events {
+			if !allowAll {
+				if _, ok := allowSet[ev.EventName]; !ok {
+					continue
+				}
+			}
+			rec := eventRecord{
+				Ts:      time.Now().UTC().Format(time.RFC3339Nano),
+				Name:    ev.EventName,
+				Tx:      ev.TransactionID,
+				Blk:     ev.BlockNumber,
+				Payload: string(ev.Payload),
+			}
+			line, err := json.Marshal(&rec)
+			if err != nil {
+				log.Printf("[fabric-gw] events: marshal %s: %v", ev.EventName, err)
+				continue
+			}
+			line = append(line, '\n')
+			if _, err := f.Write(line); err != nil {
+				log.Printf("[fabric-gw] events: write %s: %v", outPath, err)
+				continue
+			}
+			// fsync so NS-3 readers see the line as soon as it lands — important
+			// for the SCRevoke→rekey latency budget. The cost is a single fdatasync
+			// per event, which is fine at the few-events-per-second rate we expect.
+			_ = f.Sync()
+			log.Printf("[fabric-gw] events: %s tx=%.10s blk=%d", ev.EventName, ev.TransactionID, ev.BlockNumber)
+		}
+		// channel closed — gateway lost the stream; loop will resubscribe
+		log.Printf("[fabric-gw] events: stream closed; resubscribing in %s", backoff)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return
+		}
+		if backoff < 30*time.Second {
+			backoff *= 2
+		}
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // main — wire up, listen, accept loop
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -334,6 +494,14 @@ func main() {
 	} else {
 		log.Printf("[fabric-gw] startup smoke OK (GetNetworkConfig evaluated)")
 	}
+
+	// Phase 1C — start chaincode-event listener. Background lifetime matches
+	// the daemon's; on SIGINT/SIGTERM the deferred listener.Close + os.Exit
+	// path tears it down.
+	evCtx, evCancel := context.WithCancel(context.Background())
+	defer evCancel()
+	go runEventListener(evCtx, network, cfg.chaincodeName,
+		cfg.eventsPath, cfg.eventsAllow)
 
 	for {
 		c, err := listener.Accept()
