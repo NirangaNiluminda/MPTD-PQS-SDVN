@@ -5,8 +5,10 @@
 This document maps every equation in paper §3.5.5 (Smart-Contract layer) to its
 implementation: the NS-3 C++ caller, the Hyperledger Fabric chaincode handler,
 and the commit that introduced the wiring. All paths use **real Hyperledger
-Fabric (CCAAS chaincode `trajectory_2.0`)** — no simulated blockchain, no REST
-shim between RSU and ledger (Invariant 1 preserved).
+Fabric (CCAAS chaincode `trajectory_2.0`)** via a long-lived gRPC Gateway
+daemon (commit `315b08d`, Phase 1A) over a Unix-domain socket at
+`/tmp/mptd_fabric.sock` — no simulated blockchain, no REST shim between RSU
+and ledger, no fork-per-call subprocess overhead (Invariant 1 preserved).
 
 ---
 
@@ -69,10 +71,13 @@ emitted.
 
 ## Architectural Invariants Preserved
 
-1. **RSU → Fabric direct.** RSU submissions go straight to the peer via
-   `fabric_invoke.sh` (interim shim, to be replaced by a long-lived gRPC
-   Gateway client in the next sprint). No controller relay; no centralized
-   proxy.
+1. **RSU → Fabric direct.** RSU submissions go straight to the peer via the
+   long-lived gRPC Gateway daemon at `/tmp/mptd_fabric.sock` (commit
+   `315b08d` Phase 1A; NS-3 socket client `cb8b5aa` Phase 1B). Async
+   evidence submissions use a fire-and-forget extension (`4f315e6`) so the
+   100 ms beacon budget is preserved even when the orderer round-trip takes
+   a few hundred ms. Auto-fallback to the legacy `fabric_invoke.sh` shell
+   shim if the daemon is down. No controller relay; no centralized proxy.
 2. **Controller is a non-authoritative peer.** CSUBM is submitted as one
    peer opinion alongside the RSU SUBMs; CP-DETECT (Eq 3.59) can flag the
    controller's own submission as deceitful — and does so even when every
@@ -103,6 +108,8 @@ emitted.
 
 ## Commits Landing TASK ① (chronological)
 
+**Wave 1 — §3.5.5 equation wiring (TASK ①-E…N):**
+
 | Commit | What |
 |---|---|
 | `232d15a` | TASK ①-E: IPFS C++ client (libcurl → kubo HTTP API) |
@@ -113,20 +120,61 @@ emitted.
 | `479c3eb` | TASK ①-N: Migrate revocation to Eq 3.58 BFT 2f+1 vote |
 | `8b37eea` | TASK ①-J: Plumb real σ_j via ITrsBackend::partial_sign |
 | `f30cd1e` | Fix: count non-submitting RSUs as implicit clean votes in CPDetectCheck |
+| `ffd4105` | Docs: this supervisor deliverable map (initial cut) |
 
-All eight commits are on `master`, 8 commits ahead of `origin/master`.
-`git log --oneline -8` reproduces the table above.
+**Wave 2 — TASK ①-O / ①-P transport stack (long-lived gRPC + cross-RSU broadcast):**
+
+| Commit | What |
+|---|---|
+| `315b08d` | Phase 1A: Fabric Gateway daemon (Go, long-lived gRPC over Unix socket) |
+| `4f315e6` | Phase 1A+: FireAndForget extension on the daemon — preserves the 100 ms LW T_b budget |
+| `cb8b5aa` | TASK ①-O Phase 1B: NS-3 socket client (replaces fork-per-call `fabric_invoke.sh` shim) |
+| `f01a48d` | TASK ①-P Phase 1C-a: daemon ChaincodeEvents subscriber → JSONL log |
+| `ed9ae65` | TASK ①-P Phase 1C-b: NS-3 chaincode-event drainer + cross-RSU LKH rekey broadcast |
+
+All commits are on `master`. `git log --oneline -14` reproduces the two
+tables above (most recent first).
+
+---
+
+## Transport Stack (TASK ①-O / ①-P, Phase 1A–1C)
+
+The original wiring used `fabric_invoke.sh`, a shell shim that forked
+`peer chaincode invoke` per call (~200–400 ms wall-clock). Wave 2
+replaced it with a long-lived gRPC client and added the chaincode-event
+subscription needed to close the cross-RSU rekey gap.
+
+| Phase | What | Daemon side | NS-3 side |
+|---|---|---|---|
+| 1A  | Long-lived gRPC over Unix socket | `fabric_gateway_daemon/main.go` connects once at startup, accepts JSON-line requests on `/tmp/mptd_fabric.sock` | — |
+| 1A+ | FireAndForget for hot-path writes | Daemon ACKs immediately, submits in background goroutine | `mptd_fabric_invoke_async` flags `fire_and_forget:true` |
+| 1B  | Socket transport in NS-3 | — | `06c_blockchain_api.h` — `mptd_fabric_call_socket` replaces shell exec; auto/socket/shell mode selector |
+| 1C-a | ChaincodeEvents subscriber on daemon | `runEventListener` writes JSONL to `/tmp/mptd_fabric_events.jsonl`; truncate-on-startup; allowlist `SCRevoke,TrustLow,CPDetectFlag` | — |
+| 1C-b | NS-3 event drainer + cross-RSU broadcast | — | `08_detection_engine.h` — 1 Hz drainer reads JSONL; SCRevoke fans out to all 4 RSUs via `send_lkh_rekey_if_new` (dedup'd against the inline rekey path) |
+
+**Wire format** (one JSON line per request, one per reply):
+```
+REQ : {"action":"invoke","function":"SCTrustSubmitEvidence","args":[…],"fire_and_forget":true}
+RESP: {"ok":true,"payload":""}
+```
+
+**Verification (synthetic SCRevoke for vid=5):**
+```
+[FABRIC-EVT] drainer armed @1Hz starting +0.5s
+[FABRIC-EVT] SCRevoke vid=5 blk=999 → 4 new RSU rekeys t=0.5
+[LKH-REKEY-TX] RSU0 → V5  nonce=1
+[LKH-REKEY-TX] RSU1 → V5  nonce=2
+[LKH-REKEY-TX] RSU2 → V5  nonce=3
+[LKH-REKEY-TX] RSU3 → V5  nonce=4
+```
+
+This closes the original "Cross-RSU SCRevoke broadcast rekey" gap listed
+in the first cut of this document (`ffd4105`).
 
 ---
 
 ## Known Gaps (deferred — not blocking TASK ① delivery)
 
-- **Cross-RSU SCRevoke broadcast rekey.** Only the voting RSU rekeys its
-  LKH ring on a successful revocation; remote RSUs need a Fabric event
-  listener subscribed to the `SCRevoke` chaincode event to learn about
-  revocations they did not vote on. Blocked on the C++ Gateway gRPC
-  client (next sprint), which provides the long-lived gRPC stream the
-  event-hub subscription requires.
 - **Attack 4 (stolen-ID) HMAC-bypass refactor (TASK ①-H5).** Independent
   of §3.5.5 — needed for the 4th column of the MCC/FPR per-attacker-class
   table in §4.1.1, not for the TASK ① blockchain deliverable itself.
