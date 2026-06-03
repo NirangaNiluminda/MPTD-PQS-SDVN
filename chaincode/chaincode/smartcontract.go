@@ -1,8 +1,56 @@
+// MPTD-PQS chaincode — paper §3.5.5 distributed trust layer.
+//
+// Implements the four smart contracts from the framework's "Blockchain Trust
+// Layer" section (paper §3.5.5):
+//   • SC-Register (Algorithm 7)        — on-chain identity onboarding with
+//                                        ≥ 2f+1 RSU endorsement quorum.
+//   • SC-Trust    (Eq 3.55 / 3.56 / 3.57)
+//                                       — epoch-aggregated EMA trust score
+//                                         with T_rev consecutive-low gate.
+//   • CP-DETECT   (Algorithm 8, Eq 3.59)
+//                                       — controller / RSU disagreement
+//                                         flag at f+1 threshold.
+//   • SC-Revoke   (Eq 3.58)             — BFT 2f+1 distinct-RSU revocation
+//                                         vote → immutable revocation
+//                                         record + SCRevoke event.
+//
+// Architectural invariants honoured:
+//   1. RSU → blockchain submissions are direct (no controller relay; the
+//      controller appears as a non-authoritative peer per invariant 2).
+//   2. SC-Trust evidence and SC-Revoke votes are accepted ONLY from
+//      identities that hold a valid on-chain registration record (status
+//      = ACTIVE). This is the SC-Register gate established in Algorithm 7
+//      and referenced in §3.5.5 ("SC-Trust processes anomaly evidence
+//      exclusively for identities with a valid on-chain registration").
+//   3. Lazy SCTRUST_<id> materialisation is gone — τ_init is committed at
+//      registration time, so finalize-epoch reads a record that always
+//      exists for registered vehicles.
+//
+// Crypto choices (decided in TASK ② design-gap resolution):
+//   • Endorsement signature = EC-ECDSA on the NIST P-256 curve, ASN.1-DER
+//     encoded. Reuses each RSU's existing Fabric MSP identity key.
+//   • τ_init = 1.0 (benign vehicles start fully trusted; SC-Trust's EMA
+//     only drags scores down on detected anomalies).
+//   • Endorsement digest = SHA-256(vehicleID ‖ pkHex ‖ hKuHex). String
+//     concatenation matches the NS-3 endorsement-collection path.
+//
+// Bootstrap: paper §3.5.5 does not specify how the first 2f+1 RSUs come
+// online with no peers to endorse them. SCBootstrapRSU is the explicit
+// genesis-time path used by the simulation driver — it is intentionally
+// admin-flavoured (callers must hold an Org1MSP identity) and is exercised
+// only at sim start for the initial RSU set. Every subsequent registration
+// — RSU additions, vehicle onboarding — flows through SCRegister with
+// strict endorsement enforcement.
 package chaincode
 
 import (
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"strconv"
 	"time"
 
@@ -14,147 +62,126 @@ type SmartContract struct {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const (
+	RoleVehicle    = "VEHICLE"
+	RoleRSU        = "RSU"
+	RoleController = "CONTROLLER"
+
+	StatusActive  = "ACTIVE"
+	StatusRevoked = "REVOKED"
+
+	// τ_init at registration time. Paper §3.5.5 mentions τ_init without a
+	// numeric default; we set it to the fully-clean ceiling so SC-Trust's
+	// EMA (Eq 3.55) only ever drags benign vehicles down on real anomalies.
+	TauInit = 1.0
+)
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Data structures
 // ─────────────────────────────────────────────────────────────────────────────
 
-// TrajectoryReport – vehicle mobility report (MRTPA Attack Scenario 1)
-type TrajectoryReport struct {
-	ID         string  `json:"ID"`
-	VehicleID  string  `json:"VehicleID"`
-	RSUID      string  `json:"RSUID"`
-	PositionX  float64 `json:"PositionX"`
-	PositionY  float64 `json:"PositionY"`
-	PositionZ  float64 `json:"PositionZ"`
-	VelocityX  float64 `json:"VelocityX"`
-	VelocityY  float64 `json:"VelocityY"`
-	VelocityZ  float64 `json:"VelocityZ"`
-	AccelX     float64 `json:"AccelX"`
-	AccelY     float64 `json:"AccelY"`
-	AccelZ     float64 `json:"AccelZ"`
-	Timestamp  string  `json:"Timestamp"`
-	IsPoisoned bool    `json:"IsPoisoned"`
-	StoredAt   string  `json:"StoredAt"`
+// RegistrationRecord — Algorithm 7 SC-Register output. Stored under key
+// REG_<ID>. Status flips to "REVOKED" when SC-Revoke commits.
+type RegistrationRecord struct {
+	ID           string  `json:"ID"`
+	Role         string  `json:"Role"`         // VEHICLE | RSU | CONTROLLER
+	PkHex        string  `json:"PkHex"`        // uncompressed P-256, 0x04‖X‖Y, 130 hex chars
+	HKuHex       string  `json:"HKuHex"`       // h(K_u_i), 64 hex chars (SHA-256)
+	TauInit      float64 `json:"TauInit"`      // τ_init at registration
+	Status       string  `json:"Status"`       // ACTIVE | REVOKED
+	TReg         string  `json:"TReg"`         // caller-supplied registration timestamp
+	RegisteredAt string  `json:"RegisteredAt"` // server-side commit time (RFC3339)
 }
 
-// TrajectoryRef – on-chain record with IPFS hash + detection scores.
-// Full trajectory data (posX/Y/Z, velX/Y/Z, accX/Y/Z) lives off-chain in IPFS.
-// Detection fields (GATScore, AutoencoderScore, TrustScore, ControllerDecision)
-// are initially empty ("") and updated later by the detection pipeline.
-type TrajectoryRef struct {
-	ID                 string `json:"ID"`
-	VehicleID          string `json:"VehicleID"`
-	RSUID              string `json:"RSUID"`
-	IPFSHash           string `json:"IPFSHash"`           // CID of full data in IPFS
-	IsPoisoned         bool   `json:"IsPoisoned"`         // flag set by RSU (simulation)
-	Timestamp          string `json:"Timestamp"`
-	StoredAt           string `json:"StoredAt"`
-	// ── Detection results (filled later by GAT / Autoencoder pipeline) ──
-	GATScore           string `json:"GATScore"`           // Graph Attention Network anomaly score
-	AutoencoderScore   string `json:"AutoencoderScore"`   // Temporal Autoencoder reconstruction error
-	TrustScore         string `json:"TrustScore"`         // Combined/total trust value
-	ControllerDecision string `json:"ControllerDecision"` // e.g. "ACCEPT", "REJECT", "QUARANTINE"
+// NetworkConfig — channel-wide BFT parameters. Bootstrap via SCInitNetworkConfig.
+type NetworkConfig struct {
+	ID           string  `json:"ID"`           // always "NETCFG"
+	NumRSUs      int     `json:"NumRSUs"`      // |R_total|
+	Alpha        float64 `json:"Alpha"`        // EMA factor in Eq 3.55
+	TauThreshold float64 `json:"TauThreshold"` // τ_th — trust floor for T_rev gate
+	TRev         int     `json:"TRev"`         // T_rev consecutive-epoch gate
+	PsiAnomalyTh float64 `json:"PsiAnomalyTh"` // ψ_th — anomaly cutoff
+	UpdatedAt    string  `json:"UpdatedAt"`
 }
 
-// ControlDecision – SDVN controller routing decision
-type ControlDecision struct {
-	ID           string `json:"ID"`
-	ControllerID string `json:"ControllerID"`
-	Decision     string `json:"Decision"`
-	Timestamp    string `json:"Timestamp"`
-	BasedOnData  string `json:"BasedOnData"`
+// SCTrustScore — per-vehicle EMA trust score (Eq 3.55). Created at registration
+// with TrustScore = TauInit; updated by SCTrustFinalizeEpoch.
+type SCTrustScore struct {
+	ID                   string  `json:"ID"`
+	VehicleID            string  `json:"VehicleID"`
+	TrustScore           float64 `json:"TrustScore"`           // τ_i ∈ [0,1]; higher = more trusted
+	MeanPsi              float64 `json:"MeanPsi"`              // (1/|R|)·Σ ψ_j^{(i)}(t) from last finalised epoch
+	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R| of last finalised epoch
+	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for T_rev gate
+	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
+	UpdateCount          int     `json:"UpdateCount"`
+	UpdatedAt            string  `json:"UpdatedAt"`
 }
 
-// MaliciousFlag – flagged malicious entity
-type MaliciousFlag struct {
+// EpochSubmission — Eq 3.56 RSU evidence tuple. Key: SUBM_<vehicleID>_<epoch>_<rsuID>.
+type EpochSubmission struct {
+	ID          string  `json:"ID"`
+	VehicleID   string  `json:"VehicleID"`
+	RSUID       string  `json:"RSUID"`
+	Epoch       string  `json:"Epoch"`
+	Psi         float64 `json:"Psi"`        // ψ_j^{(i)}(t)
+	BeaconHash  string  `json:"BeaconHash"` // h(b_i(t))
+	Signature   string  `json:"Signature"`  // σ_j^sub
+	SubmittedAt string  `json:"SubmittedAt"`
+}
+
+// ControllerSubmission — Eq 3.57 controller evidence tuple. Key: CSUBM_<vehicleID>_<epoch>.
+type ControllerSubmission struct {
+	ID           string  `json:"ID"`
+	ControllerID string  `json:"ControllerID"`
+	VehicleID    string  `json:"VehicleID"`
+	Epoch        string  `json:"Epoch"`
+	Phi          float64 `json:"Phi"`        // Φ_i(t)
+	BeaconHash   string  `json:"BeaconHash"` // h(X_i(t))
+	Signature    string  `json:"Signature"`  // σ_c^sub
+	SubmittedAt  string  `json:"SubmittedAt"`
+}
+
+// RevokeVote — per-RSU vote (BFT 2f+1, Eq 3.58). Key: VOTE_<vehicleID>_<rsuID>.
+type RevokeVote struct {
 	ID        string `json:"ID"`
-	EntityID  string `json:"EntityID"`
+	VehicleID string `json:"VehicleID"`
+	RSUID     string `json:"RSUID"`
 	Reason    string `json:"Reason"`
-	FlaggedAt string `json:"FlaggedAt"`
+	Signature string `json:"Signature"`
+	VotedAt   string `json:"VotedAt"`
 }
 
-// AuthState – node authentication/reputation state (putauthStates / getauthStates)
-// Matches the original lda_attack.cc Store_timestamp() call format
-type AuthState struct {
-	ID                     string `json:"ID"`
-	CurNodeID              string `json:"CurNodeID"`
-	OthNodeID              string `json:"OthNodeID"`
-	EncryptedReputation    string `json:"EncryptedReputation"`
-	EncryptedLocation      string `json:"EncryptedLocation"`
-	Signature              string `json:"Signature"`
-	ZKPSignature           string `json:"ZKPSignature"`
-	DigitalSignature       string `json:"DigitalSignature"`
-	IsValid                string `json:"IsValid"`
-	UpdatedAt              string `json:"UpdatedAt"`
+// RevokeRecord — immutable revocation entry (Eq 3.58). Key: SCREVOKE_<vehicleID>_<timestamp>.
+type RevokeRecord struct {
+	ID        string `json:"ID"`
+	VehicleID string `json:"VehicleID"`
+	Reason    string `json:"Reason"`
+	RSUID     string `json:"RSUID"` // RSU that pushed the count over threshold
+	Timestamp string `json:"Timestamp"`
+	RevokedAt string `json:"RevokedAt"`
 }
 
-// TrustRecord – per-node LLDP trust/routing data (BWTRCB function)
-type TrustRecord struct {
-	ID           string `json:"ID"`
-	NodeID       string `json:"NodeID"`
-	MatLLDP      string `json:"MatLLDP"`
-	RepLocStr    string `json:"RepLocStr"`
-	DupCntStr    string `json:"DupCntStr"`
-	FabCntStr    string `json:"FabCntStr"`
-	RepCntStr    string `json:"RepCntStr"`
-	Neighbors    string `json:"Neighbors"`
-	Controller   string `json:"Controller"`
-	UpdatedAt    string `json:"UpdatedAt"`
+// ControllerFlag — CP-DETECT output (Eq 3.59). Key: CFLAG_<controllerID>_<vehicleID>_<epoch>.
+type ControllerFlag struct {
+	ID                 string `json:"ID"`
+	ControllerID       string `json:"ControllerID"`
+	VehicleID          string `json:"VehicleID"`
+	Epoch              string `json:"Epoch"`
+	ConflictCount      int    `json:"ConflictCount"`
+	NumRSUs            int    `json:"NumRSUs"`
+	ImplicitCleanVotes int    `json:"ImplicitCleanVotes"`
+	ThresholdFP1       int    `json:"ThresholdFP1"`
+	FlaggedAt          string `json:"FlaggedAt"`
 }
 
-// ConsortiumElection – Byzantine Controller Trust Election (BCTES function)
-type ConsortiumElection struct {
-	ID           string `json:"ID"`
-	Controller   string `json:"Controller"`
-	Consortium   string `json:"Consortium"`
-	NodeID       string `json:"NodeID"`
-	ExpNodeIDs   string `json:"ExpNodeIDs"`
-	RecNodeIDs   string `json:"RecNodeIDs"`
-	PoutCnt      string `json:"PoutCnt"`
-	UpdatedAt    string `json:"UpdatedAt"`
-}
-
-// AttackConfig – global attack-type flags set by declare_attack_states()
-// Stores which attack types are active for the current simulation run
-type AttackConfig struct {
-	ID                             string `json:"ID"`
-	AttackNumber                   string `json:"AttackNumber"`
-	LocationAttackNodes            string `json:"LocationAttackNodes"`
-	FloodingAttackNodes            string `json:"FloodingAttackNodes"`
-	FabricationAttackNodes         string `json:"FabricationAttackNodes"`
-	MIMAttackNodes                 string `json:"MIMAttackNodes"`
-	VanishingAttackNodes           string `json:"VanishingAttackNodes"`
-	FloodingAttackControllers      string `json:"FloodingAttackControllers"`
-	FabricationAttackControllers   string `json:"FabricationAttackControllers"`
-	MIMAttackControllers           string `json:"MIMAttackControllers"`
-	VanishingAttackControllers     string `json:"VanishingAttackControllers"`
-	ControllerMaliciousAssumption  string `json:"ControllerMaliciousAssumption"`
-	StoredAt                       string `json:"StoredAt"`
-}
-
-// NodeAttackState – per-node attacker assignment set by declare_attackers()
-// Records whether each node is malicious for each attack type
-type NodeAttackState struct {
-	ID                      string `json:"ID"`
-	NodeIndex               string `json:"NodeIndex"`
-	AttackPercentage        string `json:"AttackPercentage"`
-	IsLocationMalicious     string `json:"IsLocationMalicious"`
-	IsFloodingMalicious     string `json:"IsFloodingMalicious"`
-	IsFabricationMalicious  string `json:"IsFabricationMalicious"`
-	IsMIMMalicious          string `json:"IsMIMMalicious"`
-	IsVanishingMalicious    string `json:"IsVanishingMalicious"`
-	IsTrajectoryMalicious   string `json:"IsTrajectoryMalicious"`
-	StoredAt                string `json:"StoredAt"`
-}
-
-// ControllerAssignment – per-node controller/consortium mapping set by assign_controllers()
-// Records the initial assignment of each node to a controller and consortium
-type ControllerAssignment struct {
-	ID                    string `json:"ID"`
-	NodeIndex             string `json:"NodeIndex"`
-	ControllerID          string `json:"ControllerID"`
-	ConsortiumID          string `json:"ConsortiumID"`
-	IsTrajectoryPoisoner  string `json:"IsTrajectoryPoisoner"`
-	StoredAt              string `json:"StoredAt"`
+// Endorser — one element of the endorsersJSON array passed to SCRegister.
+type Endorser struct {
+	RSUID  string `json:"rsuID"`
+	SigHex string `json:"sigHex"` // ASN.1-DER ECDSA-P256 signature, hex-encoded
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -166,891 +193,11 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Trajectory functions (MRTPA Attack Scenario 1)
+// Helpers
 // ─────────────────────────────────────────────────────────────────────────────
 
-func (s *SmartContract) StoreTrajectory(ctx contractapi.TransactionContextInterface,
-	vehicleID, rsuID,
-	posX, posY, posZ,
-	velX, velY, velZ,
-	accX, accY, accZ,
-	timestamp, isPoisonedStr string) error {
-
-	pX, _ := strconv.ParseFloat(posX, 64)
-	pY, _ := strconv.ParseFloat(posY, 64)
-	pZ, _ := strconv.ParseFloat(posZ, 64)
-	vX, _ := strconv.ParseFloat(velX, 64)
-	vY, _ := strconv.ParseFloat(velY, 64)
-	vZ, _ := strconv.ParseFloat(velZ, 64)
-	aX, _ := strconv.ParseFloat(accX, 64)
-	aY, _ := strconv.ParseFloat(accY, 64)
-	aZ, _ := strconv.ParseFloat(accZ, 64)
-	isPoisoned := isPoisonedStr == "true" || isPoisonedStr == "True" || isPoisonedStr == "1"
-
-	id := fmt.Sprintf("TRAJ_%s_%s_%s", vehicleID, rsuID, timestamp)
-	report := TrajectoryReport{
-		ID: id, VehicleID: vehicleID, RSUID: rsuID,
-		PositionX: pX, PositionY: pY, PositionZ: pZ,
-		VelocityX: vX, VelocityY: vY, VelocityZ: vZ,
-		AccelX: aX, AccelY: aY, AccelZ: aZ,
-		Timestamp: timestamp, IsPoisoned: isPoisoned,
-		StoredAt: time.Now().Format(time.RFC3339),
-	}
-	reportJSON, err := json.Marshal(report)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, reportJSON)
-}
-
-func (s *SmartContract) QueryTrajectory(ctx contractapi.TransactionContextInterface, id string) (*TrajectoryReport, error) {
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read: %v", err)
-	}
-	if data == nil {
-		return nil, fmt.Errorf("trajectory %s not found", id)
-	}
-	var report TrajectoryReport
-	err = json.Unmarshal(data, &report)
-	return &report, err
-}
-
-func (s *SmartContract) GetAllTrajectories(ctx contractapi.TransactionContextInterface) ([]*TrajectoryReport, error) {
-	iter, err := ctx.GetStub().GetStateByRange("TRAJ_", "TRAJ_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*TrajectoryReport
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var r TrajectoryReport
-		if err := json.Unmarshal(qr.Value, &r); err != nil {
-			return nil, err
-		}
-		results = append(results, &r)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// TrajectoryRef functions (IPFS off-chain storage — MRTPA Attack Scenario 1)
-// ─────────────────────────────────────────────────────────────────────────────
-
-// StoreTrajectoryRef – stores IPFS hash + key fields on-chain.
-// Full trajectory data is already stored in IPFS; only the CID comes here.
-// Detection fields (GATScore etc.) are left empty — filled by UpdateTrajectoryRef later.
-func (s *SmartContract) StoreTrajectoryRef(ctx contractapi.TransactionContextInterface,
-	vehicleID, rsuID, ipfsHash, isPoisonedStr, timestamp string) error {
-
-	isPoisoned := isPoisonedStr == "true" || isPoisonedStr == "True" || isPoisonedStr == "1"
-	id := fmt.Sprintf("TRAJREF_%s_%s_%s", vehicleID, rsuID, timestamp)
-	ref := TrajectoryRef{
-		ID:                 id,
-		VehicleID:          vehicleID,
-		RSUID:              rsuID,
-		IPFSHash:           ipfsHash,
-		IsPoisoned:         isPoisoned,
-		Timestamp:          timestamp,
-		StoredAt:           time.Now().Format(time.RFC3339),
-		GATScore:           "",
-		AutoencoderScore:   "",
-		TrustScore:         "",
-		ControllerDecision: "",
-	}
-	refJSON, err := json.Marshal(ref)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, refJSON)
-}
-
-// UpdateTrajectoryRef – updates detection scores on an existing TrajectoryRef.
-// Called after GAT / Autoencoder analysis is complete.
-func (s *SmartContract) UpdateTrajectoryRef(ctx contractapi.TransactionContextInterface,
-	id, gatScore, autoencoderScore, trustScore, controllerDecision string) error {
-
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return fmt.Errorf("failed to read TrajectoryRef %s: %v", id, err)
-	}
-	if data == nil {
-		return fmt.Errorf("TrajectoryRef %s not found", id)
-	}
-	var ref TrajectoryRef
-	if err := json.Unmarshal(data, &ref); err != nil {
-		return err
-	}
-	ref.GATScore           = gatScore
-	ref.AutoencoderScore   = autoencoderScore
-	ref.TrustScore         = trustScore
-	ref.ControllerDecision = controllerDecision
-	refJSON, err := json.Marshal(ref)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, refJSON)
-}
-
-// GetAllTrajectoryRefs – returns all IPFS-backed trajectory references
-func (s *SmartContract) GetAllTrajectoryRefs(ctx contractapi.TransactionContextInterface) ([]*TrajectoryRef, error) {
-	iter, err := ctx.GetStub().GetStateByRange("TRAJREF_", "TRAJREF_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*TrajectoryRef
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var r TrajectoryRef
-		if err := json.Unmarshal(qr.Value, &r); err != nil {
-			return nil, err
-		}
-		results = append(results, &r)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Control & flag functions
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) StoreControlDecision(ctx contractapi.TransactionContextInterface,
-	controllerID, decision, timestamp, basedOnData string) error {
-
-	id := fmt.Sprintf("CTRL_%s_%s", controllerID, timestamp)
-	cd := ControlDecision{ID: id, ControllerID: controllerID,
-		Decision: decision, Timestamp: timestamp, BasedOnData: basedOnData}
-	cdJSON, err := json.Marshal(cd)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, cdJSON)
-}
-
-func (s *SmartContract) FlagMalicious(ctx contractapi.TransactionContextInterface,
-	entityID, reason string) error {
-
-	id := fmt.Sprintf("FLAG_%s_%s", entityID, time.Now().Format("20060102150405"))
-	flag := MaliciousFlag{ID: id, EntityID: entityID, Reason: reason,
-		FlaggedAt: time.Now().Format(time.RFC3339)}
-	flagJSON, err := json.Marshal(flag)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, flagJSON)
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// putauthStates / getauthStates  (original lda_attack.cc Store_timestamp calls)
-// Args: curNodeID, othNodeID, encReputation, encLocation, signature, zkp, ds, isValid
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) PutAuthStates(ctx contractapi.TransactionContextInterface,
-	curNodeID, othNodeID, encReputation, encLocation,
-	signature, zkpSignature, digitalSig, isValid string) error {
-
-	id := fmt.Sprintf("AUTH_%s_%s", curNodeID, othNodeID)
-	auth := AuthState{
-		ID:                  id,
-		CurNodeID:           curNodeID,
-		OthNodeID:           othNodeID,
-		EncryptedReputation: encReputation,
-		EncryptedLocation:   encLocation,
-		Signature:           signature,
-		ZKPSignature:        zkpSignature,
-		DigitalSignature:    digitalSig,
-		IsValid:             isValid,
-		UpdatedAt:           time.Now().Format(time.RFC3339),
-	}
-	authJSON, err := json.Marshal(auth)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, authJSON)
-}
-
-func (s *SmartContract) GetAuthStates(ctx contractapi.TransactionContextInterface,
-	controllerID, curNodeID, othNodeID, reqID string) (*AuthState, error) {
-
-	id := fmt.Sprintf("AUTH_%s_%s", curNodeID, othNodeID)
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read auth state: %v", err)
-	}
-	if data == nil {
-		// Return empty auth state if not found (don't error - NS3 handles missing)
-		return &AuthState{ID: id, CurNodeID: curNodeID, OthNodeID: othNodeID,
-			IsValid: "false", UpdatedAt: "never"}, nil
-	}
-	var auth AuthState
-	err = json.Unmarshal(data, &auth)
-	return &auth, err
-}
-
-func (s *SmartContract) GetAllAuthStates(ctx contractapi.TransactionContextInterface) ([]*AuthState, error) {
-	iter, err := ctx.GetStub().GetStateByRange("AUTH_", "AUTH_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*AuthState
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var a AuthState
-		if err := json.Unmarshal(qr.Value, &a); err != nil {
-			return nil, err
-		}
-		results = append(results, &a)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BWTRCB – Bandwidth-Trust-Routing-Consortium-Blockchain
-// Stores per-node LLDP trust matrix data
-// Args: nodeID, matLLDP, repLoc, dupCnt, fabCnt, repCnt, neighbors, neighborsAlt, controller
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) BWTRCB(ctx contractapi.TransactionContextInterface,
-	nodeID, matLLDP, repLoc, dupCnt, fabCnt, repCnt,
-	neighbors, neighborsAlt, controller string) error {
-
-	id := fmt.Sprintf("TRUST_%s", nodeID)
-	rec := TrustRecord{
-		ID:         id,
-		NodeID:     nodeID,
-		MatLLDP:    matLLDP,
-		RepLocStr:  repLoc,
-		DupCntStr:  dupCnt,
-		FabCntStr:  fabCnt,
-		RepCntStr:  repCnt,
-		Neighbors:  neighbors,
-		Controller: controller,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
-	}
-	recJSON, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	// Return a simple acknowledgement that NS3 can parse
-	ctx.GetStub().SetEvent("BWTRCB", []byte(fmt.Sprintf(`{"node":"%s","status":"ok"}`, nodeID)))
-	return ctx.GetStub().PutState(id, recJSON)
-}
-
-func (s *SmartContract) GetTrustRecord(ctx contractapi.TransactionContextInterface, nodeID string) (*TrustRecord, error) {
-	id := fmt.Sprintf("TRUST_%s", nodeID)
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read trust record: %v", err)
-	}
-	if data == nil {
-		return &TrustRecord{ID: id, NodeID: nodeID, UpdatedAt: "never"}, nil
-	}
-	var rec TrustRecord
-	err = json.Unmarshal(data, &rec)
-	return &rec, err
-}
-
-func (s *SmartContract) GetAllTrustRecords(ctx contractapi.TransactionContextInterface) ([]*TrustRecord, error) {
-	iter, err := ctx.GetStub().GetStateByRange("TRUST_", "TRUST_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*TrustRecord
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var r TrustRecord
-		if err := json.Unmarshal(qr.Value, &r); err != nil {
-			return nil, err
-		}
-		results = append(results, &r)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// BCTES – Byzantine Controller Trust Election System
-// Args: controller, consortium, nodeID, expNodeIDs, recNodeIDs, poutCnt
-// Returns a result string that NS3 parses for controller changes
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) BCTES(ctx contractapi.TransactionContextInterface,
-	controller, consortium, nodeID,
-	expNodeIDs, recNodeIDs, poutCnt string) (string, error) {
-
-	id := fmt.Sprintf("ELECT_%s_%s_%s", consortium, controller, nodeID)
-	election := ConsortiumElection{
-		ID:         id,
-		Controller: controller,
-		Consortium: consortium,
-		NodeID:     nodeID,
-		ExpNodeIDs: expNodeIDs,
-		RecNodeIDs: recNodeIDs,
-		PoutCnt:    poutCnt,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
-	}
-	electionJSON, err := json.Marshal(election)
-	if err != nil {
-		return "", err
-	}
-	if err := ctx.GetStub().PutState(id, electionJSON); err != nil {
-		return "", err
-	}
-
-	// Return response in the format NS3 BCTES function expects:
-	// "Controller changed for consortium X as: CY" or just acknowledge
-	result := fmt.Sprintf(`{"result":"Controller maintained for consortium %s as: %s","node":"%s","status":"ok"}`,
-		consortium, controller, nodeID)
-	return result, nil
-}
-
-func (s *SmartContract) GetAllElections(ctx contractapi.TransactionContextInterface) ([]*ConsortiumElection, error) {
-	iter, err := ctx.GetStub().GetStateByRange("ELECT_", "ELECT_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*ConsortiumElection
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var e ConsortiumElection
-		if err := json.Unmarshal(qr.Value, &e); err != nil {
-			return nil, err
-		}
-		results = append(results, &e)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// StoreAttackConfig – stores global attack flags from declare_attack_states()
-// Args: attackNumber, locNodes, floodNodes, fabNodes, mimNodes, vanNodes,
-//       floodCtrl, fabCtrl, mimCtrl, vanCtrl, ctrlMalAssumption
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) StoreAttackConfig(ctx contractapi.TransactionContextInterface,
-	attackNumber,
-	locNodes, floodNodes, fabNodes, mimNodes, vanNodes,
-	floodCtrl, fabCtrl, mimCtrl, vanCtrl,
-	ctrlMalAssumption string) error {
-
-	id := fmt.Sprintf("ATKCFG_%s", attackNumber)
-	cfg := AttackConfig{
-		ID:                            id,
-		AttackNumber:                  attackNumber,
-		LocationAttackNodes:           locNodes,
-		FloodingAttackNodes:           floodNodes,
-		FabricationAttackNodes:        fabNodes,
-		MIMAttackNodes:                mimNodes,
-		VanishingAttackNodes:          vanNodes,
-		FloodingAttackControllers:     floodCtrl,
-		FabricationAttackControllers:  fabCtrl,
-		MIMAttackControllers:          mimCtrl,
-		VanishingAttackControllers:    vanCtrl,
-		ControllerMaliciousAssumption: ctrlMalAssumption,
-		StoredAt:                      time.Now().Format(time.RFC3339),
-	}
-	cfgJSON, err := json.Marshal(cfg)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, cfgJSON)
-}
-
-func (s *SmartContract) GetAttackConfig(ctx contractapi.TransactionContextInterface, attackNumber string) (*AttackConfig, error) {
-	id := fmt.Sprintf("ATKCFG_%s", attackNumber)
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read attack config: %v", err)
-	}
-	if data == nil {
-		return &AttackConfig{ID: id, AttackNumber: attackNumber, StoredAt: "never"}, nil
-	}
-	var cfg AttackConfig
-	err = json.Unmarshal(data, &cfg)
-	return &cfg, err
-}
-
-func (s *SmartContract) GetAllAttackConfigs(ctx contractapi.TransactionContextInterface) ([]*AttackConfig, error) {
-	iter, err := ctx.GetStub().GetStateByRange("ATKCFG_", "ATKCFG_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*AttackConfig
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var c AttackConfig
-		if err := json.Unmarshal(qr.Value, &c); err != nil {
-			return nil, err
-		}
-		results = append(results, &c)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// StoreNodeAttackState – stores per-node attacker role from declare_attackers()
-// Args: nodeIndex, attackPercentage, isLocMal, isFloodMal, isFabMal, isMIMMal,
-//       isVanMal, isTrajMal
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) StoreNodeAttackState(ctx contractapi.TransactionContextInterface,
-	nodeIndex, attackPercentage,
-	isLocMal, isFloodMal, isFabMal, isMIMMal, isVanMal, isTrajMal string) error {
-
-	id := fmt.Sprintf("NODEATTK_%s", nodeIndex)
-	state := NodeAttackState{
-		ID:                     id,
-		NodeIndex:              nodeIndex,
-		AttackPercentage:       attackPercentage,
-		IsLocationMalicious:    isLocMal,
-		IsFloodingMalicious:    isFloodMal,
-		IsFabricationMalicious: isFabMal,
-		IsMIMMalicious:         isMIMMal,
-		IsVanishingMalicious:   isVanMal,
-		IsTrajectoryMalicious:  isTrajMal,
-		StoredAt:               time.Now().Format(time.RFC3339),
-	}
-	stateJSON, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, stateJSON)
-}
-
-func (s *SmartContract) GetNodeAttackState(ctx contractapi.TransactionContextInterface, nodeIndex string) (*NodeAttackState, error) {
-	id := fmt.Sprintf("NODEATTK_%s", nodeIndex)
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read node attack state: %v", err)
-	}
-	if data == nil {
-		return &NodeAttackState{ID: id, NodeIndex: nodeIndex, StoredAt: "never"}, nil
-	}
-	var state NodeAttackState
-	err = json.Unmarshal(data, &state)
-	return &state, err
-}
-
-func (s *SmartContract) GetAllNodeAttackStates(ctx contractapi.TransactionContextInterface) ([]*NodeAttackState, error) {
-	iter, err := ctx.GetStub().GetStateByRange("NODEATTK_", "NODEATTK_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*NodeAttackState
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var s NodeAttackState
-		if err := json.Unmarshal(qr.Value, &s); err != nil {
-			return nil, err
-		}
-		results = append(results, &s)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// StoreControllerAssignment – stores node-to-controller mapping from assign_controllers()
-// Args: nodeIndex, controllerID, consortiumID, isTrajPoisoner
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) StoreControllerAssignment(ctx contractapi.TransactionContextInterface,
-	nodeIndex, controllerID, consortiumID, isTrajPoisoner string) error {
-
-	id := fmt.Sprintf("ASSIGN_%s", nodeIndex)
-	assignment := ControllerAssignment{
-		ID:                   id,
-		NodeIndex:            nodeIndex,
-		ControllerID:         controllerID,
-		ConsortiumID:         consortiumID,
-		IsTrajectoryPoisoner: isTrajPoisoner,
-		StoredAt:             time.Now().Format(time.RFC3339),
-	}
-	assignJSON, err := json.Marshal(assignment)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, assignJSON)
-}
-
-func (s *SmartContract) GetControllerAssignment(ctx contractapi.TransactionContextInterface, nodeIndex string) (*ControllerAssignment, error) {
-	id := fmt.Sprintf("ASSIGN_%s", nodeIndex)
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read controller assignment: %v", err)
-	}
-	if data == nil {
-		return &ControllerAssignment{ID: id, NodeIndex: nodeIndex, StoredAt: "never"}, nil
-	}
-	var a ControllerAssignment
-	err = json.Unmarshal(data, &a)
-	return &a, err
-}
-
-func (s *SmartContract) GetAllControllerAssignments(ctx contractapi.TransactionContextInterface) ([]*ControllerAssignment, error) {
-	iter, err := ctx.GetStub().GetStateByRange("ASSIGN_", "ASSIGN_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*ControllerAssignment
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var a ControllerAssignment
-		if err := json.Unmarshal(qr.Value, &a); err != nil {
-			return nil, err
-		}
-		results = append(results, &a)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SC-Trust: MPTD-PQS per-vehicle trust score (Stage 6)
-// Key prefix: SCTRUST_<vehicleID>
-// Trust update rule: τ_i(t) = α·τ_i(t-1) + (1-α)·(1-Φ),  α=0.3
-// ─────────────────────────────────────────────────────────────────────────────
-
-// SCTrustScore – per-vehicle trust score maintained by MPTD-PQS detection.
-//
-// Paper §3.5.5 / Eq 3.55:
-//   τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - (1/|R|)·Σ_{r_j∈R} ψ_j^{(i)}(t))
-// The new MeanPsi / NumRSUsLastEpoch / ConsecutiveLowEpochs / LastEpochTimestamp
-// fields are populated by SCTrustFinalizeEpoch (Eq 3.55-aligned path).
-// The legacy PhiScore / SigMask / IsAnomaly fields are kept for backward
-// compatibility with the deprecated single-RSU SCTrustUpdate entry point.
-type SCTrustScore struct {
-	ID         string  `json:"ID"`
-	VehicleID  string  `json:"VehicleID"`
-	TrustScore float64 `json:"TrustScore"` // τ_i ∈ [0,1]; higher = more trusted
-	// ── Paper Eq 3.55 fields (set by SCTrustFinalizeEpoch) ──
-	MeanPsi              float64 `json:"MeanPsi"`              // (1/|R|)·Σ ψ_j^{(i)}(t) from last epoch
-	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R| of last finalized epoch
-	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for T_rev gate
-	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`   // epoch label of last finalize
-	// ── Legacy single-RSU update fields (deprecated) ──
-	PhiScore    float64 `json:"PhiScore"`    // last Φ_i(t) fused anomaly score (legacy)
-	SigMask     string  `json:"SigMask"`     // bitmask of triggered detection rules (legacy)
-	IsAnomaly   bool    `json:"IsAnomaly"`   // last detection decision (legacy)
-	UpdateCount int     `json:"UpdateCount"` // total number of updates received (both paths)
-	UpdatedAt   string  `json:"UpdatedAt"`
-}
-
-// SCTrustUpdate – LEGACY single-RSU trust update path (deprecated).
-//
-// This entry point does NOT implement Eq 3.55 correctly because it accepts a
-// single fused Φ_i directly from the caller instead of computing the mean
-// across the witnessing RSU set R.  It is preserved only so existing
-// Stage-6 integrations keep working while the production path is migrated.
-//
-// New code MUST use the Eq 3.56 evidence-submission pipeline:
-//   SCTrustSubmitEvidence(...)   per RSU in the witnessing set
-//   SCTrustFinalizeEpoch(...)    once the epoch closes
-// Args: vehicleID, phiScore, sigMask, isAnomaly ("true"/"false"), timestamp
-func (s *SmartContract) SCTrustUpdate(ctx contractapi.TransactionContextInterface,
-	vehicleID, phiScore, sigMask, isAnomalyStr, timestamp string) error {
-
-	const alpha = 0.3 // smoothing factor (paper §3.5, legacy value)
-
-	phi, _ := strconv.ParseFloat(phiScore, 64)
-	isAnomaly := isAnomalyStr == "true" || isAnomalyStr == "1"
-
-	id := fmt.Sprintf("SCTRUST_%s", vehicleID)
-	var rec SCTrustScore
-
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return fmt.Errorf("SCTrustUpdate read failed: %v", err)
-	}
-	if data == nil {
-		rec = SCTrustScore{ID: id, VehicleID: vehicleID, TrustScore: 1.0}
-	} else {
-		if err := json.Unmarshal(data, &rec); err != nil {
-			return err
-		}
-	}
-
-	// τ_i(t) = α·τ_i(t-1) + (1-α)·(1-Φ)
-	rec.TrustScore  = alpha*rec.TrustScore + (1-alpha)*(1-phi)
-	rec.PhiScore    = phi
-	rec.SigMask     = sigMask
-	rec.IsAnomaly   = isAnomaly
-	rec.UpdateCount++
-	rec.UpdatedAt   = timestamp
-
-	recJSON, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	return ctx.GetStub().PutState(id, recJSON)
-}
-
-// GetTrustScore – read the current MPTD-PQS trust score for a vehicle.
-func (s *SmartContract) GetTrustScore(ctx contractapi.TransactionContextInterface,
-	vehicleID string) (*SCTrustScore, error) {
-
-	id := fmt.Sprintf("SCTRUST_%s", vehicleID)
-	data, err := ctx.GetStub().GetState(id)
-	if err != nil {
-		return nil, fmt.Errorf("GetTrustScore read failed: %v", err)
-	}
-	if data == nil {
-		return &SCTrustScore{ID: id, VehicleID: vehicleID,
-			TrustScore: 1.0, UpdatedAt: "never"}, nil
-	}
-	var rec SCTrustScore
-	err = json.Unmarshal(data, &rec)
-	return &rec, err
-}
-
-func (s *SmartContract) GetAllTrustScores(ctx contractapi.TransactionContextInterface) ([]*SCTrustScore, error) {
-	iter, err := ctx.GetStub().GetStateByRange("SCTRUST_", "SCTRUST_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*SCTrustScore
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var r SCTrustScore
-		if err := json.Unmarshal(qr.Value, &r); err != nil {
-			return nil, err
-		}
-		results = append(results, &r)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// SC-Revoke: immutable revocation record (Stage 6)
-// Key prefix: SCREVOKE_<vehicleID>_<timestamp>
-// A vehicle is considered revoked if ANY SCREVOKE_ record exists for it.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// RevokeRecord – immutable record written when a vehicle is revoked
-type RevokeRecord struct {
-	ID        string `json:"ID"`
-	VehicleID string `json:"VehicleID"`
-	Reason    string `json:"Reason"`    // e.g. "3_consecutive_anomalies"
-	RSUID     string `json:"RSUID"`     // RSU that triggered revocation
-	Timestamp string `json:"Timestamp"`
-	RevokedAt string `json:"RevokedAt"`
-}
-
-// SCRevoke – LEGACY single-RSU revocation path (deprecated).
-//
-// This entry point lets ONE RSU write a revocation record unilaterally and is
-// therefore NOT compatible with paper Eq 3.58 (which requires ≥ 2f+1 distinct
-// RSU votes for revocation under BFT consensus).  It is preserved only so
-// existing Stage-6 integrations keep working.
-//
-// New code MUST use SCRevokeVote(...), which (a) records the per-RSU vote
-// idempotently, (b) counts distinct voters across all stored votes, and (c)
-// commits the immutable SCREVOKE_ record + emits "SCRevoke" event only once
-// the 2f+1 threshold is reached.
-// Args: vehicleID, reason, rsuID, timestamp
-func (s *SmartContract) SCRevoke(ctx contractapi.TransactionContextInterface,
-	vehicleID, reason, rsuID, timestamp string) error {
-
-	id := fmt.Sprintf("SCREVOKE_%s_%s", vehicleID, timestamp)
-	rec := RevokeRecord{
-		ID:        id,
-		VehicleID: vehicleID,
-		Reason:    reason,
-		RSUID:     rsuID,
-		Timestamp: timestamp,
-		RevokedAt: time.Now().Format(time.RFC3339),
-	}
-	recJSON, err := json.Marshal(rec)
-	if err != nil {
-		return err
-	}
-	ctx.GetStub().SetEvent("SCRevoke",
-		[]byte(fmt.Sprintf(`{"vehicleID":"%s","reason":"%s"}`, vehicleID, reason)))
-	return ctx.GetStub().PutState(id, recJSON)
-}
-
-// IsRevoked – returns "true" or "false" string (chaincode args are strings).
-func (s *SmartContract) IsRevoked(ctx contractapi.TransactionContextInterface,
-	vehicleID string) (string, error) {
-
-	prefix := fmt.Sprintf("SCREVOKE_%s_", vehicleID)
-	iter, err := ctx.GetStub().GetStateByRange(prefix, prefix+"~")
-	if err != nil {
-		return "false", err
-	}
-	defer iter.Close()
-	if iter.HasNext() {
-		return "true", nil
-	}
-	return "false", nil
-}
-
-func (s *SmartContract) GetAllRevokeRecords(ctx contractapi.TransactionContextInterface) ([]*RevokeRecord, error) {
-	iter, err := ctx.GetStub().GetStateByRange("SCREVOKE_", "SCREVOKE_~")
-	if err != nil {
-		return nil, err
-	}
-	defer iter.Close()
-	var results []*RevokeRecord
-	for iter.HasNext() {
-		qr, err := iter.Next()
-		if err != nil {
-			return nil, err
-		}
-		var r RevokeRecord
-		if err := json.Unmarshal(qr.Value, &r); err != nil {
-			return nil, err
-		}
-		results = append(results, &r)
-	}
-	return results, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// VerifyAuthConditions – query endpoint for authentication verification
-// ─────────────────────────────────────────────────────────────────────────────
-
-func (s *SmartContract) VerifyAuthConditions(ctx contractapi.TransactionContextInterface,
-	repSta, locSta, idSta, timeExpired, hmacMatch, zkpVerified string) (string, error) {
-
-	// Simple verification logic: all conditions must be true, none expired
-	allValid := (repSta == "true" && locSta == "true" && idSta == "true" &&
-		timeExpired == "false" && hmacMatch == "true" && zkpVerified == "true")
-
-	result := fmt.Sprintf(`{"verified":%t,"repSta":"%s","locSta":"%s","idSta":"%s","timeExpired":"%s","hmacMatch":"%s","zkpVerified":"%s"}`,
-		allValid, repSta, locSta, idSta, timeExpired, hmacMatch, zkpVerified)
-	return result, nil
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// MPTD-PQS paper §3.5.5 — Distributed Trust / Revocation / Controller Audit
-//
-// This block implements the canonical paper-aligned versions of:
-//   • SC-Trust   per Eq 3.55  (mean RSU anomaly EMA + T_rev consecutive-epoch gate)
-//   • SC-Revoke  per Eq 3.58  (BFT 2f+1 distinct-RSU vote threshold)
-//   • CP-DETECT  per Eq 3.59  (f+1 RSU-vs-controller conflict gate)
-//
-// Evidence tuples follow Eq 3.56 / 3.57:
-//   E_j(t) = (ID_i, ψ_j^{(i)}(t), t, h(b_i(t)), σ_j^sub)        — RSU evidence
-//   E_c(t) = (ID_i, Φ_i(t),       t, h(X_i(t)), σ_c^sub)        — Controller evidence
-//
-// Only the hash h(b_i(t)) is stored on-chain; raw beacon payload lives in IPFS
-// (paper invariant: blockchain holds only references + scores, never raw
-// kinematics).
-//
-// Legacy SCTrustUpdate / SCRevoke from the Stage-6 prototype are kept above
-// for backward compatibility but DO NOT satisfy Eq 3.55 / Eq 3.58. New
-// ingestion paths must use this block.
-// ─────────────────────────────────────────────────────────────────────────────
-
-// NetworkConfig — system-wide BFT parameters.  Bootstrap via SCInitNetworkConfig.
-type NetworkConfig struct {
-	ID           string  `json:"ID"`           // always "NETCFG"
-	NumRSUs      int     `json:"NumRSUs"`      // |R_total| (channel-wide RSU count)
-	Alpha        float64 `json:"Alpha"`        // EMA factor in Eq 3.55
-	TauThreshold float64 `json:"TauThreshold"` // τ_th — trust floor for T_rev gate
-	TRev         int     `json:"TRev"`         // T_rev consecutive-epoch gate
-	PsiAnomalyTh float64 `json:"PsiAnomalyTh"` // ψ_th — anomaly cutoff (used by CP-DETECT)
-	UpdatedAt    string  `json:"UpdatedAt"`
-}
-
-// EpochSubmission — Eq 3.56 E_j(t) tuple from RSU r_j on vehicle i at epoch t.
-// Key: SUBM_<vehicleID>_<epoch>_<rsuID>  → at most one submission per (i,t,j).
-type EpochSubmission struct {
-	ID          string  `json:"ID"`
-	VehicleID   string  `json:"VehicleID"`
-	RSUID       string  `json:"RSUID"`
-	Epoch       string  `json:"Epoch"`
-	Psi         float64 `json:"Psi"`        // ψ_j^{(i)}(t) anomaly score
-	BeaconHash  string  `json:"BeaconHash"` // h(b_i(t)) — IPFS CID or content hash
-	Signature   string  `json:"Signature"`  // σ_j^sub
-	SubmittedAt string  `json:"SubmittedAt"`
-}
-
-// ControllerSubmission — Eq 3.57 E_c(t) tuple from controller on vehicle i.
-// Key: CSUBM_<vehicleID>_<epoch>
-type ControllerSubmission struct {
-	ID           string  `json:"ID"`
-	ControllerID string  `json:"ControllerID"`
-	VehicleID    string  `json:"VehicleID"`
-	Epoch        string  `json:"Epoch"`
-	Phi          float64 `json:"Phi"`        // Φ_i(t) controller's fused score
-	BeaconHash   string  `json:"BeaconHash"` // h(X_i(t))
-	Signature    string  `json:"Signature"`  // σ_c^sub
-	SubmittedAt  string  `json:"SubmittedAt"`
-}
-
-// RevokeVote — per-RSU vote for revoking a vehicle (BFT 2f+1, Eq 3.58).
-// Key: VOTE_<vehicleID>_<rsuID>  (one vote per RSU; idempotent on resend).
-type RevokeVote struct {
-	ID        string `json:"ID"`
-	VehicleID string `json:"VehicleID"`
-	RSUID     string `json:"RSUID"`
-	Reason    string `json:"Reason"`
-	Signature string `json:"Signature"`
-	VotedAt   string `json:"VotedAt"`
-}
-
-// ControllerFlag — CP-DETECT result (Eq 3.59) when ≥ f+1 RSUs disagree.
-// Key: CFLAG_<controllerID>_<vehicleID>_<epoch>
-//
-// ConflictCount = explicit conflicts (RSU submitted SUBM, ψ disagreed with Φ)
-//               + implicit conflicts (RSU did NOT submit SUBM but controller
-//                 said anomalous — missing SUBM means RSU saw ψ ≤ ψ_th, which
-//                 is the NS-3 RSU gating contract from TASK ①-I).
-// NumRSUs       = explicit witness count (RSUs that submitted SUBM).
-// ImplicitCleanVotes = cfg.NumRSUs - NumRSUs (RSUs the controller decision
-//                 ranges over that did not submit). Only contributes to
-//                 ConflictCount when the controller submission is anomalous
-//                 (cAnom=true); when the controller agrees the vehicle is
-//                 clean, missing SUBMs are implicit agreement, not conflict.
-type ControllerFlag struct {
-	ID                 string `json:"ID"`
-	ControllerID       string `json:"ControllerID"`
-	VehicleID          string `json:"VehicleID"`
-	Epoch              string `json:"Epoch"`
-	ConflictCount      int    `json:"ConflictCount"`
-	NumRSUs            int    `json:"NumRSUs"`
-	ImplicitCleanVotes int    `json:"ImplicitCleanVotes"`
-	ThresholdFP1       int    `json:"ThresholdFP1"` // f+1 used at evaluation time
-	FlaggedAt          string `json:"FlaggedAt"`
-}
-
-// fByzantine returns Byzantine-tolerance f given the total RSU count.
-// Hyperledger requires n ≥ 3f+1, so f = floor((n-1)/3).  Returns 0 if n < 4.
+// fByzantine returns f given the total RSU count under the Fabric n ≥ 3f+1
+// rule. Returns 0 when n < 4 so 2f+1 = 1 (degenerate single-RSU test setups).
 func fByzantine(numRSUs int) int {
 	if numRSUs < 4 {
 		return 0
@@ -1058,10 +205,355 @@ func fByzantine(numRSUs int) int {
 	return (numRSUs - 1) / 3
 }
 
-// ── NetworkConfig ────────────────────────────────────────────────────────────
+// getRegistration returns the on-chain registration record for `id`, or nil
+// if no record exists. Distinct error vs. nil is reserved for I/O failures.
+func (s *SmartContract) getRegistration(ctx contractapi.TransactionContextInterface,
+	id string) (*RegistrationRecord, error) {
+
+	data, err := ctx.GetStub().GetState("REG_" + id)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	var rec RegistrationRecord
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// requireActive asserts that `id` is registered with the given role and
+// status = ACTIVE. Returns a chaincode-side rejection error when the gate
+// fails so callers (SCTrust*, SCRevokeVote) bounce on unregistered IDs.
+func (s *SmartContract) requireActive(ctx contractapi.TransactionContextInterface,
+	id, expectedRole string) error {
+
+	rec, err := s.getRegistration(ctx, id)
+	if err != nil {
+		return fmt.Errorf("registration lookup for %s: %v", id, err)
+	}
+	if rec == nil {
+		return fmt.Errorf("rejected: %s is not registered", id)
+	}
+	if rec.Status != StatusActive {
+		return fmt.Errorf("rejected: %s status=%s (expected ACTIVE)", id, rec.Status)
+	}
+	if expectedRole != "" && rec.Role != expectedRole {
+		return fmt.Errorf("rejected: %s role=%s (expected %s)",
+			id, rec.Role, expectedRole)
+	}
+	return nil
+}
+
+// parseP256PubKey decodes an uncompressed P-256 public key from hex.
+// Expected format: 130 hex chars (1 byte 0x04 prefix + 32 bytes X + 32 bytes Y).
+func parseP256PubKey(pkHex string) (*ecdsa.PublicKey, error) {
+	raw, err := hex.DecodeString(pkHex)
+	if err != nil {
+		return nil, fmt.Errorf("pk hex decode: %v", err)
+	}
+	if len(raw) != 65 || raw[0] != 0x04 {
+		return nil, fmt.Errorf("pk must be 65-byte uncompressed P-256 (got %d bytes)", len(raw))
+	}
+	curve := elliptic.P256()
+	x := new(big.Int).SetBytes(raw[1:33])
+	y := new(big.Int).SetBytes(raw[33:65])
+	if !curve.IsOnCurve(x, y) {
+		return nil, fmt.Errorf("pk point not on P-256")
+	}
+	return &ecdsa.PublicKey{Curve: curve, X: x, Y: y}, nil
+}
+
+// verifyECDSAP256 verifies an ASN.1-DER ECDSA signature over `digest` using
+// the public key in `pkHex`. Returns true on success, false on any failure
+// (decode, parse, signature mismatch). Mirrors crypto/ecdsa.VerifyASN1.
+func verifyECDSAP256(pkHex, sigHex string, digest []byte) bool {
+	pub, err := parseP256PubKey(pkHex)
+	if err != nil {
+		return false
+	}
+	sig, err := hex.DecodeString(sigHex)
+	if err != nil {
+		return false
+	}
+	return ecdsa.VerifyASN1(pub, digest, sig)
+}
+
+// endorsementDigest returns SHA-256(vehicleID ‖ pkHex ‖ hKuHex). The string
+// concatenation is the canonical form NS-3 endorsement collectors hash, and
+// must stay byte-identical on both sides.
+func endorsementDigest(vehicleID, pkHex, hKuHex string) []byte {
+	h := sha256.New()
+	h.Write([]byte(vehicleID))
+	h.Write([]byte(pkHex))
+	h.Write([]byte(hKuHex))
+	out := h.Sum(nil)
+	return out
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Algorithm 7 — SC-Register
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SCRegister — paper Algorithm 7 verbatim.
+// Args:
+//   vehicleID   — paper ID_i; chaincode key suffix.
+//   role        — "VEHICLE" | "RSU" | "CONTROLLER".
+//   pkHex       — uncompressed P-256 pubkey (130 hex chars, "04…").
+//   hKuHex      — SHA-256(K_u_i) hex (64 chars).
+//   tReg        — caller-supplied registration timestamp.
+//   endorsersJSON — JSON array [{"rsuID":"…","sigHex":"…"}, …].
+//
+// Returns nil on commit, or a "rejected: …" error on duplicate / insufficient
+// endorsements / signature failure. Emits "Registered" event on commit so
+// RSUs / vehicles can be tracked in real time by the gateway event drainer.
+func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
+	vehicleID, role, pkHex, hKuHex, tReg, endorsersJSON string) error {
+
+	// 1. Validate role / encoding.
+	switch role {
+	case RoleVehicle, RoleRSU, RoleController:
+	default:
+		return fmt.Errorf("rejected: invalid role %q", role)
+	}
+	if _, err := parseP256PubKey(pkHex); err != nil {
+		return fmt.Errorf("rejected: invalid pk: %v", err)
+	}
+	if len(hKuHex) != 64 {
+		return fmt.Errorf("rejected: hKuHex must be 64 hex chars (got %d)", len(hKuHex))
+	}
+	if _, err := hex.DecodeString(hKuHex); err != nil {
+		return fmt.Errorf("rejected: hKuHex not hex: %v", err)
+	}
+
+	// 2. Algorithm 7 line 2-4: duplicate-identity check.
+	existing, err := s.getRegistration(ctx, vehicleID)
+	if err != nil {
+		return fmt.Errorf("registration lookup: %v", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("rejected: duplicate identity %s", vehicleID)
+	}
+
+	// 3. Parse endorsements.
+	var endorsers []Endorser
+	if err := json.Unmarshal([]byte(endorsersJSON), &endorsers); err != nil {
+		return fmt.Errorf("rejected: endorsersJSON parse: %v", err)
+	}
+
+	// 4. Algorithm 7 line 5: count distinct endorsing RSU peers whose
+	//    on-chain pk verifies sigHex against the digest. Each endorser
+	//    must be a registered ACTIVE RSU; we look up the pk on-chain so
+	//    callers cannot inject arbitrary keys.
+	digest := endorsementDigest(vehicleID, pkHex, hKuHex)
+	seen := make(map[string]bool)
+	validCount := 0
+	for _, e := range endorsers {
+		if e.RSUID == "" || e.SigHex == "" {
+			continue
+		}
+		if seen[e.RSUID] {
+			continue
+		}
+		regE, err := s.getRegistration(ctx, e.RSUID)
+		if err != nil || regE == nil {
+			continue
+		}
+		if regE.Role != RoleRSU || regE.Status != StatusActive {
+			continue
+		}
+		if !verifyECDSAP256(regE.PkHex, e.SigHex, digest) {
+			continue
+		}
+		seen[e.RSUID] = true
+		validCount++
+	}
+
+	// 5. Algorithm 7 line 6-8: 2f+1 BFT threshold (Eq 3.58 same constant).
+	cfg, err := s.GetNetworkConfig(ctx)
+	if err != nil {
+		return fmt.Errorf("NetworkConfig: %v", err)
+	}
+	threshold := 2*fByzantine(cfg.NumRSUs) + 1
+	if validCount < threshold {
+		return fmt.Errorf("rejected: insufficient endorsements (got %d valid, need %d)",
+			validCount, threshold)
+	}
+
+	// 6. Algorithm 7 line 9-11: commit registration + initial trust state.
+	rec := RegistrationRecord{
+		ID:           vehicleID,
+		Role:         role,
+		PkHex:        pkHex,
+		HKuHex:       hKuHex,
+		TauInit:      TauInit,
+		Status:       StatusActive,
+		TReg:         tReg,
+		RegisteredAt: time.Now().Format(time.RFC3339),
+	}
+	rJSON, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := ctx.GetStub().PutState("REG_"+vehicleID, rJSON); err != nil {
+		return err
+	}
+
+	// Eagerly seed SCTRUST_<id> with τ_init so SCTrustFinalizeEpoch never
+	// has to lazy-init a row for an unregistered vehicle.
+	if role == RoleVehicle {
+		if err := s.initTrustScore(ctx, vehicleID); err != nil {
+			return err
+		}
+	}
+
+	ctx.GetStub().SetEvent("Registered",
+		[]byte(fmt.Sprintf(`{"ID":"%s","role":"%s","tReg":"%s"}`,
+			vehicleID, role, tReg)))
+	return nil
+}
+
+// SCBootstrapRSU — genesis-time path used to seed the initial RSU set when
+// no peers yet exist to provide 2f+1 endorsements. Unconditionally commits
+// a registration record with Role=RSU, Status=ACTIVE.
+//
+// SECURITY: in a multi-org production deployment this MUST be gated by a
+// Fabric MSP admin role check (cid.GetMSPID + an "admin" OU attribute). The
+// current test-network is single-org (Org1MSP), so all callers share the
+// same MSP identity — the access control reduces to "the sim driver invokes
+// this once at genesis, no runtime caller invokes it". Adding an OU-based
+// admin check is a Phase 4 task once Fabric-CA per-node enrollment lands.
+//
+// Args: rsuID, pkHex, hKuHex, tReg
+func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterface,
+	rsuID, pkHex, hKuHex, tReg string) error {
+
+	if _, err := parseP256PubKey(pkHex); err != nil {
+		return fmt.Errorf("rejected: invalid pk: %v", err)
+	}
+	if len(hKuHex) != 64 {
+		return fmt.Errorf("rejected: hKuHex must be 64 hex chars")
+	}
+
+	existing, err := s.getRegistration(ctx, rsuID)
+	if err != nil {
+		return fmt.Errorf("registration lookup: %v", err)
+	}
+	if existing != nil {
+		return fmt.Errorf("rejected: duplicate identity %s", rsuID)
+	}
+
+	rec := RegistrationRecord{
+		ID:           rsuID,
+		Role:         RoleRSU,
+		PkHex:        pkHex,
+		HKuHex:       hKuHex,
+		TauInit:      TauInit,
+		Status:       StatusActive,
+		TReg:         tReg,
+		RegisteredAt: time.Now().Format(time.RFC3339),
+	}
+	rJSON, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	if err := ctx.GetStub().PutState("REG_"+rsuID, rJSON); err != nil {
+		return err
+	}
+
+	ctx.GetStub().SetEvent("Registered",
+		[]byte(fmt.Sprintf(`{"ID":"%s","role":"%s","tReg":"%s","bootstrap":true}`,
+			rsuID, RoleRSU, tReg)))
+	return nil
+}
+
+// GetRegistration — read a single registration record.
+func (s *SmartContract) GetRegistration(ctx contractapi.TransactionContextInterface,
+	id string) (*RegistrationRecord, error) {
+
+	rec, err := s.getRegistration(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if rec == nil {
+		return nil, fmt.Errorf("not found: %s", id)
+	}
+	return rec, nil
+}
+
+// IsRegistered — string-typed wrapper for clients that need a yes/no answer
+// without the full record payload.
+func (s *SmartContract) IsRegistered(ctx contractapi.TransactionContextInterface,
+	id string) (string, error) {
+
+	rec, err := s.getRegistration(ctx, id)
+	if err != nil {
+		return "false", err
+	}
+	if rec == nil || rec.Status != StatusActive {
+		return "false", nil
+	}
+	return "true", nil
+}
+
+// GetAllRegistrations — list every committed registration record. Useful
+// for diagnostics + sim-side verification of bootstrap completion.
+func (s *SmartContract) GetAllRegistrations(ctx contractapi.TransactionContextInterface) ([]*RegistrationRecord, error) {
+	iter, err := ctx.GetStub().GetStateByRange("REG_", "REG_~")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []*RegistrationRecord
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return nil, e
+		}
+		var r RegistrationRecord
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return nil, e
+		}
+		out = append(out, &r)
+	}
+	return out, nil
+}
+
+// initTrustScore seeds SCTRUST_<vehicleID> with TrustScore = TauInit. Called
+// from SCRegister at registration time so SCTrustFinalizeEpoch can assume
+// the row already exists.
+func (s *SmartContract) initTrustScore(ctx contractapi.TransactionContextInterface,
+	vehicleID string) error {
+
+	id := "SCTRUST_" + vehicleID
+	existing, err := ctx.GetStub().GetState(id)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return nil // idempotent on duplicate-SCRegister bootstrap retries
+	}
+	rec := SCTrustScore{
+		ID:         id,
+		VehicleID:  vehicleID,
+		TrustScore: TauInit,
+		UpdatedAt:  time.Now().Format(time.RFC3339),
+	}
+	j, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(id, j)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// NetworkConfig
+// ─────────────────────────────────────────────────────────────────────────────
 
 // SCInitNetworkConfig — bootstrap or update channel-wide BFT parameters.
-// Args: numRSUs, alpha, tauTh, T_rev, psiAnomalyTh   (all strings)
+// Args: numRSUs, alpha, tauTh, T_rev, psiAnomalyTh (all strings).
 func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextInterface,
 	numRSUsStr, alphaStr, tauThStr, tRevStr, psiThStr string) error {
 
@@ -1105,7 +597,7 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 	return ctx.GetStub().PutState("NETCFG", j)
 }
 
-// GetNetworkConfig — read NETCFG; if absent, return sensible paper-§4.1.3 defaults.
+// GetNetworkConfig — read NETCFG; if absent, return paper §4.1.3 defaults.
 func (s *SmartContract) GetNetworkConfig(ctx contractapi.TransactionContextInterface) (*NetworkConfig, error) {
 	data, err := ctx.GetStub().GetState("NETCFG")
 	if err != nil {
@@ -1114,11 +606,11 @@ func (s *SmartContract) GetNetworkConfig(ctx contractapi.TransactionContextInter
 	if data == nil {
 		return &NetworkConfig{
 			ID:           "NETCFG",
-			NumRSUs:      4,   // minimum N for BFT (f=1)
-			Alpha:        0.3, // EMA smoothing (paper §3.5)
-			TauThreshold: 0.5, // τ_th
-			TRev:         3,   // T_rev consecutive-epoch gate
-			PsiAnomalyTh: 0.5, // ψ_th
+			NumRSUs:      4,
+			Alpha:        0.3,
+			TauThreshold: 0.5,
+			TRev:         3,
+			PsiAnomalyTh: 0.5,
 			UpdatedAt:    "default",
 		}, nil
 	}
@@ -1129,13 +621,23 @@ func (s *SmartContract) GetNetworkConfig(ctx contractapi.TransactionContextInter
 	return &c, nil
 }
 
-// ── Eq 3.56 / 3.57: evidence submission ──────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Eq 3.56 / 3.57 — evidence submission (REGISTRATION-GATED)
+// ─────────────────────────────────────────────────────────────────────────────
 
-// SCTrustSubmitEvidence — RSU r_j writes E_j(t) tuple for vehicle i in epoch t.
-// Args: vehicleID, rsuID, epoch, psi, beaconHash, signature
-// Idempotent: re-submitting overwrites the previous entry for the same (i,t,j).
+// SCTrustSubmitEvidence — RSU r_j writes E_j(t) for vehicle i at epoch t.
+// Idempotent on (i,t,j) — re-submitting overwrites the previous entry.
+//
+// REGISTRATION GATE: both vehicleID and rsuID must hold ACTIVE registrations.
 func (s *SmartContract) SCTrustSubmitEvidence(ctx contractapi.TransactionContextInterface,
 	vehicleID, rsuID, epoch, psiStr, beaconHash, signature string) error {
+
+	if err := s.requireActive(ctx, vehicleID, RoleVehicle); err != nil {
+		return err
+	}
+	if err := s.requireActive(ctx, rsuID, RoleRSU); err != nil {
+		return err
+	}
 
 	psi, err := strconv.ParseFloat(psiStr, 64)
 	if err != nil {
@@ -1159,11 +661,20 @@ func (s *SmartContract) SCTrustSubmitEvidence(ctx contractapi.TransactionContext
 	return ctx.GetStub().PutState(id, j)
 }
 
-// SCControllerSubmitEvidence — Controller writes E_c(t) tuple for vehicle i.
-// Args: vehicleID, controllerID, epoch, phi, beaconHash, signature
+// SCControllerSubmitEvidence — Controller writes E_c(t) for vehicle i.
 // Idempotent on (vehicleID, epoch).
+//
+// REGISTRATION GATE: both vehicleID and controllerID must hold ACTIVE
+// registrations.
 func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionContextInterface,
 	vehicleID, controllerID, epoch, phiStr, beaconHash, signature string) error {
+
+	if err := s.requireActive(ctx, vehicleID, RoleVehicle); err != nil {
+		return err
+	}
+	if err := s.requireActive(ctx, controllerID, RoleController); err != nil {
+		return err
+	}
 
 	phi, err := strconv.ParseFloat(phiStr, 64)
 	if err != nil {
@@ -1187,31 +698,40 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 	return ctx.GetStub().PutState(id, j)
 }
 
-// ── Eq 3.55: SC-Trust finalize per-epoch ─────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Eq 3.55 — SC-Trust finalize per-epoch
+// ─────────────────────────────────────────────────────────────────────────────
 
-// SCTrustFinalizeEpoch — once an epoch closes, compute mean RSU anomaly and
-// update τ_i(t) per Eq 3.55.  Also updates the T_rev consecutive-low counter
-// and emits "TrustLow" event when ConsecutiveLowEpochs ≥ T_rev so RSUs can
-// begin voting on revocation.
+// SCTrustFinalizeEpoch — aggregate the RSU submissions for one (vehicle,
+// epoch) and update τ_i per Eq 3.55. Increments the ConsecutiveLowEpochs
+// counter when τ_i < τ_th, emits "TrustLow" once ConsecutiveLowEpochs ≥
+// T_rev so RSUs begin voting on SC-Revoke.
+//
+// Lazy materialisation is gone — SCTRUST_<vehicleID> is created at
+// SCRegister time, so a missing row means the vehicle is unregistered and
+// finalize should not have been called.
 //
 // Args: vehicleID, epoch
 // Returns the updated SCTrustScore record.
 func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextInterface,
 	vehicleID, epoch string) (*SCTrustScore, error) {
 
+	if err := s.requireActive(ctx, vehicleID, RoleVehicle); err != nil {
+		return nil, err
+	}
+
 	cfg, err := s.GetNetworkConfig(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("NetworkConfig: %v", err)
 	}
 
-	// 1. Aggregate all RSU submissions for this (vehicleID, epoch).
+	// Aggregate distinct-RSU submissions for (vehicleID, epoch).
 	prefix := fmt.Sprintf("SUBM_%s_%s_", vehicleID, epoch)
 	iter, err := ctx.GetStub().GetStateByRange(prefix, prefix+"~")
 	if err != nil {
 		return nil, err
 	}
 	defer iter.Close()
-
 	seenRSU := make(map[string]bool)
 	sumPsi := 0.0
 	for iter.HasNext() {
@@ -1224,7 +744,7 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 			return nil, e
 		}
 		if seenRSU[sub.RSUID] {
-			continue // dedupe in case of replays / re-submissions
+			continue
 		}
 		seenRSU[sub.RSUID] = true
 		sumPsi += sub.Psi
@@ -1236,22 +756,22 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 	}
 	meanPsi := sumPsi / float64(numWitnesses)
 
-	// 2. Read prior trust score (initialise to 1.0 if absent).
-	id := fmt.Sprintf("SCTRUST_%s", vehicleID)
-	var rec SCTrustScore
+	// Read current SCTRUST_ record (must exist — created at SC-Register).
+	id := "SCTRUST_" + vehicleID
 	data, err := ctx.GetStub().GetState(id)
 	if err != nil {
 		return nil, err
 	}
 	if data == nil {
-		rec = SCTrustScore{ID: id, VehicleID: vehicleID, TrustScore: 1.0}
-	} else {
-		if err := json.Unmarshal(data, &rec); err != nil {
-			return nil, err
-		}
+		return nil, fmt.Errorf("SCTrustFinalizeEpoch: SCTRUST_%s missing (registration lost?)",
+			vehicleID)
+	}
+	var rec SCTrustScore
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, err
 	}
 
-	// 3. Eq 3.55: τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - meanPsi)
+	// Eq 3.55: τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - meanPsi).
 	rec.TrustScore = cfg.Alpha*rec.TrustScore + (1-cfg.Alpha)*(1-meanPsi)
 	rec.MeanPsi = meanPsi
 	rec.NumRSUsLastEpoch = numWitnesses
@@ -1259,14 +779,13 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 	rec.UpdateCount++
 	rec.UpdatedAt = time.Now().Format(time.RFC3339)
 
-	// 4. T_rev consecutive-low-epoch gate.
+	// T_rev consecutive-low-epoch gate.
 	if rec.TrustScore < cfg.TauThreshold {
 		rec.ConsecutiveLowEpochs++
 	} else {
 		rec.ConsecutiveLowEpochs = 0
 	}
 
-	// 5. Emit TrustLow event if T_rev reached so RSUs can begin voting on SCRevoke.
 	if rec.ConsecutiveLowEpochs >= cfg.TRev {
 		ctx.GetStub().SetEvent("TrustLow", []byte(fmt.Sprintf(
 			`{"vehicleID":"%s","epoch":"%s","trust":%f,"consec":%d,"trev":%d}`,
@@ -1283,13 +802,63 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 	return &rec, nil
 }
 
-// ── Eq 3.59: CP-DETECT controller-conflict ───────────────────────────────────
+// GetTrustScore — read τ_i for one vehicle.
+func (s *SmartContract) GetTrustScore(ctx contractapi.TransactionContextInterface,
+	vehicleID string) (*SCTrustScore, error) {
 
-// CPDetectCheck — count RSU disagreements with the controller for (vehicleID, epoch).
-// Disagreement is defined as binary classification mismatch:
-//   conflict_j  =  (Φ_i > ψ_th)  XOR  (ψ_j^{(i)} > ψ_th)
-// If the total conflict count ≥ f+1, writes ControllerFlag and emits
-// "CPDetectFlag" event.  Returns nil if no flag was raised.
+	id := "SCTRUST_" + vehicleID
+	data, err := ctx.GetStub().GetState(id)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, fmt.Errorf("no trust score for %s (vehicle unregistered?)", vehicleID)
+	}
+	var rec SCTrustScore
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// GetAllTrustScores — list every vehicle's current trust score.
+func (s *SmartContract) GetAllTrustScores(ctx contractapi.TransactionContextInterface) ([]*SCTrustScore, error) {
+	iter, err := ctx.GetStub().GetStateByRange("SCTRUST_", "SCTRUST_~")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []*SCTrustScore
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return nil, e
+		}
+		var r SCTrustScore
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return nil, e
+		}
+		out = append(out, &r)
+	}
+	return out, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Algorithm 8 / Eq 3.59 — CP-DETECT
+// ─────────────────────────────────────────────────────────────────────────────
+
+// CPDetectCheck — counts RSU disagreements with the controller for one
+// (vehicleID, epoch). Disagreement is the binary classifier mismatch:
+//
+//	conflict_j  =  (Φ_i > ψ_th) XOR (ψ_j^{(i)} > ψ_th)
+//
+// Plus implicit clean votes: RSUs that did NOT submit a SUBM are reporting
+// ψ_j ≤ ψ_th (the NS-3 RSU gating contract — only writes SUBM on anomaly).
+// When the controller flags the vehicle as anomalous (cAnom=true) those
+// implicit clean votes count as conflicts; when the controller agrees the
+// vehicle is clean, missing SUBMs are agreement, not conflict.
+//
+// Returns the ControllerFlag on flag-fire, or nil if conflict < f+1.
 func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterface,
 	vehicleID, epoch string) (*ControllerFlag, error) {
 
@@ -1303,7 +872,7 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		return nil, err
 	}
 	if csubData == nil {
-		return nil, nil // no controller submission → nothing to check
+		return nil, nil
 	}
 	var cs ControllerSubmission
 	if err := json.Unmarshal(csubData, &cs); err != nil {
@@ -1317,7 +886,6 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		return nil, err
 	}
 	defer iter.Close()
-
 	seenRSU := make(map[string]bool)
 	conflict := 0
 	for iter.HasNext() {
@@ -1339,17 +907,6 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		}
 	}
 
-	// ── Implicit clean-vote handling (KNOWN GAP fix, post-TASK ①-M) ─────────
-	// NS-3 RSU code (TASK ①-I) only writes SUBM when rsu_lw.anomalous == true,
-	// so any RSU that does NOT appear in seenRSU is implicitly reporting
-	// ψ_j^{(i)} ≤ ψ_th (clean). When the controller's Φ_i > ψ_th (cAnom=true)
-	// and all witnesses said clean, that is the textbook controller-deceit
-	// pattern Eq 3.59 is meant to catch — but the previous implementation
-	// returned nil when len(seenRSU)==0, missing it entirely.
-	//
-	// Fix: treat (cfg.NumRSUs - len(seenRSU)) as implicit clean votes; each
-	// counts as a conflict iff cAnom=true (XOR semantics). When cAnom=false,
-	// implicit clean = implicit agreement, no conflict added.
 	implicitCleanVotes := cfg.NumRSUs - len(seenRSU)
 	if implicitCleanVotes < 0 {
 		implicitCleanVotes = 0
@@ -1361,7 +918,7 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 	f := fByzantine(cfg.NumRSUs)
 	fP1 := f + 1
 	if conflict < fP1 {
-		return nil, nil // not enough explicit+implicit conflicts to flag
+		return nil, nil
 	}
 
 	flag := ControllerFlag{
@@ -1388,10 +945,10 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 	return &flag, nil
 }
 
-// IsControllerFlagged — returns "true" / "false" based on whether ANY
-// CFLAG_ record exists for the controller.
+// IsControllerFlagged — yes/no string for clients.
 func (s *SmartContract) IsControllerFlagged(ctx contractapi.TransactionContextInterface,
 	controllerID string) (string, error) {
+
 	prefix := fmt.Sprintf("CFLAG_%s_", controllerID)
 	iter, err := ctx.GetStub().GetStateByRange(prefix, prefix+"~")
 	if err != nil {
@@ -1425,23 +982,33 @@ func (s *SmartContract) GetAllControllerFlags(ctx contractapi.TransactionContext
 	return out, nil
 }
 
-// ── Eq 3.58: SC-Revoke BFT 2f+1 vote ─────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────────────
+// Eq 3.58 — SC-Revoke BFT 2f+1 vote (REGISTRATION-GATED)
+// ─────────────────────────────────────────────────────────────────────────────
 
-// SCRevokeVote — RSU r_j casts a revocation vote for vehicle i.  After storing
-// the vote, count distinct RSU votes; if ≥ 2f+1, write the immutable
-// SCREVOKE_<vehicleID>_<timestamp> record and emit "SCRevoke" event.
+// SCRevokeVote — RSU r_j casts a revocation vote for vehicle i. Stores the
+// vote idempotently, then counts distinct RSU votes; on ≥ 2f+1 commits the
+// SCREVOKE_ record, flips the vehicle's registration Status to REVOKED,
+// and emits "SCRevoke".
 //
-// Args: vehicleID, rsuID, reason, signature, timestamp
+// REGISTRATION GATE: both vehicleID and rsuID must hold ACTIVE registrations.
+//
 // Returns: {"voted":true,"votes":N,"threshold":2f+1,"revoked":bool}
 func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface,
 	vehicleID, rsuID, reason, signature, timestamp string) (string, error) {
+
+	if err := s.requireActive(ctx, vehicleID, RoleVehicle); err != nil {
+		return "", err
+	}
+	if err := s.requireActive(ctx, rsuID, RoleRSU); err != nil {
+		return "", err
+	}
 
 	cfg, err := s.GetNetworkConfig(ctx)
 	if err != nil {
 		return "", err
 	}
 
-	// 1. Store the vote (idempotent per RSU).
 	voteID := fmt.Sprintf("VOTE_%s_%s", vehicleID, rsuID)
 	vote := RevokeVote{
 		ID:        voteID,
@@ -1459,14 +1026,9 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		return "", err
 	}
 
-	// 2. Count distinct votes.
-	//
-	// IMPORTANT: in Fabric, PutState writes within a transaction are NOT visible
-	// to GetStateByRange in the same transaction — the iterator only sees the
-	// already-committed state. We therefore seed `seen` with the rsuID we just
-	// wrote so the threshold check fires on the same TX that pushes the count
-	// over 2f+1 (otherwise it would lag one TX behind and SCRevoke would never
-	// commit until a 4th, redundant vote arrived).
+	// Count distinct votes. PutState inside a TX is not visible to
+	// GetStateByRange inside the same TX, so seed `seen` with the rsuID
+	// we just wrote — otherwise the threshold check lags by one TX.
 	prefix := fmt.Sprintf("VOTE_%s_", vehicleID)
 	iter, err := ctx.GetStub().GetStateByRange(prefix, prefix+"~")
 	if err != nil {
@@ -1474,7 +1036,7 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 	}
 	defer iter.Close()
 	seen := make(map[string]bool)
-	seen[rsuID] = true // count the vote we just PutState'd in this TX
+	seen[rsuID] = true
 	for iter.HasNext() {
 		qr, e := iter.Next()
 		if e != nil {
@@ -1490,7 +1052,6 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 	f := fByzantine(cfg.NumRSUs)
 	threshold := 2*f + 1
 
-	// 3. Commit revocation iff threshold reached AND no prior SCREVOKE_ exists.
 	revoked := false
 	if count >= threshold {
 		chkPrefix := fmt.Sprintf("SCREVOKE_%s_", vehicleID)
@@ -1517,6 +1078,18 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 			if err := ctx.GetStub().PutState(id, rJSON); err != nil {
 				return "", err
 			}
+			// Flip registration status to REVOKED so subsequent
+			// evidence / vote submissions for this vehicle bounce
+			// at the requireActive gate.
+			regData, err := ctx.GetStub().GetState("REG_" + vehicleID)
+			if err == nil && regData != nil {
+				var reg RegistrationRecord
+				if err := json.Unmarshal(regData, &reg); err == nil {
+					reg.Status = StatusRevoked
+					rj, _ := json.Marshal(reg)
+					_ = ctx.GetStub().PutState("REG_"+vehicleID, rj)
+				}
+			}
 			ctx.GetStub().SetEvent("SCRevoke", []byte(fmt.Sprintf(
 				`{"vehicleID":"%s","reason":"%s","votes":%d,"threshold":%d}`,
 				vehicleID, reason, count, threshold)))
@@ -1527,7 +1100,7 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		count, threshold, revoked), nil
 }
 
-// SCRevokeStatus — diagnostics: current vote count + threshold + revoked flag.
+// SCRevokeStatus — diagnostics: vote count + threshold + revoked flag.
 func (s *SmartContract) SCRevokeStatus(ctx contractapi.TransactionContextInterface,
 	vehicleID string) (string, error) {
 
@@ -1535,7 +1108,6 @@ func (s *SmartContract) SCRevokeStatus(ctx contractapi.TransactionContextInterfa
 	if err != nil {
 		return "", err
 	}
-
 	prefix := fmt.Sprintf("VOTE_%s_", vehicleID)
 	iter, err := ctx.GetStub().GetStateByRange(prefix, prefix+"~")
 	if err != nil {
@@ -1561,7 +1133,47 @@ func (s *SmartContract) SCRevokeStatus(ctx contractapi.TransactionContextInterfa
 		len(seen), threshold, isRev), nil
 }
 
-// GetEpochSubmissions — list all RSU submissions for one (vehicleID, epoch).
+// IsRevoked — string-typed wrapper checking for ANY SCREVOKE_<id>_ entry.
+func (s *SmartContract) IsRevoked(ctx contractapi.TransactionContextInterface,
+	vehicleID string) (string, error) {
+
+	prefix := fmt.Sprintf("SCREVOKE_%s_", vehicleID)
+	iter, err := ctx.GetStub().GetStateByRange(prefix, prefix+"~")
+	if err != nil {
+		return "false", err
+	}
+	defer iter.Close()
+	if iter.HasNext() {
+		return "true", nil
+	}
+	return "false", nil
+}
+
+func (s *SmartContract) GetAllRevokeRecords(ctx contractapi.TransactionContextInterface) ([]*RevokeRecord, error) {
+	iter, err := ctx.GetStub().GetStateByRange("SCREVOKE_", "SCREVOKE_~")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []*RevokeRecord
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return nil, e
+		}
+		var r RevokeRecord
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return nil, e
+		}
+		out = append(out, &r)
+	}
+	return out, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Diagnostic read APIs
+// ─────────────────────────────────────────────────────────────────────────────
+
 func (s *SmartContract) GetEpochSubmissions(ctx contractapi.TransactionContextInterface,
 	vehicleID, epoch string) ([]*EpochSubmission, error) {
 
@@ -1586,7 +1198,6 @@ func (s *SmartContract) GetEpochSubmissions(ctx contractapi.TransactionContextIn
 	return out, nil
 }
 
-// GetControllerSubmission — fetch the controller's E_c(t) for (vehicleID, epoch).
 func (s *SmartContract) GetControllerSubmission(ctx contractapi.TransactionContextInterface,
 	vehicleID, epoch string) (*ControllerSubmission, error) {
 
@@ -1605,7 +1216,6 @@ func (s *SmartContract) GetControllerSubmission(ctx contractapi.TransactionConte
 	return &cs, nil
 }
 
-// GetRevokeVotes — list all stored votes for a vehicle.
 func (s *SmartContract) GetRevokeVotes(ctx contractapi.TransactionContextInterface,
 	vehicleID string) ([]*RevokeVote, error) {
 
