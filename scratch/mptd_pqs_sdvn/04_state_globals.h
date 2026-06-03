@@ -12,6 +12,8 @@
 #ifndef NS3_UDP_ARQ_APPLICATION_H
 #define NS3_UDP_ARQ_APPLICATION_H
 
+#include <set>     // SC-Register registered-vid cache (P6 detection gate)
+
 // ── Network Performance Timing (kept from original) ───────────────────────
 double dsrc_utilization_time        = 0.0;
 double lte_utilization_time         = 0.0;
@@ -138,6 +140,32 @@ RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 // compromised_rsu[i] = true means RSU i intercepts+modifies vehicle data.
 // Set by declare_compromised_rsus() in 11_blockchain_transmission.h.
 bool compromised_rsu[4] = {false, false, false, false};
+
+// ── SC-Register: registered-vehicle cache (paper §3.5.5 Algorithm 7) ─────────
+// Populated by register_all_nodes() in 11_blockchain_setup.h on each successful
+// vehicle SCRegister commit. Read by the unregistered-vehicle gate in
+// 08_detection_engine.h::handle_readone() before any detection-pipeline work
+// runs for an arriving beacon.
+//
+// Cache key = vehicle NS-3 NodeID (raw nid, == BsmBeaconTag::GetVehicleId()).
+// This matches the cache check site in handle_readone, where vid is already
+// available as a uint32_t. The chaincode-facing prefixed string ID
+// ("VEH_<nid>") is *not* used here — the gate is a pure local lookup so
+// invariant 3 (lightweight skip-on-pass at RSU, no blockchain call on the
+// fast path) holds.
+//
+// Gate bypass: when skip_blockchain=true or ablation_mode==5 (A5: no-BC) the
+// set is empty / not populated, and the gate falls through. The detection
+// pipeline then runs over every beacon as if SC-Register were absent — this
+// is what A5 ablation requires for RQ6 (paper §4.1.1, blockchain isolation).
+std::set<uint32_t> g_registered_vids;
+
+// ── Counter for end-of-run metrics print ─────────────────────────────────────
+// Incremented once per gate-rejected beacon (vid not in g_registered_vids).
+// Distinct from cm_FN: a rejected beacon is *not* counted as a detection event
+// — it never enters the LW-DETECT / TP-DETECT / MITM-DETECT pipeline, so
+// MCC/FPR/PARR/CDER are not inflated by unregistered-vid noise.
+uint64_t unregistered_beacon_reject_count = 0;
 
 // ── Option B: DSRC-RSU relay globals ──────────────────────────────────────────
 // Set by 12_main.h after node creation + IP assignment, before Simulator::Run().

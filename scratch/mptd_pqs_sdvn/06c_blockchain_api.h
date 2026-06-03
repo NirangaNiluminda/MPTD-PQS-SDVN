@@ -1,13 +1,11 @@
 // ============================================================
-// 06c_blockchain_api.h — RSU → Hyperledger Fabric chaincode bridge
-// MPTD-PQS SDVN (split from 06_mrtpa_attack.h, Stage 10B cleanup;
-//                refactored Phase R8.5 / 2026-05-30 for paper §3.5.5)
+// 06c_blockchain_api.h — NS-3 ↔ Hyperledger Fabric chaincode bridge
+// MPTD-PQS SDVN (paper §3.5.5 — SC-Register / SC-Trust / SC-Revoke)
 // ============================================================
-// Replaces the legacy REST shim (curl localhost:3000/api/*) with direct
-// chaincode invocations against the running Fabric test-network via the
-// `fabric_invoke.sh` peer-CLI wrapper. This preserves paper Invariant 1
-// (RSU→Blockchain direct: no controller relay, no centralized REST endpoint
-// between the RSU code and Fabric peers).
+// Direct chaincode invocations over AF_UNIX to the Fabric Gateway daemon at
+// /tmp/mptd_fabric.sock (see fabric_gateway_daemon/). Preserves paper
+// Invariant 1 (RSU→Blockchain direct: no controller relay, no centralized
+// REST endpoint between the RSU code and Fabric peers).
 //
 // Depends on:
 //   06b_pq_crypto.h   (TRSSignature, FHECiphertext, evidence_sign_and_verify)
@@ -15,27 +13,14 @@
 //   05_utils.h        (execCmd)
 //   02_config_globals.h (use_pq_crypto, routing_algorithm, ablation_mode, …)
 //
-// Public API (legacy — preserved for caller compatibility, retargeted to
-// chaincode functions; the function bodies POST nothing over HTTP anymore):
-//   StoreAttackConfigToBlockchain()         — StoreAttackConfig
-//   StoreNodeAttackStateToBlockchain()      — StoreNodeAttackState
-//   StoreControllerAssignmentToBlockchain() — StoreControllerAssignment
-//   StoreTrajectoryToBlockchain()           — StoreTrajectory (legacy raw kinematics
-//                                              path; ALSO submits the paper-aligned
-//                                              E_j(t) evidence tuple when use_pq_crypto
-//                                              is on, see Eq 3.56 helper below)
-//   StoreControlDecisionToBlockchain()      — StoreControlDecision
-//   FlagMaliciousOnBlockchain()             — FlagMalicious
-//   CallSCTrust()                           — legacy SCTrustUpdate path (single-RSU
-//                                              ψ submission; deprecated by chaincode
-//                                              comments but kept routable)
-//   CallSCRevoke()                          — legacy SCRevoke single-RSU revocation
-//                                              (deprecated; new code should call
-//                                              CallSCRevokeVote)
-//
-// Public API (new — paper §3.5.5 Eq 3.55/3.56/3.57/3.58/3.59 aligned):
+// Public API — paper §3.5.5 aligned:
 //   CallSCInitNetworkConfig()        — one-time network bootstrap (numRSUs, α, τ_th,
 //                                       T_rev, ψ_th)
+//   CallSCBootstrapRSU()             — Algorithm 7 genesis path for first RSUs
+//                                       (admin-only; no endorsement)
+//   CallSCRegister()                 — Algorithm 7 SC-Register: vehicle/RSU/controller
+//                                       submits identity + public key + LKH leaf
+//                                       hash with 2f+1 RSU endorsements
 //   CallSCTrustSubmitEvidence()      — Eq 3.56 evidence tuple E_j(t) =
 //                                       (vehicleID, ψ_j^(i)(t), epoch, h(b_i(t)), σ_j^sub)
 //                                       This is the RSU-side submission that
@@ -56,15 +41,13 @@
 #include <atomic>      // ipfs_disabled latch
 #include <curl/curl.h> // TASK ①-E: kubo HTTP API client for h(b_i(t)) CID
 
-// Phase 1B (TASK ①-O): NS-3 → Fabric Gateway daemon over AF_UNIX. Replaces the
-// per-call fork+exec of `fabric_invoke.sh` with a single-line JSON write to a
+// NS-3 → Fabric Gateway daemon over AF_UNIX. A single-line JSON write to a
 // long-lived Go daemon that holds a persistent gRPC Gateway connection to the
-// peer. Falls back to the legacy shell shim when the socket is absent so the
-// simulation stays runnable on machines where the daemon hasn't been started.
+// peer.
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <sys/stat.h>  // fstat (Phase 1C-b event drainer)
-#include <fcntl.h>     // open + O_RDONLY (Phase 1C-b event drainer)
+#include <sys/stat.h>  // fstat (event drainer)
+#include <fcntl.h>     // open + O_RDONLY (event drainer)
 #include <unistd.h>
 
 // R7g.3 / R8.5: Single guard macro for every chaincode helper. When
@@ -74,56 +57,10 @@
 // numerator + PBPO clock still tick correctly in sweep mode.
 #define MPTD_BLOCKCHAIN_GUARD() do { if (skip_blockchain) return; } while (0)
 
-// Absolute path to the peer-CLI wrapper. Overridable at build time, e.g.
-//   -DMPTD_FABRIC_INVOKE_SH='"/opt/mptd/fabric_invoke.sh"'
-#ifndef MPTD_FABRIC_INVOKE_SH
-#define MPTD_FABRIC_INVOKE_SH \
-    "/home/niranga/ns-allinone-3.35/ns-3.35/scratch/mptd_pqs_sdvn/fabric_invoke.sh"
-#endif
-
-// ── Shell-quote a single argument safely (single-quote wrapping) ─────────────
-// Returns the input wrapped in single quotes, with any embedded single-quote
-// replaced by the canonical '"'"' escape sequence. Sufficient for any string
-// the chaincode may receive — the script then re-quotes for JSON.
-static inline std::string mptd_shellq(const std::string& s) {
-    std::string out;
-    out.reserve(s.size() + 2);
-    out.push_back('\'');
-    for (char c : s) {
-        if (c == '\'') {
-            out.append("'\"'\"'");
-        } else {
-            out.push_back(c);
-        }
-    }
-    out.push_back('\'');
-    return out;
-}
-
-// ── Build a `fabric_invoke.sh <action> <fn> <args…>` command line ─────────────
-// `action` is "invoke" or "query". `args` is the chaincode function's argument
-// list (excluding the function name, which is passed separately).
-static inline std::string mptd_build_fabric_cmd(
-    const std::string& action,
-    const std::string& fn,
-    const std::vector<std::string>& args)
-{
-    std::string cmd = MPTD_FABRIC_INVOKE_SH " ";
-    cmd += action;
-    cmd += ' ';
-    cmd += mptd_shellq(fn);
-    for (const auto& a : args) {
-        cmd += ' ';
-        cmd += mptd_shellq(a);
-    }
-    return cmd;
-}
-
 // ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  Fabric Gateway daemon socket transport (TASK ①-O, Phase 1B)             ║
+// ║  Fabric Gateway daemon socket transport                                  ║
 // ║                                                                          ║
-// ║  Replaces the per-call `system("fabric_invoke.sh …")` round-trip with a  ║
-// ║  one-line JSON exchange over /tmp/mptd_fabric.sock. Wire protocol:       ║
+// ║  One-line JSON exchange over /tmp/mptd_fabric.sock. Wire protocol:       ║
 // ║                                                                          ║
 // ║    REQ  → {"action":"invoke|query","function":"Fn","args":["a","b"],     ║
 // ║            "fire_and_forget":true}\n                                     ║
@@ -133,26 +70,7 @@ static inline std::string mptd_build_fabric_cmd(
 // ║  and submits in a detached goroutine — used by the RSU beacon path so    ║
 // ║  Fabric commit latency doesn't blow the paper's T_b = 100 ms budget      ║
 // ║  (Invariant 3).                                                          ║
-// ║                                                                          ║
-// ║  Transport selection (env `MPTD_FABRIC_TRANSPORT`):                      ║
-// ║    auto   (default) → try socket; fall back to shell on any failure.     ║
-// ║    socket           → socket only (no fallback; surfaces daemon issues). ║
-// ║    shell            → legacy shell shim only (the pre-Phase-1B path).    ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
-
-enum class MptdFabricTransport { Auto, Socket, Shell };
-
-static inline MptdFabricTransport mptd_fabric_transport_mode() {
-    static MptdFabricTransport m = []() {
-        const char* e = std::getenv("MPTD_FABRIC_TRANSPORT");
-        if (!e || !*e) return MptdFabricTransport::Auto;
-        std::string s(e);
-        if (s == "socket") return MptdFabricTransport::Socket;
-        if (s == "shell")  return MptdFabricTransport::Shell;
-        return MptdFabricTransport::Auto;
-    }();
-    return m;
-}
 
 // Daemon socket path — overridable via env (must match FABRIC_GW_SOCKET in the
 // daemon). Cached after first lookup.
@@ -200,7 +118,8 @@ static inline std::string mptd_build_socket_request(
     const std::string& action,
     const std::string& fn,
     const std::vector<std::string>& args,
-    bool fire_and_forget)
+    bool fire_and_forget,
+    const std::string& identity = "")
 {
     std::string out;
     out.reserve(64 + fn.size() + args.size() * 32);
@@ -217,6 +136,14 @@ static inline std::string mptd_build_socket_request(
     }
     out += ']';
     if (fire_and_forget) out += ",\"fire_and_forget\":true";
+    // P4 — per-node Fabric-CA identity selector. When non-empty the daemon
+    // submits under this enrolled wallet identity (pool0../rsu0../ctrl0..);
+    // empty → daemon's default User1 identity (pre-P4 behaviour).
+    if (!identity.empty()) {
+        out += ",\"id\":\"";
+        out += mptd_jesc(identity);
+        out += '"';
+    }
     out += "}\n";
     return out;
 }
@@ -285,7 +212,8 @@ static inline bool mptd_fabric_call_socket(
     const std::string& fn,
     const std::vector<std::string>& args,
     bool fire_and_forget,
-    std::string& payload_out)
+    std::string& payload_out,
+    const std::string& identity = "")
 {
     payload_out.clear();
 
@@ -321,7 +249,7 @@ static inline bool mptd_fabric_call_socket(
 
     // Send the request line
     std::string req = mptd_build_socket_request(action, fn, args,
-                                                fire_and_forget);
+                                                fire_and_forget, identity);
     const char* buf       = req.data();
     size_t      remaining = req.size();
     while (remaining > 0) {
@@ -350,9 +278,14 @@ static inline bool mptd_fabric_call_socket(
     if (resp.find("\"ok\":true") == std::string::npos) {
         // Surface daemon-side error for visibility — but still return false so
         // auto-mode can fall back to shell on transient daemon hiccups.
+        // Propagate the error text into payload_out so callers like
+        // register_one() in 11_blockchain_setup.h can distinguish a
+        // chaincode-side "rejected: …" from a true transport failure
+        // (empty payload_out + false return).
         std::string err;
         if (mptd_decode_payload_field(resp, "error", err)) {
             std::cerr << "[fabric-gw] " << fn << " err: " << err << '\n';
+            payload_out = err;
         }
         return false;
     }
@@ -529,53 +462,29 @@ static inline bool mptd_fabric_drain_events(std::vector<MptdFabricEvent>& out)
 // ── Async fabric_invoke (fire-and-forget, returns immediately) ────────────────
 // Used for hot-path RSU writes where the simulation cannot block on the
 // orderer round-trip (paper Invariant 3: the lightweight beacon path must
-// stay under T_b = 100 ms). With the Phase-1B daemon up (auto/socket mode)
-// this is a ~50 ms socket round-trip; with the legacy shell shim it forks
-// a peer-CLI subprocess and detaches via `&`.
+// stay under T_b = 100 ms).
 static inline void mptd_fabric_invoke_async(
     const std::string& fn, const std::vector<std::string>& args)
 {
-    if (mptd_fabric_transport_mode() != MptdFabricTransport::Shell) {
-        std::string ignored;
-        if (mptd_fabric_call_socket("invoke", fn, args,
-                                    /*fire_and_forget=*/true, ignored)) {
-            return; // daemon ACKed; submit runs in its goroutine
-        }
-        if (mptd_fabric_transport_mode() == MptdFabricTransport::Socket) {
-            // socket-only mode: do NOT fall back; the operator wants visibility
-            // into daemon failures, so swallow rather than mask with the shim.
-            return;
-        }
-    }
-    std::string cmd = mptd_build_fabric_cmd("invoke", fn, args);
-    cmd += " > /dev/null 2>&1 &";
-    int rc = system(cmd.c_str());
-    (void)rc; // intentional: fire-and-forget, status unobserved by design
+    std::string ignored;
+    mptd_fabric_call_socket("invoke", fn, args,
+                            /*fire_and_forget=*/true, ignored);
 }
 
-// ── Sync fabric_invoke (waits for endorsement + commit, returns stdout) ──────
+// ── Sync fabric_invoke (waits for endorsement + commit, returns payload) ─────
 // Used for control-path calls where the caller needs the return payload
 // (e.g. CPDetectCheck reads a ControllerFlag struct, SCRevokeVote reads the
 // current vote count). NOT for beacon-rate calls — synchronous fabric
-// commits cost 1–2 s.
+// commits cost 1–2 s. Returns empty string on transport error.
 static inline std::string mptd_fabric_invoke_sync(
     const std::string& action,
     const std::string& fn,
     const std::vector<std::string>& args)
 {
-    if (mptd_fabric_transport_mode() != MptdFabricTransport::Shell) {
-        std::string payload;
-        if (mptd_fabric_call_socket(action, fn, args,
-                                    /*fire_and_forget=*/false, payload)) {
-            return payload;
-        }
-        if (mptd_fabric_transport_mode() == MptdFabricTransport::Socket) {
-            return std::string(); // socket-only mode: surface the failure
-        }
-    }
-    std::string cmd = mptd_build_fabric_cmd(action, fn, args);
-    cmd += " 2>/dev/null";
-    return execCmd(cmd);
+    std::string payload;
+    mptd_fabric_call_socket(action, fn, args,
+                            /*fire_and_forget=*/false, payload);
+    return payload;
 }
 
 // ╔══════════════════════════════════════════════════════════════════════════╗
@@ -822,6 +731,21 @@ static inline std::vector<uint8_t> mptd_evidence_message(
 // ║  prefer them over the legacy Store*/Call* wrappers below.                ║
 // ╚══════════════════════════════════════════════════════════════════════════╝
 
+// ── Identity prefix helpers (SC-Register key disambiguation) ─────────────────
+// SC-Register stores REG_<id> records keyed by an opaque string. Numerically
+// identical roles (e.g. rsu_idx=0 vs controller_idx=0) would collide on the
+// raw uint→string conversion, so every chaincode-facing helper builds a
+// role-prefixed string via these wrappers. Call sites continue to pass raw
+// numeric IDs; the prefix is added once at the call boundary.
+//
+// Convention (locked, see memory project_sc_register_decisions.md):
+//   Vehicle      → "VEH_<nid>"   (nid = NS-3 node ID, 2..N_Vehicles+1)
+//   RSU          → "RSU_<idx>"   (idx = 0..N_RSUs-1, NOT nid)
+//   Controller   → "CTRL_<idx>"  (idx = 0..N_Controllers-1)
+inline std::string MakeVehId(uint32_t nid)        { return "VEH_"  + std::to_string(nid); }
+inline std::string MakeRsuId(uint32_t rsu_idx)    { return "RSU_"  + std::to_string(rsu_idx); }
+inline std::string MakeCtrlId(uint32_t ctrl_idx)  { return "CTRL_" + std::to_string(ctrl_idx); }
+
 // ── CallSCInitNetworkConfig — Eq 3.55/3.58/3.59 bootstrap ────────────────────
 // One-time per-run setup. Persists the trust EMA smoothing α, trust threshold
 // τ_th, T_rev consecutive-epoch gate, anomaly threshold ψ_th, and RSU set
@@ -849,6 +773,68 @@ inline void CallSCInitNetworkConfig(
               << " → " << out;
 }
 
+// SCResult — registration-call outcome (ok flag + error/payload string).
+// `ok=true`  → chaincode committed; `msg` is the chaincode-returned payload
+//             (empty when chaincode returns nil, e.g. SCRegister on success).
+// `ok=false` → submission failed. `msg` carries the daemon's error text when
+//             available — chaincode-side rejects start with "rejected:" so
+//             callers can distinguish them from transport failures (empty
+//             msg). See register_one() in 11_blockchain_setup.h.
+struct SCResult {
+    bool        ok;
+    std::string msg;
+};
+
+// ── CallSCBootstrapRSU — Algorithm 7 genesis path (admin-only) ───────────────
+// Registers the initial RSU set without endorsement checks. Run once per RSU
+// at network bootstrap, before any SCRegister flow can have valid 2f+1
+// endorsers. Returns SCResult{ok, msg} — see SCResult docs above.
+inline SCResult CallSCBootstrapRSU(
+    uint32_t rsuID, const std::string& pkHex,
+    const std::string& hKuHex, double tReg,
+    const std::string& identity = "")
+{
+    if (skip_blockchain) return {true, ""};   // bypass path
+    std::vector<std::string> args = {
+        MakeRsuId(rsuID),
+        pkHex,
+        hKuHex,
+        std::to_string(tReg)
+    };
+    std::string payload;
+    bool ok = mptd_fabric_call_socket("invoke", "SCBootstrapRSU", args,
+                                       /*fire_and_forget=*/false, payload,
+                                       identity);
+    return {ok, payload};
+}
+
+// ── CallSCRegister — Algorithm 7 SC-Register (paper §3.5.5 page 64) ──────────
+// Submits identity (id, role, pk, h(K_u)) with 2f+1 distinct RSU endorsements
+// signed over sha256(id || pkHex || hKuHex) using EC-ECDSA P-256 ASN.1-DER.
+// endorsementsJSON is a JSON array of {"rsuID":"...","sigHex":"..."}.
+// Synchronous: caller must know whether registration committed before any
+// downstream SCTrustSubmitEvidence / SCRevokeVote will be accepted by the
+// chaincode (gated on Status==ACTIVE via requireActive).
+// Returns SCResult{ok, msg} — see SCResult docs above.
+inline SCResult CallSCRegister(
+    const std::string& id, const std::string& role,
+    const std::string& pkHex, const std::string& hKuHex,
+    double tReg, const std::string& endorsementsJSON,
+    const std::string& identity = "")
+{
+    if (skip_blockchain) return {true, ""};   // bypass path
+    std::vector<std::string> args = {
+        id, role, pkHex, hKuHex,
+        std::to_string(tReg),
+        endorsementsJSON
+    };
+    std::string payload;
+    bool ok = mptd_fabric_call_socket("invoke", "SCRegister", args,
+                                       /*fire_and_forget=*/false, payload,
+                                       identity);
+    return {ok, payload};
+}
+
 // ── CallSCTrustSubmitEvidence — Eq 3.56 RSU evidence tuple ───────────────────
 // E_j(t) = (vehicleID, ψ_j^(i)(t), epoch, h(b_i(t)), σ_j^sub)
 // One call per RSU witness per beacon; SCTrustFinalizeEpoch later aggregates
@@ -860,8 +846,8 @@ inline void CallSCTrustSubmitEvidence(
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
-        std::to_string(vehicleID),
-        std::to_string(rsuID),
+        MakeVehId(vehicleID),
+        MakeRsuId(rsuID),
         epoch,
         std::to_string(psi),
         beaconHash,
@@ -882,8 +868,8 @@ inline void CallSCControllerSubmitEvidence(
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
-        std::to_string(vehicleID),
-        std::to_string(controllerID),
+        MakeVehId(vehicleID),
+        MakeCtrlId(controllerID),
         epoch,
         std::to_string(phi),
         beaconHash,
@@ -903,7 +889,7 @@ inline std::string CallSCTrustFinalizeEpoch(
 {
     if (skip_blockchain) return "";
     std::vector<std::string> args = {
-        std::to_string(vehicleID), epoch
+        MakeVehId(vehicleID), epoch
     };
     return mptd_fabric_invoke_sync("invoke", "SCTrustFinalizeEpoch", args);
 }
@@ -921,7 +907,7 @@ inline void CallSCTrustFinalizeEpochAsync(
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
-        std::to_string(vehicleID), epoch
+        MakeVehId(vehicleID), epoch
     };
     mptd_fabric_invoke_async("SCTrustFinalizeEpoch", args);
 }
@@ -935,7 +921,7 @@ inline std::string CallCPDetectCheck(
 {
     if (skip_blockchain) return "";
     std::vector<std::string> args = {
-        std::to_string(vehicleID), epoch
+        MakeVehId(vehicleID), epoch
     };
     return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args);
 }
@@ -955,7 +941,7 @@ inline void CallCPDetectCheckAsync(
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
-        std::to_string(vehicleID), epoch
+        MakeVehId(vehicleID), epoch
     };
     mptd_fabric_invoke_async("CPDetectCheck", args);
 }
@@ -973,8 +959,8 @@ inline std::string CallSCRevokeVote(
 {
     if (skip_blockchain) return "";
     std::vector<std::string> args = {
-        std::to_string(vehicleID),
-        std::to_string(rsuID),
+        MakeVehId(vehicleID),
+        MakeRsuId(rsuID),
         reason,
         signatureHex,
         std::to_string(timestamp)
@@ -982,255 +968,4 @@ inline std::string CallSCRevokeVote(
     return mptd_fabric_invoke_sync("invoke", "SCRevokeVote", args);
 }
 
-// ╔══════════════════════════════════════════════════════════════════════════╗
-// ║  Legacy helpers (kept for caller compatibility — Stage 6 / R7 / R8.4)    ║
-// ║                                                                          ║
-// ║  Bodies retargeted from REST → fabric_invoke. The on-chain function      ║
-// ║  contracts they hit are still useful for the global config / per-node    ║
-// ║  attacker labels / control-decision audit log — these are NOT covered    ║
-// ║  by the Eq 3.55 evidence pipeline.                                       ║
-// ╚══════════════════════════════════════════════════════════════════════════╝
 
-// ── StoreAttackConfigToBlockchain — store global attack flags to ledger ───────
-// Called by declare_attack_states() to record the active attack type.
-void StoreAttackConfigToBlockchain(
-    uint32_t attackNum,
-    bool tpVehicle, bool headingSpoof, bool rsuFab, bool sybilMitm, bool beaconSup,
-    bool ctrlMalAssumption)
-{
-    MPTD_BLOCKCHAIN_GUARD();
-    std::vector<std::string> args = {
-        std::to_string(attackNum),
-        tpVehicle      ? "true" : "false",
-        headingSpoof   ? "true" : "false",
-        rsuFab         ? "true" : "false",
-        sybilMitm      ? "true" : "false",
-        beaconSup      ? "true" : "false",
-        ctrlMalAssumption ? "true" : "false"
-    };
-    std::cout << "[ATTACK_CFG] Storing attack config for attack_number="
-              << attackNum << " to chaincode" << std::endl;
-    mptd_fabric_invoke_async("StoreAttackConfig", args);
-}
-
-// ── StoreNodeAttackStateToBlockchain — store per-node attacker role ───────────
-// Called by declare_attackers() for each node in the simulation.
-void StoreNodeAttackStateToBlockchain(
-    uint32_t nodeIdx, int atkPct,
-    bool isLocMal, bool isFloodMal, bool isFabMal,
-    bool isMIMMal, bool isVanMal, bool isTrajMal)
-{
-    MPTD_BLOCKCHAIN_GUARD();
-    std::vector<std::string> args = {
-        std::to_string(nodeIdx),
-        std::to_string(atkPct),
-        isLocMal   ? "true" : "false",
-        isFloodMal ? "true" : "false",
-        isFabMal   ? "true" : "false",
-        isMIMMal   ? "true" : "false",
-        isVanMal   ? "true" : "false",
-        isTrajMal  ? "true" : "false"
-    };
-    mptd_fabric_invoke_async("StoreNodeAttackState", args);
-    std::cout << "[NODE_ATK] Node " << nodeIdx
-              << " locMal=" << isLocMal << " trajMal=" << isTrajMal
-              << " → chaincode" << std::endl;
-}
-
-// ── StoreControllerAssignmentToBlockchain — store node→controller mapping ────
-// Called by assign_controllers() in 11_blockchain_setup.h.
-void StoreControllerAssignmentToBlockchain(
-    uint32_t nodeIdx, uint32_t ctrlID, uint32_t consID, bool isTrajPoisoner)
-{
-    MPTD_BLOCKCHAIN_GUARD();
-    std::vector<std::string> args = {
-        std::to_string(nodeIdx),
-        std::to_string(ctrlID),
-        std::to_string(consID),
-        isTrajPoisoner ? "true" : "false"
-    };
-    mptd_fabric_invoke_async("StoreControllerAssignment", args);
-    std::cout << "[ASSIGN] Node " << nodeIdx
-              << " → controller=" << ctrlID << " consortium=" << consID
-              << " trajPoisoner=" << isTrajPoisoner
-              << " → chaincode" << std::endl;
-}
-
-// ── StoreTrajectoryToBlockchain — record real + poisoned trajectory ───────────
-// Paper §3.3.4: per-beacon reception is recorded on Fabric ledger.
-//
-// When use_pq_crypto=true: runs real TRS signing (§3.5.4 Eq. 3.46–3.49) +
-// FHE encryption (§3.5.4 Eq. 3.61). Per Invariant 5, TRS verification gates
-// the submission — a failed σ_TRS verify bails out before any chaincode call
-// and the trajectory_stored counter is NOT incremented.
-//
-// R8.4 (2026-05-29): Replaced the legacy generate_trs_aggregate string-hash
-// stub with the real evidence_sign_and_verify pipeline (paper Algorithm 6).
-// PARR is now empirically observable via g_trs_verified_count /
-// g_trs_rejected_count instead of formula-approximated in evaluate_all.py.
-//
-// R8.5 (2026-05-30): Replaced REST POST with chaincode invoke. The legacy
-// StoreTrajectory function still receives the raw kinematics (useful for the
-// audit log / off-chain analytics replay); on top of that, when use_pq_crypto
-// is on we now ALSO submit the paper-aligned Eq 3.56 evidence tuple E_j(t)
-// via CallSCTrustSubmitEvidence — h(b_i(t)) is computed locally so only the
-// hash + ψ score + σ_j^sub touch the chain (raw beacon stays off-chain;
-// IPFS retrieval channel lands in TASK ①-E).
-void StoreTrajectoryToBlockchain(std::string vehicleID, std::string rsuID,
-    Vector position, Vector velocity, Vector acceleration,
-    double timestamp, bool isPoisoned)
-{
-    // ── PQ TRS gate (Invariant 5: TRS-then-FHE-then-submit) ──────────────────
-    // TRS verification runs whenever use_pq_crypto, REGARDLESS of
-    // skip_blockchain. Sweep mode still needs the crypto cost on the PBPO
-    // clock and σ_TRS verify/reject counts on the PARR clock — only the
-    // chaincode call is the part we skip. The explicit skip_blockchain check
-    // is below, after the TRS gate.
-    std::vector<uint8_t> sigma_trs;
-    if (use_pq_crypto) {
-        // Build m_j evidence (paper Eq. 3.46). Per-beacon mode: vehicle_set = {vid}.
-        uint32_t rsu_idx = 0;
-        if (rsuID.size() > 3) {
-            try { rsu_idx = (uint32_t)std::stoi(rsuID.substr(3)); } catch (...) {}
-        }
-        uint32_t vid = 0;
-        try { vid = (uint32_t)std::stoi(vehicleID); } catch (...) {}
-
-        EvidenceMessage m_j;
-        m_j.rsu_id      = rsu_idx;
-        m_j.timestamp   = timestamp;
-        m_j.agg_pos_x   = position.x;
-        m_j.agg_pos_y   = position.y;
-        m_j.agg_vel_x   = velocity.x;
-        m_j.agg_vel_y   = velocity.y;
-        m_j.agg_accel_x = acceleration.x;
-        m_j.agg_accel_y = acceleration.y;
-        m_j.vehicle_set.push_back(vid);
-
-        // Real TRS chain: partial_sign × t → aggregate → verify_threshold
-        // (paper Eq. 3.47–3.49). evidence_sign_and_verify lives in
-        // 06b1_trs_backend.h.
-        std::vector<uint32_t> signers;
-        bool verified = evidence_sign_and_verify(m_j, sigma_trs, signers);
-        if (verified) g_trs_verified_count++;
-        else          g_trs_rejected_count++;
-
-        std::cout << "[TRS] Vehicle=" << vehicleID
-                  << " RSU=" << rsuID
-                  << " signers=" << signers.size()
-                  << " sigma_bytes=" << sigma_trs.size()
-                  << " verified=" << (verified ? "YES" : "NO") << "\n";
-
-        if (!verified) {
-            // Invariant 5: σ_TRS verification gates submission. Reject early.
-            std::cout << "[TRS-REJECT] vehicle=" << vehicleID
-                      << " t=" << timestamp
-                      << " — σ_TRS verify failed; skipping chain submit\n";
-            return;
-        }
-
-        // FHE: encrypt speed scalar AFTER TRS verify (paper Eq. 3.61).
-        double spd = std::sqrt(velocity.x * velocity.x + velocity.y * velocity.y);
-        FHECiphertext ct = fhe_encrypt_scalar(spd);
-        std::cout << "[FHE] Vehicle=" << vehicleID
-                  << " speed_enc=" << ct.noisy_value
-                  << " (plaintext≈" << spd << ")\n";
-    }
-
-    // ── Submit to Fabric chaincode (gated on TRS verify above) ───────────────
-    // Sweep mode (--skip_blockchain=true) stops here: PARR/PBPO already booked
-    // above, no need to pay the chaincode roundtrip when there's no Fabric.
-    if (skip_blockchain) return;
-
-    // Legacy raw-kinematics path — kept for audit-log compatibility with the
-    // existing StoreTrajectory chaincode function. Cosmetic only; the paper's
-    // evidence pipeline below is the authoritative path.
-    std::vector<std::string> args = {
-        vehicleID, rsuID,
-        std::to_string(position.x),     std::to_string(position.y),     std::to_string(position.z),
-        std::to_string(velocity.x),     std::to_string(velocity.y),     std::to_string(velocity.z),
-        std::to_string(acceleration.x), std::to_string(acceleration.y), std::to_string(acceleration.z),
-        std::to_string(timestamp),
-        isPoisoned ? "true" : "false"
-    };
-    mptd_fabric_invoke_async("StoreTrajectory", args);
-
-    std::cout << "[BLOCKCHAIN] Storing trajectory: Vehicle=" << vehicleID
-              << " RSU=" << rsuID
-              << " Poisoned=" << (isPoisoned ? "YES" : "NO")
-              << " t=" << timestamp << "s" << std::endl;
-    total_trajectories_stored_blockchain++;
-}
-
-// ── StoreControlDecisionToBlockchain — record SDN control packet decision ────
-void StoreControlDecisionToBlockchain(std::string controllerID, std::string decision,
-    double timestamp, std::string basedOnData)
-{
-    MPTD_BLOCKCHAIN_GUARD();
-    std::vector<std::string> args = {
-        controllerID, decision,
-        std::to_string(timestamp), basedOnData
-    };
-    mptd_fabric_invoke_async("StoreControlDecision", args);
-}
-
-// ── FlagMaliciousOnBlockchain — write immutable malicious flag for an entity ─
-void FlagMaliciousOnBlockchain(std::string entityID, std::string reason)
-{
-    MPTD_BLOCKCHAIN_GUARD();
-    std::vector<std::string> args = { entityID, reason };
-    mptd_fabric_invoke_async("FlagMalicious", args);
-}
-
-// ── CallSCTrust — LEGACY single-RSU trust update ─────────────────────────────
-// DEPRECATED: This wraps the chaincode's `SCTrustUpdate`, which the chaincode
-// itself marks as the legacy single-Φ path. The signature mismatches Eq 3.55
-// because it carries Φ_i (already fused at the RSU) instead of ψ_j^(i)(t)
-// per-witness. New code MUST call CallSCTrustSubmitEvidence (Eq 3.56) so the
-// chaincode can compute the multi-RSU mean and update τ_i(t) per Eq 3.55.
-//
-// Kept routable for the existing detection-engine call site at
-// 08_detection_engine.h:2250 until that call site is migrated to the
-// per-witness path. The migration also needs the witness `rsuID`, which the
-// current signature does not include — see the Eq 3.56 helper above.
-void CallSCTrust(uint32_t vehicleID, double phiScore, uint32_t sigMask,
-                 bool isAnomaly, double timestamp)
-{
-    MPTD_BLOCKCHAIN_GUARD();
-    std::vector<std::string> args = {
-        std::to_string(vehicleID),
-        std::to_string(phiScore),
-        std::to_string(sigMask),
-        isAnomaly ? "true" : "false",
-        std::to_string(timestamp)
-    };
-    mptd_fabric_invoke_async("SCTrustUpdate", args);
-
-    if (isAnomaly)
-        std::cout << "[SC-TRUST] Vehicle " << vehicleID
-                  << "  Φ=" << phiScore << "  isAnomaly=1" << std::endl;
-}
-
-// ── CallSCRevoke — LEGACY single-RSU revocation ──────────────────────────────
-// DEPRECATED: This wraps the chaincode's `SCRevoke`, which the chaincode
-// itself marks as the legacy single-RSU path. Eq 3.58 requires ≥ 2f+1
-// distinct RSU votes — use CallSCRevokeVote instead. Kept routable so the
-// existing detection-engine call site at 08_detection_engine.h:2236 keeps
-// working until that call site is migrated.
-void CallSCRevoke(uint32_t vehicleID, const std::string &reason,
-                  uint32_t rsuID, double timestamp)
-{
-    MPTD_BLOCKCHAIN_GUARD();
-    std::vector<std::string> args = {
-        std::to_string(vehicleID),
-        reason,
-        std::to_string(rsuID),
-        std::to_string(timestamp)
-    };
-    mptd_fabric_invoke_async("SCRevoke", args);
-
-    std::cout << "[SC-REVOKE] Vehicle " << vehicleID
-              << " REVOKED by RSU " << rsuID
-              << " reason=" << reason
-              << " t=" << timestamp << "s" << std::endl;
-}

@@ -1561,10 +1561,9 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 				  //if(routing_algorithm == 4)
 				  //{
 					  for (uint32_t i=0; i<wifidevices.GetN() ; i++)
-					  {     
+					  {
 						if (i >= dsrc_Nodes.GetN()) { continue; }
 						if (i < N_Vehicles) { // Only vehicle nodes broadcast location; RSUs do not
-						     Simulator::Schedule (Seconds (t+0.0002*i), centralized_dsrc_data_broadcast, wifidevices.Get (i), dsrc_Nodes.Get(i), i, 0);
 						     Simulator::Schedule (Seconds(t-0.0001), setting_last_true_location_and_timestamp, i);
 						}
 					  }
@@ -1662,17 +1661,11 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 				} else {
 					initialize_blockchain();
 				}
-				if (!routing_test) { assign_basic_keys(); } // Skip heavy crypto setup during routing_test
-				if (routing_test) { generate_adjacency_matrix(); } // Initialize adjacency matrix for routing_test
-				//call_blockchain();
-				if (!skip_blockchain) { initialize_server(); }
-
 			}
 			
 			//Simulator::Schedule (Seconds (7.400), reset_packet_timestamps);
 			//Simulator::Schedule(Seconds(7.400),generate_F_and_E);
 			
-			Simulator::Schedule(Seconds(0.0010),generate_B_matrix);
 			Simulator::Schedule(Seconds(0.0010),generate_F_and_E);
 //*/
 ///*			
@@ -1699,11 +1692,6 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 ///*					  
 				  if (!routing_test) { // Skip link-discovery/LLDP/crypto when routing_test=true
 				      Simulator::Schedule(Seconds(t), generate_F_and_E);
-				      if(routing_algorithm == 4)
-					  {	
-						    Simulator::Schedule(Seconds(t-0.001), generate_adjacency_matrix);
-							Simulator::Schedule(Seconds(t), initialize_bmatrix);
-					  }
 					  Simulator::Schedule(Seconds(t+0.034500),run_optimization_link_lifetime);
 					  Simulator::Schedule(Seconds(t+0.034800),update_flows);
 					  
@@ -1750,7 +1738,6 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 					  //Simulator::Schedule(Seconds(t+0.100000),initiate_all_flows); 
 					  Simulator::Schedule(Seconds(t+data_transmission_period-0.002-0.3),calculate_performance_evaluation_metricsLLDP);
 					  Simulator::Schedule(Seconds(t+data_transmission_period-0.001-0.3),reset_LLDP_counters);
-					  //Simulator::Schedule(Seconds(t+data_transmission_period-1.582),CallBWTRCBFromNS3, 0);
 					  Simulator::Schedule (Seconds (t), reset_packet_timestamps);
 					  Simulator::Schedule (Seconds (t), reset_confusion_matrix); 
 					  Simulator::Schedule (Seconds (t), set_lte_initial_timestamp);
@@ -1784,23 +1771,6 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 				 {  
 					// Guard: skip node indices that don't exist in dsrc_Nodes (e.g. routing_test=true)
 					if (i >= dsrc_Nodes.GetN()) continue;
-					if(routing_algorithm ==5)
-					{ 
-						for(uint32_t j=0; j<total_size;j++)
-						{
-							 int o = 31*i+7*j;
-							 srand(o);
-							 double rand_delay1 = 0.000001*(rand()%100);
-							 int p = 27*i+11*j;
-							 srand(p);
-							 double rand_delay2 = 0.000001*(rand()%100);
-							 double delta = 0.005; // base spacing
-							 double delay1 = t + delta * (i * total_size + j) + rand_delay1;
-							 double delay2 = t + delta * (i * total_size + j) + rand_delay2;
-							Simulator::Schedule (Seconds (delay1), centralized_dsrc_data_unicast, dsrc_Nodes.Get(i), i, j, 0);
-							Simulator::Schedule (Seconds (delay2), centralized_dsrc_data_unicast, dsrc_Nodes.Get(i), i, j, 1);
-						}
-					}
 					if(routing_algorithm == 4)
 					{
 						std::string controller_str;
@@ -1844,54 +1814,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 								break;
 						
 						}    
-					// V2RSU: only RSU nodes (i >= N_Vehicles) upload to blockchain
-					if (N_RSUs > 0) {
-						if (i >= N_Vehicles && i < (N_Vehicles + N_RSUs)) {
-							Simulator::Schedule(Seconds(t+0.0050*(total_size+1)+0.0050*(total_size+1)+i*0.002+0.05), CallBWTRCBFromNS3, i+2, controller_str);
-						}
-					} else {
-						// No RSUs: all dsrc nodes call BWTRCB (V2V fallback)
-						Simulator::Schedule(Seconds(t+0.0050*(total_size+1)+0.0050*(total_size+1)+i*0.002+0.05), CallBWTRCBFromNS3, i+2, controller_str);
-					}
-
-				// MRTPA Phase 1: Vehicles send trajectory to nearest RSU (V2RSU global path)
-				// Only vehicle nodes (i < N_Vehicles) transmit; RSUs do not initiate
-				if (attack_number == 1 && i < N_Vehicles && i < dsrc_Nodes.GetN())
-				{
-					if (N_RSUs > 0) {
-						// V2RSU: vehicle sends to its nearest RSU via DSRC
-						int o = 17*i; srand(o);
-						double rand_delay = 0.000001 * (rand() % 100);
-						double delay = t + 0.001 * i + rand_delay;
-						vehicle_send_to_nearest_rsu(i, delay);
-					} else {
-						// Fallback V2V (no RSUs present)
-						uint32_t dsrc_n = dsrc_Nodes.GetN();
-						for (uint32_t j = 0; j < dsrc_n; j++) {
-							if (i != j) {
-								int o2 = 17*i + 5*j; srand(o2);
-								double rand_delay2 = 0.000001 * (rand() % 100);
-								double delay2 = t + 0.001 * (i * total_size + j) + rand_delay2;
-								Simulator::Schedule(Seconds(delay2), centralized_dsrc_data_unicast,
-									dsrc_Nodes.Get(i), i, j, 0);
-							}
-						}
-					}
-				}
-					// V2RSU: only RSU nodes run BCTES trajectory election
-					if (N_RSUs > 0) {
-						if (i >= N_Vehicles && i < (N_Vehicles + N_RSUs)) {
-							Simulator::Schedule(Seconds(t+0.0050*(total_size+2)+0.0050*(total_size+2)+0.002*total_size + i*0.002+0.05), BCTES, i+2, 0, controller_str, consortium_str);
-						}
-					} else {
-						// No RSUs: all dsrc nodes call BCTES (V2V fallback)
-						Simulator::Schedule(Seconds(t+0.0050*(total_size+2)+0.0050*(total_size+2)+0.002*total_size + i*0.002+0.05), BCTES, i+2, 0, controller_str, consortium_str);
-					}
 				 }
-				 //Simulator::Schedule (Seconds (t+0.0), centralized_dsrc_data_unicast, dsrc_Nodes.Get(0), 0, 1, 1);
-				 //Simulator::Schedule(Seconds(t+0.0050), CallBWTRCBFromNS3, 0+2, "consortium1");
-				 //Simulator::Schedule(Seconds(t+0.0150), BCTES, 0+2, 0, "C1", "consortium1");
-				 
 			}	
 //*/	
 	}
@@ -2191,6 +2114,16 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // Must be called AFTER N_Vehicles and N_RSUs are finalised (set in cmd args above)
   // and BEFORE Simulator::Run() so all vehicles have valid K_i for HMAC on first beacon.
   lkh_init_all((int)N_Vehicles, (int)N_RSUs);
+
+  // ── SC-Register: paper §3.5.5 Algorithm 7 boot-time node registration ───────
+  // Must run AFTER lkh_init_all() (h(K_u_i) is taken from g_vehicle_session_key
+  // and g_rsu_ring_key) and BEFORE Simulator::Run() so every node has a
+  // committed REG_<id> entry on-chain before any SCTrustSubmitEvidence /
+  // SCControllerSubmitEvidence / SCRevokeVote fires. No-op when
+  // skip_blockchain=true or routing_algorithm != 4.
+  if (routing_algorithm == 4) {
+    register_all_nodes();
+  }
 
   // ── Phase 1C-b: unconditional drainer arm when MPTD_FABRIC_EVT_FORCE_ARM=1 ──
   // The beacon-path hook only fires if a beacon actually arrives; a synthetic-

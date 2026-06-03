@@ -12,13 +12,13 @@ github.com/go-openapi/spec
 ## explicit; go 1.20
 github.com/go-openapi/swag
 # github.com/hyperledger/fabric-chaincode-go/v2 v2.0.0
-## explicit; go 1.21
+## explicit; go 1.21.0
 github.com/hyperledger/fabric-chaincode-go/v2/pkg/attrmgr
 github.com/hyperledger/fabric-chaincode-go/v2/pkg/cid
 github.com/hyperledger/fabric-chaincode-go/v2/shim
 github.com/hyperledger/fabric-chaincode-go/v2/shim/internal
 # github.com/hyperledger/fabric-contract-api-go/v2 v2.2.0
-## explicit; go 1.21
+## explicit; go 1.21.0
 github.com/hyperledger/fabric-contract-api-go/v2/contractapi
 github.com/hyperledger/fabric-contract-api-go/v2/contractapi/utils
 github.com/hyperledger/fabric-contract-api-go/v2/internal
@@ -27,7 +27,7 @@ github.com/hyperledger/fabric-contract-api-go/v2/internal/utils
 github.com/hyperledger/fabric-contract-api-go/v2/metadata
 github.com/hyperledger/fabric-contract-api-go/v2/serializer
 # github.com/hyperledger/fabric-protos-go-apiv2 v0.3.4
-## explicit; go 1.21
+## explicit; go 1.21.0
 github.com/hyperledger/fabric-protos-go-apiv2/common
 github.com/hyperledger/fabric-protos-go-apiv2/ledger/queryresult
 github.com/hyperledger/fabric-protos-go-apiv2/ledger/rwset
@@ -51,7 +51,7 @@ github.com/xeipuuv/gojsonreference
 ## explicit
 github.com/xeipuuv/gojsonschema
 # golang.org/x/net v0.38.0
-## explicit; go 1.23
+## explicit; go 1.23.0
 golang.org/x/net/http/httpguts
 golang.org/x/net/http2
 golang.org/x/net/http2/hpack
@@ -60,11 +60,11 @@ golang.org/x/net/internal/httpcommon
 golang.org/x/net/internal/timeseries
 golang.org/x/net/trace
 # golang.org/x/sys v0.31.0
-## explicit; go 1.23
+## explicit; go 1.23.0
 golang.org/x/sys/unix
 golang.org/x/sys/windows
 # golang.org/x/text v0.23.0
-## explicit; go 1.23
+## explicit; go 1.23.0
 golang.org/x/text/secure/bidirule
 golang.org/x/text/transform
 golang.org/x/text/unicode/bidi
@@ -73,7 +73,7 @@ golang.org/x/text/unicode/norm
 ## explicit; go 1.19
 google.golang.org/genproto/googleapis/rpc/status
 # google.golang.org/grpc v1.71.0
-## explicit; go 1.22
+## explicit; go 1.22.0
 google.golang.org/grpc
 google.golang.org/grpc/attributes
 google.golang.org/grpc/backoff

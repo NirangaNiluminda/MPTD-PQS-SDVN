@@ -54,6 +54,7 @@ import (
 	"os"
 	"os/signal"
 	"path"
+	"sync"
 	"syscall"
 	"time"
 
@@ -79,6 +80,14 @@ type config struct {
 	gatewayPeer   string
 	channelName   string
 	chaincodeName string
+
+	// P4 — per-node Fabric-CA identity pool (see P4_FABRIC_CA_ENROLLMENT.md).
+	// walletPath is the root produced by enroll_pool.sh; it holds one
+	// <name>/msp/ per enrolled identity (pool0.., rsu0.., ctrl0..). A request
+	// carrying "id":"<name>" is submitted under that identity; absent "id"
+	// falls back to the default User1 identity (certPath/keyPath above), so
+	// pre-P4 callers are unaffected.
+	walletPath string
 
 	// Phase 1C — chaincode-event subscription. The daemon tails Fabric events
 	// matching `eventsAllow` into `eventsPath` (append-only JSONL). NS-3 reads
@@ -121,6 +130,7 @@ func loadConfig() config {
 		chaincodeName: envOr("FABRIC_GW_CHAINCODE", "trajectory"),
 		eventsPath:    envOr("FABRIC_GW_EVENTS_PATH", "/tmp/mptd_fabric_events.jsonl"),
 		eventsAllow:   allow,
+		walletPath:    envOr("FABRIC_GW_WALLET", crypto+"/users/_mptd_pool"),
 	}
 }
 
@@ -207,6 +217,114 @@ func readFirstFile(dirPath string) ([]byte, error) {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// P4 — per-node Fabric-CA identity pool
+//
+// The Fabric Gateway SDK binds ONE signing identity at client.Connect time, so
+// "submit as identity X" means "use the gateway connected with X's signer". We
+// keep a lazily-populated map of identityName → gateway/contract, each backed by
+// that identity's wallet MSP but SHARING the single grpc connection (only the
+// signer differs). The default User1 identity is pre-seeded under the name
+// defaultIdentity so requests with no "id" resolve without touching the wallet.
+//
+// Concurrency: contractFor is mutex-guarded on first build; the returned
+// *client.Contract is itself concurrency-safe (multiple goroutines may submit),
+// matching the daemon's existing no-serialize design.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const defaultIdentity = "User1"
+
+type idPool struct {
+	mu        sync.Mutex
+	conn      *grpc.ClientConn
+	mspID     string
+	walletDir string
+	channel   string
+	ccname    string
+	gateways  map[string]*client.Gateway  // kept alive so contracts stay valid
+	contracts map[string]*client.Contract // identityName → contract
+}
+
+func newIDPool(conn *grpc.ClientConn, cfg config) *idPool {
+	return &idPool{
+		conn:      conn,
+		mspID:     cfg.mspID,
+		walletDir: cfg.walletPath,
+		channel:   cfg.channelName,
+		ccname:    cfg.chaincodeName,
+		gateways:  map[string]*client.Gateway{},
+		contracts: map[string]*client.Contract{},
+	}
+}
+
+// put pre-seeds an already-built gateway/contract under name (used for User1).
+func (p *idPool) put(name string, gw *client.Gateway, c *client.Contract) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.gateways[name] = gw
+	p.contracts[name] = c
+}
+
+// gatewayFromMSP builds a gateway bound to the identity whose MSP lives at
+// <walletDir>/<name>/msp (signcerts + keystore), sharing the pool's grpc conn.
+func (p *idPool) gatewayFromMSP(name string) (*client.Gateway, error) {
+	mspDir := path.Join(p.walletDir, name, "msp")
+	certPEM, err := readFirstFile(path.Join(mspDir, "signcerts"))
+	if err != nil {
+		return nil, fmt.Errorf("read signcert: %w", err)
+	}
+	cert, err := identity.CertificateFromPEM(certPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse signcert: %w", err)
+	}
+	id, err := identity.NewX509Identity(p.mspID, cert)
+	if err != nil {
+		return nil, fmt.Errorf("x509 identity: %w", err)
+	}
+	keyPEM, err := readFirstFile(path.Join(mspDir, "keystore"))
+	if err != nil {
+		return nil, fmt.Errorf("read key: %w", err)
+	}
+	key, err := identity.PrivateKeyFromPEM(keyPEM)
+	if err != nil {
+		return nil, fmt.Errorf("parse key: %w", err)
+	}
+	sign, err := identity.NewPrivateKeySign(key)
+	if err != nil {
+		return nil, fmt.Errorf("signer: %w", err)
+	}
+	return client.Connect(
+		id,
+		client.WithSign(sign),
+		client.WithHash(hash.SHA256),
+		client.WithClientConnection(p.conn),
+		client.WithEvaluateTimeout(5*time.Second),
+		client.WithEndorseTimeout(15*time.Second),
+		client.WithSubmitTimeout(15*time.Second),
+		client.WithCommitStatusTimeout(1*time.Minute),
+	)
+}
+
+// contractFor returns the contract for identityName, lazily loading it from the
+// wallet on first use. A miss surfaces as an error so the caller can reject the
+// request rather than silently fall back to the wrong identity.
+func (p *idPool) contractFor(name string) (*client.Contract, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if c, ok := p.contracts[name]; ok {
+		return c, nil
+	}
+	gw, err := p.gatewayFromMSP(name)
+	if err != nil {
+		return nil, fmt.Errorf("load identity %q from wallet: %w", name, err)
+	}
+	contract := gw.GetNetwork(p.channel).GetContract(p.ccname)
+	p.gateways[name] = gw
+	p.contracts[name] = contract
+	log.Printf("[fabric-gw] identity loaded from wallet: %s", name)
+	return contract, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Wire protocol
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -214,6 +332,11 @@ type request struct {
 	Action   string   `json:"action"`   // "invoke" | "query"
 	Function string   `json:"function"` // chaincode function name
 	Args     []string `json:"args"`     // string args (Args[0] is implicitly fn)
+
+	// P4 — identity selector. Names an enrolled wallet identity (pool0../rsu0..
+	// /ctrl0..) to submit under. Empty → defaultIdentity (User1), so pre-P4
+	// callers and the skip_blockchain path are unaffected.
+	Id string `json:"id,omitempty"`
 
 	// FireAndForget — when true on an invoke, daemon writes {"ok":true}
 	// immediately and submits in a detached goroutine. The caller can close
@@ -235,7 +358,7 @@ type response struct {
 // serialize here; doing so would defeat the whole point of switching off the
 // shell shim (which serialized on fork-exec contention).
 
-func handleConn(c net.Conn, contract *client.Contract) {
+func handleConn(c net.Conn, pool *idPool) {
 	defer c.Close()
 	c.SetDeadline(time.Now().Add(60 * time.Second))
 	rd := bufio.NewReader(c)
@@ -258,6 +381,17 @@ func handleConn(c net.Conn, contract *client.Contract) {
 	}
 	if req.Function == "" {
 		writeErr(wr, "missing function")
+		return
+	}
+
+	// P4 — resolve the submitting identity. Empty id → User1 (back-compat).
+	idName := req.Id
+	if idName == "" {
+		idName = defaultIdentity
+	}
+	contract, err := pool.contractFor(idName)
+	if err != nil {
+		writeErr(wr, fmt.Sprintf("identity %q: %v", idName, err))
 		return
 	}
 
@@ -462,6 +596,13 @@ func main() {
 	contract := network.GetContract(cfg.chaincodeName)
 	log.Printf("[fabric-gw] gateway connected; contract=%s/%s", cfg.channelName, cfg.chaincodeName)
 
+	// P4 — identity pool. Pre-seed the default User1 identity (already built
+	// above) so requests with no "id" resolve instantly; per-node identities
+	// (pool0../rsu0../ctrl0..) load lazily from the wallet on first use.
+	pool := newIDPool(conn, cfg)
+	pool.put(defaultIdentity, gw, contract)
+	log.Printf("[fabric-gw] identity pool ready; wallet=%s default=%s", cfg.walletPath, defaultIdentity)
+
 	// Unix socket setup — clean stale socket if it exists, then chmod 660.
 	_ = os.Remove(cfg.socketPath)
 	listener, err := net.Listen("unix", cfg.socketPath)
@@ -513,6 +654,6 @@ func main() {
 			log.Printf("[fabric-gw] accept: %v", err)
 			continue
 		}
-		go handleConn(c, contract)
+		go handleConn(c, pool)
 	}
 }

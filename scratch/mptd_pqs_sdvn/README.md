@@ -40,9 +40,26 @@ NS-3 Simulation  ──(curl)──►  localhost:5001  ◄──  analytics/ml/
 ## Prerequisites
 
 - NS-3 3.35 installed at `/home/niranga/ns-allinone-3.35/ns-3.35/`
-- Docker Desktop (desktop-linux context) with `/home/niranga` added to File Sharing
+- **Native Docker Engine** (`docker-ce`, systemd-managed `dockerd`) on the `default` context.
+  Docker Desktop is **no longer used** — see the migration note below.
 - Python 3.8+, PyTorch, Flask, scikit-learn (see `analytics/ml/requirements.txt`)
 - Hyperledger Fabric binaries in `/home/niranga/fabric-samples/bin/`
+
+> **Migration note (2026-06-02): moved from Docker Desktop → native Docker Engine.**
+> The blockchain stack was migrated off the slow Docker Desktop VM onto the native
+> `docker-ce` engine (`default` context). Everything (Fabric CAs, orderer, peers, the
+> trajectory CCAAS chaincode, and Fabric Explorer) was verified working on the native
+> engine. Three things had to be fixed during the move — keep them in mind if you
+> rebuild from scratch:
+> 1. **fabric-ca version**: the native `hyperledger/fabric-ca:latest` was v1.5.17 but the
+>    CA crypto material on disk requires **v1.5.19**. Fixed with:
+>    `docker pull hyperledger/fabric-ca:1.5.19 && docker tag hyperledger/fabric-ca:1.5.19 hyperledger/fabric-ca:latest`
+> 2. **`registerEnroll.sh`** must exist at `organizations/fabric-ca/registerEnroll.sh`
+>    (it had been moved into a `fabric-ca.STALE.*` backup — restore it if enrollment fails
+>    with "No such file or directory").
+> 3. **Deploy with `deployCCAAS`, not `deployCC -ccl go`** — the in-peer Go build on native
+>    Docker 29.x produces a chaincode binary without the `+x` bit, so the container fails
+>    with `exec: "chaincode": executable file not found`. CCAAS sidesteps this entirely.
 
 ---
 
@@ -50,22 +67,27 @@ NS-3 Simulation  ──(curl)──►  localhost:5001  ◄──  analytics/ml/
 
 Open **3 terminals** and run in order:
 
-### Before anything — set Docker context (every session)
+### Before anything — confirm Docker context (every session)
 
 ```bash
-# Run this FIRST every session, especially after a reboot or Docker Desktop restart.
-docker context use desktop-linux
+# Native Docker Engine uses the 'default' context. It is normally already active.
+docker context use default
+docker context ls          # 'default' should be the one marked with *
 ```
 
 ### Terminal 1 — Blockchain + REST API
 
 ```bash
 cd /home/niranga/fabric-samples/test-network
+
+# Start the Docker API proxy — exposes the host Docker socket on TCP :12375 so the
+# Fabric peer (CORE_VM_ENDPOINT=tcp://host.docker.internal:12375) can reach it.
 pkill -f docker-api-proxy.py 2>/dev/null || true
 python3 docker-api-proxy.py &
 
 ./network.sh up createChannel -ca
-./network.sh deployCC -ccn trajectory -ccp ../trajectory-chaincode/chaincode -ccl go
+# Deploy as Chaincode-as-a-Service (runs trajectory_ccaas_image as a sidecar container):
+./network.sh deployCCAAS -ccn trajectory -ccp ../trajectory-chaincode
 
 cd /home/niranga/fabric-samples/trajectory-rest-api
 python3 server.py
@@ -257,11 +279,11 @@ View all blocks, transactions, and chaincode calls in a web browser.
 bash /home/niranga/fabric-samples/explorer/start-explorer.sh
 ```
 
-Wait ~30 seconds, then open: **http://localhost:8080**
+Wait ~30 seconds, then open: **http://localhost:8888**
 
 | Field | Value |
 |---|---|
-| URL | http://localhost:8080 |
+| URL | http://localhost:8888 |
 | Username | `exploreradmin` |
 | Password | `exploreradminpw` |
 
@@ -277,9 +299,24 @@ docker compose down -v
 
 IPFS stores large trajectory data off-chain; only the CID hash goes to Fabric.
 
-**Current status:** IPFS daemon is not installed on this machine.
-The simulation REST API writes full trajectory JSON directly to Fabric (suitable
-for demo). To enable full IPFS integration:
+**Current status:** IPFS runs as a **native binary** (`/usr/local/bin/ipfs`, kubo v0.27.0),
+NOT in Docker. Its repo lives at `~/.ipfs` (~956 objects). Because the default ports 5001
+(API) and 8080 (gateway) are taken by other local containers, this install is configured on:
+
+| Endpoint | Address |
+|---|---|
+| RPC API | `http://127.0.0.1:5002` |
+| WebUI | `http://127.0.0.1:5002/webui` |
+| Gateway | `http://127.0.0.1:8090` |
+
+Start the daemon (must be running before the REST API stores CIDs):
+```bash
+ipfs daemon &
+# verify:
+curl -s -X POST http://127.0.0.1:5002/api/v0/version    # → {"Version":"0.27.0",...}
+```
+
+Fresh install (only if `~/.ipfs` is missing):
 
 ```bash
 # Install IPFS
@@ -318,7 +355,7 @@ pkill -f prediction_server.py 2>/dev/null || true
 pkill -f "trajectory-rest-api/server.py" 2>/dev/null || true
 ```
 
-> `network.sh down` wipes all blockchain data. Run `deployCC` again next startup.
+> `network.sh down` wipes all blockchain data. Run `deployCCAAS` again next startup.
 
 ---
 
@@ -365,9 +402,10 @@ analytics/
 fabric-samples/
   test-network/
     network.sh                    Fabric network lifecycle script
-    docker-api-proxy.py           TCP proxy: rewrites Docker API v1.25→v1.41
+    docker-api-proxy.py           Exposes host Docker socket on TCP :12375 for the peer
   trajectory-chaincode/
     chaincode/smartcontract.go    SC-Trust (Eq. 3.66) + SC-Revoke (Eq. 3.67)
+    connection.json               CCAAS metadata (chaincode-as-a-service endpoint)
   trajectory-rest-api/
     server.py                     REST API bridge (port 3000)
   explorer/
@@ -380,11 +418,9 @@ fabric-samples/
 
 ### Port already in use (18054, 7051, etc.)
 
-Old containers from a different Docker context are still running:
+Old Fabric containers are still running:
 ```bash
-docker context use default
 docker ps --format "{{.Names}}" | grep -E "ca_|peer|orderer" | xargs -r docker rm -f
-docker context use desktop-linux
 ```
 
 ### Permission denied when running `network.sh down`
@@ -395,19 +431,28 @@ sudo chown -R $USER:$USER /home/niranga/fabric-samples/test-network/organization
 ./network.sh down
 ```
 
-### Chaincode install fails: `client version 1.25 is too old`
+### Chaincode install/launch fails: `cannot connect to Docker endpoint`
 
-The Docker API proxy is not running:
+The Docker API proxy is not running (the peer can't reach `tcp://host.docker.internal:12375`):
 ```bash
 cd /home/niranga/fabric-samples/test-network
 python3 docker-api-proxy.py &
 ```
 
-### Containers not visible in Docker Desktop
+### Chaincode container exits: `exec: "chaincode": executable file not found`
 
-Wrong Docker context:
+You deployed with `deployCC -ccl go` instead of `deployCCAAS`. The native Docker 29.x
+in-peer Go build drops the binary's execute bit. Always deploy with:
 ```bash
-docker context use desktop-linux
+./network.sh deployCCAAS -ccn trajectory -ccp ../trajectory-chaincode
+```
+
+### CA container exits: `Configuration file version 'v1.5.19' is higher than server version`
+
+The native `fabric-ca:latest` is older than the on-disk CA material. Pull the matching version:
+```bash
+docker pull hyperledger/fabric-ca:1.5.19
+docker tag hyperledger/fabric-ca:1.5.19 hyperledger/fabric-ca:latest
 ```
 
 ### Peer fails to join channel (connection refused on port 7051)
@@ -431,7 +476,7 @@ python3 docker-api-proxy.py &
 | Docker API proxy | ~10 MB | `pkill -f docker-api-proxy.py` |
 | ML prediction server | ~500 MB | Ctrl+C |
 | REST API server | ~100 MB | Ctrl+C |
-| Docker Desktop engine | ~500 MB | Only if not needed |
+| Trajectory CCAAS sidecars (2) | ~60 MB | removed by `./network.sh down` |
 
 ---
 

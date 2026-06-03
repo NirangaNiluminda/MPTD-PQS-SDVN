@@ -411,16 +411,6 @@ void declare_attack_states()
         // controller_malicious_assumption=true (set in 02_config_globals.h) handles the attack
     }
 
-    if (routing_algorithm == 4) {
-        StoreAttackConfigToBlockchain(
-            attack_number,
-            present_tp_vehicle_attack,
-            present_heading_spoof_attack,
-            present_rsu_fabrication_attack,
-            present_sybil_mitm_attack,
-            present_beacon_suppression_attack,
-            controller_malicious_assumption);
-    }
 }
 
 // ── declare_pre_registered_sybils() — mark Sybil vehicles at registration time ──
@@ -484,16 +474,6 @@ void declare_attackers()
             sybil_mitm_nodes[i] = sybil_mitm_nodes[i] && pre_registered_sybil[i];
         }
 
-        if (routing_algorithm == 4) {
-            StoreNodeAttackStateToBlockchain(
-                i, attack_percentage,
-                tp_vehicle_nodes[i],
-                heading_spoof_nodes[i],
-                rsu_fabrication_nodes[i],
-                sybil_mitm_nodes[i],
-                beacon_suppression_nodes[i],
-                trajectory_poisoning_malicious_nodes[i]);
-        }
     }
 
 }
