@@ -118,7 +118,8 @@ static inline std::string mptd_build_socket_request(
     const std::string& action,
     const std::string& fn,
     const std::vector<std::string>& args,
-    bool fire_and_forget)
+    bool fire_and_forget,
+    const std::string& identity = "")
 {
     std::string out;
     out.reserve(64 + fn.size() + args.size() * 32);
@@ -135,6 +136,14 @@ static inline std::string mptd_build_socket_request(
     }
     out += ']';
     if (fire_and_forget) out += ",\"fire_and_forget\":true";
+    // P4 — per-node Fabric-CA identity selector. When non-empty the daemon
+    // submits under this enrolled wallet identity (pool0../rsu0../ctrl0..);
+    // empty → daemon's default User1 identity (pre-P4 behaviour).
+    if (!identity.empty()) {
+        out += ",\"id\":\"";
+        out += mptd_jesc(identity);
+        out += '"';
+    }
     out += "}\n";
     return out;
 }
@@ -203,7 +212,8 @@ static inline bool mptd_fabric_call_socket(
     const std::string& fn,
     const std::vector<std::string>& args,
     bool fire_and_forget,
-    std::string& payload_out)
+    std::string& payload_out,
+    const std::string& identity = "")
 {
     payload_out.clear();
 
@@ -239,7 +249,7 @@ static inline bool mptd_fabric_call_socket(
 
     // Send the request line
     std::string req = mptd_build_socket_request(action, fn, args,
-                                                fire_and_forget);
+                                                fire_and_forget, identity);
     const char* buf       = req.data();
     size_t      remaining = req.size();
     while (remaining > 0) {
@@ -781,7 +791,8 @@ struct SCResult {
 // endorsers. Returns SCResult{ok, msg} — see SCResult docs above.
 inline SCResult CallSCBootstrapRSU(
     uint32_t rsuID, const std::string& pkHex,
-    const std::string& hKuHex, double tReg)
+    const std::string& hKuHex, double tReg,
+    const std::string& identity = "")
 {
     if (skip_blockchain) return {true, ""};   // bypass path
     std::vector<std::string> args = {
@@ -792,7 +803,8 @@ inline SCResult CallSCBootstrapRSU(
     };
     std::string payload;
     bool ok = mptd_fabric_call_socket("invoke", "SCBootstrapRSU", args,
-                                       /*fire_and_forget=*/false, payload);
+                                       /*fire_and_forget=*/false, payload,
+                                       identity);
     return {ok, payload};
 }
 
@@ -807,7 +819,8 @@ inline SCResult CallSCBootstrapRSU(
 inline SCResult CallSCRegister(
     const std::string& id, const std::string& role,
     const std::string& pkHex, const std::string& hKuHex,
-    double tReg, const std::string& endorsementsJSON)
+    double tReg, const std::string& endorsementsJSON,
+    const std::string& identity = "")
 {
     if (skip_blockchain) return {true, ""};   // bypass path
     std::vector<std::string> args = {
@@ -817,7 +830,8 @@ inline SCResult CallSCRegister(
     };
     std::string payload;
     bool ok = mptd_fabric_call_socket("invoke", "SCRegister", args,
-                                       /*fire_and_forget=*/false, payload);
+                                       /*fire_and_forget=*/false, payload,
+                                       identity);
     return {ok, payload};
 }
 

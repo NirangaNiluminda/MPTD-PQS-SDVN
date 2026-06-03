@@ -40,6 +40,7 @@
 #include <map>
 #include <string>
 #include <cstdint>
+#include <cstdlib>
 
 // Paper Fig 3.9 / invariant 2: exactly one SDN controller. The chaincode side
 // uses N_RSUs (NetworkConfig) for the 2f+1 / f+1 BFT math; controllers are
@@ -154,11 +155,19 @@ void assign_controllers()
 //
 // Deviations from paper §3.5.5 + locked design decisions
 // (memory project_sc_register_decisions.md):
-//   - Fabric-CA enrollment (decision #1) is PAUSED — keys are generated in
-//     this file rather than read from MSP x509 certs. Same chaincode
-//     accepts either: the on-chain record just stores `PkHex` opaquely.
-//     Switching to Fabric-CA on Phase 4 only changes how secret keys are
-//     loaded; the chaincode side is unchanged.
+//   - Fabric-CA enrollment (decision #1) is LIVE as of P4 — but operates at
+//     TWO distinct layers, kept deliberately separate:
+//       (a) Application keypair: the EC-ECDSA P-256 (id, pk, h(K_u)) tuple
+//           registered ON CHAIN is still generated here (g_node_ec_keys).
+//           This is the LKH/endorsement key the chaincode stores in PkHex.
+//       (b) Fabric submitting identity: WHICH Fabric MSP x509 cert SIGNS the
+//           transaction. Pre-P4 every node submitted as the shared User1;
+//           P4 makes each node submit under its OWN CA-enrolled identity
+//           (rsu<idx>/ctrl<idx>, or a leased pool<slot> for vehicles), set
+//           via the `submit_identity` arg threaded into CallSC* below.
+//     The chaincode is unchanged — it stores PkHex opaquely and (per
+//     smartcontract.go:423) does not yet enforce an admin-OU check on the
+//     submitting identity. See P4_FABRIC_CA_ENROLLMENT.md for the full model.
 //   - 2f+1 RSU endorsement set is sampled uniformly at random from the
 //     active RSU set (decision #2).
 //   - Endorsements use EC-ECDSA P-256 ASN.1-DER (decision #3).
@@ -177,6 +186,78 @@ namespace mptd_scregister {
 // for an NS-3 sim, matches existing OpenFHE/TRS lifetime).
 static std::map<std::string, EC_KEY*> g_node_ec_keys;
 static std::map<std::string, std::string> g_node_pk_hex;
+
+// ── P4 — leased Fabric-CA identity pool (see P4_FABRIC_CA_ENROLLMENT.md) ──────
+// Selects WHICH enrolled wallet identity signs each SC-Register submission.
+// RSUs/controllers use stable names (rsu<idx>/ctrl<idx>); vehicles LEASE a slot
+// from a bounded pool (pool<slot>) so the model scales to SUMO (lease on spawn,
+// release on depart) and degrades to unique-per-vehicle identities whenever
+// pool_size >= vehicle count. The names MUST match those enrolled by
+// enroll_pool.sh and loaded by the gateway daemon's wallet.
+
+// Toggle: env MPTD_CA_IDENTITY=0 disables identity stamping (every submit goes
+// through the daemon's default User1 — pre-P4 behaviour). Useful when the
+// wallet has not been enrolled (enroll_pool.sh not run). Default ON.
+static inline bool ca_identity_enabled()
+{
+    static bool on = []() {
+        const char* e = std::getenv("MPTD_CA_IDENTITY");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
+// Pool size — mirrors enroll_pool.sh's FABRIC_CA_POOL_SIZE (default 32).
+static inline int ca_pool_size()
+{
+    static int n = []() {
+        const char* e = std::getenv("FABRIC_CA_POOL_SIZE");
+        int v = (e && *e) ? std::atoi(e) : 32;
+        return v > 0 ? v : 32;
+    }();
+    return n;
+}
+
+// Vehicle lease table: vid → pool slot, with free-list semantics so a released
+// slot (SUMO arrival) can be re-leased. The static topology never departs, so
+// today every vehicle holds its slot for the whole run.
+static std::map<uint32_t, int> g_veh_pool_lease;
+static std::vector<bool>       g_pool_slot_busy;
+
+// LeasePoolIdentity — return "pool<slot>" for vid, assigning a free slot. When
+// the pool is exhausted (SUMO scale) reuse slot (vid % pool_size) — the V2X
+// pseudonym-pool reuse path; per-vehicle attribution still comes from the
+// VEH_<nid> chaincode arg, not the (now shared) cert.
+static std::string LeasePoolIdentity(uint32_t vid)
+{
+    auto it = g_veh_pool_lease.find(vid);
+    if (it != g_veh_pool_lease.end())
+        return "pool" + std::to_string(it->second);
+
+    const int n = ca_pool_size();
+    if ((int)g_pool_slot_busy.size() < n) g_pool_slot_busy.resize(n, false);
+    for (int s = 0; s < n; ++s) {
+        if (!g_pool_slot_busy[s]) {
+            g_pool_slot_busy[s] = true;
+            g_veh_pool_lease[vid] = s;
+            return "pool" + std::to_string(s);
+        }
+    }
+    int s = (int)(vid % (uint32_t)n);   // pool exhausted → pseudonym reuse
+    g_veh_pool_lease[vid] = s;
+    return "pool" + std::to_string(s);
+}
+
+// ReleasePoolIdentity — free vid's slot (call on SUMO vehicle departure).
+// Unused by the static topology; wired so the SUMO integration has the hook.
+[[maybe_unused]] static void ReleasePoolIdentity(uint32_t vid)
+{
+    auto it = g_veh_pool_lease.find(vid);
+    if (it == g_veh_pool_lease.end()) return;
+    if (it->second >= 0 && it->second < (int)g_pool_slot_busy.size())
+        g_pool_slot_busy[it->second] = false;
+    g_veh_pool_lease.erase(it);
+}
 
 // hex_encode — byte buffer → lowercase hex string.
 static inline std::string hex_encode(const uint8_t* data, size_t len)
@@ -349,7 +430,8 @@ static std::string build_endorsements_json(const std::string& target_id,
 static bool register_one(const std::string& id, const std::string& role,
                           const std::string& h_ku_hex, double t_reg,
                           uint32_t n_rsus, uint32_t need_endorsers,
-                          uint32_t max_retries)
+                          uint32_t max_retries,
+                          const std::string& submit_identity)
 {
     // Generate per-node keypair (kept alive in g_node_ec_keys so RSUs can
     // later sign endorsements).
@@ -372,7 +454,8 @@ static bool register_one(const std::string& id, const std::string& role,
             try { rsu_idx = (uint32_t)std::stoul(id.substr(4)); }
             catch (...) { return false; }
         }
-        SCResult r = CallSCBootstrapRSU(rsu_idx, pk_hex, h_ku_hex, t_reg);
+        SCResult r = CallSCBootstrapRSU(rsu_idx, pk_hex, h_ku_hex, t_reg,
+                                        submit_identity);
         if (!r.ok) {
             // Daemon/transport failure (empty msg) OR chaincode-side reject
             // ("rejected: …"). Both are fatal here — the RSU is not on chain
@@ -409,7 +492,7 @@ static bool register_one(const std::string& id, const std::string& role,
         }
 
         SCResult r = CallSCRegister(id, role, pk_hex, h_ku_hex,
-                                     t_reg, endorsersJSON);
+                                     t_reg, endorsersJSON, submit_identity);
         if (r.ok) {
             std::cout << "[SC-REGISTER] " << id << " " << role
                       << " OK (endorsers=" << need_endorsers
@@ -486,8 +569,11 @@ void register_all_nodes()
                       << " skipped (rsu_idx >= LKH ring slots)\n";
             continue;
         }
+        // P4: bootstrap under this RSU's own enrolled identity (rsu<idx>).
+        std::string submit_id = ca_identity_enabled()
+                                    ? ("rsu" + std::to_string(rsu_idx)) : "";
         if (register_one(id, "RSU", h_ku_hex, t_reg,
-                         n_rsus, /*endorsers=*/0, max_retries))
+                         n_rsus, /*endorsers=*/0, max_retries, submit_id))
             rsu_ok++;
     }
     std::cout << "[SC-REGISTER] RSUs registered: " << rsu_ok << "/"
@@ -516,8 +602,11 @@ void register_all_nodes()
                       << " skipped (veh_idx >= LKH_MAX_VEH)\n";
             continue;
         }
+        // P4: vehicle leases a pool identity (pool<slot>) for the whole run.
+        std::string submit_id = ca_identity_enabled()
+                                    ? LeasePoolIdentity(nid) : "";
         if (register_one(id, "VEHICLE", h_ku_hex, t_reg,
-                         n_rsus, need_endorsers, max_retries)) {
+                         n_rsus, need_endorsers, max_retries, submit_id)) {
             veh_ok++;
             // P6: populate detection-engine gate cache. Raw nid is what the
             // BsmBeaconTag carries and what handle_readone reads as `vid`.
@@ -533,8 +622,11 @@ void register_all_nodes()
     for (uint32_t c = 0; c < N_Controllers; ++c) {
         std::string id = MakeCtrlId(c);
         std::string h_ku_hex = derive_controller_h_ku(c);
+        // P4: controller submits under its own enrolled identity (ctrl<idx>).
+        std::string submit_id = ca_identity_enabled()
+                                    ? ("ctrl" + std::to_string(c)) : "";
         if (register_one(id, "CONTROLLER", h_ku_hex, t_reg,
-                         n_rsus, need_endorsers, max_retries))
+                         n_rsus, need_endorsers, max_retries, submit_id))
             ctrl_ok++;
     }
     std::cout << "[SC-REGISTER] controllers registered: " << ctrl_ok << "/"
