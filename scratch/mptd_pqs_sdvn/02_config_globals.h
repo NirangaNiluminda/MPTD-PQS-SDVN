@@ -407,7 +407,8 @@ bool GetBooleanWithProbability(double probabilityPercent, int nodeID) {
 // ── Attack flag variables (active — used by 06a_attack_models.h) ─────────────
 int routing_algorithm = 0;
 // R7g.3: skip Hyperledger Fabric + REST API bring-up during training-data
-// sweeps. When true, initialize_blockchain()/initialize_server() are no-ops;
+// sweeps. When true, initialize_blockchain() is a no-op and every Call* in
+// 06c_blockchain_api.h short-circuits before contacting the Fabric daemon;
 // detection, attack injection, and beacon CSV logging still run normally so
 // the master training CSV can be built without a working Fabric environment.
 // Defaults to false (production behaviour preserved).

@@ -441,6 +441,50 @@ void log_vehicle_tx(uint32_t vid, uint32_t nearest_rsu,
     fout.close();
 }
 
+// ── P6: SC-Register Unregistered-Beacon Reject Log ───────────────────────────
+// One row per beacon dropped by the SC-Register authorisation gate in
+// 08_detection_engine.h::handle_readone(). Lets analysts inspect *which*
+// vids leaked beacons without a valid REG_VEH_<nid> record — typically the
+// result of (a) registration failure (e.g., daemon down, <2f+1 endorsers),
+// or (b) an attacker injecting beacons under a vid that was never SC-Registered.
+//
+// Important: rejected beacons are NOT counted in MCC/FPR/PARR/CDER — those
+// metrics measure detection-pipeline behaviour over valid peers only
+// (paper §4.1.2). This separate log avoids polluting the confusion matrix.
+//
+// Output: analytics/results/unregistered_beacon_log.csv
+// Columns: sim_time, vehicle_id, rsu_id, pos_x, pos_y, attack_number,
+//          attack_pct, ablation_mode
+void log_unregistered_beacon_reject(uint32_t vid, uint32_t rsu_id, double sim_t,
+                                    double pos_x, double pos_y)
+{
+    ensure_analytics_dir(NS3_ROOT "/analytics");
+    ensure_analytics_dir(NS3_ROOT "/analytics/results");
+
+    std::string path = NS3_ROOT "/analytics/results/unregistered_beacon_log.csv";
+    static bool ureg_first_call = true;
+    std::ofstream fout;
+    if (ureg_first_call) {
+        fout.open(path, std::ios::out | std::ios::trunc);
+        fout << "sim_time,vehicle_id,rsu_id,pos_x,pos_y,"
+             << "attack_number,attack_pct,ablation_mode\n";
+        ureg_first_call = false;
+    } else {
+        fout.open(path, std::ios::out | std::ios::app);
+    }
+
+    fout << std::fixed << std::setprecision(4)
+         << sim_t            << ","
+         << vid              << ","
+         << rsu_id           << ","
+         << pos_x            << ","
+         << pos_y            << ","
+         << attack_number    << ","
+         << attack_percentage << ","
+         << ablation_mode    << "\n";
+    fout.close();
+}
+
 // ── Controller Poison Log — Attack 7 (MP-S4): one row per beacon poisoned ────
 // Shows real speed from honest vehicle vs the poisoned speed the controller used.
 // Controller receives correct data but intentionally shifts distribution upward.
@@ -682,6 +726,13 @@ void print_mptd_metrics()
               << g_cp_detect_epochs_evaluated << " audited epochs,"
               << " flag_c=" << (g_flag_c_active ? "1" : "0")
               << " (paper §3.5.5 Algorithm 7, Eq 3.59)" << std::endl;
+    // P6: SC-Register authorisation gate — dropped beacons (forensics only;
+    // not in MCC/FPR/PARR/CDER). registered_vids = vehicles that have a
+    // legal REG_VEH_<nid> record on chain (paper §3.5.5 Algorithm 7).
+    std::cout << "  SC-Register gate = " << unregistered_beacon_reject_count
+              << " beacons rejected (unregistered vid), "
+              << g_registered_vids.size() << "/" << N_Vehicles
+              << " vehicles on-chain (paper §3.5.5 Algorithm 7)" << std::endl;
     std::cout << "──────────────────────────────────────────────────────" << std::endl;
 }
 
@@ -722,7 +773,8 @@ void write_mptd_results_csv()
          << "TDEE,TPE,"
          << "PBPO_LW_ms,PBPO_Full_ms,"
          << "total_received,total_poisoned,total_stored,"
-         << "trs_verified_count,trs_rejected_count\n";   // R8.4: per-beacon σ_j outcomes
+         << "trs_verified_count,trs_rejected_count,"   // R8.4: per-beacon σ_j outcomes
+         << "sc_register_rejects,sc_register_active\n"; // P6: SC-Register gate outcomes
 
     // Values
     fout << attack_number              << ","
@@ -747,7 +799,9 @@ void write_mptd_results_csv()
          << total_trajectories_poisoned          << ","
          << total_trajectories_stored_blockchain << ","
          << g_trs_verified_count                 << ","   // R8.4
-         << g_trs_rejected_count                 << "\n"; // R8.4
+         << g_trs_rejected_count                 << ","   // R8.4
+         << unregistered_beacon_reject_count     << ","   // P6
+         << g_registered_vids.size()             << "\n"; // P6
     fout.close();
 
     // Also print to stdout and note the file written

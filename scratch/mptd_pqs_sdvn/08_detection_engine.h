@@ -73,14 +73,13 @@ void log_controller_poison(double sim_t,
                            double shift_factor,
                            double real_hdg,  double fake_hdg,
                            uint8_t alert_type, double spd_adv);
+// P6: SC-Register gate rejection logger (defined in 10_metrics_csv.h).
+// Called from handle_readone() when a vehicle's vid is not in
+// g_registered_vids — beacon is dropped before any detection pipeline runs.
+void log_unregistered_beacon_reject(uint32_t vid, uint32_t rsu_id, double sim_t,
+                                    double pos_x, double pos_y);
 // PBPO timing accumulator (defined in 02_config_globals.h)
 // pbpo_time_sum_ms and pbpo_cnt are global — updated directly here.
-
-// ── Forward declarations (Stage 6: defined in 06_mrtpa_attack.h) ─────────────
-void CallSCTrust(uint32_t vehicleID, double phiScore, uint32_t sigMask,
-                 bool isAnomaly, double timestamp);
-void CallSCRevoke(uint32_t vehicleID, const std::string &reason,
-                  uint32_t rsuID, double timestamp);
 
 // ── Stage 6: consecutive anomaly counter per vehicle (revoke after 3) ─────────
 static int consecutive_anomaly_count[total_size + 2] = {};
@@ -2278,6 +2277,48 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             continue;  // drop: do not forward to management
         }
 
+        // ── SC-Register authorisation gate (paper §3.5.5 Algorithm 7) ──────
+        // Reject beacons from vehicles that did NOT successfully complete
+        // boot-time SCRegister (no on-chain REG_VEH_<nid> record → no τ_init
+        // → no legal evidence path). This is a LOCAL cache check populated
+        // by register_all_nodes() at boot — strictly read-only at runtime so
+        // invariant 3 (skip-on-pass at RSU, no blockchain call on the fast
+        // path) holds.
+        //
+        // Bypass conditions (each is a different correctness reason):
+        //   - skip_blockchain=true  → register_all_nodes() was a no-op, the
+        //                             cache is empty by design, so gating
+        //                             would reject every beacon.
+        //   - ablation_mode == 5    → A5 variant (paper §4.1.1, RQ6) runs
+        //                             *without* SC-Trust / SC-Register so we
+        //                             can isolate the blockchain's metric
+        //                             contribution; gate must be transparent.
+        //   - routing_algorithm!=4  → legacy/baseline algorithms don't run
+        //                             register_all_nodes() at all.
+        //   - vid >= 10000          → RSU-injected ghost packet (MP-S1
+        //                             attack, paper §3.4.2). The ghost is
+        //                             synthesised locally by the compromised
+        //                             RSU and must reach SYB-DETECT for the
+        //                             paper attack scenario to be evaluable.
+        //
+        // Rejected beacons are logged to a separate CSV (forensics + debug)
+        // and counted in unregistered_beacon_reject_count, but NEVER feed
+        // confusion matrix / PARR / CDER — those metrics measure the
+        // detection pipeline's behaviour on *valid* peers only (paper §4.1.2).
+        if (!skip_blockchain && ablation_mode != 5 &&
+            routing_algorithm == 4 && vid < 10000)
+        {
+            if (g_registered_vids.find(vid) == g_registered_vids.end()) {
+                unregistered_beacon_reject_count++;
+                log_unregistered_beacon_reject(vid, rsu_idx, t, real_px, real_py);
+                cout << "[SC-REGISTER-REJECT] RSU" << rsu_idx
+                     << " V" << vid << " (nid=" << vid
+                     << ") not in registered-vid cache — beacon dropped"
+                     << " (not counted in MCC/FPR/PARR/CDER) t=" << t << endl;
+                continue;
+            }
+        }
+
         cout << "[DSRC-RSU" << rsu_idx << "] V" << vid
              << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
              << " compromised=" << (compromised_rsu[rsu_idx] ? "YES" : "no") << endl;
@@ -2673,15 +2714,6 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // A5 ablation skips SC-Trust for the blockchain-isolation comparison (RQ6).
             if (!routing_test && ablation_mode != 5 && rsu_lw.anomalous) {
                 double ts = Simulator::Now().GetSeconds();
-                uint32_t sigmask = rsu_lw.tp_flags | (rsu_lw.mp_flags << 5);
-
-                // ── Legacy single-RSU SCTrustUpdate path ─────────────────────
-                // Kept live during the Eq 3.56 migration window so the existing
-                // chaincode tests, audit logs, and downstream metrics that
-                // depend on SCTrustUpdate output continue to work. This call
-                // will be removed in a follow-on task once SCTrustFinalizeEpoch
-                // aggregation has been validated end-to-end.
-                CallSCTrust(vid, rsu_lw.psi, sigmask, rsu_lw.detected, ts);
 
                 // ── Paper-aligned Eq 3.56 RSU evidence tuple (TASK ①-I) ──────
                 // E_j(t) = (vehicleID, ψ_j^(i)(t), epoch, h(b_i(t)), σ_j^sub)
