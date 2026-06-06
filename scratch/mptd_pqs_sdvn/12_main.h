@@ -66,6 +66,10 @@ int main(int argc, char *argv[])
     cmd.AddValue ("enable_lstm_ae",
                   "R7f: force LSTM-AE temporal detector on(1)/off(0); -1=follow ablation_mode",
                   g_enable_lstm_ae_cli);
+    cmd.AddValue ("trs_classical",
+                  "TRS scheme: 0=PQ Dilithium/ML-DSA-44 (default, paper Eq 3.49), "
+                  "1=classical Shamir-Schnorr-P256 ECDSA-class baseline for RQ5 PBPO",
+                  g_trs_classical_baseline);
     cmd.AddValue ("skip_blockchain",
                   "R7g.3: skip Hyperledger Fabric + REST API bring-up "
                   "(for training-data sweeps without a working Fabric env); "
@@ -1628,20 +1632,6 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 			declare_attack_states();
 			declare_attackers();
 			declare_compromised_rsus(); // TP-S1, MP-S1: set which RSUs are compromised
-
-			// ── Stage 7: PQ Crypto self-test (always runs) ────────────────────────────
-			if (use_pq_crypto) {
-			    TRSSignature pq_sig = generate_trs_aggregate(0, 100.0, 200.0, 15.0, 1.57, 0.0);
-			    verify_trs(pq_sig);
-			    std::cout << "[TRS] PQ-INIT: RSU ring self-test — "
-			              << "signers=" << pq_sig.signers.size()
-			              << " verified=" << (pq_sig.verified ? "YES" : "NO")
-			              << " hash=" << pq_sig.aggregate_hash << "\n";
-			    FHECiphertext pq_ct = fhe_encrypt_scalar(15.0);
-			    std::cout << "[FHE] PQ-INIT: CKKS self-test — "
-			              << "enc=" << pq_ct.noisy_value
-			              << " err=" << std::abs(fhe_decrypt_scalar(pq_ct) - 15.0) << "\n";
-			}
 
 			// R6.5: initialize TRS (OpenSSL EC P-256) + FHE (OpenFHE BFV)
 			// backends BEFORE any sim event runs. CP-DETECT depends on

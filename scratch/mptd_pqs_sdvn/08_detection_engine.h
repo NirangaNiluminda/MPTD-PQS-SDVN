@@ -103,9 +103,10 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
     // veh_idx of the revoked vehicle
     int rev_idx = lkh_veh_idx(revoked_vehicle_id);
 
-    // Regenerate LKH path keys (Eq.3.34: N_rekey = log₂|V_j| messages)
-    int rekey_path[32] = {};
-    int n_rekeyed = lkh_rekey_on_revoke(rev_idx, sim_time, rekey_path, 32);
+    // Zone-scoped rekey: marks the revoked vehicle, rekeys its zone path, and
+    // fills g_lkh_affected_members with the surviving members of THAT zone only
+    // (paper §3.5.2 Eq 3.23: N_rekey = log₂|V_j|, the zone population).
+    int n_rekeyed = lkh_rekey_on_revoke(rev_idx, sim_time);
 
     // RSU rekey socket (set in 07_socket_layer.h StartApplication)
     Ptr<Socket> rekey_sock = (rsu_id < 4) ? g_rsu_rekey_socket[rsu_id] : nullptr;
@@ -116,22 +117,22 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
 
     int packets_sent = 0;
 
-    // Send unicast RekeyTag to every non-revoked, IP-known vehicle
-    for (int vi = 0; vi < (int)N_Vehicles && vi < LKH_MAX_VEH; vi++) {
+    // Send unicast RekeyTag only to the surviving members of the revoked
+    // vehicle's ZONE (paper §3.5.2: rekey is zone-scoped, not network-wide).
+    for (int vi : g_lkh_affected_members) {
+        if (vi < 0 || vi >= LKH_MAX_VEH) continue;
         uint32_t veh_nid = (uint32_t)(vi + 2);
-        if (veh_nid == revoked_vehicle_id) continue;   // skip revoked vehicle itself
 
-        // Increment nonce η_i → new K_i cannot be derived from old K_leaf
+        // Increment nonce η_i → new K_i cannot be derived from the old one
         g_vehicle_nonce[vi]++;
 
-        // Recompute K_i = KDF(new_K_leaf, new_η_i, ID_i) [Eq.3.33]
+        // Recompute K_i = KDF(K_{u_i}, new_η_i, ID_i) [Eq.3.22]
         lkh_compute_session_key(vi);
 
-        // Build RekeyTag with this vehicle's new leaf key
-        int leaf_idx = g_lkh_first_leaf + vi;
+        // Build RekeyTag carrying this vehicle's (current) leaf key + new nonce
         RekeyTag rk;
         rk.SetTargetVehicleId(veh_nid);
-        rk.SetNewLeafKey(g_lkh_tree[leaf_idx].key);
+        rk.SetNewLeafKey(g_vehicle_leaf_key[vi]);
         rk.SetNewNonce(g_vehicle_nonce[vi]);
         rk.SetRsuId(rsu_id);
         rk.SetTimestamp(sim_time);
@@ -166,8 +167,7 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
     cout << "[LKH-REKEY] Revoked V" << (revoked_vehicle_id - 2)
          << ": rekeyed " << n_rekeyed << " tree nodes,"
          << " sent " << packets_sent << " rekey packets"
-         << " (Eq.3.34 N_rekey=log2(" << g_lkh_n_leaves
-         << ")=" << (int)std::log2((double)g_lkh_n_leaves) << ")"
+         << " (Eq.3.23 N_rekey=log2|V_j|≈" << n_rekeyed << ")"
          << " t=" << sim_time << endl;
 }
 
@@ -1094,6 +1094,157 @@ void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
 //   • Treat its own opinion as authoritative when ≥f+1 RSUs disagree
 //     (CP-DETECT, paper §3.5.5 Algorithm 7, will be added in R6)
 // ──────────────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+// Full-mode cryptographic mitigation pipeline — paper §3.5.4, Algorithm 6
+// (PQ-FHE-TRS) + Eq 3.51–3.53 cloud gate + Algorithm 7 (THRESH-DEC).
+//
+// Real crypto end-to-end (no simulation, no hardcoded values — every operation
+// below is a genuine OpenFHE / liboqs call over the live RSU window aggregates):
+//   Eq 3.45  A_j(t)            field-wise plaintext aggregate per RSU window
+//   Eq 3.46  c_j = Enc(pk,A_j) per-RSU FHE encrypt BEFORE ring sharing
+//   Eq 3.47  Enc(A_ring)=⊕c_j  ring homomorphic add (entirely on ciphertext)
+//   Eq 3.48  m=(Enc(A_ring),t,ID_S,h(S))   TRS message binds the CIPHERTEXT
+//   Eq 3.49  σ_j = Sign(sk_j,m)            t partial Dilithium signatures
+//   Eq 3.50  σ_TRS = Aggregate({σ_j})      threshold ring bundle (D1)
+//   Eq 3.51  Verify(...) ∈ {0,1}           cloud gate — reject before decrypt
+//   Eq 3.52  Enc(X_global)                 cloud blind aggregate (M=1 ring here)
+//   Eq 3.53/3.55/3.56  pd_cloud / pd_j / ThDec   threshold (t,n+1) decryption
+//
+// Sim orchestration note (transport only, NOT crypto): RSU 0 acts as the ring
+// aggregation coordinator. Algorithm 6 lines 4–5 (each RSU broadcasts c_j and
+// receives peers' {c_k}) are realized in-process by reading every RSU's latest
+// window snapshot — there is no inter-RSU DSRC frame in the single-process NS-3
+// sim. The cryptographic chain (encrypt → ⊕ → sign → verify → threshold-decrypt)
+// is fully real; only the c_j delivery is in-process. Ablation isolation
+// (TRS/FHE on-vs-off) does not depend on this transport.
+// ════════════════════════════════════════════════════════════════════════════
+struct FullModeCryptoResult {
+    bool   ran                  = false;
+    bool   trs_verified         = false;
+    bool   decrypt_ok           = false;
+    size_t contributing_rsus    = 0;
+    size_t sigma_bytes          = 0;
+    int64_t total_vehicles      = 0;
+    double recovered_mean_speed = 0.0;   // from threshold decrypt (Eq 3.56)
+    double plaintext_mean_speed = 0.0;   // local plaintext reference for sanity
+    double elapsed_ms           = 0.0;
+};
+
+// Full-mode crypto PBPO accounting (paper Eq 4.7, per-window W = L·T_b split).
+static uint64_t g_fullcrypto_runs       = 0;
+static double   g_fullcrypto_time_sum_ms = 0.0;
+
+// Returns true iff the pipeline executed (verified or rejected). Caller gates on
+// full mode + use_pq_crypto; this function additionally requires both backends
+// ready and only runs for the coordinator RSU.
+static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
+                                          FullModeCryptoResult &res)
+{
+    // Only the ring coordinator drives one pipeline run per window (see note).
+    if (closing_rsu != 0) return false;
+    if (!use_pq_crypto)   return false;
+    if (!g_trs_ready || !g_trs_backend) return false;
+    if (!g_thfhe_backend || !g_thfhe_backend->ready()) return false;
+
+    struct timespec t0, t1;
+    clock_gettime(CLOCK_MONOTONIC, &t0);
+
+    const uint32_t n = g_trs_ring_n;            // RSUs in the signing ring
+    auto append_u32 = [](std::vector<uint8_t> &v, uint32_t x) {
+        for (int b = 0; b < 4; b++) v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
+    };
+
+    // ── Algorithm 6 lines 2–3: each RSU computes A_j (Eq 3.45 mean) then FHE-
+    // encrypts it (Eq 3.46). We carry SUMs in packed slots [Σspeed, Σpos_x,
+    // Σpos_y, Σcount] so the cloud recovers the field-wise MEAN after decrypt
+    // (mean = Σ / count, integer-exact in BFV — no FP inside ciphertext).
+    std::vector<ThresholdBfvBackend::Ciphertext> c_j;
+    std::vector<uint32_t> vehicle_union;
+    int64_t total_count   = 0;
+    int64_t pt_speed_sum  = 0;                  // plaintext reference only
+    for (uint32_t r = 0; r < n && r < 4; r++) {
+        if (!rsu_last_window_valid[r]) continue;
+        const RsuBeaconWindow &rw = rsu_last_window[r];
+        const uint32_t N = rw.beacon_count;
+        if (N == 0) continue;
+        int64_t s_speed = 0, s_px = 0, s_py = 0;
+        for (uint32_t i = 0; i < N; i++) {
+            s_speed += (int64_t)std::llround(rw.speed[i] * (double)ThresholdBfvBackend::SPEED_SCALE);
+            s_px    += (int64_t)std::llround(rw.pos_x[i] * (double)ThresholdBfvBackend::POS_SCALE);
+            s_py    += (int64_t)std::llround(rw.pos_y[i] * (double)ThresholdBfvBackend::POS_SCALE);
+            vehicle_union.push_back(rw.vid[i]);
+        }
+        std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
+        c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
+        total_count  += (int64_t)N;
+        pt_speed_sum += s_speed;
+    }
+    if (c_j.empty()) return false;
+    res.contributing_rsus = c_j.size();
+    res.total_vehicles    = total_count;
+
+    // ── Algorithm 6 line 6: ring homomorphic add (Eq 3.47), ciphertext-only ──
+    ThresholdBfvBackend::Ciphertext enc_ring = g_thfhe_backend->add_many(c_j);
+
+    // ── Algorithm 6 line 7: bind ciphertext into TRS message (Eq 3.48) ───────
+    std::vector<uint8_t> msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
+    append_u32(msg, g_trs_ring_t);              // t
+    append_u32(msg, closing_rsu);               // ID_S (ring identity)
+    append_u32(msg, epoch);                      // timestamp surrogate
+    for (uint32_t v : vehicle_union) append_u32(msg, v);   // h(S) material
+
+    // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
+    std::vector<std::vector<uint8_t>> partials;
+    std::vector<uint32_t> signers;
+    for (uint32_t j = 0; j < g_trs_ring_t && j < g_trs_ring_n; j++) {
+        std::vector<uint8_t> p;
+        if (!g_trs_backend->partial_sign(msg, g_trs_ring_sks[j], p)) return false;
+        partials.push_back(std::move(p));
+        signers.push_back(j + 1);               // 1-indexed signer ids
+    }
+    std::vector<uint8_t> sigma_trs;
+    if (!g_trs_backend->aggregate(partials, signers, sigma_trs)) return false;
+    res.sigma_bytes = sigma_trs.size();
+
+    // ── Cloud-side Eq 3.51: TRS-verify gate. Reject before any decryption ────
+    res.trs_verified = g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
+    if (!res.trs_verified) {
+        g_trs_rejected_count++;                 // PARR numerator (Eq 4.3)
+        clock_gettime(CLOCK_MONOTONIC, &t1);
+        res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                       + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        g_fullcrypto_runs++;
+        g_fullcrypto_time_sum_ms += res.elapsed_ms;
+        res.ran = true;
+        return true;
+    }
+    g_trs_verified_count++;
+
+    // ── Eq 3.52: cloud blind global aggregate. Single ring cluster ⇒ M=1, so
+    // Enc(X_global) = Enc(A_ring); the mean is taken after decryption ──────────
+    ThresholdBfvBackend::Ciphertext enc_global = enc_ring;
+
+    // ── Algorithm 7 (THRESH-DEC): cloud(lead) + t−1 RSU partials (Eq 3.53–3.56)
+    std::vector<uint32_t> present;              // t−1 RSUs; cloud auto-added
+    for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++) present.push_back(j);
+    std::vector<int64_t> out_vec;
+    res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
+    if (res.decrypt_ok && total_count > 0) {
+        res.recovered_mean_speed = (double)out_vec[0]
+                                 / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
+        res.plaintext_mean_speed = (double)pt_speed_sum
+                                 / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &t1);
+    res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+                   + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    g_fullcrypto_runs++;
+    g_fullcrypto_time_sum_ms += res.elapsed_ms;
+    res.ran = true;
+    return true;
+}
+
 void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id)
 {
     double now = Simulator::Now().GetSeconds();
@@ -1569,6 +1720,29 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                  << " t_close=" << std::setprecision(3) << now
                  << " W=" << WINDOW_L_BEACONS * T_b << "s" << endl;
 
+            // ── Full-mode crypto mitigation: Algorithm 6 (PQ-FHE-TRS) + Eq 3.51
+            // cloud gate + Algorithm 7 (THRESH-DEC). Runs once per window via the
+            // ring coordinator (RSU 0). Full mode only: skipped for A1 (LW-only)
+            // and B1 (LTT baseline); TRS/FHE gated by use_pq_crypto (off for A4).
+            // Independent of the AI block below — crypto runs even when GAT/AE are
+            // disabled (A4/A5), preserving ablation isolation (paper §4.1.1).
+            if (use_pq_crypto && ablation_mode != 1 && ablation_mode != 6) {
+                FullModeCryptoResult cr;
+                if (run_full_mode_crypto_pipeline(rsu_id, cw.window_epoch, cr) && cr.ran) {
+                    cout << "[FULLCRYPTO] epoch=" << cw.window_epoch
+                         << " rings=" << cr.contributing_rsus
+                         << " veh=" << cr.total_vehicles
+                         << " trs=" << (cr.trs_verified ? "VERIFIED" : "REJECTED")
+                         << " sigma=" << cr.sigma_bytes << "B"
+                         << " dec=" << (cr.decrypt_ok ? "ok" : "fail")
+                         << std::fixed << std::setprecision(3)
+                         << " mean_speed_dec=" << cr.recovered_mean_speed
+                         << " mean_speed_pt=" << cr.plaintext_mean_speed
+                         << " " << std::setprecision(2) << cr.elapsed_ms << "ms"
+                         << " (Alg6/7 Eq 3.45-3.56)" << endl;
+                }
+            }
+
             // ── R7d: Full-mode GAT spatial scoring (paper §3.5.3 Eq 3.38–3.42) ──
             // The RSU-side ipfs_push_and_maybe_flush() runs in handle_readone
             // BEFORE this controller-side block sees the same beacon, so by
@@ -1840,44 +2014,15 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     //    (Actual blockchain call is in 11_routing_blockchain_transmission.h)
     total_trajectories_stored_blockchain++;
 
-    // ── R8.4: Real TRS partial_sign + aggregate + verify_threshold ──────────
-    // Paper §3.5.4 Algorithm 6 (PQ-TRS-SIGN), Eq. 3.46–3.49.
-    //
-    // Wires the ITrsBackend pipeline into the per-beacon RSU detection hot
-    // path so the (a) σ_TRS verification really gates trajectory acceptance
-    // (paper Invariant 5), and (b) the partial_sign/aggregate/verify cost
-    // gets booked to PBPO_Full (answering RQ5 TRS-vs-ECDSA latency).
-    //
-    // Sim-only deviation: the t partial signatures come from the first t
-    // entries in g_trs_ring_sks rather than being delivered over a real DSRC
-    // inter-RSU channel. The crypto chain itself is real; only the σ_j
-    // transport is shortcut. Lives inside the PBPO timing window (started
-    // at line ~960 via clock_gettime). Without RSU-key-compromise
-    // simulation the verify always passes, so g_trs_rejected_count stays at
-    // zero — the chain still exercises the real partial/aggregate/verify
-    // code paths, which is what we need for PBPO + paper conformance.
-    if (use_pq_crypto && g_trs_ready) {
-        EvidenceMessage m_j;
-        m_j.rsu_id      = rsu_id;
-        m_j.timestamp   = tag.GetTimestamp();
-        m_j.agg_pos_x   = tag.GetPosX();
-        m_j.agg_pos_y   = tag.GetPosY();
-        // BSM stores polar (speed, heading) — reconstruct vx, vy for m_j.
-        const double s_polar = tag.GetSpeed();
-        const double h_polar = tag.GetHeading();
-        m_j.agg_vel_x   = s_polar * std::cos(h_polar);
-        m_j.agg_vel_y   = s_polar * std::sin(h_polar);
-        // BSM stores scalar acceleration magnitude (no per-axis split).
-        m_j.agg_accel_x = tag.GetAcceleration();
-        m_j.agg_accel_y = 0.0;
-        m_j.vehicle_set.push_back(vehicle_id);
-
-        std::vector<uint8_t>  sigma_trs;
-        std::vector<uint32_t> signers;
-        bool verified = evidence_sign_and_verify(m_j, sigma_trs, signers);
-        if (verified) g_trs_verified_count++;
-        else          g_trs_rejected_count++;
-    }
+    // ── TRS moved to the Full-mode window-close hook (paper-correct) ─────────
+    // The per-beacon TRS block that used to live here signed the *plaintext*
+    // single-beacon aggregate (|V_j|=1) — a deviation from Eq 3.48, which signs
+    // the FHE *ciphertext* Enc(A_ring) over the whole window. Per Algorithm 6
+    // the TRS is a Full-mode, per-window (W = L·T_b) cluster operation, not a
+    // per-beacon RSU-hot-path op. It now runs in HandleBeaconReceived's
+    // window-close branch via run_full_mode_crypto_pipeline() (real ciphertext
+    // signing + threshold decrypt). Removing it here also stops the TRS cost
+    // from leaking into the per-beacon PBPO_LW budget (T_b = 100 ms).
 
     // Update confusion matrix + beacon CSV log
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
@@ -2258,6 +2403,19 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         pbpo_lw_time_sum_ms += (t_lw_end.tv_sec  - t_lw_start.tv_sec)  * 1000.0
                              + (t_lw_end.tv_nsec - t_lw_start.tv_nsec) / 1e6;
         pbpo_lw_cnt++;
+
+        // ── LKH dynamic membership (paper §3.5.2, P1b-C) ─────────────────────────
+        // After verifying with the CURRENT K_i, register/hand-off this vehicle to
+        // the nearest RSU's zone. The geographic filter above guarantees
+        // rsu_idx == nearest_rsu_for_position, so exactly ONE RSU migrates a given
+        // beacon — no cross-RSU key race. On a zone change this rotates K_i to the
+        // new zone's leaf key for the NEXT beacon (per-RSU-contact keys, Eq 3.22).
+        // Only on a genuine HMAC pass (don't register a vehicle off a forged beacon).
+        if (vid < 10000 && hmac_gate_pass) {
+            int mv_idx = lkh_veh_idx(vid);
+            if (mv_idx >= 0 && mv_idx < LKH_MAX_VEH)
+                lkh_on_beacon_at_rsu((int)rsu_idx, mv_idx, t);
+        }
 
         // If HMAC gate fails: do not forward to management node (drop the beacon)
         // The beacon is silently dropped — no detection pipeline, no downlink response.

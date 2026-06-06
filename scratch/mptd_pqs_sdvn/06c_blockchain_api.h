@@ -8,7 +8,6 @@
 // REST endpoint between the RSU code and Fabric peers).
 //
 // Depends on:
-//   06b_pq_crypto.h   (TRSSignature, FHECiphertext, evidence_sign_and_verify)
 //   06b1_trs_backend.h (TRS pipeline)
 //   05_utils.h        (execCmd)
 //   02_config_globals.h (use_pq_crypto, routing_algorithm, ablation_mode, …)

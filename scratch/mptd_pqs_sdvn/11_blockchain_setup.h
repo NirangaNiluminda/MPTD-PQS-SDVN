@@ -90,8 +90,18 @@ std::string escapeQuotes(const std::string& input)
 // unaffected; FHE aggregates are only consumed by R9 which isn't wired yet).
 void initialize_crypto_backends()
 {
+    // Ensure LKH master keys (K_root, K_ring) are CSPRNG-generated BEFORE the TRS
+    // backend seeds its ring polynomial from K_ring. This path runs before
+    // lkh_init_all() in 12_main.h, so generate here (idempotent).  [P1b-1]
+    lkh_init_master_keys();
+
     // TRS: ring size n=4, threshold t=3 (matches 3-RSU + 1-ctrl peer setup).
-    if (init_trs_backend(/*n=*/4, /*t=*/3)) {
+    // Full-mode default is the paper-correct PQ scheme (Dilithium / ML-DSA-44,
+    // Eq 3.49); --trs_classical=1 selects the classical Shamir-Schnorr-P256
+    // signing-latency baseline for RQ5 (paper §3.5.4, behind ITrsBackend).
+    const TrsScheme trs_scheme = g_trs_classical_baseline
+                               ? TrsScheme::Classical : TrsScheme::Dilithium;
+    if (init_trs_backend(/*n=*/4, /*t=*/3, trs_scheme)) {
         std::cout << "[CRYPTO/TRS] " << g_trs_backend->scheme_name()
                   << " ready (n=" << g_trs_ring_n
                   << " t=" << g_trs_ring_t
@@ -101,7 +111,25 @@ void initialize_crypto_backends()
         std::cerr << "[CRYPTO/TRS] init FAILED — CP-DETECT σ_TRS path disabled\n";
     }
 
-    // FHE: BFV-RNS, plaintext modulus 65537, mult depth 1 (sum-only).
+    // FHE: threshold (t, n+1) BFV-RNS — the paper-correct Full-mode scheme
+    // (Eq 3.54 ThGen, multiparty key gen + Shamir ShareKeys "with aborts").
+    // n_rsus=4, threshold=3; Cloud is the mandatory (n+1)-th lead party.
+    if (init_threshold_fhe_backend(/*n_rsus=*/4, /*threshold=*/3,
+                                   /*ptmod=*/65537, /*depth=*/1)) {
+        std::cout << "[CRYPTO/THFHE] " << g_thfhe_backend->scheme_name()
+                  << " ready (ring_dim=" << g_thfhe_backend->ring_dim()
+                  << " parties=" << g_thfhe_backend->num_parties()
+                  << " t=" << g_thfhe_backend->threshold()
+                  << " shares=" << (g_thfhe_backend->shares_available() ? "yes" : "no")
+                  << ")\n";
+    } else {
+        std::cerr << "[CRYPTO/THFHE] init FAILED"
+                  << (g_thfhe_backend ? (": " + g_thfhe_backend->last_error()) : "")
+                  << " — Full-mode FHE-TRS pipeline (Alg 6/7) will be disabled\n";
+    }
+
+    // Single-key BFV retained ONLY for the 06b3 selftest's legacy sum/mean
+    // checks; the live Full-mode aggregate path uses g_thfhe_backend above.
     if (init_fhe_backend(/*ptmod=*/65537, /*depth=*/1)) {
         std::cout << "[CRYPTO/FHE] " << g_fhe_backend->scheme_name()
                   << " ready (ring_dim=" << g_fhe_backend->ring_dim()
@@ -109,7 +137,7 @@ void initialize_crypto_backends()
     } else {
         std::cerr << "[CRYPTO/FHE] init FAILED"
                   << (g_fhe_backend ? (": " + g_fhe_backend->last_error()) : "")
-                  << " — R9 FHE aggregate channel will be disabled\n";
+                  << " — single-key selftest path disabled\n";
     }
 
     // R6.5-C-8: optional self-test (env MPTD_CRYPTO_SELFTEST=1).
@@ -362,9 +390,10 @@ static std::string derive_controller_h_ku(uint32_t ctrl_idx)
 {
     uint8_t k_u[LKH_KEY_BYTES];
     uint8_t id_c[8] = { 'C','T','R','L', (uint8_t)ctrl_idx, 0, 0, 0 };
-    lkh_kdf(LKH_K_RING, LKH_KEY_BYTES,
-            LKH_K_RING, LKH_KEY_BYTES,
-            id_c,       sizeof(id_c),
+    lkh_init_master_keys();   // ensure K_ring is CSPRNG-ready before deriving
+    lkh_kdf(g_lkh_k_ring_current, LKH_KEY_BYTES,
+            g_lkh_k_ring_current, LKH_KEY_BYTES,
+            id_c,                 sizeof(id_c),
             k_u);
     return sha256_hex(k_u, LKH_KEY_BYTES);
 }

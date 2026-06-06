@@ -35,7 +35,8 @@ python3 waf --run "mptd_pqs_sdvn --attack_number=1 --routing_algorithm=4 --routi
 | `03_packet_tags.h` | BsmBeaconTag (uplink) + DownlinkControlTag (downlink) |
 | `04_state_globals.h` | Runtime state: vehicle_state[], RSU globals, Option B globals |
 | `05_utils.h` | Utility functions |
-| `06b_pq_crypto.h` | Post-quantum crypto: TRS + CKKS FHE |
+| `06b1_trs_backend.h` | TRS backend (ITrsBackend seam; OpenSSL EC) |
+| `06b2_fhe_backend.h` | FHE backend (OpenFHE BFV) |
 | `06c_blockchain_api.h` | Blockchain REST API calls |
 | `06a_attack_models.h` | PoisonTrajectoryByType(), declare_attack_states(), declare_attackers() |
 | `07_socket_layer.h` | SimpleUdpApplication class (sockets, StartApplication, HandleReadTwo) |

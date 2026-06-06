@@ -17,9 +17,21 @@
 //           but verify_threshold REJECTS (no a_0 recovery from < t shares)
 //   TRS-3: tampered message → verify_threshold = REJECT
 //   TRS-4: wrong-ring pks (different n → different K_ring-seeded poly) → REJECT
-//   FHE-1: encrypt single int → decrypt = same int
+//   FHE-1: encrypt single int → decrypt = same int (single-key BFV)
 //   FHE-2: Σ EvalAdd(Enc(x_i)) → Decrypt = Σ x_i
 //   FHE-3: encrypt_speed_mps round-trip with ×100 quantization
+//
+// Threshold-FHE + full ciphertext-signing pipeline (paper §3.5.4 Alg 6/7):
+//   THFHE-1: packed-vector encrypt → threshold (cloud + t−1 RSU) decrypt round-trip
+//            (exercises the Shamir "with aborts" key-recovery path, Algorithm 7)
+//   THFHE-2: ring homomorphic ⊕ of 3 packed aggregates → decrypt = slot-wise sums (Eq 3.47)
+//   THFHE-3: serialize_ciphertext non-empty + deterministic (binds Enc(A_ring), Eq 3.48)
+//   PIPE-1:  TRS signs the SERIALIZED CIPHERTEXT (not plaintext) → verify accepts (Eq 3.48-3.51)
+//   PIPE-2:  tampered ciphertext message rejected by TRS
+//
+// NOTE: with the Jun-2026 redesign the active g_trs_backend defaults to PQ
+// Dilithium and the live FHE path uses g_thfhe_backend (threshold). Single-key
+// g_fhe_backend remains only for the FHE-1..4 legacy checks above.
 // ============================================================
 
 #ifndef MPTD_PQS_06B3_CRYPTO_SELFTEST_H
@@ -56,8 +68,12 @@ static void crypto_selftest_run()
              g_trs_ring_pks.size() == (size_t)g_trs_ring_n + 1);
         step("TRS-1b: sk table size == n",
              g_trs_ring_sks.size() == (size_t)g_trs_ring_n);
-        step("TRS-1c: master_pk size matches scheme",
-             g_trs_ring_pks[0].size() == g_trs_backend->expected_pk_size());
+        // pks[1] is a real per-signer public key in BOTH backends (classical
+        // s_j·G, or a Dilithium ML-DSA public key), so it always matches
+        // expected_pk_size(). pks[0] differs by scheme (classical master_pk vs
+        // Dilithium ring descriptor), so it is not size-checked here.
+        step("TRS-1c: signer pk size matches scheme",
+             g_trs_ring_pks[1].size() == g_trs_backend->expected_pk_size());
         step("TRS-1d: share sk size matches scheme",
              g_trs_ring_sks[0].size() == g_trs_backend->expected_sk_size());
 
@@ -81,8 +97,10 @@ static void crypto_selftest_run()
 
         std::vector<uint8_t> sigma_123;
         bool sign_ok_123 = sign_subset({1, 2, 3}, sigma_123);
+        // Scheme-agnostic size check: classical aggregate == one scalar sig;
+        // Dilithium bundle (D1) carries t partial sigs so it is >= one sig.
         step("TRS-2a: partial_sign × 3 + aggregate produced σ_TRS (signers 1,2,3)",
-             sign_ok_123 && sigma_123.size() == g_trs_backend->expected_sig_size());
+             sign_ok_123 && sigma_123.size() >= g_trs_backend->expected_sig_size());
 
         bool verify_ok_123 = sign_ok_123 &&
             g_trs_backend->verify_threshold(msg, sigma_123, g_trs_ring_pks);
@@ -179,6 +197,94 @@ static void crypto_selftest_run()
         }
     } else {
         step("FHE: backend not initialized — skipping all FHE tests", false);
+    }
+
+    // ── Threshold (t,n+1) FHE tests (paper §3.5.4 Eq 3.54–3.56) ─────────────
+    if (g_thfhe_backend && g_thfhe_backend->ready()) {
+        try {
+            using TCt = ThresholdBfvBackend::Ciphertext;
+            // Present set = first t−1 RSUs; Cloud (lead) is auto-added by the
+            // backend. Absent RSUs' keys are recovered from Shamir shares
+            // (Algorithm 7 "with aborts") — this exercises the recovery path.
+            std::vector<uint32_t> present;
+            for (uint32_t j = 0; j + 1 < g_thfhe_backend->threshold(); j++)
+                present.push_back(j);
+
+            // THFHE-1: packed-vector encrypt → threshold decrypt round-trip.
+            std::vector<int64_t> vec{ 12345, -678, 9001, 7 };
+            TCt cv = g_thfhe_backend->encrypt_vector_int(vec);
+            std::vector<int64_t> back;
+            bool dec_ok = g_thfhe_backend->threshold_decrypt_vec(cv, present, vec.size(), back);
+            bool vec_match = dec_ok && back.size() == vec.size();
+            for (size_t k = 0; vec_match && k < vec.size(); k++)
+                if (back[k] != vec[k]) vec_match = false;
+            step("THFHE-1: packed-vector threshold round-trip (cloud + t-1 RSUs, aborts recovery)",
+                 vec_match);
+
+            // THFHE-2: ring homomorphic add (Eq 3.47) of 3 vectors → decrypt = slot-wise Σ.
+            std::vector<std::vector<int64_t>> rows{
+                { 100, 10, 1, 2 }, { 200, 20, 2, 3 }, { 300, 30, 3, 4 } };
+            std::vector<TCt> cts;
+            for (auto &r : rows) cts.push_back(g_thfhe_backend->encrypt_vector_int(r));
+            TCt ring = g_thfhe_backend->add_many(cts);
+            std::vector<int64_t> ring_back;
+            bool ring_ok = g_thfhe_backend->threshold_decrypt_vec(ring, present, 4, ring_back);
+            bool ring_match = ring_ok &&
+                ring_back.size() == 4 &&
+                ring_back[0] == 600 && ring_back[1] == 60 &&
+                ring_back[2] == 6   && ring_back[3] == 9;
+            step("THFHE-2: ring ⊕ of 3 packed aggregates → threshold decrypt = slot sums",
+                 ring_match);
+
+            // THFHE-3: serialize_ciphertext is non-empty and deterministic for a
+            // fixed ciphertext object (required to bind Enc(A_ring) into the TRS
+            // message, Eq 3.48 — same ct must hash to the same bytes).
+            std::vector<uint8_t> b1 = g_thfhe_backend->serialize_ciphertext(ring);
+            std::vector<uint8_t> b2 = g_thfhe_backend->serialize_ciphertext(ring);
+            step("THFHE-3: serialize_ciphertext non-empty + deterministic",
+                 !b1.empty() && b1 == b2);
+
+            // ── PIPE: full Algorithm 6 ciphertext-signing path (Eq 3.46–3.51) ──
+            // Sign the SERIALIZED CIPHERTEXT (not plaintext) with t partial
+            // Dilithium sigs, aggregate, then verify — the paper-correct gate.
+            if (g_trs_backend && g_trs_ready &&
+                g_trs_ring_t > 0 && g_trs_ring_sks.size() >= g_trs_ring_t) {
+                std::vector<uint8_t> msg = b1;                 // Enc(A_ring) bytes
+                msg.push_back((uint8_t)g_trs_ring_t);          // bind t
+                std::vector<std::vector<uint8_t>> parts;
+                std::vector<uint32_t> ids;
+                bool sign_all = true;
+                for (uint32_t j = 0; j < g_trs_ring_t; j++) {
+                    std::vector<uint8_t> p;
+                    if (!g_trs_backend->partial_sign(msg, g_trs_ring_sks[j], p)) {
+                        sign_all = false; break;
+                    }
+                    parts.push_back(std::move(p));
+                    ids.push_back(j + 1);
+                }
+                std::vector<uint8_t> sigma;
+                bool agg_ok = sign_all && g_trs_backend->aggregate(parts, ids, sigma);
+                bool pipe_verified = agg_ok &&
+                    g_trs_backend->verify_threshold(msg, sigma, g_trs_ring_pks);
+                step("PIPE-1: TRS signs Enc(A_ring) ciphertext → verify accepts (Eq 3.48-3.51)",
+                     pipe_verified);
+
+                std::vector<uint8_t> msg_t = msg;
+                msg_t[0] ^= 0x01;                              // tamper ciphertext byte
+                bool pipe_tamper_rej = agg_ok &&
+                    !g_trs_backend->verify_threshold(msg_t, sigma, g_trs_ring_pks);
+                step("PIPE-2: tampered ciphertext message rejected by TRS",
+                     pipe_tamper_rej);
+            } else {
+                step("PIPE: TRS backend unavailable — skipping ciphertext-sign tests", false);
+            }
+        }
+        catch (const std::exception &e) {
+            std::cout << "  [FAIL] Threshold-FHE/PIPE tests threw: " << e.what() << "\n";
+            failed++;
+        }
+    } else {
+        step("THFHE: threshold backend not initialized — skipping threshold-FHE tests", false);
     }
 
     std::cout << "[CRYPTO/SELFTEST] done: " << passed << " passed, "

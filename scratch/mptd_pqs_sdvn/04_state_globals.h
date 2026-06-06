@@ -259,9 +259,8 @@ ControllerWindow ctrl_window[4] = {};
 //
 // Simulation stub: no real IPFS daemon; we log [IPFS-STORE-RSUx] and
 // [IPFS-HASH-CHAIN-RSUx] lines and increment counters. The hash is a
-// deterministic FNV-1a digest of the concatenated beacon kinematics —
-// same simulation-stub pattern used for the TRS aggregate hash in
-// 06b_pq_crypto.h. Swap to OpenSSL EVP_sha3_256 for published runs.
+// deterministic FNV-1a digest of the concatenated beacon kinematics.
+// Swap to OpenSSL EVP_sha3_256 for published runs.
 
 #define IPFS_WINDOW_L 10   // L beacons per IPFS window (paper §3.5.3 Algorithm 1)
 
@@ -391,8 +390,8 @@ uint32_t ipfs_upload_count     = 0;  // total windows flushed to IPFS off-chain
 uint32_t ipfs_hash_chain_count = 0;  // total hashes anchored on-chain
 
 // Deterministic FNV-1a digest of the window — paper says "cryptographic hash",
-// we use FNV-1a as the SHA3-256 stand-in (same pattern as 06b_pq_crypto.h
-// TRS aggregate hash). For final published runs, swap to OpenSSL EVP_sha3_256.
+// we use FNV-1a as the SHA3-256 stand-in. For final published runs, swap to
+// OpenSSL EVP_sha3_256.
 static std::string ipfs_window_hash(const RsuBeaconWindow &w, uint32_t rsu_id) {
     uint32_t h = 2166136261u;
     auto mix = [&](uint64_t v) {

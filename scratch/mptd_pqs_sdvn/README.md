@@ -16,7 +16,7 @@ mobility pattern and trajectory poisoning attacks in SDVNs using:
 2. **GAT spatial detector** — Graph Attention Network over vehicle-RSU graphs
 3. **LSTM-AE temporal detector** — Autoencoder on beacon sequences (window k=20)
 4. **SC-Trust + SC-Revoke** — Hyperledger Fabric smart contracts for distributed trust
-5. **Post-Quantum TRS + FHE** — Simulated Threshold Ring Signatures + CKKS FHE
+5. **Post-Quantum TRS + FHE** — Real PQ-Dilithium (ML-DSA, liboqs) Threshold Ring Signature + threshold (t,n+1) BFV FHE (OpenFHE)
 
 ---
 
@@ -372,7 +372,8 @@ scratch/mptd_pqs_sdvn/            NS-3 C++ simulation
   04_state_globals.h              Per-vehicle/RSU runtime state (VehicleBeaconState)
   05_utils.h                      execCmd(), extractValue(), data_at_nodes structs
 
-  06b_pq_crypto.h                 Post-Quantum crypto (TRS + FHE) — §3.3.2–3.3.3
+  06b1_trs_backend.h              TRS backend (ITrsBackend; OpenSSL EC) — §3.5.4
+  06b2_fhe_backend.h              FHE backend (OpenFHE BFV) — §3.5.4
   06c_blockchain_api.h            Fabric REST API calls (Store*/Flag*/CallSC*)
   06a_attack_models.h             All 7 attack models + PoisonTrajectoryByType()
 
@@ -482,9 +483,10 @@ python3 docker-api-proxy.py &
 
 ## Key Implementation Notes
 
-- **Simulated PQ crypto**: TRS uses FNV-1a hash + Fisher-Yates shuffle (no real Dilithium); FHE uses Box-Muller Gaussian noise σ=1e-6 to model CKKS error. Replace with OpenFHE library when available.
+- **Real PQ crypto** (paper §3.5.4, Eq 3.45–3.56): TRS = real CRYSTALS-Dilithium / ML-DSA-44 via liboqs (`DilithiumTrsBackend`, t-of-n bundle — see D1 note below); FHE = real threshold (t,n+1) BFV via OpenFHE (`ThresholdBfvBackend`). No simulated/placeholder crypto. Classical Shamir-Schnorr-P256 retained only as the A4 ablation / ECDSA-class PBPO baseline.
+  - **D1 (Dilithium bundle):** liboqs has only single-signer ML-DSA, so σ_TRS is a bundle of t partial signatures verified as "≥t distinct valid." Real PQ + sound t-of-n gate, but NOT the compact/anonymous signature Eq 3.50's prose claims (needs paper-text correction).
 - **Blockchain non-blocking**: Simulation continues if Fabric is offline — all curl calls are fire-and-forget.
-- **Score fusion**: Φ_i(t) = 0.3·ψ + 0.4·S + 0.3·(ε/θ_ae) > 0.5 (Eq. 3.54).
+- **Score fusion**: Φ_i(t) = 0.3·ψ + 0.4·S + 0.3·(ε/θ_ae) > 0.5 (Eq. 3.43; revised paper).
 - **Docker API proxy**: Required because Fabric's embedded Docker client hardcodes API v1.25, but Docker Engine 29.x requires v1.40+. The TCP proxy at port 12375 rewrites the version in all request paths.
 - **Attack 5 (TP-S3)**: Vehicles are honest; poisoning happens at `HandleBeaconReceived()` (the control plane). No vehicle-level malicious flag is set.
 - **Attacks 6 & 7 bypass EnforceRealism**: MP-S3 requires the extreme speed value to reach the detector unclamped so KL-divergence (Eq. 3.18) fires.

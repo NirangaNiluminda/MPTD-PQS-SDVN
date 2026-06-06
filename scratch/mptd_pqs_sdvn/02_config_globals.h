@@ -170,6 +170,15 @@ bool g_enable_lstm_ae     = true; // effective value after dispatch (R7f)
 // Paper §3.3.2-3.3.3; Eq. 3.58-3.65
 bool use_pq_crypto = true;
 
+// ── TRS scheme selector (paper §3.5.4 Eq 3.49; RQ5 PBPO baseline) ───────────
+// false (default) = real PQ CRYSTALS-Dilithium / ML-DSA-44 (DilithiumTrsBackend),
+//                   the paper-correct full-mode threshold ring signature.
+// true            = classical Shamir-Schnorr-P256 (ClassicalTrsBackend), kept ONLY
+//                   as the ECDSA-class signing-latency baseline for RQ5 (TRS-vs-ECDSA
+//                   PBPO comparison) and the A4 framing. Pass --trs_classical=1.
+// This is a signing-primitive swap behind ITrsBackend — call sites are unchanged.
+bool g_trs_classical_baseline = false;
+
 // ── BSM Beacon Parameters (IEEE 802.11p, §3.4.4 Eq. 3.9) ──────────────────
 // b_i(t) = (p_i(t), s_i(t), θ_i(t), a_i(t), t, ID_i)
 double T_b = 0.1;           // Beacon broadcast interval: 100ms (IEEE 802.11p)

@@ -12,7 +12,7 @@
 //   03_packet_tags.h       - BsmBeaconTag and custom NS-3 packet tag classes
 //   04_state_globals.h     - Runtime state: vehicle beacon history buffers
 //   05_utils.h             - Utility and initialization functions
-//   06b_pq_crypto.h        - Post-quantum crypto: TRS + simulated CKKS FHE (§3.3.2-3.3.3)
+//   06b1/06b2_*.h          - Real PQ crypto backends: TRS (OpenSSL EC) + FHE (OpenFHE BFV)
 //   06c_blockchain_api.h   - Blockchain REST API calls (Store*/Call* functions)
 //   06a_attack_models.h    - Attack models: PoisonTrajectory*, declare_* (§3.4)
 //   07_socket_layer.h      - UDP socket layer: SimpleUdpApplication class
@@ -41,10 +41,9 @@
 #include "04_state_globals.h"
 #include "05_utils.h"
 // Section 6 split (Stage 10B cleanup) — include in dependency order:
-//   06b: PQ crypto (TRS + FHE) — no external deps
-//   06c: Blockchain API (Store*/Call* REST calls) — depends on 06b TRS/FHE types
+//   06b1/06b2: real PQ crypto backends (TRS via OpenSSL EC, FHE via OpenFHE BFV)
+//   06c: Blockchain API (Store*/Call* REST calls)
 //   06a: Attack models (PoisonTrajectory*, declare_*) — depends on 06c Store* calls
-#include "06b_pq_crypto.h"
 #include "06b1_trs_backend.h"   // R6.5: ITrsBackend + ClassicalTrsBackend (OpenSSL EC)
 #include "06b2_fhe_backend.h"   // R6.5: BfvBackend (OpenFHE BFV)
 #include "06b3_crypto_selftest.h" // R6.5: TRS + BFV round-trip self-tests (env-gated)

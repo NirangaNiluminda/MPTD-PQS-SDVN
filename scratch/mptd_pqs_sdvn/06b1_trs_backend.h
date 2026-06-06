@@ -87,7 +87,6 @@
 // with no API change.
 //
 // Include order: AFTER 00_lkh_keys.h (uses LKH_K_RING + lkh_hmac_sha256),
-//                AFTER 06b_pq_crypto.h (legacy callers still compile),
 //                BEFORE 06c_blockchain_api.h.
 // Linker: requires -lcrypto (OpenSSL 3.0.2 system lib, already in wscript).
 // ============================================================
@@ -113,6 +112,12 @@
 #include <openssl/sha.h>
 #include <openssl/obj_mac.h>
 #pragma GCC diagnostic pop
+
+#include <cstdio>
+// liboqs (Open Quantum Safe) — real CRYSTALS-Dilithium / ML-DSA single-signer
+// primitives for the post-quantum TRS backend (paper §3.5.4 Eq 3.49). Header at
+// $HOME/.local/include/oqs/oqs.h; lib liboqs.so under $HOME/.local/lib (wscript).
+#include <oqs/oqs.h>
 
 // ────────────────────────────────────────────────────────────────────────────
 // ITrsBackend — abstract crypto-agile threshold ring signature interface.
@@ -198,11 +203,11 @@ public:
     static constexpr size_t SK_LEN  = 32;  // raw scalar s_j
 
     // ──────────────────────────────────────────────────────────────────────
-    // generate_keys: deterministic Shamir poly seeded from LKH K_ring.
-    // Determinism is intentional — repeated init_trs_backend() produces the
-    // same ring, which lets the selftest spot regressions across runs and
-    // lets future RSU-restart logic re-derive the same shares without
-    // out-of-band coordination.
+    // generate_keys: Shamir poly seeded from the current LKH K_ring.
+    // K_ring is CSPRNG-fresh per run (P1b-1), so the ring differs run-to-run as a
+    // real deployment would. Within a run K_ring is fixed, so repeated
+    // init_trs_backend() / RSU-restart re-derives the same shares without
+    // out-of-band coordination (the property the selftest relies on).
     // ──────────────────────────────────────────────────────────────────────
     bool generate_keys(uint32_t n, uint32_t t,
                        std::vector<std::vector<uint8_t>> &out_pks,
@@ -222,8 +227,9 @@ public:
             return false;
         }
 
-        // Deterministic poly seed = LKH K_ring ‖ n ‖ t  → HMAC chain.
-        // (LKH_K_RING is defined in 00_lkh_keys.h, must be included earlier.)
+        // Poly seed = current LKH K_ring ‖ n ‖ t  → HMAC chain.
+        // (g_lkh_k_ring_current is CSPRNG-filled by lkh_init_master_keys(), called
+        //  at the top of initialize_crypto_backends() before this runs.)
         std::vector<BIGNUM*> coef(t, nullptr);
         bool sample_ok = true;
         for (uint32_t k = 0; k < t && sample_ok; k++) {
@@ -235,7 +241,7 @@ public:
                 0,0,0,0
             };
             uint8_t out32[LKH_KEY_BYTES];
-            if (!lkh_hmac_sha256(LKH_K_RING, LKH_KEY_BYTES,
+            if (!lkh_hmac_sha256(g_lkh_k_ring_current, LKH_KEY_BYTES,
                                  info, sizeof(info), out32)) {
                 sample_ok = false; break;
             }
@@ -565,17 +571,177 @@ public:
     size_t expected_pk_size()  const override { return PK_LEN;  }
     size_t expected_sk_size()  const override { return SK_LEN;  }
     const char* scheme_name()  const override {
-        return "Shamir-Schnorr-P256 t-of-n (R8 classical TRS; "
-               "Lagrange combine real; PQ-TRS swap deferred to R11)";
+        return "Shamir-Schnorr-P256 t-of-n (classical TRS / ECDSA-class baseline; "
+               "Lagrange combine real; PQ via DilithiumTrsBackend)";
     }
 };
 
+// ────────────────────────────────────────────────────────────────────────────
+// DilithiumTrsBackend — post-quantum t-of-n TRS via liboqs ML-DSA (Dilithium).
+//
+// Paper §3.5.4 Eq 3.49–3.51: σ_j = Sign(sk_j, m) with a "lattice-based Dilithium
+// secret key"; σ_TRS = Aggregate({σ_j}); Verify({pk_j}, m, σ_TRS) ∈ {0,1}.
+//
+// Why this is NOT the same shape as ClassicalTrsBackend:
+//   liboqs provides single-signer ML-DSA only — no algebraic threshold/ring
+//   combine — and Dilithium signatures are non-linear in the key (Fiat–Shamir
+//   with aborts), so the Lagrange aggregator (σ_TRS = Σ λ_j σ_j) does NOT carry
+//   over. A true compact lattice threshold-ring signature is a separate research
+//   construction not present in any installed library.
+//
+// Design decision D1 (option c — TASK2_CRYPTO_PLAN.md):
+//   Aggregate({σ_j}) = a BUNDLE of the t partial ML-DSA signatures + signer ids.
+//   verify_threshold accepts iff ≥ t DISTINCT ring members each produced a valid
+//   ML-DSA signature over m. This is real PQ crypto (no simulation): it gives a
+//   sound t-of-n predicate for PARR (Eq 4.3) and real PQ signing latency for
+//   PBPO (Eq 4.7). CAVEAT (paper-text item flagged to supervisor): σ_TRS is a
+//   bundle, NOT the *compact / signer-anonymous* single signature that Eq 3.50's
+//   prose claims. This affects none of the 7 evaluation metrics.
+//
+// Bundle wire format (out_sigma):
+//   [u32 count] then count × { [u32 signer_id][u32 siglen][siglen bytes] }
+//
+// Key/sig sizes are RUNTIME values from the OQS_SIG object (crypto-agility — no
+// hardcoded 64-byte assumptions), per the CLAUDE.md crypto-agility lock.
+// pks layout: pks[0] = ring descriptor ("MLDSA"‖n‖t, provenance only — NOT a
+// master key), pks[1..n] = per-signer ML-DSA public keys (1-indexed = signer id).
+// ────────────────────────────────────────────────────────────────────────────
+class DilithiumTrsBackend : public ITrsBackend {
+public:
+    explicit DilithiumTrsBackend(const char* alg = OQS_SIG_alg_ml_dsa_44) {
+        sig_ = OQS_SIG_new(alg);
+        if (sig_)
+            snprintf(name_, sizeof(name_),
+                     "%s t-of-n bundle TRS (liboqs option-c; real PQ)",
+                     sig_->method_name);
+    }
+    ~DilithiumTrsBackend() override { if (sig_) OQS_SIG_free(sig_); }
+
+    bool generate_keys(uint32_t n, uint32_t t,
+                       std::vector<std::vector<uint8_t>> &out_pks,
+                       std::vector<std::vector<uint8_t>> &out_sks) override
+    {
+        if (!sig_ || t == 0 || t > n || n > 64) return false;
+        out_pks.assign(n + 1, std::vector<uint8_t>{});
+        out_sks.assign(n,     std::vector<uint8_t>{});
+        // pks[0]: ring descriptor (provenance only; no master secret exists for PQ).
+        out_pks[0] = { 'M','L','D','S','A', (uint8_t)n, (uint8_t)t };
+        for (uint32_t j = 1; j <= n; j++) {
+            std::vector<uint8_t> pk(sig_->length_public_key);
+            std::vector<uint8_t> sk(sig_->length_secret_key);
+            if (OQS_SIG_keypair(sig_, pk.data(), sk.data()) != OQS_SUCCESS)
+                return false;
+            out_pks[j]   = std::move(pk);
+            out_sks[j-1] = std::move(sk);   // sks[j-1] ↔ signer id j (1-indexed)
+        }
+        return true;
+    }
+
+    bool partial_sign(const std::vector<uint8_t> &message,
+                      const std::vector<uint8_t> &sk,
+                      std::vector<uint8_t> &out_partial) override
+    {
+        if (!sig_ || sk.size() != sig_->length_secret_key) return false;
+        out_partial.assign(sig_->length_signature, 0);
+        size_t siglen = 0;
+        if (OQS_SIG_sign(sig_, out_partial.data(), &siglen,
+                         message.data(), message.size(), sk.data()) != OQS_SUCCESS)
+            return false;
+        out_partial.resize(siglen);     // ML-DSA sig length is fixed but be exact
+        return true;
+    }
+
+    bool aggregate(const std::vector<std::vector<uint8_t>> &partials,
+                   const std::vector<uint32_t> &signer_ids,
+                   std::vector<uint8_t> &out_sigma) override
+    {
+        if (!sig_ || partials.size() != signer_ids.size() || partials.empty())
+            return false;
+        // Honor the per-ring threshold when caller supplies > t partials.
+        const size_t use_n = (g_trs_ring_t > 0 && partials.size() >= g_trs_ring_t)
+                             ? (size_t)g_trs_ring_t : partials.size();
+        out_sigma.clear();
+        put_u32(out_sigma, (uint32_t)use_n);
+        for (size_t i = 0; i < use_n; i++) {
+            if (signer_ids[i] == 0) return false;       // 1-indexed signer ids
+            put_u32(out_sigma, signer_ids[i]);
+            put_u32(out_sigma, (uint32_t)partials[i].size());
+            out_sigma.insert(out_sigma.end(), partials[i].begin(), partials[i].end());
+        }
+        return true;
+    }
+
+    bool verify_threshold(const std::vector<uint8_t> &message,
+                          const std::vector<uint8_t> &sigma,
+                          const std::vector<std::vector<uint8_t>> &pks) override
+    {
+        if (!sig_ || pks.empty()) return false;
+        size_t off = 0;
+        uint32_t count = 0;
+        if (!get_u32(sigma, off, count)) return false;
+        std::vector<uint32_t> seen;
+        uint32_t n_valid = 0;
+        for (uint32_t k = 0; k < count; k++) {
+            uint32_t sid = 0, slen = 0;
+            if (!get_u32(sigma, off, sid))  return false;
+            if (!get_u32(sigma, off, slen)) return false;
+            if (off + slen > sigma.size())  return false;
+            const uint8_t* sptr = sigma.data() + off;
+            off += slen;
+            if (sid == 0 || sid >= pks.size()) continue;   // unknown signer
+            bool dup = false;
+            for (uint32_t s : seen) if (s == sid) { dup = true; break; }
+            if (dup) continue;                             // count distinct only
+            const std::vector<uint8_t> &pk = pks[sid];
+            if (pk.size() != sig_->length_public_key) continue;
+            if (OQS_SIG_verify(sig_, message.data(), message.size(),
+                               sptr, slen, pk.data()) == OQS_SUCCESS) {
+                seen.push_back(sid);
+                n_valid++;
+            }
+        }
+        uint32_t need = (g_trs_ring_t > 0) ? g_trs_ring_t : count;
+        return n_valid >= need;                            // ≥ t distinct valid
+    }
+
+    size_t expected_sig_size() const override { return sig_ ? sig_->length_signature  : 0; }
+    size_t expected_pk_size()  const override { return sig_ ? sig_->length_public_key : 0; }
+    size_t expected_sk_size()  const override { return sig_ ? sig_->length_secret_key : 0; }
+    const char* scheme_name()  const override { return sig_ ? name_ : "DilithiumTrsBackend(uninit)"; }
+
+private:
+    OQS_SIG* sig_ = nullptr;
+    char     name_[96] = "ML-DSA t-of-n bundle TRS (liboqs)";
+
+    static void put_u32(std::vector<uint8_t> &v, uint32_t x) {
+        for (int b = 0; b < 4; b++) v.push_back((uint8_t)((x >> (b*8)) & 0xFF));
+    }
+    static bool get_u32(const std::vector<uint8_t> &v, size_t &off, uint32_t &x) {
+        if (off + 4 > v.size()) return false;
+        x = (uint32_t)v[off] | ((uint32_t)v[off+1] << 8)
+          | ((uint32_t)v[off+2] << 16) | ((uint32_t)v[off+3] << 24);
+        off += 4;
+        return true;
+    }
+};
+
+// Selects the active TRS backend. Full mode (paper §3.5.4 Eq 3.49) uses the
+// Dilithium PQ-TRS; Classical is retained for the A4 ablation and the
+// ECDSA-class PBPO baseline (RQ5).
+enum class TrsScheme { Classical, Dilithium };
+
 // One-time initialization. Call once before first verify_threshold use.
 // n=4, t=3 mirrors the 3-RSU + 1-controller-as-peer BFT setup (f=1, t=f+1+1).
-static bool init_trs_backend(uint32_t n = 4, uint32_t t = 3)
+// scheme defaults to Classical to preserve legacy call sites; full mode selects
+// TrsScheme::Dilithium (wired in 11_blockchain_setup, P5).
+static bool init_trs_backend(uint32_t n = 4, uint32_t t = 3,
+                             TrsScheme scheme = TrsScheme::Classical)
 {
     if (g_trs_ready) return true;
-    g_trs_backend = std::unique_ptr<ITrsBackend>(new ClassicalTrsBackend());
+    if (scheme == TrsScheme::Dilithium)
+        g_trs_backend = std::unique_ptr<ITrsBackend>(new DilithiumTrsBackend());
+    else
+        g_trs_backend = std::unique_ptr<ITrsBackend>(new ClassicalTrsBackend());
     // ring_n/t must be visible to aggregate()'s "use first t partials" logic
     // BEFORE generate_keys returns — they're independent of generate_keys,
     // so set them up-front.

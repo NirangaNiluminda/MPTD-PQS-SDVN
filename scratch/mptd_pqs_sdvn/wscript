@@ -70,6 +70,12 @@ def customize(bld, obj):
     #   storage. Used by mptd_ipfs_add() in 06c_blockchain_api.h to pin
     #   raw beacon bytes and obtain the CID that becomes h(b_i(t)) in
     #   Eq 3.56 — replacing the FNV-1a placeholder.
+    # oqs (TASK ②): liboqs (Open Quantum Safe) provides CRYSTALS-Dilithium /
+    #   ML-DSA single-signer primitives. DilithiumTrsBackend (06b1) builds the
+    #   t-of-n threshold ring signature of paper §3.5.4 Eq 3.47–3.49 on top of
+    #   these, per the supervisor's post-quantum TRS decision. Header is
+    #   <oqs/oqs.h> under $HOME/.local/include (already on the -I path above);
+    #   lib is liboqs.so under $HOME/.local/lib (already on -L + rpath above).
     obj.env.append_value('LIB', [
         'OPENFHEpke',
         'OPENFHEcore',
@@ -77,4 +83,5 @@ def customize(bld, obj):
         'crypto',
         'onnxruntime',
         'curl',
+        'oqs',
     ])
