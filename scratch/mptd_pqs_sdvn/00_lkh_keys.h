@@ -3,37 +3,47 @@
 // MPTD-PQS: §3.5.2 Group Key Management via Logical Key Hierarchy
 // ============================================================
 // Paper Equations implemented here:
-//   Eq.3.33: K_i = KDF(K_{u_i}, η_i, ID_i)     — vehicle session key
-//   Eq.3.34: N_rekey = log₂|V_j|               — rekey cost on leave
-//   Eq.3.36: sk_j = KDF(K_{u_j}, K_ring, ID_rj) — RSU ring key
+//   Eq.3.22: K_i = KDF(K_{u_i}, η_i, ID_i)     — vehicle session key
+//   Eq.3.23: N_rekey = log₂|V_j|               — rekey cost on vehicle leave
+//   Eq.3.24: N_ring  = (n-1)                    — RSU ring rekey cost
+//   Eq.3.25: sk_j = KDF(K_{u_j}, K_ring, ID_rj) — RSU ring key; the same
+//            authenticated ring channel also distributes the FHE key shares
+//            {sk_j^share} produced by ThGen (Eq 3.54) — 2026-06 revision.
 //   Eq.3.37: MAC_i(t) = HMAC_{K_i}(b_i(t)‖t‖ID_i) — beacon tag
+//
+//   NOTE: §3.5.2 was renumbered in the 2026-06 paper revision (prior numbering
+//   3.33/3.34/3.36 → now 3.22/3.23/3.25). Underlying math is unchanged.
 //
 // Key derivation: HMAC-SHA256 used as KDF (HMAC-based KDF)
 //   KDF(master, salt, info) = HMAC-SHA256(master, salt ‖ info)
 //   This is the Extract step of HKDF — produces 32 bytes, cryptographically
 //   indistinguishable from random given secure master key.
 //
-// LKH tree structure (balanced binary heap):
-//   Node 0   = root (K_root)
-//   Node k   → left child  = 2k+1
-//           → right child = 2k+2
-//   Leaf  i  = node (g_lkh_first_leaf + i) for vehicle i
+// Topology (per-zone, paper §3.5.2 — P1b-C):
+//   • One LKH subtree PER RSU coverage zone (g_lkh_zone[rsu]), managed by the
+//     RSU. Balanced binary heap: node k → children 2k+1, 2k+2; leaf slot s at
+//     heap index (first_leaf + s). Each zone has its own CSPRNG group key K_root.
+//   • A SEPARATE RSU-ring subtree (g_lkh_ring_tree), managed by the SDN
+//     controller, from which sk_j is derived (Eq 3.25).
+//   • Vehicles are NOT statically placed: they JOIN a zone on first RSU contact
+//     and HAND OFF as they move (lkh_on_beacon_at_rsu), with K_i re-derived from
+//     the new zone's leaf key (per-RSU-contact keys, Eq 3.22).
 //
-// Rekeying (§3.5.2 Algorithm):
-//   When vehicle k is revoked:
-//     1. Traverse path from k's leaf to root
-//     2. For each internal node on path: regenerate key
-//     3. Send unicast NS-3 UDP (RekeyTag) to each remaining vehicle
-//        carrying their new K_leaf value
-//     4. Vehicle recomputes K_i from new K_leaf (Eq.3.33)
-//     5. Old K_i is dead → HMAC verification rejects future forgeries
+// Dynamic membership / rekeying (§3.5.2, Eq 3.22–3.24):
+//   • Join  : allocate a leaf slot in the zone subtree, derive K_{u_i} + K_i.
+//   • Handoff: free old-zone slot (rotate that zone's path = forward secrecy of
+//             K_root), join new zone. Benign → no unicast rekey storm.
+//   • Revoke: zone-scoped — rekey the revoked leaf's path, nonce-bump + RekeyTag
+//             only the SURVIVING members of THAT zone (Eq 3.23 N_rekey=log₂|V_j|,
+//             the zone population, NOT the global count).
 //
 // Real vs not-real:
-//   REAL: HMAC-SHA256 via OpenSSL, tree key bytes computed, unicast NS-3 packets
-//   NOT REAL: in-packet key encryption (key sent in plaintext inside NS-3 UDP;
-//             in a real system the new K_leaf would be wrapped with the
-//             sibling node key — omitted here as the NS-3 channel provides
-//             implicit addressing isolation)
+//   REAL: HMAC-SHA256 (inline FIPS), per-zone/ring subtree key derivation, CSPRNG
+//         master/zone/ring roots, unicast NS-3 RekeyTag packets, dynamic join/leave.
+//   ABSTRACTED (tracked, D-LKH-1): secure first-delivery of a leaf key to a
+//         joining vehicle. The single-process sim shares g_vehicle_session_key
+//         between vehicle-TX and RSU-verify (implicit authenticated delivery); a
+//         real deployment would wrap K_{u_i} under the vehicle's certificate.
 // ============================================================
 
 #ifndef MPTD_PQS_LKH_KEYS_H
@@ -48,12 +58,17 @@
 #include <cstring>
 #include <cstdint>
 #include <cstdio>
+#include <vector>
+#include <cmath>
+#include <random>          // std::random_device fallback CSPRNG
+#include <sys/random.h>    // getrandom(2) — kernel CSPRNG for master key material
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 #define LKH_KEY_BYTES   32          // 256-bit keys throughout
 #define LKH_HMAC_TRUNC  8           // 8-byte (64-bit) truncated MAC on beacon tag
-#define LKH_MAX_VEH     32          // maximum vehicles supported by LKH tree
-#define LKH_MAX_NODES   64          // LKH_MAX_VEH * 2 (heap nodes)
+#define LKH_MAX_VEH     1024        // max vehicles in the LKH tree (SUMO-scale ceiling;
+                                    // ~150 KB static, raise if a scenario needs more)
+#define LKH_MAX_NODES   2048        // ≥ 2 * next_pow2(LKH_MAX_VEH) heap nodes
 #define LKH_REKEY_PORT  5555        // UDP port: RSU → vehicle key update messages
 
 // ── LKH Tree Node ─────────────────────────────────────────────────────────────
@@ -64,39 +79,124 @@ struct LkhNode {
     bool     valid;                // false for unused nodes
 };
 
-// ── Global LKH State ──────────────────────────────────────────────────────────
-static LkhNode  g_lkh_tree[LKH_MAX_NODES];           // heap-indexed binary tree
-static int      g_lkh_n_leaves    = 0;               // number of leaf slots = N_Vehicles
-static int      g_lkh_total_nodes = 0;               // total tree nodes (leaves + internals)
-static int      g_lkh_first_leaf  = 0;               // index of first leaf node in heap
+// ── Global LKH State (per-zone topology, P1b-C, paper §3.5.2) ─────────────────
+// Paper model: a SEPARATE LKH subtree per RSU coverage zone (managed by the RSU),
+// plus a SEPARATE RSU-ring subtree (managed by the SDN controller). Vehicles join
+// a zone on entry, leave/handoff on exit, with forward-secrecy rekey on leave
+// (N_rekey = log₂|V_j|, the *zone* population — Eq 3.23). This replaces the old
+// single flat global tree, which deviated from the paper (one tree for everyone,
+// rekey cost log₂(total) not log₂|V_j|, no dynamic membership).
 
-// Per-vehicle session keys K_i (Eq.3.33) — updated on rekeying
+// Per-RSU-zone vehicle subtree. Heap-indexed (node k → children 2k+1, 2k+2);
+// leaf slot s lives at heap index (first_leaf + s). `root` is the zone group key
+// K_root (CSPRNG, mutable — rotated on leave/revoke for forward secrecy).
+struct LkhZone {
+    std::vector<LkhNode> nodes;          // heap tree, size = 2*cap - 1
+    int      cap        = 0;             // leaf capacity (power of 2), grows on demand
+    int      first_leaf = 0;             // = cap - 1
+    int      n_members  = 0;             // current |V_j|
+    uint8_t  root[LKH_KEY_BYTES];        // zone group key K_root
+    std::vector<int> slot_owner;         // slot → veh_idx, -1 if free
+};
+static std::vector<LkhZone> g_lkh_zone;              // one per RSU (index = rsu_idx)
+
+// Controller-managed RSU-ring subtree (separate from zone trees, paper §3.5.2).
+struct LkhRingTree {
+    std::vector<LkhNode> nodes;
+    int cap = 0, first_leaf = 0;
+};
+static LkhRingTree g_lkh_ring_tree;
+
+// Per-vehicle current membership + key state (indexed by veh_idx = nid-2).
+static int      g_vehicle_zone[LKH_MAX_VEH];         // current zone (rsu_idx), -1 = limbo
+static int      g_vehicle_slot[LKH_MAX_VEH];         // current slot within that zone, -1
+static uint8_t  g_vehicle_leaf_key[LKH_MAX_VEH][LKH_KEY_BYTES]; // current K_{u_i}
+
+// Affected-member scratch list filled by lkh_rekey_on_revoke() (zone members that
+// must receive a rekey packet) — consumed by send_lkh_rekey_to_vehicles() in 08.
+static std::vector<int> g_lkh_affected_members;
+
+// Per-vehicle session keys K_i (Eq.3.22) — K_i = KDF(K_{u_i}, η_i, ID_i).
 static uint8_t  g_vehicle_session_key[LKH_MAX_VEH][LKH_KEY_BYTES];
-// Per-vehicle nonce η_i — incremented on every rekey event to ensure forward secrecy
+// Per-vehicle nonce η_i — incremented on every rekey/handoff for forward secrecy.
 static uint32_t g_vehicle_nonce   [LKH_MAX_VEH];
 // Per-vehicle DSRC IP recorded the first time RSU receives a beacon from that vehicle
 // Used to unicast RekeyTag packets. Filled in handle_readone() / HandleBeaconReceived().
 static ns3::Ipv4Address g_vehicle_dsrc_ip[LKH_MAX_VEH];
 static bool             g_vehicle_ip_known[LKH_MAX_VEH];
 
-// RSU ring keys sk_j (Eq.3.36) — one per RSU, used by TRS partial signing
+// RSU ring keys sk_j (Eq.3.25) — one per RSU, used by TRS partial signing.
 static uint8_t  g_rsu_ring_key[4][LKH_KEY_BYTES];
 
-// LKH master root seed (simulation-fixed; in real system: HSM-provisioned)
-static const uint8_t LKH_ROOT_SEED[LKH_KEY_BYTES] = {
-    0x6D,0x70,0x74,0x64,0x2D,0x70,0x71,0x73,  // "mptd-pqs"
-    0x5F,0x6C,0x6B,0x68,0x5F,0x72,0x6F,0x6F,  // "_lkh_roo"
-    0x74,0x5F,0x6B,0x65,0x79,0x5F,0x32,0x30,  // "t_key_20"
-    0x32,0x35,0x5F,0x73,0x69,0x6D,0x00,0x00   // "25_sim\0\0"
-};
+// Back-compat: total active leaves, kept only for legacy log lines.
+static int      g_lkh_n_leaves    = 0;
 
-// K_ring shared between all RSUs for TRS (Eq.3.36)
-static const uint8_t LKH_K_RING[LKH_KEY_BYTES] = {
-    0x74,0x72,0x73,0x5F,0x72,0x69,0x6E,0x67,  // "trs_ring"
-    0x5F,0x6D,0x61,0x73,0x74,0x65,0x72,0x5F,  // "_master_"
-    0x6B,0x65,0x79,0x5F,0x73,0x64,0x76,0x6E,  // "key_sdvn"
-    0x5F,0x32,0x30,0x32,0x35,0x00,0x00,0x00   // "_2025\0\0\0"
+// Mutable current ring group key K_ring (Eq.3.25). Filled from the OS CSPRNG by
+// lkh_init_master_keys() at setup (NOT hardcoded); rotated by lkh_ring_rekey()
+// on RSU revocation (Eq.3.24) so a revoked
+// RSU whose leaf key was updated can no longer derive a valid sk_j.
+static uint8_t  g_lkh_k_ring_current[LKH_KEY_BYTES];
+
+// ── Authenticated LKH ring channel for FHE key-share distribution (Eq.3.25) ──
+// The FHE threshold shares {sk_j^share} from ThGen (Eq 3.54, 06b2) are deposited
+// here per party (RSU 0..n-1, cloud = n) with an HMAC-SHA256 tag under K_ring, and
+// retrieved with tag verification. Transport is in-process (single NS-3 process);
+// the AUTHENTICATION (real HMAC under K_ring) models the paper's "authenticated
+// ring key synchronisation channel". Share bytes = serialized OpenFHE PrivateKey.
+#define LKH_RING_PARTIES (4 + 1)   // n RSUs (≤4) + 1 cloud — the (t, n+1) party set
+struct LkhRingShareSlot {
+    std::vector<uint8_t> bytes;          // serialized FHE secret-key share
+    uint8_t              tag[LKH_KEY_BYTES];
+    bool                 present = false;
 };
+static LkhRingShareSlot g_lkh_ring_share[LKH_RING_PARTIES];
+
+// ── Master key material — generated at runtime, NOT hardcoded (P1b-1, 2026-06) ─
+// Paper §3.5.2: K_root is the *current group key* (mutable, rekeyed on membership)
+// and K_ring is the RSU ring group key — neither is a compile-time constant. Both
+// are filled from the OS CSPRNG (getrandom(2) = kernel /dev/urandom pool) at boot,
+// exactly as a real RSU / SDN-controller KDC would provision them. No secret key
+// material lives in the source tree.  (Prior code hardcoded ASCII seed strings
+// here — a simulation shortcut; removed.)
+//
+// Reproducibility: keys are fresh per run by design. Detection metrics
+// (MCC/FPR/…) depend only on key *consistency* within a run, not on key values,
+// and mobility/attack randomness is the independent NS-3 RngSeedManager — so
+// run-to-run metric reproducibility is unaffected by per-run key freshness.
+static uint8_t g_lkh_root_seed[LKH_KEY_BYTES];   // K_root master seed (was LKH_ROOT_SEED)
+static bool    g_lkh_master_ready = false;
+
+// Fill `len` bytes from the OS CSPRNG. getrandom() for ≤256 bytes is atomic and
+// won't short-read once the pool is seeded; std::random_device (also
+// /dev/urandom-backed on glibc) is the fallback if the syscall is unavailable.
+static void lkh_fill_random(uint8_t *buf, size_t len)
+{
+    size_t off = 0;
+    while (off < len) {
+        ssize_t r = getrandom(buf + off, len - off, 0);
+        if (r <= 0) break;            // error → fall through to fallback
+        off += (size_t)r;
+    }
+    if (off < len) {                  // fallback CSPRNG
+        std::random_device rd;
+        for (; off < len; off++) buf[off] = (uint8_t)(rd() & 0xFF);
+    }
+}
+
+// Generate LKH master key material once per run (idempotent). MUST run before any
+// consumer of g_lkh_root_seed / g_lkh_k_ring_current — i.e. before the LKH tree
+// build AND before the TRS backend (which seeds its ring polynomial from K_ring,
+// Eq 3.25). Called from both lkh_init_all() and initialize_crypto_backends() so
+// it is ready whichever fires first. Never prints the key bytes.
+static void lkh_init_master_keys()
+{
+    if (g_lkh_master_ready) return;
+    lkh_fill_random(g_lkh_root_seed,      LKH_KEY_BYTES);   // K_root
+    lkh_fill_random(g_lkh_k_ring_current, LKH_KEY_BYTES);   // K_ring (Eq 3.25)
+    g_lkh_master_ready = true;
+    printf("[LKH] Master key material generated from OS CSPRNG "
+           "(K_root + K_ring, %d bytes each; not hardcoded)\n", LKH_KEY_BYTES);
+}
 
 // ── Pure C++ SHA-256 (FIPS 180-4) ────────────────────────────────────────────
 // Standard round constants and initial hash values.
@@ -229,7 +329,7 @@ static bool lkh_hmac_sha256(const uint8_t *key,  size_t key_len,
     return true;
 }
 
-// ── KDF (Eq.3.33/3.36): KDF(master, salt, info) = HMAC-SHA256(master, salt‖info) ─
+// ── KDF (Eq.3.22/3.25): KDF(master, salt, info) = HMAC-SHA256(master, salt‖info) ─
 // master : the input key material (K_{u_i} or K_{u_j})
 // salt   : nonce η_i (4 bytes, little-endian) or K_ring bytes
 // info   : identity bytes (vehicle ID or RSU ID)
@@ -248,10 +348,12 @@ static bool lkh_kdf(const uint8_t *master, size_t master_len,
     return lkh_hmac_sha256(master, master_len, msg, msg_len, out);
 }
 
-// ── Derive leaf key for tree node at heap index idx ───────────────────────────
-// Each node's key = KDF(root_seed, node_index_bytes, depth_bytes)
-// This deterministically fills the entire tree from the master root seed.
-static void lkh_derive_node_key(int idx, uint8_t out[LKH_KEY_BYTES])
+// ── Derive a tree node key from a given subtree root (zone or ring) ───────────
+// node_key = KDF(root, node_index_bytes, depth_bytes). Parameterised on `root`
+// so each zone subtree and the ring subtree derive from their OWN group key
+// (paper §3.5.2: per-zone K_root + separate ring root), not one global seed.
+static void lkh_derive_node_key_from(const uint8_t *root, int idx,
+                                     uint8_t out[LKH_KEY_BYTES])
 {
     uint8_t index_bytes[4];
     index_bytes[0] = (uint8_t)( idx        & 0xFF);
@@ -260,70 +362,107 @@ static void lkh_derive_node_key(int idx, uint8_t out[LKH_KEY_BYTES])
     index_bytes[3] = (uint8_t)((idx >> 24) & 0xFF);
 
     uint8_t depth_byte[1] = { 0 };
-    // depth = floor(log2(idx+1)) — cheap approximation for tree depth
-    for (int tmp = idx + 1; tmp > 1; tmp >>= 1) depth_byte[0]++;
+    for (int tmp = idx + 1; tmp > 1; tmp >>= 1) depth_byte[0]++;  // floor(log2(idx+1))
 
-    lkh_kdf(LKH_ROOT_SEED, LKH_KEY_BYTES,
-            index_bytes,   4,
-            depth_byte,    1,
+    lkh_kdf(root,        LKH_KEY_BYTES,
+            index_bytes, 4,
+            depth_byte,  1,
             out);
 }
 
-// ── Build LKH tree (called once at simulation start) ──────────────────────────
-// n_vehicles: number of vehicles = N_Vehicles (matches simulation topology)
-// Assigns leaf node i to vehicle with NS-3 node ID (i + 2):
-//   vehicle array index i → NS-3 nid = i + 2 (controller=0, management=1, vehicles=2..N+1)
-static void lkh_build_tree(int n_vehicles)
+// ── (Re)build a zone subtree of capacity `cap` from its current root ──────────
+// Caller sets z.root first. Derives all node keys; clears membership.
+static void lkh_zone_build_nodes(LkhZone &z, int cap)
 {
-    if (n_vehicles <= 0 || n_vehicles > LKH_MAX_VEH) return;
-
-    // Compute tree size: smallest power-of-2 ≥ n_vehicles gives n_leaves,
-    // and total nodes = 2*n_leaves - 1 (complete binary tree).
-    int n_leaves = 1;
-    while (n_leaves < n_vehicles) n_leaves <<= 1;
-
-    g_lkh_n_leaves    = n_leaves;
-    g_lkh_total_nodes = 2 * n_leaves - 1;
-    g_lkh_first_leaf  = n_leaves - 1; // zero-indexed heap: leaves at [n_leaves-1, 2*n_leaves-2]
-
-    // Initialise all nodes
-    std::memset(g_lkh_tree, 0, sizeof(g_lkh_tree));
-    for (int i = 0; i < g_lkh_total_nodes; i++) {
-        lkh_derive_node_key(i, g_lkh_tree[i].key);
-        g_lkh_tree[i].valid    = true;
-        g_lkh_tree[i].revoked  = false;
-        g_lkh_tree[i].vehicle_id = 0;
+    if (cap < 1) cap = 1;
+    z.cap        = cap;
+    z.first_leaf = cap - 1;
+    int total    = 2 * cap - 1;
+    z.nodes.assign((size_t)total, LkhNode{});
+    for (int i = 0; i < total; i++) {
+        lkh_derive_node_key_from(z.root, i, z.nodes[i].key);
+        z.nodes[i].valid = true; z.nodes[i].revoked = false; z.nodes[i].vehicle_id = 0;
     }
-
-    // Assign vehicles to leaves (left to right)
-    for (int i = 0; i < n_vehicles; i++) {
-        int leaf_idx = g_lkh_first_leaf + i;
-        g_lkh_tree[leaf_idx].vehicle_id = (uint32_t)(i + 2); // NS-3 nid
-    }
-    // Extra leaf slots (padding to next power of 2) are unused
-    for (int i = n_vehicles; i < n_leaves; i++) {
-        int leaf_idx = g_lkh_first_leaf + i;
-        g_lkh_tree[leaf_idx].valid = false;
-    }
-
-    printf("[LKH] Tree built: %d vehicles, %d leaves, %d total nodes, first_leaf=%d\n",
-           n_vehicles, n_leaves, g_lkh_total_nodes, g_lkh_first_leaf);
+    z.slot_owner.assign((size_t)cap, -1);
+    z.n_members = 0;
 }
 
-// ── Derive vehicle session key K_i (Eq.3.33) ─────────────────────────────────
+// Regenerate one node key inside a zone (time-mixed) — forward secrecy on rekey.
+static void lkh_zone_regen_node(LkhZone &z, int node_idx, double sim_time)
+{
+    if (node_idx < 0 || node_idx >= (int)z.nodes.size()) return;
+    uint8_t time_bytes[8];
+    uint64_t ti = (uint64_t)(sim_time * 1e6);
+    for (int b = 0; b < 8; b++) time_bytes[b] = (uint8_t)((ti >> (b*8)) & 0xFF);
+    uint8_t nk[LKH_KEY_BYTES];
+    lkh_kdf(z.nodes[node_idx].key, LKH_KEY_BYTES, time_bytes, 8,
+            (const uint8_t*)"rekey", 5, nk);
+    std::memcpy(z.nodes[node_idx].key, nk, LKH_KEY_BYTES);
+}
+
+// Rekey the root path of leaf `slot` (forward secrecy of the zone group key).
+// Returns the number of internal nodes rekeyed = tree depth.
+static int lkh_zone_rekey_path(LkhZone &z, int slot, double sim_time)
+{
+    int depth = 0; for (int c = z.cap; c > 1; c >>= 1) depth++;
+    if (slot < 0 || slot >= z.cap) return depth;
+    int cur = z.first_leaf + slot;
+    lkh_zone_regen_node(z, cur, sim_time + 0.001);           // dead leaf
+    while (cur > 0) { cur = (cur - 1) / 2; lkh_zone_regen_node(z, cur, sim_time); }
+    return depth;
+}
+
+// Forward declaration (defined after lkh_compute_session_key).
+static void lkh_compute_session_key(int veh_idx);
+
+// Grow a full zone subtree to 2× capacity, preserving members in-place. The
+// rebuild re-derives leaf keys from z.root, so members get fresh K_{u_i}/K_i
+// (a structural rekey — fine in the single-process sim where TX/RX share state).
+static void lkh_zone_grow(LkhZone &z)
+{
+    std::vector<int> owners = z.slot_owner;     // snapshot slot→veh
+    lkh_zone_build_nodes(z, z.cap * 2);          // rebuild bigger from same root
+    for (int s = 0; s < (int)owners.size(); s++) {
+        int v = owners[s];
+        if (v < 0) continue;
+        z.slot_owner[s] = v; z.n_members++;
+        g_vehicle_slot[v] = s;
+        std::memcpy(g_vehicle_leaf_key[v], z.nodes[z.first_leaf + s].key, LKH_KEY_BYTES);
+        g_vehicle_nonce[v]++;
+        lkh_compute_session_key(v);
+    }
+    printf("[LKH] Zone grown to cap=%d (rekeyed %d members)\n", z.cap, z.n_members);
+}
+
+// ── Initialise per-zone subtrees (one per RSU) at simulation start ────────────
+// Each zone gets a fresh CSPRNG group key K_root and a base-capacity subtree.
+// Vehicles are NOT yet placed — they join via lkh_on_beacon_at_rsu() on first
+// contact (dynamic membership). Base cap doubles on demand (lkh_zone_grow).
+#define LKH_ZONE_BASE_CAP 16
+static void lkh_zones_init(int n_rsus)
+{
+    if (n_rsus < 1) n_rsus = 1;
+    g_lkh_zone.clear();
+    g_lkh_zone.resize((size_t)n_rsus);
+    for (int r = 0; r < n_rsus; r++) {
+        lkh_fill_random(g_lkh_zone[r].root, LKH_KEY_BYTES);   // per-zone K_root (CSPRNG)
+        lkh_zone_build_nodes(g_lkh_zone[r], LKH_ZONE_BASE_CAP);
+    }
+    for (int i = 0; i < LKH_MAX_VEH; i++) { g_vehicle_zone[i] = -1; g_vehicle_slot[i] = -1; }
+    printf("[LKH] %d per-RSU-zone subtrees initialised (base cap=%d, CSPRNG roots)\n",
+           n_rsus, LKH_ZONE_BASE_CAP);
+}
+
+// ── Derive vehicle session key K_i (Eq.3.22) ─────────────────────────────────
 // K_i = KDF(K_{u_i}, η_i, ID_i)
-// K_{u_i} = g_lkh_tree[leaf_node].key  (leaf node key for vehicle i)
-// η_i     = g_vehicle_nonce[i]         (4 bytes, incremented on rekey)
-// ID_i    = NS-3 node ID of vehicle i  (4 bytes)
+// K_{u_i} = g_vehicle_leaf_key[i]   (current zone-leaf key, or limbo key pre-join)
+// η_i     = g_vehicle_nonce[i]      (4 bytes, incremented on rekey/handoff)
+// ID_i    = NS-3 node ID of vehicle i (4 bytes)
 static void lkh_compute_session_key(int veh_idx)
 {
     if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH) return;
 
-    int leaf_node_idx = g_lkh_first_leaf + veh_idx;
-    if (leaf_node_idx >= g_lkh_total_nodes ||
-        !g_lkh_tree[leaf_node_idx].valid) return;
-
-    const uint8_t *k_leaf = g_lkh_tree[leaf_node_idx].key;
+    const uint8_t *k_leaf = g_vehicle_leaf_key[veh_idx];
 
     // nonce η_i as 4 little-endian bytes
     uint32_t nonce = g_vehicle_nonce[veh_idx];
@@ -347,96 +486,255 @@ static void lkh_compute_session_key(int veh_idx)
             g_vehicle_session_key[veh_idx]);
 }
 
-// ── Initialise all vehicle session keys ───────────────────────────────────────
-// Called once after lkh_build_tree() and before Simulator::Run().
+// ── Initialise vehicle bootstrap (limbo) session keys ─────────────────────────
+// Before a vehicle joins any RSU zone it is in "limbo" (g_vehicle_zone=-1) with a
+// bootstrap leaf key K_{u_i}=KDF(K_root, i, "limbo") — analogous to a long-term
+// credential held before obtaining a zone session key. This guarantees a valid K_i
+// from t=0 (so the first beacon HMAC verifies), and the vehicle is migrated to a
+// real per-zone key on its first RSU contact via lkh_on_beacon_at_rsu().
 static void lkh_init_session_keys(int n_vehicles)
 {
     std::memset(g_vehicle_nonce,       0, sizeof(g_vehicle_nonce));
     std::memset(g_vehicle_session_key, 0, sizeof(g_vehicle_session_key));
     std::memset(g_vehicle_ip_known,    0, sizeof(g_vehicle_ip_known));
+    g_lkh_n_leaves = (n_vehicles < LKH_MAX_VEH) ? n_vehicles : LKH_MAX_VEH;
 
-    for (int i = 0; i < n_vehicles && i < LKH_MAX_VEH; i++)
+    for (int i = 0; i < n_vehicles && i < LKH_MAX_VEH; i++) {
+        uint8_t idx_b[4] = { (uint8_t)(i & 0xFF), (uint8_t)((i>>8)&0xFF),
+                             (uint8_t)((i>>16)&0xFF), (uint8_t)((i>>24)&0xFF) };
+        lkh_kdf(g_lkh_root_seed, LKH_KEY_BYTES, idx_b, 4,
+                (const uint8_t*)"limbo", 5, g_vehicle_leaf_key[i]);
         lkh_compute_session_key(i);
-
-    printf("[LKH] Session keys initialised for %d vehicles\n", n_vehicles);
+    }
+    printf("[LKH] Bootstrap (limbo) session keys initialised for %d vehicles\n", n_vehicles);
 }
 
-// ── Derive RSU ring keys sk_j (Eq.3.36) ───────────────────────────────────────
-// sk_j = KDF(K_{u_j}, K_ring, ID_{r_j})
-// K_{u_j} is taken as the LKH root node key (all RSUs share the root tree;
-//          in a full deployment each RSU subtree is separate).
+// ── Build the controller-managed RSU-ring subtree ─────────────────────────────
+// Paper §3.5.2: "The n RSUs in the TRS signing ring form a separate LKH subtree
+// managed by the SDN controller." Each RSU r_j is a leaf; its leaf key K_{u_j}
+// is the ring-subtree leaf node key (derived from K_ring), replacing the prior
+// `root XOR idx` shortcut.
+static void lkh_ring_build(int n_rsus)
+{
+    int cap = 1; while (cap < n_rsus) cap <<= 1; if (cap < 1) cap = 1;
+    g_lkh_ring_tree.cap        = cap;
+    g_lkh_ring_tree.first_leaf = cap - 1;
+    int total = 2 * cap - 1;
+    g_lkh_ring_tree.nodes.assign((size_t)total, LkhNode{});
+    for (int i = 0; i < total; i++)
+        lkh_derive_node_key_from(g_lkh_k_ring_current, i, g_lkh_ring_tree.nodes[i].key);
+}
+
+// ── Derive RSU ring signing keys sk_j (Eq.3.25): sk_j = KDF(K_{u_j}, K_ring, ID) ─
 static void lkh_init_rsu_ring_keys(int n_rsus)
 {
+    // K_ring generated from the OS CSPRNG by lkh_init_master_keys() (idempotent).
+    lkh_init_master_keys();
+    lkh_ring_build(n_rsus);
+
     for (int j = 0; j < n_rsus && j < 4; j++) {
-        // K_{u_j}: use root key XORed with RSU index for uniqueness
-        uint8_t k_u_j[LKH_KEY_BYTES];
-        std::memcpy(k_u_j, g_lkh_tree[0].key, LKH_KEY_BYTES);
-        k_u_j[0] ^= (uint8_t)j;  // differentiate per-RSU
-
-        // ID_{r_j}: 4 bytes of RSU index
+        const uint8_t *k_u_j = g_lkh_ring_tree.nodes[g_lkh_ring_tree.first_leaf + j].key;
         uint8_t id_rj[4] = { (uint8_t)j, 0, 0, 0 };
-
-        lkh_kdf(k_u_j,      LKH_KEY_BYTES,
-                LKH_K_RING, LKH_KEY_BYTES,
-                id_rj,      4,
+        lkh_kdf(k_u_j,                LKH_KEY_BYTES,
+                g_lkh_k_ring_current, LKH_KEY_BYTES,
+                id_rj,                4,
                 g_rsu_ring_key[j]);
-
-        printf("[LKH] RSU ring key sk_%d derived (Eq.3.36)\n", j);
+        printf("[LKH] RSU ring key sk_%d derived from ring subtree leaf (Eq.3.25)\n", j);
     }
 }
 
-// ── Rekey one subtree node: regenerate key for internal node at heap index ────
-// Uses a time-mixed seed so consecutive rekey events produce different keys.
-static void lkh_regen_node_key(int node_idx, double sim_time)
+// ── FHE share distribution over the authenticated ring channel (Eq.3.25) ──────
+// Deposit party `party_idx`'s serialized FHE secret-key share with an HMAC-SHA256
+// tag under the current ring key. party_idx: 0..n-1 = RSU, n = cloud.
+static bool lkh_ring_distribute_share(int party_idx,
+                                      const uint8_t *share, size_t len)
 {
-    if (node_idx < 0 || node_idx >= g_lkh_total_nodes) return;
+    if (party_idx < 0 || party_idx >= LKH_RING_PARTIES) return false;
+    LkhRingShareSlot &slot = g_lkh_ring_share[party_idx];
+    slot.bytes.assign(share, share + len);
 
-    // Mix current key with simulation time to get new entropy
+    // tag = HMAC_{K_ring}( party_idx(4B) ‖ share_bytes )
+    std::vector<uint8_t> msg;
+    msg.reserve(4 + len);
+    uint32_t pid = (uint32_t)party_idx;
+    for (int b = 0; b < 4; b++) msg.push_back((uint8_t)((pid >> (b*8)) & 0xFF));
+    msg.insert(msg.end(), share, share + len);
+    lkh_hmac_sha256(g_lkh_k_ring_current, LKH_KEY_BYTES,
+                    msg.data(), msg.size(), slot.tag);
+    slot.present = true;
+    return true;
+}
+
+// Retrieve + authenticate party `party_idx`'s FHE share. Returns false on
+// absence or HMAC-tag mismatch (rejects an unauthenticated/forged share).
+static bool lkh_ring_retrieve_share(int party_idx, std::vector<uint8_t> &out)
+{
+    if (party_idx < 0 || party_idx >= LKH_RING_PARTIES) return false;
+    const LkhRingShareSlot &slot = g_lkh_ring_share[party_idx];
+    if (!slot.present) return false;
+
+    std::vector<uint8_t> msg;
+    msg.reserve(4 + slot.bytes.size());
+    uint32_t pid = (uint32_t)party_idx;
+    for (int b = 0; b < 4; b++) msg.push_back((uint8_t)((pid >> (b*8)) & 0xFF));
+    msg.insert(msg.end(), slot.bytes.begin(), slot.bytes.end());
+
+    uint8_t expect[LKH_KEY_BYTES];
+    lkh_hmac_sha256(g_lkh_k_ring_current, LKH_KEY_BYTES,
+                    msg.data(), msg.size(), expect);
+    uint8_t diff = 0;
+    for (int i = 0; i < LKH_KEY_BYTES; i++) diff |= (expect[i] ^ slot.tag[i]);
+    if (diff != 0) return false;
+
+    out = slot.bytes;
+    return true;
+}
+
+// ── RSU ring rekey on RSU revocation (Eq.3.24): N_ring = (n-1) ────────────────
+// Rotates the current ring key and re-derives sk_j for all surviving RSUs, so a
+// revoked RSU (whose leaf key is updated) can no longer derive a valid sk_j and
+// is excluded from subsequent TRS signing rounds (Eq.3.49). Returns N_ring=(n-1).
+static int lkh_ring_rekey(int n_rsus, double sim_time, int revoked_rsu_idx)
+{
+    if (n_rsus <= 0 || n_rsus > 4) return 0;
+
+    // Rotate K_ring: K_ring' = KDF(K_ring, time, "ring-rekey")
     uint8_t time_bytes[8];
-    uint64_t time_int = (uint64_t)(sim_time * 1e6); // microseconds
-    for (int b = 0; b < 8; b++)
-        time_bytes[b] = (uint8_t)((time_int >> (b*8)) & 0xFF);
+    uint64_t ti = (uint64_t)(sim_time * 1e6);
+    for (int b = 0; b < 8; b++) time_bytes[b] = (uint8_t)((ti >> (b*8)) & 0xFF);
+    uint8_t new_ring[LKH_KEY_BYTES];
+    lkh_kdf(g_lkh_k_ring_current, LKH_KEY_BYTES,
+            time_bytes,           8,
+            (const uint8_t*)"ring-rekey", 10,
+            new_ring);
+    std::memcpy(g_lkh_k_ring_current, new_ring, LKH_KEY_BYTES);
 
-    uint8_t new_key[LKH_KEY_BYTES];
-    lkh_kdf(g_lkh_tree[node_idx].key, LKH_KEY_BYTES,
-            time_bytes,                8,
-            (const uint8_t*)"rekey",  5,
-            new_key);
-    std::memcpy(g_lkh_tree[node_idx].key, new_key, LKH_KEY_BYTES);
+    // Rebuild the ring subtree from the rotated K_ring, then re-derive sk_j for
+    // survivors (revoked RSU is skipped → loses signing power, Eq.3.49).
+    lkh_ring_build(n_rsus);
+    for (int j = 0; j < n_rsus && j < 4; j++) {
+        if (j == revoked_rsu_idx) {
+            std::memset(g_rsu_ring_key[j], 0, LKH_KEY_BYTES);
+            continue;
+        }
+        const uint8_t *k_u_j = g_lkh_ring_tree.nodes[g_lkh_ring_tree.first_leaf + j].key;
+        uint8_t id_rj[4] = { (uint8_t)j, 0, 0, 0 };
+        lkh_kdf(k_u_j, LKH_KEY_BYTES, g_lkh_k_ring_current, LKH_KEY_BYTES,
+                id_rj, 4, g_rsu_ring_key[j]);
+    }
+    int n_ring = n_rsus - 1;   // Eq.3.24
+    printf("[LKH] Ring rekey (revoked RSU %d): N_ring=(n-1)=%d msgs (Eq.3.24)\n",
+           revoked_rsu_idx, n_ring);
+    return n_ring;
 }
 
-// ── Rekey path on vehicle revocation (§3.5.2, Eq.3.34) ───────────────────────
-// Traverses from revoked vehicle's leaf to root.
-// Returns the number of nodes rekeyed = N_rekey = floor(log₂|V_j|) (Eq.3.34).
-// Fills out_path[] with the heap indices of rekeyed nodes (for sending to vehicles).
-static int lkh_rekey_on_revoke(int veh_idx, double sim_time,
-                                int out_path[], int out_path_max)
+// ── Zone membership: join (paper §3.5.2 "vehicle registers with RSU r_j") ─────
+// Assign veh_idx a free leaf slot in RSU `rsu`'s zone subtree, derive its zone
+// leaf key K_{u_i} + session key K_i (Eq 3.22) with a fresh nonce. Grows on demand.
+static bool lkh_zone_join(int rsu, int veh_idx)
 {
-    if (veh_idx < 0 || veh_idx >= g_lkh_n_leaves) return 0;
+    if (rsu < 0 || rsu >= (int)g_lkh_zone.size()) return false;
+    if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH)    return false;
+    LkhZone &z = g_lkh_zone[rsu];
+    if (z.n_members >= z.cap) lkh_zone_grow(z);
+    int slot = -1;
+    for (int s = 0; s < z.cap; s++) if (z.slot_owner[s] < 0) { slot = s; break; }
+    if (slot < 0) return false;
+    z.slot_owner[slot] = veh_idx; z.n_members++;
+    z.nodes[z.first_leaf + slot].vehicle_id = (uint32_t)(veh_idx + 2);
+    z.nodes[z.first_leaf + slot].revoked    = false;
+    g_vehicle_zone[veh_idx] = rsu;
+    g_vehicle_slot[veh_idx] = slot;
+    std::memcpy(g_vehicle_leaf_key[veh_idx],
+                z.nodes[z.first_leaf + slot].key, LKH_KEY_BYTES);
+    g_vehicle_nonce[veh_idx]++;                          // fresh η_i on registration
+    lkh_compute_session_key(veh_idx);
+    return true;
+}
 
-    int leaf_node = g_lkh_first_leaf + veh_idx;
-    g_lkh_tree[leaf_node].revoked = true;
-
-    // Traverse from leaf to root, regenerating each node's key
-    int n_rekeyed = 0;
-    int cur = leaf_node;
-    while (cur > 0) {
-        cur = (cur - 1) / 2;  // parent in binary heap
-        lkh_regen_node_key(cur, sim_time);
-        if (n_rekeyed < out_path_max)
-            out_path[n_rekeyed] = cur;
-        n_rekeyed++;
+// ── Zone membership: benign handoff-leave (no rekey storm) ────────────────────
+// Vehicle exits its current zone. Free its slot and rotate the zone group key
+// along its path (forward secrecy of K_root). Surviving members keep their K_i
+// (their leaf keys are unchanged), so NO unicast rekey packets are needed for a
+// benign departure — the costly all-member rekey is reserved for SECURITY
+// revocation (lkh_rekey_on_revoke). Returns N_rekey depth for accounting.
+static int lkh_zone_handoff_leave(int veh_idx, double sim_time)
+{
+    int rsu = g_vehicle_zone[veh_idx];
+    if (rsu < 0 || rsu >= (int)g_lkh_zone.size()) return 0;
+    LkhZone &z = g_lkh_zone[rsu];
+    int slot = g_vehicle_slot[veh_idx];
+    if (slot >= 0 && slot < z.cap && z.slot_owner[slot] == veh_idx) {
+        z.slot_owner[slot] = -1; z.n_members--;
+        z.nodes[z.first_leaf + slot].vehicle_id = 0;
     }
-    // Also regenerate the leaf's own key (forward secrecy: old leaf key is dead)
-    lkh_regen_node_key(leaf_node, sim_time + 0.001);
+    g_vehicle_zone[veh_idx] = -1; g_vehicle_slot[veh_idx] = -1;
+    return lkh_zone_rekey_path(z, slot, sim_time);
+}
 
-    // Recompute session key for ALL remaining (non-revoked) vehicles whose
-    // path shares a node with the revoked vehicle.
-    // In LKH, only vehicles on the same subtree path are affected;
-    // here we recompute all for simplicity (conservative, correct).
-    printf("[LKH] Revoke vehicle_idx=%d: rekeyed %d nodes (Eq.3.34 N_rekey=log2(%d)=%.0f)\n",
-           veh_idx, n_rekeyed, g_lkh_n_leaves, std::log2((double)g_lkh_n_leaves));
-    return n_rekeyed;
+// ── Membership trigger from RSU beacon reception (call from 08 AFTER verify) ──
+// first contact → join; contact at a different RSU → handoff; same zone → no-op.
+// Verify the beacon HMAC with the CURRENT K_i BEFORE calling this, so the
+// in-flight beacon validates against the key it was actually signed with.
+static void lkh_on_beacon_at_rsu(int rsu, int veh_idx, double sim_time)
+{
+    if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH) return;
+    if (rsu < 0 || rsu >= (int)g_lkh_zone.size()) return;
+    int cur = g_vehicle_zone[veh_idx];
+    if (cur == rsu) return;
+    if (cur >= 0) lkh_zone_handoff_leave(veh_idx, sim_time);   // moving on
+    lkh_zone_join(rsu, veh_idx);
+}
+
+// Vehicle-side: install a leaf key delivered in a RekeyTag (used by 07).
+static void lkh_vehicle_install_leaf(int veh_idx, const uint8_t *new_leaf)
+{
+    if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH) return;
+    std::memcpy(g_vehicle_leaf_key[veh_idx], new_leaf, LKH_KEY_BYTES);
+}
+
+// Current zone population |V_j| (for metrics/logging).
+static int lkh_zone_population(int rsu)
+{
+    if (rsu < 0 || rsu >= (int)g_lkh_zone.size()) return 0;
+    return g_lkh_zone[rsu].n_members;
+}
+
+// ── Rekey on vehicle revocation (security) — zone-scoped (§3.5.2, Eq.3.23) ────
+// Marks veh_idx revoked, frees its slot, rekeys its zone path for forward
+// secrecy, and fills g_lkh_affected_members with the SURVIVING members of THAT
+// ZONE — the only vehicles that share path keys with the revoked one. This is
+// the paper improvement: N_rekey = log₂|V_j| (zone population), not log₂(total).
+// 08 unicasts a fresh-key (nonce-bumped) RekeyTag to each affected member.
+static int lkh_rekey_on_revoke(int veh_idx, double sim_time)
+{
+    g_lkh_affected_members.clear();
+    if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH) return 0;
+    int rsu = g_vehicle_zone[veh_idx];
+    if (rsu < 0 || rsu >= (int)g_lkh_zone.size()) {
+        printf("[LKH] Revoke veh_idx=%d: not registered to any zone (limbo), "
+               "no zone rekey needed\n", veh_idx);
+        return 0;
+    }
+    LkhZone &z = g_lkh_zone[rsu];
+    int slot = g_vehicle_slot[veh_idx];
+    if (slot >= 0 && slot < z.cap && z.slot_owner[slot] == veh_idx) {
+        z.nodes[z.first_leaf + slot].revoked = true;
+        z.slot_owner[slot] = -1; z.n_members--;
+    }
+    g_vehicle_zone[veh_idx] = -1; g_vehicle_slot[veh_idx] = -1;
+
+    lkh_zone_rekey_path(z, slot, sim_time);             // forward secrecy
+
+    for (int s = 0; s < z.cap; s++)
+        if (z.slot_owner[s] >= 0) g_lkh_affected_members.push_back(z.slot_owner[s]);
+
+    int vj = z.n_members;                               // survivors |V_j|
+    int n_rekey = 0; for (int c = (vj > 0 ? vj : 1); c > 1; c >>= 1) n_rekey++;
+    printf("[LKH] Revoke veh_idx=%d from zone %d: %zu surviving zone members to "
+           "rekey (Eq.3.23 N_rekey=log2|V_j|=log2(%d)≈%d)\n",
+           veh_idx, rsu, g_lkh_affected_members.size(), vj, n_rekey);
+    return n_rekey;
 }
 
 // ── Compute beacon HMAC-SHA256 (Eq.3.37) ─────────────────────────────────────
@@ -506,10 +804,12 @@ static inline int lkh_veh_idx(uint32_t nid) {
 // n_vehicles = N_Vehicles, n_rsus = N_RSUs
 static void lkh_init_all(int n_vehicles, int n_rsus)
 {
-    lkh_build_tree(n_vehicles);
-    lkh_init_session_keys(n_vehicles);
-    lkh_init_rsu_ring_keys(n_rsus);
-    printf("[LKH] Full init complete. HMAC-SHA256 beacon tagging active (Eq.3.37)\n");
+    lkh_init_master_keys();          // CSPRNG K_root + K_ring (must precede subtree build)
+    lkh_zones_init(n_rsus);          // per-RSU-zone vehicle subtrees (paper §3.5.2)
+    lkh_init_session_keys(n_vehicles); // bootstrap/limbo K_i until first RSU contact
+    lkh_init_rsu_ring_keys(n_rsus);  // controller-managed RSU ring subtree + sk_j
+    printf("[LKH] Full init complete (per-zone topology). HMAC-SHA256 beacon "
+           "tagging active (Eq.3.37); vehicles join zones on first RSU contact.\n");
 }
 
 #endif // MPTD_PQS_LKH_KEYS_H

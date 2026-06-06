@@ -356,17 +356,15 @@ void SimpleUdpApplication::HandleRekeyReceived(Ptr<Socket> socket)
         int veh_idx = lkh_veh_idx(my_nid);
         if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH) continue;
 
-        // 1. Install new K_leaf into the tree
+        // 1. Install the new leaf key delivered by the RSU (vehicle-side state)
         uint8_t new_leaf[LKH_KEY_BYTES];
         rk.GetNewLeafKey(new_leaf);
-        int leaf_node_idx = g_lkh_first_leaf + veh_idx;
-        if (leaf_node_idx < g_lkh_total_nodes)
-            std::memcpy(g_lkh_tree[leaf_node_idx].key, new_leaf, LKH_KEY_BYTES);
+        lkh_vehicle_install_leaf(veh_idx, new_leaf);
 
-        // 2. Update nonce η_i (new nonce from RSU, Eq.3.33)
+        // 2. Update nonce η_i (new nonce from RSU, Eq.3.22)
         g_vehicle_nonce[veh_idx] = rk.GetNewNonce();
 
-        // 3. Recompute K_i = KDF(new_K_leaf, new_η_i, ID_i) [Eq.3.33]
+        // 3. Recompute K_i = KDF(new_K_leaf, new_η_i, ID_i) [Eq.3.22]
         lkh_compute_session_key(veh_idx);
 
         cout << "[LKH-REKEY-RX] V" << (my_nid - 2)
