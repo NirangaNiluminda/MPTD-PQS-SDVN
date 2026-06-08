@@ -102,21 +102,27 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    // OVERWRITE each run: truncate on first call so CSV always reflects current run only.
-    // Use static flag (reset to true each new process) to detect first call per run.
+    // OVERWRITE each run: truncate on first call so the canonical CSV always
+    // reflects the current run only. Use a static flag (reset each process run).
     static bool beacon_first_call = true;
-    std::ofstream fout;
-    std::string path = NS3_ROOT "/analytics/results/beacon_log.csv";
+    const std::string path = NS3_ROOT "/analytics/results/beacon_log.csv";
 
-    if (beacon_first_call) {
-        fout.open(path, std::ios::out | std::ios::trunc);
-        fout << "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
-             << "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct,"
-             << "attacker_class,gt_pos_x,gt_pos_y,gt_speed\n";
-        beacon_first_call = false;
-    } else {
-        fout.open(path, std::ios::out | std::ios::app);
-    }
+    // P0 (data persistence) — beacon_log.csv is truncated every run, so a manual
+    // single `waf --run` would clobber the previous run's data. Mirror every row
+    // into a permanent per-run archive keyed on this run's attack params so no
+    // run is ever lost regardless of how the sim is launched. (The sweep also
+    // archives via run_evaluation.sh; this protects ad-hoc invocations too.)
+    ensure_analytics_dir(NS3_ROOT "/analytics/results/runs");
+    static const std::string run_path = [] {
+        std::ostringstream o;
+        o << NS3_ROOT "/analytics/results/runs/beacon_a" << attack_number
+          << "_p" << attack_percentage << "_s" << maxspeed << ".csv";
+        return o.str();
+    }();
+    static const char *kBeaconHeader =
+        "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
+        "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct,"
+        "attacker_class,gt_pos_x,gt_pos_y,gt_speed\n";
 
     // R7b: derive attacker_class — only meaningful for poisoned beacons.
     const int aclass = tag.GetIsPoisoned()
@@ -134,25 +140,42 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
         gt_spd = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
     }
 
-    fout << tag.GetTimestamp()      << ","
-         << vid                     << ","
-         << rsu_id                  << ","
-         << tag.GetPosX()           << ","
-         << tag.GetPosY()           << ","
-         << tag.GetSpeed()          << ","
-         << tag.GetHeading()        << ","
-         << tag.GetAcceleration()   << ","
-         << (tag.GetIsPoisoned() ? 1 : 0) << ","
-         << (detected            ? 1 : 0) << ","
-         << sig_mask                << ","
-         << psi                     << ","
-         << attack_number           << ","
-         << attack_percentage       << ","
-         << aclass                  << ","
-         << gt_x                    << ","
-         << gt_y                    << ","
-         << gt_spd                  << "\n";
-    fout.close();
+    // Build the row once, then write it to BOTH the canonical CSV (truncate on
+    // first call) and the permanent per-run archive (P0).
+    std::ostringstream row;
+    row << tag.GetTimestamp()      << ","
+        << vid                     << ","
+        << rsu_id                  << ","
+        << tag.GetPosX()           << ","
+        << tag.GetPosY()           << ","
+        << tag.GetSpeed()          << ","
+        << tag.GetHeading()        << ","
+        << tag.GetAcceleration()   << ","
+        << (tag.GetIsPoisoned() ? 1 : 0) << ","
+        << (detected            ? 1 : 0) << ","
+        << sig_mask                << ","
+        << psi                     << ","
+        << attack_number           << ","
+        << attack_percentage       << ","
+        << aclass                  << ","
+        << gt_x                    << ","
+        << gt_y                    << ","
+        << gt_spd                  << "\n";
+    const std::string row_str = row.str();
+    const std::ios::openmode mode = beacon_first_call
+        ? (std::ios::out | std::ios::trunc)
+        : (std::ios::out | std::ios::app);
+    {
+        std::ofstream fout(path, mode);
+        if (beacon_first_call) fout << kBeaconHeader;
+        fout << row_str;
+    }
+    {
+        std::ofstream farch(run_path, mode);
+        if (beacon_first_call) farch << kBeaconHeader;
+        farch << row_str;
+    }
+    beacon_first_call = false;
 
     // R7a: feed TDEE estimator. A beacon that PASSES detection (detected==false)
     // reaches the controller and contributes to its density estimate ρ̂(t).
