@@ -53,6 +53,19 @@ uint32_t cm_FP = 0;
 uint32_t cm_TN = 0;
 uint32_t cm_FN = 0;
 
+// ── C1: Full-mode (Fusion) confusion matrix ───────────────────────────────────
+// The lightweight matrix above scores the per-beacon LW-DETECT decision (A1).
+// These counters score the FULL-mode decision — the Fusion verdict Φ_i > Φ_th
+// (paper Eq 3.44 fusion, Eq 3.45 flag) computed at window close from
+// ψ + GAT spatial + LSTM-AE temporal. Without this, ablations A2/A3/A4/A5/Full
+// had no MCC/FPR (Eq 4.1/4.2) because only the LW decision was ever scored.
+// Populated only when full mode is the active variant (ablation_mode ∉ {1,6});
+// for A1/B1 these stay zero and the lightweight matrix is authoritative.
+uint32_t cm_full_TP = 0;
+uint32_t cm_full_FP = 0;
+uint32_t cm_full_TN = 0;
+uint32_t cm_full_FN = 0;
+
 // ── R7a: TDEE estimator state (Eq 4.5) ────────────────────────────────────────
 // ρ̂(t) = number of distinct vehicle IDs whose beacons were *accepted* by an RSU
 // (i.e. passed detection, so they reach the controller and inflate its density
@@ -82,6 +95,19 @@ void update_confusion_matrix(bool is_poisoned, bool detected)
     else                                cm_FN++; // poisoned, not detected
 }
 
+// ── C1: Full-mode confusion matrix update ─────────────────────────────────────
+// Scores one full-mode (Fusion) decision against the per-beacon ground-truth
+// poison label. `full_flag` is FusionScore::anomalous (Φ_i > Φ_th, Eq 3.45).
+// Called per beacon row at window close in 08_detection_engine.h, gated so it
+// only fires for full-mode ablations (A2/A3/A4/A5/Full).
+void update_confusion_matrix_full(bool is_poisoned, bool full_flag)
+{
+    if      ( is_poisoned &&  full_flag) cm_full_TP++;
+    else if (!is_poisoned &&  full_flag) cm_full_FP++;
+    else if (!is_poisoned && !full_flag) cm_full_TN++;
+    else                                 cm_full_FN++; // poisoned, missed
+}
+
 // ── Per-beacon CSV log ─────────────────────────────────────────────────────────
 // Appends one row per beacon for downstream ML pipeline training/evaluation.
 // Columns: sim_time, vehicle_id, rsu_id, pos_x, pos_y, speed, heading, accel,
@@ -102,21 +128,27 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    // OVERWRITE each run: truncate on first call so CSV always reflects current run only.
-    // Use static flag (reset to true each new process) to detect first call per run.
+    // OVERWRITE each run: truncate on first call so the canonical CSV always
+    // reflects the current run only. Use a static flag (reset each process run).
     static bool beacon_first_call = true;
-    std::ofstream fout;
-    std::string path = NS3_ROOT "/analytics/results/beacon_log.csv";
+    const std::string path = NS3_ROOT "/analytics/results/beacon_log.csv";
 
-    if (beacon_first_call) {
-        fout.open(path, std::ios::out | std::ios::trunc);
-        fout << "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
-             << "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct,"
-             << "attacker_class,gt_pos_x,gt_pos_y,gt_speed\n";
-        beacon_first_call = false;
-    } else {
-        fout.open(path, std::ios::out | std::ios::app);
-    }
+    // P0 (data persistence) — beacon_log.csv is truncated every run, so a manual
+    // single `waf --run` would clobber the previous run's data. Mirror every row
+    // into a permanent per-run archive keyed on this run's attack params so no
+    // run is ever lost regardless of how the sim is launched. (The sweep also
+    // archives via run_evaluation.sh; this protects ad-hoc invocations too.)
+    ensure_analytics_dir(NS3_ROOT "/analytics/results/runs");
+    static const std::string run_path = [] {
+        std::ostringstream o;
+        o << NS3_ROOT "/analytics/results/runs/beacon_a" << attack_number
+          << "_p" << attack_percentage << "_s" << maxspeed << ".csv";
+        return o.str();
+    }();
+    static const char *kBeaconHeader =
+        "sim_time,vehicle_id,rsu_id,pos_x,pos_y,speed,heading,accel,"
+        "is_poisoned,detected,sig_mask,psi_score,attack_number,attack_pct,"
+        "attacker_class,gt_pos_x,gt_pos_y,gt_speed\n";
 
     // R7b: derive attacker_class — only meaningful for poisoned beacons.
     const int aclass = tag.GetIsPoisoned()
@@ -134,25 +166,42 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
         gt_spd = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
     }
 
-    fout << tag.GetTimestamp()      << ","
-         << vid                     << ","
-         << rsu_id                  << ","
-         << tag.GetPosX()           << ","
-         << tag.GetPosY()           << ","
-         << tag.GetSpeed()          << ","
-         << tag.GetHeading()        << ","
-         << tag.GetAcceleration()   << ","
-         << (tag.GetIsPoisoned() ? 1 : 0) << ","
-         << (detected            ? 1 : 0) << ","
-         << sig_mask                << ","
-         << psi                     << ","
-         << attack_number           << ","
-         << attack_percentage       << ","
-         << aclass                  << ","
-         << gt_x                    << ","
-         << gt_y                    << ","
-         << gt_spd                  << "\n";
-    fout.close();
+    // Build the row once, then write it to BOTH the canonical CSV (truncate on
+    // first call) and the permanent per-run archive (P0).
+    std::ostringstream row;
+    row << tag.GetTimestamp()      << ","
+        << vid                     << ","
+        << rsu_id                  << ","
+        << tag.GetPosX()           << ","
+        << tag.GetPosY()           << ","
+        << tag.GetSpeed()          << ","
+        << tag.GetHeading()        << ","
+        << tag.GetAcceleration()   << ","
+        << (tag.GetIsPoisoned() ? 1 : 0) << ","
+        << (detected            ? 1 : 0) << ","
+        << sig_mask                << ","
+        << psi                     << ","
+        << attack_number           << ","
+        << attack_percentage       << ","
+        << aclass                  << ","
+        << gt_x                    << ","
+        << gt_y                    << ","
+        << gt_spd                  << "\n";
+    const std::string row_str = row.str();
+    const std::ios::openmode mode = beacon_first_call
+        ? (std::ios::out | std::ios::trunc)
+        : (std::ios::out | std::ios::app);
+    {
+        std::ofstream fout(path, mode);
+        if (beacon_first_call) fout << kBeaconHeader;
+        fout << row_str;
+    }
+    {
+        std::ofstream farch(run_path, mode);
+        if (beacon_first_call) farch << kBeaconHeader;
+        farch << row_str;
+    }
+    beacon_first_call = false;
 
     // R7a: feed TDEE estimator. A beacon that PASSES detection (detected==false)
     // reaches the controller and contributes to its density estimate ρ̂(t).
@@ -554,6 +603,24 @@ double compute_FPR()
     return fp / (fp + tn);
 }
 
+// C1: MCC / FPR on the FULL-mode (Fusion) confusion matrix (Eq 4.1/4.2).
+// These are the reportable detection metrics for ablations A2/A3/A4/A5/Full;
+// the LW compute_MCC()/compute_FPR() above remain authoritative for A1/B1.
+double compute_MCC_full()
+{
+    double tp = cm_full_TP, fp = cm_full_FP, tn = cm_full_TN, fn = cm_full_FN;
+    double denom = std::sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn));
+    if (denom < 1e-9) return 0.0;
+    return (tp*tn - fp*fn) / denom;
+}
+
+double compute_FPR_full()
+{
+    double fp = cm_full_FP, tn = cm_full_TN;
+    if (fp + tn < 1e-9) return 0.0;
+    return fp / (fp + tn);
+}
+
 // PARR: Poisoning Attack Rejection Rate (Eq. 4.3)
 // Fraction of poisoned blockchain submissions correctly rejected by the TRS layer.
 // A "TRS rejection" occurs when a vehicle accumulates ≥ REVOKE_THRESHOLD (3)
@@ -665,13 +732,25 @@ void print_mptd_metrics()
               << " (" << attack_scenario_name[attack_number] << ")"
               << "  pct=" << attack_percentage
               << "%  speed=" << maxspeed << " km/h" << std::endl;
-    std::cout << "  Confusion matrix:"
+    std::cout << "  Confusion matrix (LW / A1):"
               << "  TP=" << cm_TP
               << "  FP=" << cm_FP
               << "  TN=" << cm_TN
               << "  FN=" << cm_FN << std::endl;
-    std::cout << "  MCC  = " << compute_MCC()  << "  (Matthews Correlation Coefficient)" << std::endl;
-    std::cout << "  FPR  = " << compute_FPR()  << "  (False Positive Rate)" << std::endl;
+    std::cout << "  MCC  = " << compute_MCC()  << "  (Matthews Correlation Coefficient, LW)" << std::endl;
+    std::cout << "  FPR  = " << compute_FPR()  << "  (False Positive Rate, LW)" << std::endl;
+    // C1: full-mode (Fusion) detection metrics — authoritative for A2/A3/A4/A5/Full.
+    if (ablation_mode != 1 && ablation_mode != 6) {
+        std::cout << "  Confusion matrix (Full/Fusion):"
+                  << "  TP=" << cm_full_TP
+                  << "  FP=" << cm_full_FP
+                  << "  TN=" << cm_full_TN
+                  << "  FN=" << cm_full_FN << std::endl;
+        std::cout << "  MCC_full = " << compute_MCC_full()
+                  << "  (Fusion Φ>Φ_th, Eq 3.45/4.1)" << std::endl;
+        std::cout << "  FPR_full = " << compute_FPR_full()
+                  << "  (Fusion, Eq 4.2)" << std::endl;
+    }
     std::cout << "  PARR = " << compute_PARR()
               << "  (TRS blockchain rejection; "
               << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned revoked)" << std::endl;
@@ -765,10 +844,21 @@ void write_mptd_results_csv()
 
     std::ofstream fout(fname.str(), std::ios::out | std::ios::trunc);
 
+    // C2: explicit slice keys (attacker_class) + full-mode (Fusion) confusion
+    // matrix and MCC/FPR alongside the lightweight ones. Each run injects a
+    // single attack variant (attack_number) → one attacker_class; the sweep over
+    // attack_number × ablation_mode plus these columns lets the post-processor
+    // build the paper's "MCC/FPR per attack variant × 4 attacker classes" table
+    // for BOTH decision layers (LW = cm_*/MCC/FPR; Full = cm_full_*/MCC_full/FPR_full).
+    const int run_attacker_class = attacker_class_for((int)attack_number);
+
     // Header — note: TDEE=-1, TPE=-1 (SUMO required); CDER from ctrl-plane decisions
-    fout << "attack_number,attack_pct,maxspeed_kmh,ablation_mode,"
+    fout << "attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,"
          << "cm_TP,cm_FP,cm_TN,cm_FN,"
-         << "MCC,FPR,PARR,"
+         << "MCC,FPR,"
+         << "cm_full_TP,cm_full_FP,cm_full_TN,cm_full_FN,"
+         << "MCC_full,FPR_full,"
+         << "PARR,"
          << "CDER,ctrl_decisions_total,ctrl_decisions_wrong,"
          << "TDEE,TPE,"
          << "PBPO_LW_ms,PBPO_Full_ms,"
@@ -778,6 +868,7 @@ void write_mptd_results_csv()
 
     // Values
     fout << attack_number              << ","
+         << run_attacker_class         << ","
          << attack_percentage          << ","
          << maxspeed                   << ","
          << ablation_mode              << ","
@@ -787,6 +878,12 @@ void write_mptd_results_csv()
          << cm_FN                      << ","
          << compute_MCC()              << ","
          << compute_FPR()              << ","
+         << cm_full_TP                 << ","
+         << cm_full_FP                 << ","
+         << cm_full_TN                 << ","
+         << cm_full_FN                 << ","
+         << compute_MCC_full()         << ","
+         << compute_FPR_full()         << ","
          << compute_PARR()             << ","
          << compute_CDER()             << ","
          << ctrl_decisions_total       << ","

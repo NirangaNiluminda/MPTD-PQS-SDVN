@@ -37,6 +37,7 @@ static uint32_t best_rsu_for_position(double px, double py,    // LL-based selec
 // 10_metrics_csv.h is included after this file in simulation.cc, so we
 // forward-declare here to allow HandleBeaconReceived() to call them.
 void update_confusion_matrix(bool is_poisoned, bool detected);
+void update_confusion_matrix_full(bool is_poisoned, bool full_flag);
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi);
 void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
@@ -1835,6 +1836,20 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         if (fs.anomalous) full_flag_count++;
                         phi_sum += fs.phi;
                         if (fs.phi > phi_max) phi_max = fs.phi;
+
+                        // ── C1: score the full-mode Fusion verdict (Eq 3.45
+                        // Φ_i > Φ_th) against this beacon's ground-truth poison
+                        // label into the full-mode confusion matrix (Eq 4.1/4.2).
+                        // Gated to full-mode ablations only (A2/A3/A4/A5/Full):
+                        // for A1 (mode 1) and B1 (mode 6) full mode is inactive,
+                        // so the LW confusion matrix at HandleBeaconReceived stays
+                        // authoritative and this matrix is left empty. This is the
+                        // window-close (W = L·T_b) controller-side scoring path —
+                        // invariant #3 (LW skip-on-pass) is untouched.
+                        if (ablation_mode != 1 && ablation_mode != 6) {
+                            update_confusion_matrix_full(
+                                rw.is_poisoned[i], fs.anomalous);
+                        }
                         cout << "[FUSION-RSU" << rsu_id << "] epoch="
                              << cw.window_epoch
                              << " vid=" << vid_i
@@ -2736,7 +2751,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                                       tag.GetPosX(), tag.GetPosY(),
                                       tag.GetSpeed(), tag.GetHeading(),
                                       tag.GetAcceleration(), t,
-                                      rsu_lw.anomalous);
+                                      rsu_lw.anomalous,
+                                      tag.GetIsPoisoned());
         }
 
         // ── R7e: Cache ψ + push to per-vehicle LSTM-AE ring buffer ────────────

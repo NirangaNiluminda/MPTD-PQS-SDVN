@@ -273,6 +273,8 @@ struct RsuBeaconWindow {
     double   accel     [IPFS_WINDOW_L];
     double   timestamp [IPFS_WINDOW_L];
     bool     anomalous [IPFS_WINDOW_L]; // cached LW-DETECT result per beacon
+    bool     is_poisoned[IPFS_WINDOW_L];// ground-truth poison label per beacon
+                                        // (Eq 4.1/4.2 GT for full-mode MCC/FPR)
     uint32_t beacon_count;              // filled slots in current window
     double   window_start;              // first beacon time of current window
     uint32_t window_epoch;              // monotonic window counter
@@ -426,20 +428,22 @@ static std::string ipfs_window_hash(const RsuBeaconWindow &w, uint32_t rsu_id) {
 void ipfs_push_and_maybe_flush(uint32_t rsu_id, uint32_t vid,
                                double px, double py, double sp,
                                double hd, double ac, double ts,
-                               bool anomalous_flag) {
+                               bool anomalous_flag,
+                               bool is_poisoned_flag = false) {
     if (rsu_id >= 4) return;
     RsuBeaconWindow &w = rsu_window[rsu_id];
     if (w.beacon_count == 0) w.window_start = ts;
     if (w.beacon_count < IPFS_WINDOW_L) {
         uint32_t i = w.beacon_count;
-        w.vid[i]       = vid;
-        w.pos_x[i]     = px;
-        w.pos_y[i]     = py;
-        w.speed[i]     = sp;
-        w.heading[i]   = hd;
-        w.accel[i]     = ac;
-        w.timestamp[i] = ts;
-        w.anomalous[i] = anomalous_flag;
+        w.vid[i]         = vid;
+        w.pos_x[i]       = px;
+        w.pos_y[i]       = py;
+        w.speed[i]       = sp;
+        w.heading[i]     = hd;
+        w.accel[i]       = ac;
+        w.timestamp[i]   = ts;
+        w.anomalous[i]   = anomalous_flag;
+        w.is_poisoned[i] = is_poisoned_flag;
         w.beacon_count++;
     }
     if (w.beacon_count >= IPFS_WINDOW_L) {
