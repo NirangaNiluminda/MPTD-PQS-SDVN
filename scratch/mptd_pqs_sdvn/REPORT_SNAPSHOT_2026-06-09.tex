@@ -1,0 +1,112 @@
+% MPTD-PQS FINALIZED REPORT SNAPSHOT — captured 2026-06-09 from Overleaf.
+% This is the SPEC OF RECORD for code-conformance audits. The paper PDF
+% remains the ultimate authority; this report was aligned to it.
+% Methodology (Ch3) is the authoritative design. Key locked design points:
+%   - Multi-controller set C = {c_1,...,c_K}; RSU reassigns on revocation.
+%   - DKG key generation (no controller, no dealer) for TRS + FHE shares (Eq 3.25-3.26).
+%   - Threshold (t, n+1) FHE incl. Cloud share; t_sign=f+1, t_decrypt=f+2; n>=3f+1.
+%   - FHE-encrypt BEFORE TRS; TRS signs the combined ciphertext.
+%   - Directional conflict (1-flag_ctrl)*flag_rsu; revocation over 2f+1 DISTINCT RSUs in window T_w.
+%
+% NOTE: Only the methodology/results design text is reproduced below as the
+% conformance reference. For the full prose (intro, lit review), use Overleaf.
+% This snapshot focuses on Chapter 3 (Methodology) + Chapter 4 (Results) design.
+
+\chapter{Methodology}
+
+\section{Research Design}
+
+The proposed system is modeled as consisting of vehicles, Roadside Units (RSUs), and a distributed set of SDVN controllers $\mathcal{C} = \{c_1, c_2, \ldots, c_K\}$, none of which is individually authoritative. Vehicles periodically generate mobility reports containing position, speed, direction, and time information. These reports are forwarded to the controller through RSUs and are used by the controller to learn mobility models for network management and decision making.
+
+\section{Threat Model}
+\label{sec:threat_model}
+
+The SDVN architecture is assumed to consist of vehicles, Roadside Units (RSUs), and a set of $K$ registered controllers $\mathcal{C} = \{c_1, c_2, \ldots, c_K\}$, all of which may act as potential attack sources. RSUs are initially assigned to controllers based on geographic proximity or load-balancing. The blockchain continuously maintains trust scores for all registered controllers. When a controller is detected as malicious, RSUs previously assigned to it reassign to any currently trusted controller from $\mathcal{C}$ without disrupting network operation. Since the Cloud/ITS Server feeds aggregate results into controller decision pipelines, it is treated as part of the control plane threat boundary and is not assumed to be unconditionally trusted.
+
+The framework assumes the number of simultaneously compromised RSUs $f$ satisfies $f \leq \lfloor (n-1)/3 \rfloor$, equivalent to $n \geq 3f+1$. Threshold parameters: $t_{\mathrm{sign}} = f+1$ for TRS signing and $t_{\mathrm{decrypt}} = f+2$ for FHE decryption. Setting $t_{\mathrm{decrypt}} = f+2$ ensures that $f$ RSUs plus the Cloud ($f+1$ shares) cannot reach the decryption threshold alone.
+
+Attacker types: Malicious Vehicles; Compromised RSUs; MitM Adversaries; Malicious or Compromised Controllers.
+
+\section{SDVN System Modeling}
+
+Set of $K$ registered controllers $\mathcal{C} = \{c_1, \ldots, c_K\}$ whose trust scores are maintained on the blockchain via SC-Trust. Each RSU $r_j$ maintains a current controller assignment $c_{\mathrm{assigned}}(r_j) \in \mathcal{C}$. Trusted controller set (Eq 3.1):
+$\mathcal{C}_{\mathrm{trusted}}(t) = \{c_k \in \mathcal{C} : \tau_{c_k}(t) > \tau_{\min}\}$ (eq:trusted_ctrl_set).
+When $c_{\mathrm{assigned}}(r_j)$ is revoked, RSU queries blockchain for $\mathcal{C}_{\mathrm{trusted}}(t)$ and reassigns.
+
+\section{Attack Modeling} % Eq 3.2-3.9 mobility amplification; Eq 3.10-3.21 signatures
+% Mobility amplification: contact_duration (3.2), beacon_count (3.3), detection_condition,
+% handover_rate (3.4/3.5), drift_constraint, cumulative_drift, sybil_capacity (3.8), sybil_fraction (3.9).
+% BSM beacon b_i(t) (3.10). Signatures TP-S1..TP-S5, MP-S1..MP-S4 (3.11-3.20). Composite psi (3.21).
+
+\section{Proposed Mitigation Framework}
+
+% Crypto scope: TRS pre-detection; FHE pre-TRS-coordination; HMAC lightweight integrity.
+% Pipeline placement table: Rule-based(Detection,both), HMAC(Mitigation,LW), GAT(Detection,Full),
+% TempAE(Detection,Full), TRS(Mitigation,Full), FHE(Mitigation,Full pre-TRS), Blockchain(Both), SC(Both).
+
+\subsection{Group Key Management via LKH}
+% Vehicle session keys K_i (HMAC, Eq 3.38) + RSU ring keys sk_j (TRS, Eq 3.50).
+% LKH balanced binary tree; keyset (3.22); session_key K_i = KDF(K_u, eta, ID) (3.23);
+% rekey N = log2|V_j| (3.24).
+% FHE key shares {sk_j^share} from threshold setup (Eq thresh_keygen) distributed via LKH ring channel
+% (NO equation ref on the channel itself — it is transport only).
+
+\subsubsection{RSU Ring Key Generation via DKG}
+% TRS signing keys AND FHE key shares generated via DKG among RSU ring + Cloud,
+% NO single dealer, NO controller involvement. Blockchain = authenticated bulletin board.
+% DKG TRS (Eq 3.25): ({sk_j, pk_j}_{j=1}^n) <- DKG(R, n, t_sign). Per-RSU individual key pair.
+% FHE-DKG (Eq 3.26): (pk_FHE, {sk_j^share}_{j=1}^n, sk_cloud^share, evk) <- FHE-DKG(R U {Cloud}, n+1, t_decrypt).
+% No controller participates in TRS or FHE key generation at any stage.
+
+\subsection{Dual-Mode Detection and Mitigation Pipeline}
+\label{sec:dual_mode}
+% Controller submits full-mode GAT+AE scores as ONE untrusted peer (Eq ctrl_evidence),
+% same BFT verification as RSU. No decision relies exclusively on controller evidence.
+% RSUs submit beacon-level evidence DIRECTLY to blockchain (Eq rsu_evidence);
+% revocation triggered by RSU peer consensus alone (Eq bft_revoke_rsu, 2f+1 distinct RSUs).
+
+% Lightweight: LW-DETECT at RSU. HMAC verify (3.38) -> 9 signatures -> psi (3.21).
+%   psi<=psi_th: accept locally, NO blockchain. psi>psi_th: submit E_j(t) to SC-Trust.
+% Full mode adds GAT (3.27-3.39) + LSTM-AE (3.31-3.43) + Fusion (3.44 fusion, 3.45 flag) at CONTROLLER.
+
+% GAT: mobility-aware edge (3.27 edge_def1: dist<=R_max AND heading<=phi_max), z-score norm,
+%   multi-head attention (3.28/3.29), spatial score S_i (3.39 gat_score).
+% LSTM-AE: window X_i (ta_input), gates (3.31-3.36), decoder (ta_decoder), recon error eps_i (ta_error),
+%   threshold theta_ae from OFFLINE SUMO clean traces median+kappa*MAD (ta_threshold) — frozen, no live update.
+%   Manifold frozen offline; updates suspended if flagged fraction > alpha_freeze.
+% Fusion: Phi_i = lambda1*psi + lambda2*S + lambda3*(eps/theta_ae) (3.44); flag=1[Phi>Phi_th] (3.45).
+% Algorithms: LW-DETECT, TP-DETECT, SYB-DETECT, MITM-DETECT, FULL-DETECT (runs at controller, IPFS retrieval).
+
+\subsection{Full Mode Mitigation: Post-Quantum TRS and FHE}
+\label{sec:pqc_mitigation}
+% Order (MANDATED): each RSU FHE-encrypts OWN aggregate c_j=Enc(A_j) (3.46 rsu_aggregate, fhe_rsu_enc)
+%   BEFORE ring sharing -> ring homomorphic add Enc(A_ring)=(+)c_j (fhe_ring_combine)
+%   -> TRS signs combined CIPHERTEXT m=(Enc(A_ring),t,nu_S,ID_S,h(S)) (trs_message)
+%   -> partial sigma_j=Sign(sk_j,m) (trs_partial) -> aggregate sigma_TRS (trs_aggregate)
+%   -> Cloud freshness (trs_fresh) -> Cloud TRS-verify HARD GATE (trs_verify)
+%   -> only-if-pass: cloud blind global aggregate Enc(Xbar_global)=(1/M)(+)Enc(A_ring,k) (fhe_global)
+%   -> Cloud partial pd_cloud (partial_dec_cloud) + RSU partials pd_j (partial_dec)
+%   -> threshold decrypt ThDec when |D|>=t_decrypt=f+2 (thresh_dec). Cloud sufficient NOT mandatory.
+% Threshold keygen ThGen(1^lambda, n+1, t_decrypt) (thresh_keygen): pk_FHE, n RSU shares, 1 Cloud share, evk.
+% Algorithms: PQ-FHE-TRS (incl. pre-enc SUMO range check), THRESH-DEC (incl. post-dec SUMO envelope, reuse last valid on reject).
+
+\subsection{Blockchain Trust Layer}
+\label{sec:blockchain}
+% Permissioned consortium (Hyperledger Fabric); RSUs endorsing peers; IPFS off-chain beacon storage.
+% SC-Register (Alg): commit iff >=2f+1 RSU endorsements; tau_init; ACTIVE.
+% SC-Trust: tau_i(t) EMA (trust_update); controller trust tau_ck (ctrl_trust) via conflict.
+% SC-Revoke: RSU-direct, controller bypassed. E_j(t) (rsu_evidence), E_c(t) (ctrl_evidence, one peer vote).
+%   Revoke when >=2f+1 DISTINCT RSUs flag v_i within window T_w (bft_revoke_rsu).
+%   Directional conflict: flag_ctrl (ctrl_bin_flag), flag_rsu (rsu_bin_flag),
+%   conflict_j=(1-flag_ctrl)*flag_rsu (conflict_pred), flag_c=1[sum conflict>=f+1] (ctrl_flag).
+%   flag_c=1 -> exclude E_c from consensus, RSU rule-based fallback, reassign to C_trusted.
+%   CRL-Update broadcast directly to RSUs, no controller relay. SC-Revoke applies to controllers too.
+% Algorithm CP-DETECT: TRS verify hard gate (trs_verify) -> conflict cross-check -> flag_c.
+
+\chapter{Results}
+% Baselines: B1 Ghaleb 2014; B2 Vishwanath&Reddy 2026 (Fed-LSTM-AE); B3 Somma 2025 (hTDC-AE).
+% NOTE: per audit H4, team swapped B2/B3 to Ercan(2022)/Sharma(2021) in impl — reconcile w/ report.
+% Ablations: A1 lightweight-only; A2 GAT-only; A3 TempAE-only; A4 full-AI no-TRS/FHE; A5 full no-blockchain.
+% Metrics: MCC (4.1), FPR (4.2), PARR (4.3, TRS-rejected/total poisoned aggregates), CDER (4.4),
+%   TDEE (4.5, SUMO rho_gt), TPE (4.6, SUMO p_gt), PBPO (4.7, LW<=T_b=100ms; Full per W=L*T_b; TRS vs ECDSA).
+% MCC/FPR sliced per attack variant x 4 attacker classes.
