@@ -27,8 +27,13 @@ mptd_pqs/**/*.pyc
 sumo/**/fcd.xml
 sumo/**/fcd_shifted.xml
 sumo/**/trips.xml
+sumo/**/trips_*.xml
 sumo/**/routes.rou.xml
 sumo/**/routes.rou.alt.xml
+sumo/**/routes_*.rou.xml
+sumo/**/routes_*.rou.alt.xml
+sumo/**/*_full.net.xml
+sumo/**/keep_edges.txt
 sumo/**/mobility_*.tcl
 
 # ── Hyperledger Fabric chaincode (Go) ─────────────────────────────────────────
