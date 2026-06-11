@@ -8,9 +8,11 @@
 #   attack_pct    : 5, 10, 20, 30  (ρ_a ∈ {0.05, 0.10, 0.20, 0.30})
 #   speed_regime  : low=20, medium=50, high=100 km/h
 #
-# Total NS-3 runs: 7 × 4 × 3 = 84 (detection mode only)
-# Each run produces beacon_log.csv → evaluate_all.py computes all 7 metrics
-# across 6 detection variants (MPTD-PQS, A1-A5)
+# Total NS-3 runs: 7 × 4 × 3 × 6 modes = 504 (one run per ablation variant so
+# each variant's REAL PARR/CDER/TDEE/TPE/PBPO is measured, not proxied).
+# Each (A,P,S) cell produces beacon_log.csv (→ Python MCC/FPR re-score) plus
+# 6 per-mode metrics_a*_m{0..5}.csv (→ evaluate_all.py real metric columns).
+# Scope down with MODES="0 1" and/or --attack=N for quick iterations.
 #
 # Usage:
 #   cd /home/niranga/ns-allinone-3.35/ns-3.35
@@ -50,6 +52,15 @@ SPEEDS=(20 50 100)
 SPEED_LABELS=(low medium high)
 SIM_TIME=13
 
+# Ablation modes to simulate per (attack,pct,speed). evaluate_all.py reads each
+# variant's REAL PARR/CDER/TDEE/TPE/PBPO from its OWN per-mode C++ CSV
+# (metrics_a{A}_p{P}_s{S}_m{MODE}.csv), so every variant the plots show must be
+# simulated here — otherwise those columns are NaN (never proxied).
+#   0=MPTD-PQS(full) 1=A1(LW) 2=A2(GAT) 3=A3(AE) 4=A4(no-PQ) 5=A5(no-chain)
+# COST: this multiplies NS-3 runs by ${#MODES[@]} (6× → 504 runs for the full
+# 7×4×3 grid). Override with e.g.  MODES="0 1"  bash run_evaluation.sh  to scope.
+MODES=(${MODES:-0 1 2 3 4 5})
+
 # Flags
 DRY_RUN=false
 FILTER_ATTACK=""
@@ -79,10 +90,10 @@ speed_label() {
 # Helper: run a single NS-3 experiment
 # ---------------------------------------------------------------------------
 run_ns3() {
-    local A="$1" P="$2" S="$3"
-    local LOG="$LOG_DIR/ns3_a${A}_p${P}_s${S}.log"
+    local A="$1" P="$2" S="$3" M="$4"
+    local LOG="$LOG_DIR/ns3_a${A}_p${P}_s${S}_m${M}.log"
 
-    echo "  [ns3] attack=$A pct=$P speed=$S → $LOG"
+    echo "  [ns3] attack=$A pct=$P speed=$S mode=$M → $LOG"
     if $DRY_RUN; then
         echo "  [dry-run] skipping NS-3 execution"
         return 0
@@ -95,11 +106,14 @@ run_ns3() {
     # post-hoc from beacon_log.csv. Hyperledger Fabric is not running, and
     # paper invariant #3 means lightweight detection runs without blockchain
     # anyway; the alert-path SC-Trust calls would only add timeouts here.
+    # --ablation_mode=$M selects the variant so the C++ writes the matching
+    # metrics_a{A}_p{P}_s{S}_m{M}.csv that evaluate_all.py reads real values from.
     python3 waf --run "mptd_pqs_sdvn \
         --attack_number=${A} \
         --attack_percentage=${P} \
         --maxspeed=${S} \
         --simTime=${SIM_TIME} \
+        --ablation_mode=${M} \
         --routing_test=false \
         --skip_blockchain=true" \
         > "$LOG" 2>&1 || true
@@ -117,7 +131,6 @@ evaluate_run() {
     local A="$1" P="$2" S="$3"
     local OUT="$RESULTS/run_a${A}_p${P}_s${S}.csv"
     local SL; SL=$(speed_label "$S")
-    local METRICS_CSV="$RESULTS/metrics_a${A}_p${P}_s${S}_m1.csv"
     # R7f.followup-3: archive this run's beacon_log so post-hoc re-evaluation
     # (e.g., threshold retuning, new variants) doesn't require resimulating.
     local BEACON_ARCH_CSV="$BEACON_ARCHIVE/beacon_a${A}_p${P}_s${S}.csv"
@@ -138,7 +151,7 @@ evaluate_run() {
         --speed         "$S" \
         --speed_label   "$SL" \
         --beacon_csv    "$BEACON_CSV" \
-        --metrics_csv   "$METRICS_CSV" \
+        --metrics_dir   "$RESULTS" \
         --output        "$OUT"
 }
 
@@ -147,12 +160,14 @@ evaluate_run() {
 # ---------------------------------------------------------------------------
 cd "$NS3_ROOT"
 
-total_runs=$(( ${#ATTACKS[@]} * ${#PCTS[@]} * ${#SPEEDS[@]} ))
+total_cells=$(( ${#ATTACKS[@]} * ${#PCTS[@]} * ${#SPEEDS[@]} ))
+total_runs=$(( total_cells * ${#MODES[@]} ))
 run_idx=0
 
 echo "========================================================"
 echo " MPTD-PQS Stage 8 Evaluation Sweep"
-echo " Total NS-3 runs: $total_runs"
+echo " Cells (A×P×S): $total_cells   Modes: ${MODES[*]}"
+echo " Total NS-3 runs: $total_runs  (${#MODES[@]} per cell)"
 echo " Output dir: $RESULTS"
 $DRY_RUN && echo " [DRY RUN MODE]"
 echo "========================================================"
@@ -167,7 +182,7 @@ for A in "${ATTACKS[@]}"; do
             OUT_CSV="$RESULTS/run_a${A}_p${P}_s${S}.csv"
 
             echo ""
-            echo "── Run $run_idx/$total_runs  attack=$A  pct=$P%  speed=$S km/h ──"
+            echo "── Cell $run_idx/$total_cells  attack=$A  pct=$P%  speed=$S km/h  (modes: ${MODES[*]}) ──"
 
             # Skip if already done and --resume
             if $RESUME && [ -f "$OUT_CSV" ] && [ -s "$OUT_CSV" ]; then
@@ -175,7 +190,13 @@ for A in "${ATTACKS[@]}"; do
                 continue
             fi
 
-            run_ns3    "$A" "$P" "$S"
+            # Simulate every ablation mode so each variant's real per-mode
+            # C++ CSV (metrics_a*_m{MODE}.csv) exists for evaluate_all.py to
+            # read. The beacon_log.csv left by the last run feeds the Python
+            # MCC/FPR re-score (mode-independent: derived from raw beacons).
+            for M in "${MODES[@]}"; do
+                run_ns3 "$A" "$P" "$S" "$M"
+            done
             evaluate_run "$A" "$P" "$S"
 
         done
@@ -183,11 +204,13 @@ for A in "${ATTACKS[@]}"; do
 done
 
 # ---------------------------------------------------------------------------
-# Ablation-only runs (use synthetic data / last beacon_log)
+# Merge per-run CSVs into the summary table consumed by plot_results.py.
+# (No synthetic data: every variant's metrics come from its own real per-mode
+# C++ CSV; only absent modes are NaN.)
 # ---------------------------------------------------------------------------
 echo ""
 echo "========================================================"
-echo " Running ablation variants A1-A5 on all sweep CSVs"
+echo " Merging per-run variant rows into sweep_summary.csv"
 echo "========================================================"
 
 if ! $DRY_RUN; then
