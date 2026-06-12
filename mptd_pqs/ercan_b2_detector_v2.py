@@ -81,16 +81,41 @@ D0       = 10.0   # Reference distance [m]
 N_EXP    = 2.7    # Path-loss exponent (urban VANET, NLOS)
 SIGMA_DB = 8.0    # Log-normal shadowing std dev [dB]
 
-# RSU positions [metres] from the NS-3 simulation config
-# Confirmed from MPTD-PQS-SDVN/scratch/mptd_pqs_sdvn/12_main.h line 763-770:
-#   GridPositionAllocator MinX=250, MinY=480, DeltaX=500, GridWidth=4
-# → RSU0=(250,480), RSU1=(750,480), RSU2=(1250,480), RSU3=(1750,480)
-RSU_POS: Dict[int, Tuple[float, float]] = {
-    0: (250.0,  480.0),
-    1: (750.0,  480.0),
-    2: (1250.0, 480.0),
-    3: (1750.0, 480.0),
+# RSU positions [metres]. Loaded from the SAME file NS-3 uses to place RSUs
+# (mobility/rsu_positions_urban.csv, "rsu_id,x,y"), so the dist_decl / speed_diff
+# features (Ercan Eq. 5/6) are computed against the ACTUAL placed RSUs — including
+# the supervisor-mandated 8x8 = 64-RSU grid (2026-06-12). Earlier this was a
+# hardcoded 4-RSU line layout (250/750/1250/1750 @ y=480), which gave every
+# rsu_id >= 4 a bogus fallback position under SUMO-trace runs and corrupted the
+# distance feature. Falls back to the legacy 4-RSU test-grid if the CSV is absent
+# (i.e. test-net runs with --mobility_source=0).
+_LEGACY_RSU_POS = {
+    0: (250.0, 480.0), 1: (750.0, 480.0),
+    2: (1250.0, 480.0), 3: (1750.0, 480.0),
 }
+
+
+def load_rsu_positions(csv_path: Optional[str] = None) -> Dict[int, Tuple[float, float]]:
+    """Read RSU (x, y) keyed by rsu_id from mobility/rsu_positions_urban.csv.
+
+    This is the exact file NS-3 loads in SUMO-trace mode (12_main.h:799), so the
+    Python baseline sees the same RSU topology the simulation ran with. Returns
+    the legacy 4-RSU layout if the CSV cannot be read."""
+    if csv_path is None:
+        csv_path = os.path.join(os.path.dirname(__file__), "..",
+                                "mobility", "rsu_positions_urban.csv")
+    try:
+        df = pd.read_csv(csv_path)
+        pos = {int(r["rsu_id"]): (float(r["x"]), float(r["y"]))
+               for _, r in df.iterrows()}
+        if pos:
+            return pos
+    except (FileNotFoundError, KeyError, ValueError):
+        pass
+    return dict(_LEGACY_RSU_POS)
+
+
+RSU_POS: Dict[int, Tuple[float, float]] = load_rsu_positions()
 
 FEATURE_COLS = [
     "recv_pos_x", "recv_pos_y",      # declared BSM position (possibly faked)
