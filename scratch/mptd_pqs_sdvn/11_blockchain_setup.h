@@ -150,10 +150,14 @@ void initialize_crypto_backends()
 void assign_controllers()
 {
     cout << "DEBUG: assign_controllers called. attack_number=" << attack_number << endl;
-    for (uint32_t i = 0; i < total_size; i++) {
-        if      (i < uint32_t(0.25 * total_size)) { node_controller_ID[i] = 0; assigned_consortium_ID[i] = 0; }
-        else if (i < uint32_t(0.50 * total_size)) { node_controller_ID[i] = 1; assigned_consortium_ID[i] = 1; }
-        else if (i < uint32_t(0.75 * total_size)) { node_controller_ID[i] = 2; assigned_consortium_ID[i] = 2; }
+    // Bound on N_Vehicles (active count), not total_size (capacity=256): the
+    // quarter-split must divide the ACTUAL fleet across the 4 consortia. Using
+    // the capacity here would lump every real vehicle into consortium 0.
+    // (In the test net N_Vehicles==16, so this is bit-for-bit the old behaviour.)
+    for (uint32_t i = 0; i < N_Vehicles; i++) {
+        if      (i < uint32_t(0.25 * N_Vehicles)) { node_controller_ID[i] = 0; assigned_consortium_ID[i] = 0; }
+        else if (i < uint32_t(0.50 * N_Vehicles)) { node_controller_ID[i] = 1; assigned_consortium_ID[i] = 1; }
+        else if (i < uint32_t(0.75 * N_Vehicles)) { node_controller_ID[i] = 2; assigned_consortium_ID[i] = 2; }
         else                                       { node_controller_ID[i] = 3; assigned_consortium_ID[i] = 3; }
 
         // RSU nodes: malicious status from attack_percentage
@@ -590,10 +594,10 @@ void register_all_nodes()
         std::string id = MakeRsuId(rsu_idx);
         // hKuHex: SHA-256 over the RSU ring key sk_j (paper Eq 3.36 output).
         std::string h_ku_hex;
-        if (rsu_idx < 4) {
+        if (rsu_idx < MAX_RSUS) {
             h_ku_hex = sha256_hex(g_rsu_ring_key[rsu_idx], LKH_KEY_BYTES);
         } else {
-            // LKH_MAX_RSU is 4 in the test topology; surface the limit.
+            // Ring-key slots are capped at MAX_RSUS; surface the limit.
             std::cerr << "[SC-REGISTER] " << id
                       << " skipped (rsu_idx >= LKH ring slots)\n";
             continue;
@@ -676,7 +680,7 @@ void test_boolean()
                  << " for source node " << j << endl;
         }
     }
-    for (uint32_t j = 0; j < total_size; j++) {
+    for (uint32_t j = 0; j < N_Vehicles; j++) {  // active count, not capacity
         cout << "For " << j << "th node, tp_vehicle attack state is "         << tp_vehicle_nodes[j]        << endl;
         cout << "For " << j << "th node, heading_spoof attack state is "     << heading_spoof_nodes[j]     << endl;
         cout << "For " << j << "th node, rsu_fabrication attack state is "   << rsu_fabrication_nodes[j]   << endl;

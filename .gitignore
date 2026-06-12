@@ -19,6 +19,22 @@ mptd_pqs/**/*.pyc
 # ── Mobility trace files ──────────────────────────────────────────────────────
 !mobility/
 !mobility/**
+mobility/**/*.bak
+
+# ── SUMO pipeline: allowlist source .osm, built .net.xml, and the build script;
+#    re-ignore regeneratable intermediates (rebuilt by sumo/build_sumo_trace.sh) ─
+!sumo/
+!sumo/**
+sumo/**/fcd*.xml
+sumo/**/trips.xml
+sumo/**/trips_*.xml
+sumo/**/routes.rou.xml
+sumo/**/routes.rou.alt.xml
+sumo/**/routes_*.rou.xml
+sumo/**/routes_*.rou.alt.xml
+sumo/**/*_full.net.xml
+sumo/**/keep_edges.txt
+sumo/**/mobility_*.tcl
 
 # ── Hyperledger Fabric chaincode (Go) ─────────────────────────────────────────
 # imported May 2026 from NirangaNiluminda/mptd-pqs-blockchain → ns3 chaincode/

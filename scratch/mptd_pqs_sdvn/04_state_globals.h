@@ -139,7 +139,7 @@ RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 // ── RSU compromise flags (TP-S1, MP-S1) ──────────────────────────────────────
 // compromised_rsu[i] = true means RSU i intercepts+modifies vehicle data.
 // Set by declare_compromised_rsus() in 11_blockchain_transmission.h.
-bool compromised_rsu[4] = {false, false, false, false};
+bool compromised_rsu[MAX_RSUS] = {};
 
 // ── SC-Register: registered-vehicle cache (paper §3.5.5 Algorithm 7) ─────────
 // Populated by register_all_nodes() in 11_blockchain_setup.h on each successful
@@ -173,8 +173,8 @@ uint64_t unregistered_beacon_reject_count = 0;
 //   Vehicle → DSRC unicast → RSU (HandleBeaconAtRSU) → CSMA → management_node
 // When false: legacy LTE path (Vehicle → LTE → management_node directly).
 Ipv4Address g_management_csma_ip;            // management_node CSMA IP (10.1.1.6)
-Ipv4Address g_rsu_dsrc_ip[4];                // RSU DSRC IPs from dsrc_interfaces (3.x.x.x)
-Ipv4Address g_rsu_csma_ip[4];               // RSU CSMA IPs for management → RSU downlink (10.1.1.x)
+Ipv4Address g_rsu_dsrc_ip[MAX_RSUS];                // RSU DSRC IPs from dsrc_interfaces (3.x.x.x)
+Ipv4Address g_rsu_csma_ip[MAX_RSUS];               // RSU CSMA IPs for management → RSU downlink (10.1.1.x)
 uint32_t    g_first_rsu_node_id = 0;         // NS-3 NodeID of RSU_Nodes.Get(0)
 uint32_t    g_first_vehicle_node_id = 0;     // NS-3 NodeID of Vehicle_Nodes.Get(0)
                                              //   (R7e.4: needed to convert raw NodeID
@@ -242,8 +242,8 @@ struct ControllerWindow {
     uint32_t window_epoch;       // monotonic window counter (rollovers seen)
 };
 
-// Indexed by RSU cell id 0..3 (only the 4 routing-test RSUs are populated).
-ControllerWindow ctrl_window[4] = {};
+// Indexed by RSU cell id 0..N_RSUs-1 (sized for capacity MAX_RSUS).
+ControllerWindow ctrl_window[MAX_RSUS] = {};
 
 // ── R4.c: IPFS Off-Chain Beacon Store (paper §3.5.3 Eq 3.56, Fig 3.9) ─────────
 // RSUs accumulate L beacons per window, compute a cryptographic hash of the
@@ -280,7 +280,7 @@ struct RsuBeaconWindow {
     uint32_t window_epoch;              // monotonic window counter
 };
 
-RsuBeaconWindow rsu_window[4] = {};
+RsuBeaconWindow rsu_window[MAX_RSUS] = {};
 
 // ── R7e: Per-vehicle LSTM-AE ring buffer + ψ cache (paper §3.5.3 Eq 3.43–3.46) ─
 // Full-mode temporal anomaly detection runs LSTM-AE over a 20-beacon sliding
@@ -384,8 +384,8 @@ static inline bool lstm_ring_dump(uint32_t vid, float *out_buf) {
 // snapshot lives until the next flush overwrites it, so the controller can
 // always read the most recent complete L-beacon window for any RSU.
 // epoch_valid=0 means "no flush yet for this RSU" — controller skips GAT then.
-RsuBeaconWindow rsu_last_window[4] = {};
-bool             rsu_last_window_valid[4] = {false, false, false, false};
+RsuBeaconWindow rsu_last_window[MAX_RSUS] = {};
+bool             rsu_last_window_valid[MAX_RSUS] = {};
 
 // Statistics surfaced in the end-of-run metrics block (10_metrics_csv.h).
 uint32_t ipfs_upload_count     = 0;  // total windows flushed to IPFS off-chain
@@ -430,7 +430,7 @@ void ipfs_push_and_maybe_flush(uint32_t rsu_id, uint32_t vid,
                                double hd, double ac, double ts,
                                bool anomalous_flag,
                                bool is_poisoned_flag = false) {
-    if (rsu_id >= 4) return;
+    if (rsu_id >= N_RSUs || rsu_id >= MAX_RSUS) return;
     RsuBeaconWindow &w = rsu_window[rsu_id];
     if (w.beacon_count == 0) w.window_start = ts;
     if (w.beacon_count < IPFS_WINDOW_L) {

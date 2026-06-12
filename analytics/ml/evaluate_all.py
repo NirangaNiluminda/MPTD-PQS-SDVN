@@ -13,13 +13,24 @@ Computes all 7 paper metrics for one NS-3 beacon_log.csv run across
   A5        — Full mode, no blockchain    (no SC-Trust decay)
 
 Metrics (paper §4.1.2, Eqs. 4.1-4.7):
-  MCC   — Matthews Correlation Coefficient (Eq. 4.1)
-  FPR   — False Positive Rate (Eq. 4.2)
-  PARR  — Poisoned Aggregate Rejection Rate (Eq. 4.3) — TRS mitigation
-  CDER  — Control Decision Error Rate (Eq. 4.4)
-  TDEE  — Traffic Density Estimation Error (Eq. 4.5) — proxy
-  TPE   — Trajectory Prediction Error (Eq. 4.6) — proxy
-  PBPO  — Per-Beacon Processing Overhead ms (Eq. 4.7)
+  MCC   — Matthews Correlation Coefficient (Eq. 4.1) — Python re-score of beacons
+  FPR   — False Positive Rate (Eq. 4.2)              — Python re-score of beacons
+  PARR  — Poisoned Aggregate Rejection Rate (Eq. 4.3) — REAL, from C++ per-mode CSV
+  CDER  — Control Decision Error Rate (Eq. 4.4)       — REAL, from C++ per-mode CSV
+  TDEE  — Traffic Density Estimation Error (Eq. 4.5)  — REAL, from C++ per-mode CSV
+  TPE   — Trajectory Prediction Error (Eq. 4.6)       — REAL, from C++ per-mode CSV
+  PBPO  — Per-Beacon Processing Overhead ms (Eq. 4.7) — REAL (C++) + Python ML split
+
+NOTE (2026-06-10, "no fake/proxy values" requirement): PARR/CDER/TDEE/TPE are
+NO LONGER computed by proxy formulas here. They are the real values measured by
+the NS-3 C++ run for the matching ablation mode (write_mptd_results_csv() in
+10_metrics_csv.h), read from metrics_a{A}_p{P}_s{S}_m{MODE}.csv where MODE maps
+each variant to the C++ ablation_mode enum (02_config_globals.h §4.1):
+  MPTD-PQS→0 (Full), A1→1, A2→2, A3→3, A4→4, A5→5.
+If a variant's per-mode CSV is absent, its PARR/CDER/TDEE/TPE are written as
+empty/NaN (never fabricated) and a warning is printed. MCC/FPR remain a genuine
+Python re-score of the real beacon_log.csv (the beacon features are identical
+across modes), so they are measured, not proxied.
 
 Usage:
   # Single run evaluation
@@ -84,66 +95,12 @@ def compute_mcc(tp, fp, tn, fn):
     return (tp * tn - fp * fn) / (denom ** 0.5 + 1e-9) if denom else 0.0
 
 
-def compute_parr(n_poisoned_beacons, attack_pct, n_rsus=N_RSUS,
-                 trs_threshold=TRS_THRESHOLD, use_pq=True):
-    """
-    Eq. 4.3 — Poisoned Aggregate Rejection Rate.
-    PARR = TRS-rejected poisoned aggregates / total poisoned aggregates.
-
-    Simulation approximation:
-    - With TRS enabled (use_pq=True): an RSU aggregate is rejected if fewer
-      than trs_threshold RSUs co-sign it.  When attack_pct% of RSUs are
-      compromised: if n_compromised < trs_threshold the aggregate is always
-      rejected (PARR→1.0); if n_compromised ≥ trs_threshold it passes
-      (PARR→0.0).  Linear interpolation gives a realistic proxy.
-    - Without TRS (use_pq=False / A4): PARR = 0.0 by definition.
-    """
-    if not use_pq:
-        return 0.0
-    if n_poisoned_beacons == 0:
-        return 1.0  # no poisoning attempted → TRS trivially blocks all
-    # fraction of RSUs that might be compromised
-    rho = (attack_pct / 100.0)
-    n_compromised = rho * n_rsus
-    if n_compromised < trs_threshold:
-        return 1.0   # minority compromise — TRS blocks all poisoned aggs
-    elif n_compromised >= n_rsus:
-        return 0.0   # full compromise — TRS cannot block
-    else:
-        # partial: linear decay from 1→0 as compromise fraction rises
-        return 1.0 - (n_compromised - trs_threshold) / (n_rsus - trs_threshold)
-
-
-def compute_cder(fn, total):
-    """
-    Eq. 4.4 — Control Decision Error Rate.
-    CDER = incorrect control decisions / total decisions.
-    Approximation: every undetected poisoned beacon (FN) corrupts one
-    controller decision.
-    """
-    return _safe_div(fn, total)
-
-
-def compute_tdee(fn, total_poisoned, attack_pct):
-    """
-    Eq. 4.5 — Traffic Density Estimation Error (proxy without SUMO GT).
-    TDEE = |ρ̂(t) - ρ_gt(t)| / ρ_gt(t)
-    Proxy: undetected fraction of poisoned beacons × attack penetration rate.
-    """
-    fn_rate = _safe_div(fn, max(total_poisoned, 1))
-    return fn_rate * (attack_pct / 100.0)
-
-
-def compute_tpe(fn, total_poisoned, speed_kmh):
-    """
-    Eq. 4.6 — Trajectory Prediction Error (proxy without SUMO GT).
-    TPE = (1/|V|) Σ ‖p̂_i(t) - p_gt_i(t)‖
-    Proxy: undetected poisoned fraction × mean displacement noise.
-    Mean displacement noise scales with speed (higher speed → wider drift).
-    """
-    fn_rate  = _safe_div(fn, max(total_poisoned, 1))
-    noise_m  = speed_kmh * (1000.0 / 3600.0) * 2.0  # 2 seconds drift at max speed
-    return fn_rate * noise_m
+# NOTE: PARR/CDER/TDEE/TPE proxy formulas were removed (2026-06-10). These four
+# metrics are simulation outcomes (TRS rejections, controller decisions, SUMO
+# ground-truth density/trajectory error) that only the NS-3 C++ run measures;
+# they cannot be reconstructed from a beacon log by a Python heuristic without
+# fabricating values. They are now read from the per-mode C++ metrics CSV — see
+# read_ns3_metrics() and the VARIANT_MODE map.
 
 
 # ---------------------------------------------------------------------------
@@ -386,30 +343,23 @@ def score_beacons(df, gat, ae, theta_ae, scaler):
 # Compute all 7 metrics for one detection variant
 # ---------------------------------------------------------------------------
 
-def metrics_for_variant(det_df, det_col, attack_pct, speed_kmh,
-                         use_pq=True):
+def metrics_for_variant(det_df, det_col):
     """
-    Returns dict with all 7 paper metrics for one detection column.
+    Detection-quality metrics for one variant, computed from the real beacon
+    log re-score (Eqs. 4.1–4.2). PARR/CDER/TDEE/TPE are NOT computed here — they
+    are read from the C++ per-mode CSV in evaluate_single_run (see module note).
     """
     tp = int(((det_df["is_poisoned"] == 1) & (det_df[det_col] == 1)).sum())
     fp = int(((det_df["is_poisoned"] == 0) & (det_df[det_col] == 1)).sum())
     tn = int(((det_df["is_poisoned"] == 0) & (det_df[det_col] == 0)).sum())
     fn = int(((det_df["is_poisoned"] == 1) & (det_df[det_col] == 0)).sum())
-    total          = tp + fp + tn + fn
-    total_poisoned = tp + fn
 
     mcc  = compute_mcc(tp, fp, tn, fn)
     fpr  = _safe_div(fp, fp + tn)
-    parr = compute_parr(total_poisoned, attack_pct, use_pq=use_pq)
-    cder = compute_cder(fn, total)
-    tdee = compute_tdee(fn, total_poisoned, attack_pct)
-    tpe  = compute_tpe(fn, total_poisoned, speed_kmh)
 
     return dict(
         TP=tp, FP=fp, TN=tn, FN=fn,
         MCC=round(mcc, 6), FPR=round(fpr, 6),
-        PARR=round(parr, 6), CDER=round(cder, 6),
-        TDEE=round(tdee, 6), TPE=round(tpe, 4),
     )
 
 
@@ -438,102 +388,160 @@ def metrics_for_variant(det_df, det_col, attack_pct, speed_kmh,
 # Result: per-variant overhead is now defensible against RQ5 ("does adding
 # PQ crypto erode the lightweight-mode latency budget?").
 
-def read_ns3_pbpo(metrics_csv):
+# Python variant name → C++ ablation_mode (02_config_globals.h §4.1).
+# Each variant's real PARR/CDER/TDEE/TPE/PBPO come from the C++ run at this mode.
+VARIANT_MODE = {
+    "MPTD-PQS":    0,   # Full (no ablation)
+    "A1_LW_only":  1,   # Lightweight only
+    "A2_GAT_only": 2,   # GAT only
+    "A3_AE_only":  3,   # AE only
+    "A4_no_TRS":   4,   # Full, no PQ (TRS/FHE off)
+    "A5_no_chain": 5,   # Full, no blockchain
+}
+
+# Real metric columns emitted by write_mptd_results_csv() in 10_metrics_csv.h.
+_NS3_REAL_COLS = ["PARR", "CDER", "TDEE", "TPE", "PBPO_LW_ms", "PBPO_Full_ms"]
+
+
+def metrics_csv_for_mode(base_dir, attack_number, attack_pct, speed_kmh, mode):
+    """Path of the C++ metrics CSV for a given ablation mode."""
+    return os.path.join(
+        base_dir,
+        f"metrics_a{attack_number}_p{attack_pct}_s{speed_kmh}_m{mode}.csv")
+
+
+def read_ns3_metrics(metrics_csv):
     """
-    Returns (pbpo_lw_ms, pbpo_full_ms) from the NS-3 metrics CSV produced
-    by write_mptd_results_csv() in 10_metrics_csv.h. Returns (0.0, 0.0) if
-    the file is absent or malformed.
+    Read the REAL per-mode metrics row written by the NS-3 C++ run
+    (write_mptd_results_csv(), 10_metrics_csv.h). Returns a dict with
+    {PARR, CDER, TDEE, TPE, PBPO_LW_ms, PBPO_Full_ms}.
+
+    Missing/malformed file or column → that value is float('nan') (NEVER a
+    fabricated proxy) so downstream plots can drop it instead of charting a
+    fake number. A warning is printed so the gap is visible.
     """
+    out = {c: float("nan") for c in _NS3_REAL_COLS}
     if not metrics_csv or not os.path.exists(metrics_csv):
-        return 0.0, 0.0
+        print(f"[eval_all] WARN: no C++ metrics CSV at {metrics_csv} — "
+              f"PARR/CDER/TDEE/TPE/PBPO left as NaN (not proxied)")
+        return out
     try:
         m_df = pd.read_csv(metrics_csv)
         if len(m_df) == 0:
-            return 0.0, 0.0
-        return (float(m_df["PBPO_LW_ms"].iloc[0]),
-                float(m_df["PBPO_Full_ms"].iloc[0]))
-    except (KeyError, ValueError, pd.errors.ParserError) as e:
-        print(f"[eval_all] WARN: cannot read PBPO from {metrics_csv}: {e}")
-        return 0.0, 0.0
+            print(f"[eval_all] WARN: empty C++ metrics CSV {metrics_csv} — NaN")
+            return out
+        for c in _NS3_REAL_COLS:
+            if c in m_df.columns:
+                out[c] = float(m_df[c].iloc[0])
+            else:
+                print(f"[eval_all] WARN: column {c} missing in {metrics_csv} — NaN")
+    except (ValueError, pd.errors.ParserError) as e:
+        print(f"[eval_all] WARN: cannot read {metrics_csv}: {e} — NaN")
+
+    # C++ writes -1.0 as the "not-computed" sentinel for TDEE (no SUMO ground
+    # truth) and TPE (no dead-reckoning samples). Both metrics are non-negative
+    # by definition (Eq.4.5/4.6), so a negative reading is the sentinel — map it
+    # to NaN so downstream plots DROP it rather than charting a fake -1.
+    for c in ("TDEE", "TPE"):
+        if out[c] == out[c] and out[c] < 0.0:   # not-NaN and negative
+            print(f"[eval_all] note: {c}={out[c]} in {os.path.basename(metrics_csv)} "
+                  f"is the C++ not-computed sentinel → NaN")
+            out[c] = float("nan")
+    return out
 
 
-def compute_pbpo_per_variant(pbpo_dict, pbpo_lw_ms, pbpo_full_ms):
+def pbpo_for_variant(name, pbpo_dict, pbpo_lw_ms, pbpo_full_ms):
     """
-    Returns {variant_name: pbpo_ms} mapping per the table above.
-    pbpo_dict is the {total,gat,ae,fusion} dict from score_beacons.
+    Per-beacon overhead for one variant (paper Eq.4.7) using THIS variant's own
+    C++ PBPO_LW/PBPO_Full (from its per-mode CSV) plus the Python ML component
+    costs it actually runs. pbpo_dict is {total,gat,ae,fusion} from score_beacons.
+    Returns NaN if the required C++ term is NaN (missing CSV) — not a fake 0.
     """
     gat = pbpo_dict["gat"]
     ae  = pbpo_dict["ae"]
     fus = pbpo_dict["fusion"]
-    return {
-        "MPTD-PQS":   pbpo_full_ms + gat + ae + fus,
-        "A1_LW_only": pbpo_lw_ms,
-        "A2_GAT_only":pbpo_full_ms + gat,
-        "A3_AE_only": pbpo_full_ms + ae,
-        "A4_no_TRS":  pbpo_lw_ms   + gat + ae + fus,
-        "A5_no_chain":pbpo_full_ms + gat + ae + fus,
+    table = {
+        "MPTD-PQS":    pbpo_full_ms + gat + ae + fus,
+        "A1_LW_only":  pbpo_lw_ms,
+        "A2_GAT_only": pbpo_full_ms + gat,
+        "A3_AE_only":  pbpo_full_ms + ae,
+        "A4_no_TRS":   pbpo_lw_ms   + gat + ae + fus,
+        "A5_no_chain": pbpo_full_ms + gat + ae + fus,
     }
+    return table[name]
 
 
 # ---------------------------------------------------------------------------
 # Single-run evaluation
 # ---------------------------------------------------------------------------
 
+def _fmt(v, prec=4):
+    """Format a possibly-NaN metric for the console line."""
+    return "NaN" if v != v else f"{v:.{prec}f}"
+
+
 def evaluate_single_run(attack_number, attack_pct, speed_kmh, speed_label,
-                         beacon_csv, output_csv, metrics_csv=None):
+                         beacon_csv, output_csv, metrics_dir=None):
     df           = load_beacon_csv(beacon_csv)
     gat, ae, theta_ae, scaler = load_models()
 
-    # Score all beacons and time per-component costs (paper Eq.4.7)
+    # Score all beacons and time per-component ML costs (paper Eq.4.7)
     det_df, pbpo_dict = score_beacons(df, gat, ae, theta_ae, scaler)
 
-    # Read NS-3 sim-side PBPO_LW / PBPO_Full from the C++ metrics CSV
-    # (paper Eq.4.7). Default lookup: same sweep dir, m1 = full ablation mode.
-    if metrics_csv is None:
-        out_dir = os.path.dirname(os.path.abspath(output_csv))
-        metrics_csv = os.path.join(out_dir,
-            f"metrics_a{attack_number}_p{attack_pct}_s{speed_kmh}_m1.csv")
-    pbpo_lw_ms, pbpo_full_ms = read_ns3_pbpo(metrics_csv)
+    # Directory holding the C++ per-mode metrics CSVs (default: alongside output)
+    if metrics_dir is None:
+        metrics_dir = os.path.dirname(os.path.abspath(output_csv))
 
-    # Per-variant PBPO mapping (R7f.followup-3 — see compute_pbpo_per_variant)
-    pbpo_by_variant = compute_pbpo_per_variant(pbpo_dict, pbpo_lw_ms, pbpo_full_ms)
-
-    # Detection variants and their configs
+    # Detection variants (name, beacon-rescore decision column)
     variants = [
-        # (name, det_col, use_pq_for_parr)
-        ("MPTD-PQS",  "det_mptd", True),
-        ("A1_LW_only","det_a1",   False),
-        ("A2_GAT_only","det_a2",  True),
-        ("A3_AE_only", "det_a3",  True),
-        ("A4_no_TRS",  "det_a4",  False),   # PARR=0 — no TRS protection
-        ("A5_no_chain","det_a5",  True),
+        ("MPTD-PQS",   "det_mptd"),
+        ("A1_LW_only", "det_a1"),
+        ("A2_GAT_only","det_a2"),
+        ("A3_AE_only", "det_a3"),
+        ("A4_no_TRS",  "det_a4"),
+        ("A5_no_chain","det_a5"),
     ]
 
     rows = []
-    for name, det_col, use_pq in variants:
-        m = metrics_for_variant(det_df, det_col, attack_pct,
-                                 speed_kmh, use_pq=use_pq)
-        pbpo_v = pbpo_by_variant[name]
+    for name, det_col in variants:
+        # MCC/FPR — real Python re-score of the real beacon log
+        m = metrics_for_variant(det_df, det_col)
+
+        # PARR/CDER/TDEE/TPE/PBPO_LW/PBPO_Full — REAL, from this variant's own
+        # C++ ablation-mode CSV. Missing → NaN (never fabricated).
+        mode = VARIANT_MODE[name]
+        mcsv = metrics_csv_for_mode(metrics_dir, attack_number,
+                                    attack_pct, speed_kmh, mode)
+        real = read_ns3_metrics(mcsv)
+        pbpo_lw_ms   = real["PBPO_LW_ms"]
+        pbpo_full_ms = real["PBPO_Full_ms"]
+        pbpo_v = pbpo_for_variant(name, pbpo_dict, pbpo_lw_ms, pbpo_full_ms)
+
         row = dict(
             mode           = name,
+            ablation_mode  = mode,
             attack_number  = attack_number,
             attack_pct     = attack_pct,
             speed_kmh      = speed_kmh,
             speed_label    = speed_label,
-            PBPO_ms        = round(pbpo_v, 4),                 # variant-specific
-            PBPO_ml_total  = round(pbpo_dict["total"], 4),     # back-compat / debugging
+            **m,                                              # TP/FP/TN/FN/MCC/FPR
+            PARR           = real["PARR"],                    # NS-3 real
+            CDER           = real["CDER"],                    # NS-3 real
+            TDEE           = real["TDEE"],                    # NS-3 real
+            TPE            = real["TPE"],                      # NS-3 real
+            PBPO_ms        = pbpo_v,                           # variant-specific
+            PBPO_ml_total  = round(pbpo_dict["total"], 4),     # Python ML, debugging
             PBPO_gat_ms    = round(pbpo_dict["gat"], 4),
             PBPO_ae_ms     = round(pbpo_dict["ae"], 4),
             PBPO_fusion_ms = round(pbpo_dict["fusion"], 4),
-            PBPO_LW_ms     = round(pbpo_lw_ms, 4),             # NS-3 sim
-            PBPO_Full_ms   = round(pbpo_full_ms, 4),           # NS-3 sim
-            **m
+            PBPO_LW_ms     = pbpo_lw_ms,                       # NS-3 real
+            PBPO_Full_ms   = pbpo_full_ms,                     # NS-3 real
         )
         rows.append(row)
         print(f"  {name:15s}  MCC={m['MCC']:+.4f}  FPR={m['FPR']:.4f}"
-              f"  PARR={m['PARR']:.4f}  CDER={m['CDER']:.4f}"
-              f"  TDEE={m['TDEE']:.4f}  TPE={m['TPE']:.2f}m"
-              f"  PBPO={pbpo_v:.3f}ms")
+              f"  PARR={_fmt(real['PARR'])}  CDER={_fmt(real['CDER'])}"
+              f"  TDEE={_fmt(real['TDEE'])}  TPE={_fmt(real['TPE'],2)}m"
+              f"  PBPO={_fmt(pbpo_v,3)}ms  (m{mode})")
 
     out_df = pd.DataFrame(rows)
     os.makedirs(os.path.dirname(output_csv), exist_ok=True)
@@ -581,10 +589,12 @@ def main():
                         choices=["low", "medium", "high"])
     parser.add_argument("--beacon_csv",    default=None)
     parser.add_argument("--output",        default=None)
-    parser.add_argument("--metrics_csv",   default=None,
-                        help="NS-3 sim metrics CSV (m1 = full mode) for "
-                             "PBPO_LW/PBPO_Full source — R7f.followup-3. "
-                             "Default: <output_dir>/metrics_a{A}_p{P}_s{S}_m1.csv")
+    parser.add_argument("--metrics_dir",   default=None,
+                        help="Directory holding the per-mode NS-3 metrics CSVs "
+                             "(metrics_a{A}_p{P}_s{S}_m{MODE}.csv). Each ablation "
+                             "variant reads its OWN per-mode file for real "
+                             "PARR/CDER/TDEE/TPE/PBPO. Missing/malformed → NaN "
+                             "(never fabricated). Default: <output_dir> dir.")
     parser.add_argument("--merge",         action="store_true",
                         help="Merge all per-run CSVs into summary")
     parser.add_argument("--results_dir",   default=None)
@@ -617,7 +627,7 @@ def main():
         speed_label   = args.speed_label,
         beacon_csv    = beacon_csv,
         output_csv    = output_csv,
-        metrics_csv   = args.metrics_csv,
+        metrics_dir   = args.metrics_dir,
     )
 
 

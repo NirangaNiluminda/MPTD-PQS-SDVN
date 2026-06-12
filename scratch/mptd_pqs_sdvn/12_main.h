@@ -149,6 +149,19 @@ int main(int argc, char *argv[])
         if (N_Vehicles < 16) N_Vehicles = 16;
         if (N_RSUs    <  4) N_RSUs    = 4;
     }
+
+    // Clamp to compile-time array capacities (all modes) — prevents OOB if the
+    // CLI passes counts larger than total_size / MAX_RSUS.
+    if (N_Vehicles > (uint32_t)total_size) {
+        std::cerr << "[CONFIG] N_Vehicles " << N_Vehicles << " > capacity "
+                  << total_size << " — clamped.\n";
+        N_Vehicles = (uint32_t)total_size;
+    }
+    if (N_RSUs > MAX_RSUS) {
+        std::cerr << "[CONFIG] N_RSUs " << N_RSUs << " > capacity " << MAX_RSUS
+                  << " — clamped.\n";
+        N_RSUs = MAX_RSUS;
+    }
     
     ueBusy.resize(total_size, false);
     ueDLBusy.resize(total_size, false);
@@ -280,7 +293,7 @@ int main(int argc, char *argv[])
   	  // ── Store RSU CSMA IPs for management → RSU downlink (port 8888) ──────────────
   	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
   	  // RSU r is at csmaInterfaces index r → IPs 10.1.1.1 .. 10.1.1.4
-  	  for (uint32_t r = 0; r < N_RSUs && r < 4; r++) {
+  	  for (uint32_t r = 0; r < N_RSUs && r < MAX_RSUS; r++) {
   	      g_rsu_csma_ip[r] = csmaInterfaces.GetAddress(r);
   	      cout << "[OPT-B] RSU" << r << " CSMA IP = " << g_rsu_csma_ip[r] << endl;
   	  }
@@ -770,11 +783,53 @@ int main(int argc, char *argv[])
       "LayoutType",StringValue("RowFirst"));
   }
   
+  // ── SUMO-trace RSU placement override ───────────────────────────────────
+  // The hardcoded grid allocators above are anchored to the legacy small-map
+  // coordinates (e.g. urban: 4 RSUs in a line at y=480). When mobility is
+  // driven from a SUMO trace the vehicles span that city's full extent, so
+  // those fixed RSUs fall outside DSRC range and emit ZERO beacons. Instead we
+  // load the realistic, coverage-aware layout produced offline by
+  // sumo/place_rsus.py (mobility/rsu_positions_{urban,rural,autobahn}.csv),
+  // which places RSUs on real road intersections spread to cover the travelled
+  // roads, and put RSU_i at CSV row i. Falls back to the hardcoded grid if the
+  // CSV is missing or has fewer rows than N_RSUs, so a stale/absent CSV never
+  // crashes the run (it just reverts to the old behaviour with a warning).
+  if (g_mobility_source == MOBILITY_SRC_SUMO_TRACE && N_RSUs > 0)
+  {
+      std::string rsu_csv = default_rsu_positions_path(mobility_scenario);
+      std::vector<std::pair<double,double>> rsu_xy = load_rsu_positions(rsu_csv);
+      if (rsu_xy.size() >= (size_t)N_RSUs)
+      {
+          Ptr<ListPositionAllocator> rsuAlloc = CreateObject<ListPositionAllocator>();
+          for (uint32_t i = 0; i < (uint32_t)N_RSUs; i++)
+              rsuAlloc->Add(Vector(rsu_xy[i].first, rsu_xy[i].second, 0.0));
+          RSU_mobility.SetPositionAllocator(rsuAlloc);
+          std::cout << "[RSU/PLACEMENT] SUMO-trace mode: placed " << N_RSUs
+                    << " RSUs from " << rsu_csv << "\n";
+      }
+      else
+      {
+          std::cerr << "[RSU/PLACEMENT] WARNING: need " << N_RSUs
+                    << " RSU positions but CSV has " << rsu_xy.size()
+                    << " (path='" << rsu_csv << "'). Keeping hardcoded grid — "
+                    << "regenerate with: python3 sumo/place_rsus.py --n_rsus "
+                    << N_RSUs << " --net sumo/<city>/<city>.net.xml --trace <trace> "
+                    << "--out " << (rsu_csv.empty() ? "mobility/rsu_positions_<city>.csv" : rsu_csv) << "\n";
+      }
+  }
+
   if (N_RSUs > 0)
   {
   	RSU_mobility.Install(RSU_Nodes);
+  	// Sync the detection-engine cell-mapping table to the ACTUAL placed RSU
+  	// positions (grid defaults in test net; CSV positions in SUMO-trace mode).
+  	for (uint32_t i = 0; i < (uint32_t)N_RSUs && i < RSU_Nodes.GetN(); i++)
+  	{
+  		Ptr<MobilityModel> mm = RSU_Nodes.Get(i)->GetObject<MobilityModel>();
+  		if (mm) { Vector p = mm->GetPosition(); set_rsu_actual_pos(i, p.x, p.y); set_ltt_rsu_pos(i, p.x, p.y); }
+  	}
   }
-  
+
   Ptr <Node> nd;
   NodeContainer other_stationary_LTE_nodes;
   if (N_Vehicles > 0)
@@ -1450,7 +1505,7 @@ int main(int argc, char *argv[])
   // dsrc_Nodes order: Vehicle_Nodes(0..N_Vehicles-1), RSU_Nodes(0..N_RSUs-1)
   // So RSU r's DSRC IP is at dsrc_interfaces index (N_Vehicles + r).
   if (N_RSUs > 0) {
-      for (uint32_t r = 0; r < N_RSUs && r < 4; r++) {
+      for (uint32_t r = 0; r < N_RSUs && r < MAX_RSUS; r++) {
           g_rsu_dsrc_ip[r] = dsrc_interfaces.GetAddress(N_Vehicles + r);
           cout << "[OPT-B] RSU" << r << " DSRC IP = " << g_rsu_dsrc_ip[r] << endl;
       }
@@ -1934,6 +1989,14 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // NOTE: EnablePacketMetadata(true) is intentionally omitted — NS-3 3.35 requires
   // it to be called before ANY packet is created (before scheduling), otherwise it
   // triggers SIGIOT.  Packet-level animation data is not needed for topology colours.
+  //
+  // Raise the per-file packet cap.  AnimationInterface's default m_maxPktsPerFile
+  // is 100 000; once exceeded it stops writing packet/mobility records and closes
+  // the trace.  At SUMO scale (200 vehicles × 25 RSUs) the DSRC beacon + control
+  // traffic hits 100 000 records in only ~7.4 sim-seconds, so a 60 s run would
+  // otherwise animate just the first 7 s.  Lift the cap so the full sim duration
+  // is captured (≈13.5 k records/sim-sec → ~0.8 M for 60 s; ~65 MB XML).
+  anim.SetMaxPktsPerTraceFile(50000000);
   std::cout << "[ANIM-DBG] architecture=" << architecture
             << " N_RSUs=" << N_RSUs << " N_Vehicles=" << N_Vehicles << std::endl;
 
@@ -1980,7 +2043,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   {
       for (uint32_t i = 0; i < RSU_Nodes.GetN(); i++)
       {
-          bool comp = (i < 4) && compromised_rsu[i];
+          bool comp = (i < N_RSUs) && compromised_rsu[i];
           if (comp)
               anim.UpdateNodeColor(RSU_Nodes.Get(i), 255, 0, 0);    // RED = attacker RSU
           else
@@ -2013,7 +2076,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 
           if (attack_number == 1 || attack_number == 3) {
               // RSU-level attack: vehicle affected if its RSU zone is compromised
-              affected = (rsu_zone < 4) && compromised_rsu[rsu_zone];
+              affected = (rsu_zone < N_RSUs) && compromised_rsu[rsu_zone];
               reason   = affected ? "COMPROMISED ZONE" : "CLEAN ZONE";
               colour_class = affected ? 1 : 0;
           } else if (attack_number == 2) {
