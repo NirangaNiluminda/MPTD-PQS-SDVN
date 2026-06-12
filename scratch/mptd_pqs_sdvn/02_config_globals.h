@@ -45,13 +45,14 @@ using namespace std::chrono;
 #define MAX_NODES 320
 
 // MAX_RSUS = per-RSU array CAPACITY (compile-time). The ACTIVE RSU count is the
-// runtime global N_RSUs below. Test net uses N_RSUs=4; SUMO urban uses up to 25
-// (rsu_positions_urban.csv). All per-RSU arrays are sized [MAX_RSUS]; every loop
-// / gate over actual RSUs bounds on N_RSUs (NOT the literal 4 or MAX_RSUS).
-#define MAX_RSUS 32
+// runtime global N_RSUs below. Test net uses N_RSUs=4; SUMO urban uses an 8×8 =
+// 64-RSU uniform grid (rsu_positions_urban.csv; supervisor-mandated 2026-06-12,
+// 250 m spacing). All per-RSU arrays are sized [MAX_RSUS]; every loop / gate
+// over actual RSUs bounds on N_RSUs (NOT the literal 4 or MAX_RSUS).
+#define MAX_RSUS 64
 
 const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
-uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban up to 25)
+uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban 8×8 grid=64)
 uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
 
 uint16_t N_eNodeBs = 1 + N_Vehicles / 40;

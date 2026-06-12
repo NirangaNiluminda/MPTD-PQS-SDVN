@@ -123,6 +123,31 @@ def grid_candidates(pts, n_rsus):
     return cand
 
 
+def grid_overlay(pts, rows, cols, spacing):
+    """Supervisor-mandated layout (2026-06-12): a fixed rows×cols RSU grid with
+    a fixed metre `spacing` horizontally and vertically, CENTRED over the
+    travelled area (trace bounding-box centre).
+
+    Unlike grid_candidates() (which stretches a grid to fill the bbox), this
+    lays an EXACT uniform grid at the requested physical spacing — the RSU
+    topology is then a controlled, reproducible variable independent of where
+    the roads happen to be. With spacing < DSRC range every vehicle stays in
+    range of >=1 RSU (overlapping coverage, no gaps).
+
+    Returns a list of (x, y), row-major (RSU 0 = bottom-left)."""
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    cx = (min(xs) + max(xs)) / 2.0
+    cy = (min(ys) + max(ys)) / 2.0
+    x0 = cx - (cols - 1) * spacing / 2.0
+    y0 = cy - (rows - 1) * spacing / 2.0
+    rsus = []
+    for r in range(rows):
+        for c in range(cols):
+            rsus.append((x0 + c * spacing, y0 + r * spacing))
+    return rsus
+
+
 def density_filter(cands, pts, radius):
     """Keep only candidates with >=1 vehicle sample within `radius`.
 
@@ -186,13 +211,44 @@ def coverage_pct(rsus, pts, radius):
 
 def main():
     ap = argparse.ArgumentParser(description="Realistic coverage-aware RSU placement for a SUMO map")
-    ap.add_argument("--net", required=True, help="SUMO .net.xml road network")
+    ap.add_argument("--net", help="SUMO .net.xml road network (not needed in --grid mode)")
     ap.add_argument("--trace", required=True, help="ns-2 .tcl mobility trace")
-    ap.add_argument("--n_rsus", type=int, required=True, help="number of RSUs to place")
+    ap.add_argument("--n_rsus", type=int, help="number of RSUs (coverage-aware mode)")
     ap.add_argument("--range", type=float, default=300.0,
                     help="DSRC coverage radius in metres (default 300)")
+    ap.add_argument("--grid", metavar="ROWSxCOLS",
+                    help="uniform-grid mode, e.g. 8x8 (overrides coverage-aware placement)")
+    ap.add_argument("--spacing", type=float, default=250.0,
+                    help="grid spacing in metres, H and V (default 250; used with --grid)")
     ap.add_argument("--out", required=True, help="output CSV (rsu_id,x,y)")
     args = ap.parse_args()
+
+    pts = parse_trace_positions(args.trace)
+    print(f"[place_rsus] vehicle position samples from trace: {len(pts)}")
+    if not pts:
+        print("[place_rsus] ERROR: no vehicle positions parsed from trace", file=sys.stderr)
+        return 2
+
+    # ── Grid mode (supervisor-mandated, 2026-06-12) ───────────────────────────
+    if args.grid:
+        rows, cols = (int(v) for v in args.grid.lower().split("x"))
+        rsus = grid_overlay(pts, rows, cols, args.spacing)
+        cov = coverage_pct(rsus, pts, args.range)
+        with open(args.out, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["rsu_id", "x", "y"])
+            for i, (x, y) in enumerate(rsus):
+                w.writerow([i, f"{x:.2f}", f"{y:.2f}"])
+        print(f"[place_rsus] GRID mode: {rows}x{cols} = {len(rsus)} RSUs, "
+              f"{args.spacing:.0f} m spacing, centred on trace -> {args.out}")
+        print(f"[place_rsus] MEASURED COVERAGE = {cov:.1f}% of vehicle-position "
+              f"samples within {args.range:.0f} m of an RSU")
+        return 0
+
+    if not args.n_rsus or not args.net:
+        print("[place_rsus] ERROR: coverage-aware mode needs --net and --n_rsus "
+              "(or use --grid ROWSxCOLS)", file=sys.stderr)
+        return 2
 
     print(f"[place_rsus] net   = {args.net}")
     print(f"[place_rsus] trace = {args.trace}")
@@ -201,12 +257,6 @@ def main():
     tl, priority, other = parse_junctions(args.net)
     print(f"[place_rsus] junctions: traffic_light={len(tl)} "
           f"priority={len(priority)} other={len(other)}")
-
-    pts = parse_trace_positions(args.trace)
-    print(f"[place_rsus] vehicle position samples from trace: {len(pts)}")
-    if not pts:
-        print("[place_rsus] ERROR: no vehicle positions parsed from trace", file=sys.stderr)
-        return 2
 
     # Candidate cascade: grow the pool until it is comfortably larger than
     # N_RSUs so farthest-point sampling has room to spread.
