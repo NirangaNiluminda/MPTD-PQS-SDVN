@@ -1,0 +1,15 @@
+<configuration>
+    <input>
+        <net-file value="urban.net.xml"/>
+        <route-files value="routes_car_flow.rou.xml,routes_bus_flow.rou.xml,routes_lorry_flow.rou.xml,routes_van_flow.rou.xml,routes_truck_flow.rou.xml"/>
+    </input>
+    <time>
+        <begin value="0"/>
+        <end value="600"/>
+        <step-length value="1.0"/>
+    </time>
+    <processing>
+        <time-to-teleport value="120"/>
+        <ignore-route-errors value="true"/>
+    </processing>
+</configuration>
