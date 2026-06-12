@@ -19,13 +19,13 @@ mptd_pqs/**/*.pyc
 # ── Mobility trace files ──────────────────────────────────────────────────────
 !mobility/
 !mobility/**
+mobility/**/*.bak
 
 # ── SUMO pipeline: allowlist source .osm, built .net.xml, and the build script;
 #    re-ignore regeneratable intermediates (rebuilt by sumo/build_sumo_trace.sh) ─
 !sumo/
 !sumo/**
-sumo/**/fcd.xml
-sumo/**/fcd_shifted.xml
+sumo/**/fcd*.xml
 sumo/**/trips.xml
 sumo/**/trips_*.xml
 sumo/**/routes.rou.xml
