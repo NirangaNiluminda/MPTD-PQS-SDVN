@@ -181,50 +181,126 @@ export LD_LIBRARY_PATH=$PWD/build/lib:$HOME/.local/lib:$LD_LIBRARY_PATH
 
 ## 5. Running the 3 baseline techniques (B1 / B2 / B3)
 
-The paper compares MPTD-PQS against **three existing techniques**. Two run as
-post-processing on the simulation's CSV; one runs *inside* the simulation.
+The paper compares MPTD-PQS against **three existing techniques**:
 
-| Baseline | Method | How it runs | Input |
-|----------|--------|-------------|-------|
+| Baseline | Method | How it runs | Input file it reads |
+|----------|--------|-------------|---------------------|
 | **B1** | Ghaleb 2014 — LTT location/time plausibility | **inside NS-3** (`--ablation_mode=6`) | live beacons |
-| **B2** | Ercan 2022 — kNN / RF / Stacking | Python post-processor | `analytics/results/rsu_relay_log.csv` |
-| **B3** | Sharma & Liu 2021 — SVM/kNN/NB/RF/AdaBoost | Python post-processor | `analytics/results/rsu_relay_log.csv` |
+| **B2** | Ercan 2022 — kNN / RF / Stacking | Python, **train-then-predict** | `beacon_log.csv` (+ attack logs) |
+| **B3** | Sharma & Liu 2021 — SVM/kNN/NB/RF/AdaBoost | Python, **train-then-predict** | `beacon_log.csv` (+ attack logs) |
 
-### Step 1 — produce the shared data with a simulation run
+> **Important:** the canonical B2/B3 detectors read **`beacon_log.csv`**, *not*
+> `rsu_relay_log.csv` (older notes/scripts said relay log — that is wrong for the
+> `*_v2`/`*_train_save`/`*_live_predict` pipeline). `beacon_log.csv` is the file
+> that has the `pos_x`/`pos_y` columns the feature extractor needs. The scripts
+> also read the attack-specific logs (`tp_s1_poison_log.csv`, `vehicle_tx_log.csv`,
+> `ghost_identity_log.csv`) from the same folder to recover each beacon's *real*
+> position for the displacement/RSSI features.
 
-B2/B3 read `analytics/results/rsu_relay_log.csv`, which the NS-3 run writes. Run
-the sim once (any detection mode is fine for generating the log; use A1):
+### B1 — runs inside the simulator (no training)
+
+B1 is a rule-based C++ detector; just run the sim with `--ablation_mode=6`:
+
+```bash
+export LD_LIBRARY_PATH=$PWD/build/lib:$HOME/.local/lib:$LD_LIBRARY_PATH
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+  --skip_blockchain=true --ablation_mode=6 --attack_number=2 \
+  --attack_percentage=20 --simTime=30"
+```
+B1 metrics come out of the same metric layer as MPTD-PQS (directly comparable).
+
+### B2 / B3 — the train-then-predict workflow (ML baselines)
+
+B2 and B3 are **machine-learning** detectors. An ML model has two phases:
+
+1. **Train (fit + freeze)** — show the model labelled data so it learns; save it
+   to disk (a `.joblib` file). Do this **once**.
+2. **Predict** — load the frozen model and run it on **new** simulation output to
+   get malicious/benign decisions.
+
+> **Why two separate simulation runs?** If you train and score on the *same*
+> beacons, the model has already seen the answers — accuracy is fake (data
+> leakage). So: **train on RUN A, predict on a fresh RUN B.** Use different
+> `--RngRun` / random seeds (or just run twice — the SUMO trace replays the same
+> motion but attacker injection and channel noise differ per run).
+
+#### Step 1 — RUN A: produce the *training* data
+
+Run the sim for the attack scenario you want a model for, e.g. attack 2 @ 20 %:
 
 ```bash
 export LD_LIBRARY_PATH=$PWD/build/lib:$HOME/.local/lib:$LD_LIBRARY_PATH
 ./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
   --skip_blockchain=true --ablation_mode=1 --attack_number=2 \
-  --attack_percentage=20 --simTime=30"
+  --attack_percentage=20 --simTime=30 --RngRun=1"
 ```
+This writes `analytics/results/beacon_log.csv` (and the attack logs).
 
-### Step 2 — B1 (runs in the simulator)
+> **Regenerate the data on the 64-RSU grid.** Any `beacon_log.csv` left over from
+> an older 4- or 25-RSU run is stale — the B2 detector now reads the 64-RSU grid
+> positions from `mobility/rsu_positions_urban.csv`, so its RSSI/distance features
+> only match a beacon log produced *with* `--N_RSUs=64`.
+
+#### Step 2 — organise RUN A into a "datasets" folder
+
+The trainer expects one sub-folder per scenario, named `a<attack>_p<pct>`, each
+holding that run's CSVs. Copy RUN A's results into the matching folder:
 
 ```bash
-./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
-  --skip_blockchain=true --ablation_mode=6 --attack_number=2 \
-  --attack_percentage=20 --simTime=30"
+mkdir -p datasets/a2_p20
+cp analytics/results/beacon_log.csv          datasets/a2_p20/
+cp analytics/results/tp_s1_poison_log.csv    datasets/a2_p20/ 2>/dev/null || true
+cp analytics/results/vehicle_tx_log.csv      datasets/a2_p20/ 2>/dev/null || true
+cp analytics/results/ghost_identity_log.csv  datasets/a2_p20/ 2>/dev/null || true
 ```
-B1 metrics are emitted by the same metric layer as MPTD-PQS (directly comparable).
+Repeat (re-run + copy) for every `a<attack>_p<pct>` scenario you want a model for.
 
-### Step 3 — B2 and B3 (Python, from the project root)
+#### Step 3 — train and FREEZE the models (run once)
 
 ```bash
 cd $NS3
-python3 mptd_pqs/ercan_b2_detector.py     # B2 — Ercan 2022
-python3 mptd_pqs/sharma_b3_detector.py    # B3 — Sharma & Liu 2021
+python3 mptd_pqs/ercan_b2_train_save.py  datasets  models_ercan_b2
+python3 mptd_pqs/sharma_b3_train_save.py datasets  models_sharma_b3
 ```
-Each prints the 7 evaluation metrics. They read
-`analytics/results/rsu_relay_log.csv` automatically.
+- arg 1 = the datasets root from Step 2; arg 2 = where to save the frozen models.
+- Each scenario produces `ercan_a2_p20_kNN.joblib`, `..._RF.joblib`,
+  `..._Stacking.joblib` (+ a `_scaler.joblib`). These are the **frozen** models —
+  you do not retrain them again.
 
-> The `mptd_pqs/` folder also contains newer `*_v2.py`, `*_new.py`,
-> `*_live_predict.py`, `*_train_save.py` variants owned by the baseline teammate.
-> The canonical scoring entry points are the two files above; use the teammate's
-> variants only if they tell you to.
+#### Step 4 — RUN B: produce *fresh* data to score
+
+Run the sim again with a **different** seed so the model is tested on data it has
+never seen:
+
+```bash
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+  --skip_blockchain=true --ablation_mode=1 --attack_number=2 \
+  --attack_percentage=20 --simTime=30 --RngRun=2"
+```
+This overwrites `analytics/results/beacon_log.csv` with the new run's beacons.
+
+#### Step 5 — predict with the frozen models
+
+```bash
+python3 mptd_pqs/ercan_b2_live_predict.py \
+  analytics/results/beacon_log.csv  2  20  models_ercan_b2 \
+  live_results/ercan_a2_p20.csv
+
+python3 mptd_pqs/sharma_b3_live_predict.py \
+  analytics/results/beacon_log.csv  2  20  models_sharma_b3 \
+  live_results/sharma_a2_p20.csv
+```
+Positional args: `<beacon_csv> <attack_num> <attack_pct> <models_dir> [output_csv]`.
+The `<attack_num> <attack_pct>` select which frozen model to load (must match the
+scenario you trained in Step 3). Each script prints the 7 evaluation metrics
+(MCC/FPR/PARR/PBPO… — when the beacon log carries ground-truth `label`/`is_poisoned`
+columns) and writes per-row predictions to the optional output CSV.
+
+> **One-shot alternative (no separate train file):** `ercan_b2_detector.py` /
+> `sharma_b3_detector.py` train + score in a single pass with internal
+> cross-validation. That is fine for a quick number, but the **frozen-model**
+> workflow above is what mirrors real deployment (train offline, predict live) and
+> avoids leakage between training and scoring.
 
 ---
 
@@ -278,7 +354,9 @@ cluster.
 
 | Output | Path |
 |--------|------|
-| Per-beacon / relay logs | `analytics/results/*.csv` (incl. `rsu_relay_log.csv`) |
+| Per-beacon / relay logs | `analytics/results/*.csv` (B2/B3 read `beacon_log.csv`) |
+| Frozen baseline models | `models_ercan_b2/*.joblib`, `models_sharma_b3/*.joblib` |
+| Baseline predictions | `live_results/*.csv` |
 | Sweep metrics | `analytics/results/sweep/metrics_a{N}_p{P}_s{S}_m{M}.csv` |
 | NetAnim XML (if enabled) | `analytics/results/mptd_netanim_*.xml` |
 
@@ -295,7 +373,9 @@ These are auto-generated and **gitignored** — copy them off the node yourself.
 | 0 beacons received | check `--mobility_source=1` is set and the `.tcl` + CSV use the same coordinate frame (they do by default) |
 | `[AI-INIT] ... NO` but you expected full mode | ONNX models missing (§1d) — A2/A3/Full invalid; A1/B1 still fine |
 | Fabric / Docker errors at start | you forgot `--skip_blockchain=true` |
-| `rsu_relay_log.csv not found` (B2/B3) | run the NS-3 sim first (§5 Step 1), run Python from the project root |
+| `beacon_log.csv not found` (B2/B3) | run the NS-3 sim first (§5 Step 1), run Python from the project root |
+| B2/B3 accuracy looks impossibly perfect | you trained and predicted on the *same* run — use different `--RngRun` for RUN A vs RUN B (§5) |
+| `Model not found: ..._kNN.joblib` (live_predict) | you skipped Step 3, or the `<attack_num> <attack_pct>` args don't match a trained scenario |
 | Run never finishes interactively | expected — use SLURM (§7), not a login shell |
 
 ---
@@ -307,4 +387,5 @@ These are auto-generated and **gitignored** — copy them off the node yourself.
 - [ ] `./waf configure && ./waf build` succeeds with no `error:` (§3)
 - [ ] `export LD_LIBRARY_PATH=$PWD/build/lib:$HOME/.local/lib:$LD_LIBRARY_PATH` (§4)
 - [ ] run with `--mobility_source=1 --N_RSUs=64 --skip_blockchain=true` (§0)
-- [ ] B1 via `--ablation_mode=6`; B2/B3 via the two Python scripts (§5)
+- [ ] B1 via `--ablation_mode=6` (§5)
+- [ ] B2/B3: RUN A → train/freeze (`*_train_save.py`) → RUN B → predict (`*_live_predict.py`), different seeds (§5)
