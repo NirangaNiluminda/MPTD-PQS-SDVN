@@ -15,6 +15,7 @@ mptd_pqs/**/*.pyc
 !mptd_pqs_pipeline.py
 !attack_comparison.py
 !mptd_pqs_results.json
+!plot_baselines_real.py
 
 # ── Mobility trace files ──────────────────────────────────────────────────────
 !mobility/
