@@ -43,6 +43,9 @@
 #include <string>
 #include <sstream>
 #include <iostream>
+#include <fstream>
+#include <vector>
+#include <utility>
 #include <sys/stat.h>
 
 #include "ns3/mobility-module.h"
@@ -237,6 +240,62 @@ inline std::string default_sumo_trace_path(int scenario, int speed_kmh)
     struct stat st;
     if (stat(oss.str().c_str(), &st) != 0) return "";  // file not present
     return oss.str();
+}
+
+// ── default_rsu_positions_path() — pick RSU layout CSV from scenario ──────
+// Maps mobility_scenario → $NS3_ROOT/mobility/rsu_positions_{tag}.csv, the
+// realistic coverage-aware layout produced offline by sumo/place_rsus.py.
+// Returns "" if no CSV exists (caller then keeps the hardcoded grid layout).
+inline std::string default_rsu_positions_path(int scenario)
+{
+    const char* root = NS3_ROOT "/mobility/";
+    const char* tag  = (scenario == 0) ? "urban"
+                     : (scenario == 1) ? "rural"
+                     : (scenario == 2) ? "autobahn"
+                                       : nullptr;
+    if (!tag) return "";
+    std::ostringstream oss;
+    oss << root << "rsu_positions_" << tag << ".csv";
+    struct stat st;
+    if (stat(oss.str().c_str(), &st) != 0) return "";  // not generated yet
+    return oss.str();
+}
+
+// ── load_rsu_positions() — read "rsu_id,x,y" CSV into (x,y) pairs ─────────
+// Consumes the CSV emitted by sumo/place_rsus.py. The header row and any
+// malformed lines are skipped. Returns positions in file order (rsu_id 0..N-1).
+inline std::vector<std::pair<double, double>>
+load_rsu_positions(const std::string& csv_path)
+{
+    std::vector<std::pair<double, double>> out;
+    if (csv_path.empty()) return out;
+    std::ifstream fh(csv_path.c_str());
+    if (!fh.is_open()) {
+        std::cerr << "[RSU/PLACEMENT] cannot open " << csv_path << "\n";
+        return out;
+    }
+    std::string line;
+    bool first = true;
+    while (std::getline(fh, line)) {
+        if (line.empty()) continue;
+        if (first) {                       // skip header "rsu_id,x,y"
+            first = false;
+            if (line.find("rsu_id") != std::string::npos) continue;
+        }
+        std::istringstream ss(line);
+        std::string id_s, x_s, y_s;
+        if (!std::getline(ss, id_s, ',')) continue;
+        if (!std::getline(ss, x_s, ','))  continue;
+        if (!std::getline(ss, y_s, ','))  continue;
+        try {
+            out.emplace_back(std::stod(x_s), std::stod(y_s));
+        } catch (const std::exception&) {
+            continue;                      // malformed numeric → skip
+        }
+    }
+    std::cout << "[RSU/PLACEMENT] loaded " << out.size()
+              << " RSU positions from " << csv_path << "\n";
+    return out;
 }
 
 // ── Factory ─────────────────────────────────────────────────────────────

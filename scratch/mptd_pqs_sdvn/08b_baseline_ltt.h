@@ -47,15 +47,22 @@ struct LttEntry {
 // Global LTT — one entry per vehicle (indexed by vehicle_id, max total_size+2)
 static LttEntry g_ltt[MAX_NODES + 2];
 
-// ── RSU grid positions (matches topology in 12_main.h routing_test layout) ────
+// ── RSU positions (sized MAX_RSUS; first 4 = routing_test grid default) ───────
 // RSU0=(250,480) RSU1=(750,480) RSU2=(1250,480) RSU3=(1750,480)
-static const double LTT_RSU_X[4] = {250.0, 750.0, 1250.0, 1750.0};
-static const double LTT_RSU_Y[4] = {480.0, 480.0,  480.0,  480.0};
+// 12_main.h overwrites entries 0..N_RSUs-1 from the actual placed RSU nodes
+// (grid in test net, CSV in SUMO-trace mode) via set_ltt_rsu_pos().
+static double LTT_RSU_X[MAX_RSUS] = {250.0, 750.0, 1250.0, 1750.0};
+static double LTT_RSU_Y[MAX_RSUS] = {480.0, 480.0,  480.0,  480.0};
+
+inline void set_ltt_rsu_pos(uint32_t idx, double x, double y)
+{
+    if (idx < MAX_RSUS) { LTT_RSU_X[idx] = x; LTT_RSU_Y[idx] = y; }
+}
 
 // ── Helper: Euclidean distance between two RSUs ───────────────────────────────
 static double ltt_rsu_dist(uint32_t r1, uint32_t r2)
 {
-    if (r1 >= 4 || r2 >= 4) return 0.0;
+    if (r1 >= N_RSUs || r2 >= N_RSUs) return 0.0;
     double dx = LTT_RSU_X[r1] - LTT_RSU_X[r2];
     double dy = LTT_RSU_Y[r1] - LTT_RSU_Y[r2];
     return std::sqrt(dx*dx + dy*dy);
@@ -105,7 +112,7 @@ bool run_ltt_detect(uint32_t vehicle_id, uint32_t rsu_id, BsmBeaconTag &tag)
     // If the vehicle's serving RSU changed, verify the inter-RSU distance
     // is physically traversable in the elapsed time.
     // Ghaleb: "location outside reachable area given previous position" → flag
-    if (!flagged && rsu_id != entry.rsu_id && rsu_id < 4 && entry.rsu_id < 4) {
+    if (!flagged && rsu_id != entry.rsu_id && rsu_id < N_RSUs && entry.rsu_id < N_RSUs) {
         double rsu_dist = ltt_rsu_dist(entry.rsu_id, rsu_id);
         if (rsu_dist / dt > s_max)
             flagged = true;

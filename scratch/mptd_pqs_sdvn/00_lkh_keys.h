@@ -126,7 +126,7 @@ static ns3::Ipv4Address g_vehicle_dsrc_ip[LKH_MAX_VEH];
 static bool             g_vehicle_ip_known[LKH_MAX_VEH];
 
 // RSU ring keys sk_j (Eq.3.25) — one per RSU, used by TRS partial signing.
-static uint8_t  g_rsu_ring_key[4][LKH_KEY_BYTES];
+static uint8_t  g_rsu_ring_key[MAX_RSUS][LKH_KEY_BYTES];
 
 // Back-compat: total active leaves, kept only for legacy log lines.
 static int      g_lkh_n_leaves    = 0;
@@ -532,7 +532,7 @@ static void lkh_init_rsu_ring_keys(int n_rsus)
     lkh_init_master_keys();
     lkh_ring_build(n_rsus);
 
-    for (int j = 0; j < n_rsus && j < 4; j++) {
+    for (int j = 0; j < n_rsus && j < MAX_RSUS; j++) {
         const uint8_t *k_u_j = g_lkh_ring_tree.nodes[g_lkh_ring_tree.first_leaf + j].key;
         uint8_t id_rj[4] = { (uint8_t)j, 0, 0, 0 };
         lkh_kdf(k_u_j,                LKH_KEY_BYTES,
@@ -612,7 +612,7 @@ static int lkh_ring_rekey(int n_rsus, double sim_time, int revoked_rsu_idx)
     // Rebuild the ring subtree from the rotated K_ring, then re-derive sk_j for
     // survivors (revoked RSU is skipped → loses signing power, Eq.3.49).
     lkh_ring_build(n_rsus);
-    for (int j = 0; j < n_rsus && j < 4; j++) {
+    for (int j = 0; j < n_rsus && j < MAX_RSUS; j++) {
         if (j == revoked_rsu_idx) {
             std::memset(g_rsu_ring_key[j], 0, LKH_KEY_BYTES);
             continue;

@@ -457,7 +457,7 @@ void declare_pre_registered_sybils()
 // ── declare_attackers() — assign per-node malicious status ───────────────────
 void declare_attackers()
 {
-    for (uint32_t i = 0; i < total_size; i++) {
+    for (uint32_t i = 0; i < N_Vehicles; i++) {  // active count, not capacity (256)
         bool attacking_state = GetBooleanWithProbability(attack_percentage, i);
 
         tp_vehicle_nodes[i]         = present_tp_vehicle_attack         ? attacking_state : false;
@@ -496,7 +496,7 @@ void declare_attackers()
 //   - rsu_relay_log.csv     (is_poisoned column)
 void declare_compromised_rsus()
 {
-    compromised_rsu[0] = compromised_rsu[1] = compromised_rsu[2] = compromised_rsu[3] = false;
+    for (uint32_t r = 0; r < N_RSUs && r < MAX_RSUS; r++) compromised_rsu[r] = false;
 
     if (attack_number != 1 && attack_number != 3) return; // only RSU-level attacks
 
@@ -510,7 +510,7 @@ void declare_compromised_rsus()
 
     // How many RSUs to compromise
     int n_active = (int)N_RSUs;
-    if (n_active > 4) n_active = 4;
+    if (n_active > MAX_RSUS) n_active = MAX_RSUS;
     int n_comp = (int)std::round((double)n_active * attack_percentage / 100.0);
     if (n_comp < 0) n_comp = 0;
     if (n_comp > n_active) n_comp = n_active;

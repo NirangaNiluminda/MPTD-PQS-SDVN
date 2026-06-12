@@ -110,7 +110,7 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
     int n_rekeyed = lkh_rekey_on_revoke(rev_idx, sim_time);
 
     // RSU rekey socket (set in 07_socket_layer.h StartApplication)
-    Ptr<Socket> rekey_sock = (rsu_id < 4) ? g_rsu_rekey_socket[rsu_id] : nullptr;
+    Ptr<Socket> rekey_sock = (rsu_id < N_RSUs) ? g_rsu_rekey_socket[rsu_id] : nullptr;
     if (!rekey_sock) {
         cout << "[LKH-REKEY] WARNING: no rekey socket for RSU" << rsu_id << endl;
         return;
@@ -235,7 +235,7 @@ static void mptd_drain_and_dispatch_fabric_events()
                 continue;
             }
             int dispatched = 0;
-            for (uint32_t rsu_id = 0; rsu_id < 4; ++rsu_id) {
+            for (uint32_t rsu_id = 0; rsu_id < N_RSUs; ++rsu_id) {
                 if (send_lkh_rekey_if_new(ev.vehicle_id, rsu_id, now)) {
                     ++dispatched;
                 }
@@ -604,7 +604,7 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
         for (int b = 0; b < KL_BINS; b++) P_t[b] /= (double)n_speeds;
 
         // ── Step 3: initialise or update P_hist ─────────────────────────────
-        int ri = (rsu_id >= 0 && rsu_id < 4) ? rsu_id : 0;
+        int ri = (rsu_id >= 0 && rsu_id < N_RSUs) ? rsu_id : 0;
         if (!kl_hist_ready[ri]) {
             // Cold start: set P_hist = P_t (first observation = baseline)
             for (int b = 0; b < KL_BINS; b++) kl_hist[ri][b] = P_t[b];
@@ -1163,7 +1163,7 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     std::vector<uint32_t> vehicle_union;
     int64_t total_count   = 0;
     int64_t pt_speed_sum  = 0;                  // plaintext reference only
-    for (uint32_t r = 0; r < n && r < 4; r++) {
+    for (uint32_t r = 0; r < n && r < MAX_RSUS; r++) {
         if (!rsu_last_window_valid[r]) continue;
         const RsuBeaconWindow &rw = rsu_last_window[r];
         const uint32_t N = rw.beacon_count;
@@ -1280,7 +1280,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         // per RSU cell → est_count >> gt_count → TDEE rises proportional to ghost count.
         {
             uint32_t ghost_rsu = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
-            if (ghost_rsu < 4) tdee_est_count[ghost_rsu]++;
+            if (ghost_rsu < N_RSUs) tdee_est_count[ghost_rsu]++;
         }
         cout << "[MP-S1-GHOST-RX] ghost_id=" << vehicle_id
              << " RSU" << rsu_id
@@ -1327,7 +1327,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // No second probability gate — ALL vehicles at a compromised RSU are poisoned.
     if (!g_option_b_active &&
         attack_number == 1 &&
-        rsu_id < 4 &&
+        rsu_id < N_RSUs &&
         compromised_rsu[rsu_id])
     {
         double real_px  = tag.GetPosX();
@@ -1380,7 +1380,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // MP-S1: same logic — no second probability gate.
     if (!g_option_b_active &&
         attack_number == 3 &&
-        rsu_id < 4 &&
+        rsu_id < N_RSUs &&
         compromised_rsu[rsu_id])
     {
         tag.SetIsPoisoned(true);
@@ -1544,10 +1544,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // est_count[rsu_rep]++ : estimated   — where reported position maps (may differ if forged)
     // Placed AFTER all attack injection blocks so tag.GetPosX()/GetPosY() is the
     // final forged position the controller actually sees.
-    if (rsu_id < 4) {
+    if (rsu_id < N_RSUs) {
         tdee_gt_count[rsu_id]++;
         uint32_t rsu_rep = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
-        if (rsu_rep < 4) tdee_est_count[rsu_rep]++;
+        if (rsu_rep < N_RSUs) tdee_est_count[rsu_rep]++;
     }
 
     // ── R1: LW-DETECT result dispatch (paper §3.5.3 Algorithm 1, Fig 3.10) ───
@@ -1701,7 +1701,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // stats-only push — the authoritative control decision is owned by the RSU
     // (R2). The rollover hook is currently a no-op log stub (R7+ will replace
     // the log with the actual GAT + LSTM-AE invocation).
-    if (rsu_id < 4) {
+    if (rsu_id < N_RSUs) {
         ControllerWindow &cw = ctrl_window[rsu_id];
         if (cw.beacon_count == 0) cw.window_start = now;
         cw.beacon_count++;
@@ -1756,7 +1756,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             // LSTM-AE temporal scoring needs a per-vehicle 20-beacon sliding
             // ring buffer that we do NOT yet maintain — R7e adds that ring and
             // wires score_lstm_ae() into the same window-close hook.
-            if (g_ai_engine.ready() && rsu_id < 4 && rsu_last_window_valid[rsu_id]) {
+            if (g_ai_engine.ready() && rsu_id < N_RSUs && rsu_last_window_valid[rsu_id]) {
                 const RsuBeaconWindow &rw = rsu_last_window[rsu_id];
                 const int N = (int)rw.beacon_count;
                 if (N > 0) {
@@ -2095,7 +2095,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     //
     // CDER (Eq.4.4) stays well-defined: exactly one control decision per beacon —
     // R2 fast-path for {2,3,4,6,clean}; controller-here for {1,5,7}.
-    if (g_option_b_active && rsu_id < 4 && g_mgmt_downlink_socket &&
+    if (g_option_b_active && rsu_id < N_RSUs && g_mgmt_downlink_socket &&
         (attack_number == 1 || attack_number == 5 || attack_number == 7)) {
         bool malicious_ctrl = (attack_number == 5 || attack_number == 7);
 
@@ -2511,7 +2511,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // compromised_rsu[] already reflects attack_percentage via declare_compromised_rsus().
         // No second per-vehicle gate — ALL vehicles at a compromised RSU are poisoned.
         if (attack_number == 1 &&
-            rsu_idx < 4 &&
+            rsu_idx < N_RSUs &&
             compromised_rsu[rsu_idx])
         {
             double real_px  = tag.GetPosX();
@@ -2582,7 +2582,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         //   ghosts arrive at the controller before the real beacon → count is pre-inflated
         //   when the real beacon arrives → density check fires on the real beacon. ✓
         if (attack_number == 3 &&
-            rsu_idx < 4 &&
+            rsu_idx < N_RSUs &&
             compromised_rsu[rsu_idx])
         {
             // Step 3: Mark real beacon as poisoned (ground-truth provenance flag)
@@ -2746,7 +2746,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // window from IPFS to run GAT + LSTM-AE in Full mode (pending R7+).
         // Uses the POST-LW-DETECT kinematic tag fields so the stored window
         // reflects exactly what the RSU's authoritative path saw.
-        if (rsu_idx < 4) {
+        if (rsu_idx < N_RSUs) {
             ipfs_push_and_maybe_flush(rsu_idx, vid,
                                       tag.GetPosX(), tag.GetPosY(),
                                       tag.GetSpeed(), tag.GetHeading(),
@@ -2864,7 +2864,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // LKH rekey (Eq.3.34): N_rekey = log₂|V_j| unicasts to
                     // remaining vehicles. Fires only when BFT quorum was hit
                     // (Eq 3.58) OR the no-BC fallback authorized local revoke.
-                    if (revoked && rsu_idx < 4) {
+                    if (revoked && rsu_idx < N_RSUs) {
                         cout << "[LKH-REVOKE-RSU" << rsu_idx << "] V" << (vid - 2)
                              << " revoked (Eq.3.58 BFT) → group rekey (Eq.3.34)"
                              << endl;
@@ -3080,15 +3080,27 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 //   RSU0=(750,1200) RSU1=(1150,1200) RSU2=(1550,1200) RSU3=(1950,1200)
 // Uses g_rsu_actual_pos[] populated at startup so positions never go stale.
 // ─────────────────────────────────────────────────────────────────────────────
-static double g_rsu_actual_pos_x[4] = {250.0, 750.0, 1250.0, 1750.0}; // routing_test default
-static double g_rsu_actual_pos_y[4] = {480.0, 480.0,  480.0,  480.0};
+// Sized for capacity MAX_RSUS; first 4 entries are the routing_test default.
+// In SUMO-trace mode 12_main.h overwrites entries 0..N_RSUs-1 from the RSU CSV
+// (rsu_positions_<scenario>.csv) so cell mapping matches the placed RSU nodes.
+static double g_rsu_actual_pos_x[MAX_RSUS] = {250.0, 750.0, 1250.0, 1750.0}; // routing_test default
+static double g_rsu_actual_pos_y[MAX_RSUS] = {480.0, 480.0,  480.0,  480.0};
+
+// Populate the cell-mapping table from the ACTUAL placed RSU node positions
+// (called once at startup from 12_main.h after RSU_mobility.Install). In test
+// net the placed positions equal the grid defaults above (bit-identical); in
+// SUMO-trace mode they are the CSV positions, so beacons map to the right cell.
+inline void set_rsu_actual_pos(uint32_t idx, double x, double y)
+{
+    if (idx < MAX_RSUS) { g_rsu_actual_pos_x[idx] = x; g_rsu_actual_pos_y[idx] = y; }
+}
 
 static uint32_t nearest_rsu_for_position(double px, double py)
 {
     // Use actual RSU positions (set at startup, matches 12_main.h topology)
-    static const double (&rsu_x)[4] = g_rsu_actual_pos_x;
-    static const double (&rsu_y)[4] = g_rsu_actual_pos_y;
-    int active = (N_RSUs > 0 && N_RSUs <= 4) ? (int)N_RSUs : 4;
+    static const double (&rsu_x)[MAX_RSUS] = g_rsu_actual_pos_x;
+    static const double (&rsu_y)[MAX_RSUS] = g_rsu_actual_pos_y;
+    int active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? (int)N_RSUs : MAX_RSUS;
     uint32_t nearest = 0;
     double   min_d2  = 1e18;
     for (int r = 0; r < active; r++) {
@@ -3167,9 +3179,9 @@ static uint32_t best_rsu_for_position(double px, double py,
                                        uint32_t vid, bool is_mal)
 {
     (void)is_mal; // reserved for future per-attack diagnostic hooks
-    static const double (&rsu_x)[4] = g_rsu_actual_pos_x;
-    static const double (&rsu_y)[4] = g_rsu_actual_pos_y;
-    int active = (N_RSUs > 0 && N_RSUs <= 4) ? (int)N_RSUs : 4;
+    static const double (&rsu_x)[MAX_RSUS] = g_rsu_actual_pos_x;
+    static const double (&rsu_y)[MAX_RSUS] = g_rsu_actual_pos_y;
+    int active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? (int)N_RSUs : MAX_RSUS;
 
     uint32_t best_idx   = 0;
     double   best_score = -1.0;

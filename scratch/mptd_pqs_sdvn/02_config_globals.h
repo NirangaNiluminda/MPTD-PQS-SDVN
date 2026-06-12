@@ -31,10 +31,27 @@ using namespace std::chrono;
 // ── SDVN Topology ──────────────────────────────────────────────────────────
 // Test network (routing_test=true):  16 vehicles, 4 RSUs, 1 controller, 1 management node
 // Full network (routing_test=false): N_Vehicles/N_RSUs set via command-line args
-#define MAX_NODES 40
+// ── Capacity constants (NOT the active counts) ────────────────────────────
+// MAX_NODES / total_size are COMPILE-TIME ARRAY CAPACITIES, sized for the
+// largest supported run (SUMO ~200 vehicles), NOT the active node count.
+// The ACTIVE counts are the runtime globals N_Vehicles / N_RSUs below.
+//   • test net   (--mobility_source=0): N_Vehicles=16, N_RSUs=4
+//   • SUMO trace (--mobility_source=1): N_Vehicles up to ~200, N_RSUs (keep ≤4
+//     until the deferred RSU-subsystem scale-up; see memory project_dynamic_scaleup)
+// Loops that iterate ACTUAL vehicles must bound on N_Vehicles, not total_size.
+// Most per-vehicle loops self-guard (skip vehicle_state[i].count==0), so they
+// stay correct at this larger capacity; the non-self-guarding consortium split
+// in 11_blockchain_setup.h uses N_Vehicles explicitly.
+#define MAX_NODES 320
 
-const int total_size = 16;  // vehicle array size (= N_Vehicles for routing_test topology)
-uint32_t N_RSUs     = 4;    // 4 RSUs at x={750,1150,1550,1950}, y=1200 (routing_test default)
+// MAX_RSUS = per-RSU array CAPACITY (compile-time). The ACTIVE RSU count is the
+// runtime global N_RSUs below. Test net uses N_RSUs=4; SUMO urban uses up to 25
+// (rsu_positions_urban.csv). All per-RSU arrays are sized [MAX_RSUS]; every loop
+// / gate over actual RSUs bounds on N_RSUs (NOT the literal 4 or MAX_RSUS).
+#define MAX_RSUS 32
+
+const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
+uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban up to 25)
 uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
 
 uint16_t N_eNodeBs = 1 + N_Vehicles / 40;
@@ -225,8 +242,8 @@ double rho_sync  = 0.8;     // Co-occurrence rate threshold
 //   MitM/Sybil (speed shifted by >30%) → KL > 0.1 (detected)
 static const int    KL_BINS  = 10;    // speed histogram resolution
 static const double KL_ALPHA = 0.05;  // P_hist adaptation rate (slow: ~20 beacons to update)
-double kl_hist[4][KL_BINS]   = {};    // per-RSU historical speed distribution P_hist
-bool   kl_hist_ready[4]      = {};    // true once P_hist has been initialised
+double kl_hist[MAX_RSUS][KL_BINS] = {};  // per-RSU historical speed distribution P_hist
+bool   kl_hist_ready[MAX_RSUS]    = {};  // true once P_hist has been initialised
 double kappa_th              = 0.1;   // KL divergence detection threshold (Eq. 3.18)
 
 // Composite rule-based anomaly threshold (Eq. 3.20)
@@ -312,8 +329,8 @@ uint32_t total_trajectories_stored_blockchain = 0;
 // gt_count[j]  = beacons received via RSU j  (ground-truth: vehicle is near RSU j)
 // est_count[j] = beacons whose REPORTED position maps into RSU j's cell
 // TDEE_j = |est_j − gt_j| / gt_j  →  TDEE = mean_j(TDEE_j)
-uint32_t tdee_gt_count [4] = {};
-uint32_t tdee_est_count[4] = {};
+uint32_t tdee_gt_count [MAX_RSUS] = {};
+uint32_t tdee_est_count[MAX_RSUS] = {};
 
 // ── PARR: TRS blockchain rejection accumulators (paper Eq. 4.3) ─────────────
 // parr_trs_rejected  = poisoned beacons where vehicle hit TRS revoke threshold

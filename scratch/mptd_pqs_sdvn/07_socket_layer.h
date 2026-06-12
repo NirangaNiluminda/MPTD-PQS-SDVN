@@ -18,7 +18,7 @@ bool routing_test = true;
 // ── LKH rekey sockets — one per RSU, set in StartApplication() ───────────────
 // Indexed by RSU index (0..3). Used by send_lkh_rekey_to_vehicle() in 08_detection_engine.h
 // to unicast RekeyTag packets to vehicles via DSRC broadcast (3.255.255.255:5555).
-Ptr<Socket> g_rsu_rekey_socket[4];
+Ptr<Socket> g_rsu_rekey_socket[MAX_RSUS];
 
 // ── DSRC device containers (installed in 12_main.h) ──────────────────────────
 NetDeviceContainer wifidevices;
@@ -153,7 +153,7 @@ void SimpleUdpApplication::StartApplication()
         // Store globally so detection engine can call it without 'this'
         {
             uint32_t rsu_idx_local = nid - g_first_rsu_node_id;
-            if (rsu_idx_local < 4)
+            if (rsu_idx_local < N_RSUs)
                 g_rsu_rekey_socket[rsu_idx_local] = m_rekey_send_socket;
         }
 
