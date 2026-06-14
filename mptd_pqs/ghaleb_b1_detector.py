@@ -43,7 +43,7 @@ from typing import Dict, List, Optional, Tuple
 #  PHYSICAL / PROTOCOL CONSTANTS  (IEEE 802.11p / VANET defaults)
 # ───────────────────────────────────────────────────────────────────
 Tb             = 0.1          # beacon interval [s]  (100 ms, IEEE 802.11p)
-WAVE_RANGE_M   = 300.0        # V2V/V2I comm range [m]
+WAVE_RANGE_M   = 270.0        # V2V/V2I comm range [m]  (41 dBm DSRC link-lifetime calibration)
 SPEED_MIN_MS   = 0.0          # 0 km/h in m/s
 SPEED_MAX_MS   = 66.67        # 240 km/h in m/s  (Ghaleb upper plausibility bound)
 SPEED_HWY_MS   = 33.33        # 120 km/h  — highway road-type limit

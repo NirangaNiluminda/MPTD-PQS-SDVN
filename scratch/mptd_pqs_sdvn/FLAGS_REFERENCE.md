@@ -19,11 +19,11 @@ Booleans take `true`/`false`; everything else is a number.
 | Flag | Default | Type | One-line meaning |
 |------|---------|------|------------------|
 | `--N_RSUs` | `4` | uint | Active RSU count. **64** for the SUMO 8×8 grid. Clamped to `MAX_RSUS=64`. |
-| `--N_Vehicles` | `16` | uint | Active vehicle count. **~135** for the SUMO urban trace. Clamped to capacity (`total_size`). |
+| `--N_Vehicles` | `16` | uint | Active vehicle count. **200** for the supervisor-spec SUMO urban trace (`urban_150`); the older `urban_60` trace has 135. Clamped to capacity (`total_size`). |
 | `--simTime` | `15.0` | double | Seconds of simulated time. |
 | `--mobility_source` | `0` | int | **0**=hardcoded 16-veh · **1**=SUMO `.tcl` trace (paper) · **2**=live TraCI (reserved). |
 | `--mobility_scenario` | `0` | int | **0**=urban · **1**=non-urban/rural · **2**=highway/autobahn. Selects the trace + RSU-CSV tag. |
-| `--maxspeed` | `60` | int | Speed tag (km/h) → picks `mobility_<scenario>_<maxspeed>.tcl`. Only `urban_60` & `urban_150` exist today. |
+| `--maxspeed` | `60` | int | Speed tag (km/h) → picks `mobility_<scenario>_<maxspeed>.tcl`. `urban_60` (135 veh) & `urban_150` (200 veh, supervisor spec — use this) exist today. |
 | `--attack_number` | `1` | int | Which attack signature 1–7 (TP-S*/MP-S*). See §3. |
 | `--attack_percentage` | `40` | int | % of nodes that are malicious (0–100, **avoid 100**). The "how many attackers" knob. |
 | `--sybil_registration_pct` | `0` | int | Attack-3 only: % of vehicles pre-registered as Sybil at startup (0 = ghost-ID mode). |
@@ -146,20 +146,20 @@ Python post-processors run on the simulation output (see `HPC_RUN_GUIDE.md` §5)
 
 **MPTD-PQS A1 on the SUMO 64-RSU grid (the standard run):**
 ```bash
-./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 \
   --skip_blockchain=true --routing_test=true --ablation_mode=1 \
   --attack_number=2 --attack_percentage=20 --simTime=30"
 ```
 
 **Full mode (all AI + crypto + blockchain — needs Docker + ONNX models):**
 ```bash
-./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 \
   --ablation_mode=0 --attack_number=2 --attack_percentage=20 --simTime=30"
 ```
 
 **B1 SOTA baseline (Ghaleb LTT, in-sim):**
 ```bash
-./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 \
   --skip_blockchain=true --ablation_mode=6 \
   --attack_number=2 --attack_percentage=20 --simTime=30"
 ```
@@ -181,7 +181,7 @@ For the FYP detection/evaluation work you normally only vary these:
 
 - `--ablation_mode` (which variant) · `--attack_number` (which attack) ·
   `--attack_percentage` (intensity)
-- `--mobility_source=1 --N_RSUs=64 --N_Vehicles=135` (SUMO map, fixed)
+- `--mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200` (SUMO map, supervisor spec: 200 veh + 64 RSU)
 - `--skip_blockchain=true` on HPC · `--simTime`
 - `--rsu_seed` for reproducibility · `--trs_classical=1` only for the RQ5 PBPO baseline
 
