@@ -29,7 +29,7 @@ import joblib
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from mptd_pqs.sharma_b3_detector_v2 import (
-    _attach_disp_err,
+    _augment_with_real_pos,
     extract_features,
     compute_metrics,
     FEATURE_COLS,
@@ -72,7 +72,7 @@ def predict_live(beacon_csv:   str,
     print(f"  Loaded {len(beacon)} beacon rows")
 
     sc_dir = scenario_dir or os.path.dirname(beacon_csv)
-    beacon_aug = _attach_disp_err(beacon, sc_dir)
+    beacon_aug = _augment_with_real_pos(beacon, sc_dir)
 
     feat_df = extract_features(beacon_aug)
     feat_df = feat_df.dropna(subset=FEATURE_COLS)

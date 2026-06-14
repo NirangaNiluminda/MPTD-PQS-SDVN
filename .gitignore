@@ -15,6 +15,10 @@ mptd_pqs/**/*.pyc
 !mptd_pqs_pipeline.py
 !attack_comparison.py
 !mptd_pqs_results.json
+!plot_baselines_real.py
+!global_baseline_eval.py
+!global_heldout_eval.py
+!GLOBAL_BASELINE_README.md
 
 # ── Mobility trace files ──────────────────────────────────────────────────────
 !mobility/
