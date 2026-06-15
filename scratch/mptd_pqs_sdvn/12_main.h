@@ -2025,7 +2025,7 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
               case 1:  anim.UpdateNodeColor(Vehicle_Nodes.Get(i), 255, 128,   0); break; // ORANGE
               default: anim.UpdateNodeColor(Vehicle_Nodes.Get(i),   0, 200,   0); break; // GREEN
           }
-          anim.UpdateNodeSize(Vehicle_Nodes.Get(i)->GetId(), 20.0, 20.0);
+          anim.UpdateNodeSize(Vehicle_Nodes.Get(i)->GetId(), 35.0, 35.0);
           std::string vlabel = "V" + std::to_string(i)
                              + "\nRSU" + std::to_string(rsu_zone)
                              + "\n" + reason;
