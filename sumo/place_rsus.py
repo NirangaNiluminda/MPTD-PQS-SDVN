@@ -72,6 +72,55 @@ def parse_junctions(net_path):
     return tl, priority, other
 
 
+def parse_mainline_points(net_path):
+    """Return a flat list of (x,y) points sampled along highway.motorway edges.
+
+    Used by --line mode for the highway scenario: RSUs follow the carriageway
+    instead of a 2D grid. motorway_link (ramps) are excluded so RSUs track the
+    through-corridor, not the interchange loops.
+    """
+    pts = []
+    for _event, elem in ET.iterparse(net_path, events=("end",)):
+        if elem.tag != "edge":
+            continue
+        if (elem.get("type") or "") == "highway.motorway":
+            for lane in elem.findall("lane"):
+                for p in (lane.get("shape") or "").split():
+                    x, y = p.split(",")
+                    pts.append((float(x), float(y)))
+        elem.clear()
+    return pts
+
+
+def line_overlay(mainline_pts, spacing):
+    """Place RSUs every `spacing` metres along the highway corridor centreline.
+
+    The mainline runs along one dominant axis (the longer bbox dimension). We
+    step along that axis at `spacing` intervals and put each RSU at the mean of
+    the other coordinate over nearby carriageway points — i.e. on the centreline
+    between the two carriageways, so one RSU covers both directions (they sit
+    well within the DSRC range of each other). Returns row-major list of (x,y)."""
+    if not mainline_pts:
+        return []
+    xs = [p[0] for p in mainline_pts]
+    ys = [p[1] for p in mainline_pts]
+    spanx, spany = max(xs) - min(xs), max(ys) - min(ys)
+    axis = 1 if spany >= spanx else 0     # 1 = step along Y, 0 = step along X
+    other = 1 - axis
+    lo = min(ys) if axis == 1 else min(xs)
+    hi = max(ys) if axis == 1 else max(xs)
+    half = spacing / 2.0
+    rsus = []
+    pos = lo
+    while pos <= hi + 1e-6:
+        near = [p for p in mainline_pts if abs(p[axis] - pos) <= half]
+        if near:
+            o = sum(p[other] for p in near) / len(near)
+            rsus.append((o, pos) if axis == 1 else (pos, o))
+        pos += spacing
+    return rsus
+
+
 _TCL_SETDEST = re.compile(r'setdest\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)')
 _TCL_SETX = re.compile(r'set\s+X_\s+([\d.eE+-]+)')
 _TCL_SETY = re.compile(r'set\s+Y_\s+([\d.eE+-]+)')
@@ -218,8 +267,11 @@ def main():
                     help="DSRC coverage radius in metres (default 270; 41 dBm DSRC)")
     ap.add_argument("--grid", metavar="ROWSxCOLS",
                     help="uniform-grid mode, e.g. 8x8 (overrides coverage-aware placement)")
+    ap.add_argument("--line", action="store_true",
+                    help="highway mode: place RSUs linearly along the mainline "
+                         "(highway.motorway) at --spacing intervals; needs --net")
     ap.add_argument("--spacing", type=float, default=250.0,
-                    help="grid spacing in metres, H and V (default 250; used with --grid)")
+                    help="RSU spacing in metres (default 250; used with --grid and --line)")
     ap.add_argument("--out", required=True, help="output CSV (rsu_id,x,y)")
     args = ap.parse_args()
 
@@ -228,6 +280,29 @@ def main():
     if not pts:
         print("[place_rsus] ERROR: no vehicle positions parsed from trace", file=sys.stderr)
         return 2
+
+    # ── Line mode (highway scenario): RSUs along the mainline carriageway ──────
+    if args.line:
+        if not args.net:
+            print("[place_rsus] ERROR: --line needs --net", file=sys.stderr)
+            return 2
+        mainline = parse_mainline_points(args.net)
+        if not mainline:
+            print("[place_rsus] ERROR: no highway.motorway edges in net "
+                  "(is this actually a highway map?)", file=sys.stderr)
+            return 2
+        rsus = line_overlay(mainline, args.spacing)
+        cov = coverage_pct(rsus, pts, args.range)
+        with open(args.out, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["rsu_id", "x", "y"])
+            for i, (x, y) in enumerate(rsus):
+                w.writerow([i, f"{x:.2f}", f"{y:.2f}"])
+        print(f"[place_rsus] LINE mode: {len(rsus)} RSUs along mainline, "
+              f"{args.spacing:.0f} m spacing -> {args.out}")
+        print(f"[place_rsus] MEASURED COVERAGE = {cov:.1f}% of vehicle-position "
+              f"samples within {args.range:.0f} m of an RSU")
+        return 0
 
     # ── Grid mode (supervisor-mandated, 2026-06-12) ───────────────────────────
     if args.grid:
