@@ -957,18 +957,38 @@ int main(int argc, char *argv[])
   	//channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
   	//channel.AddPropagationLoss("ns3::FriisPropagationLossModel");
   }
-  if ((mobility_scenario==1) or (mobility_scenario==2))
+  if (mobility_scenario == 1)//non-urban / rural mobility → LogDistance
   {
-  	//channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
-  	channel.AddPropagationLoss("ns3::Cost231PropagationLossModel");//For sub-urban and highway
-  	channel_172.AddPropagationLoss("ns3::Cost231PropagationLossModel");//For sub-urban and highway
-  	channel_174.AddPropagationLoss("ns3::Cost231PropagationLossModel");//For sub-urban and highway
-  	channel_176.AddPropagationLoss("ns3::Cost231PropagationLossModel");//For sub-urban and highway
-  	channel_180.AddPropagationLoss("ns3::Cost231PropagationLossModel");//For sub-urban and highway
-  	channel_182.AddPropagationLoss("ns3::Cost231PropagationLossModel");//For sub-urban and highway
-  	channel_184.AddPropagationLoss("ns3::Cost231PropagationLossModel");//For sub-urban and highway
-  	
-  	//channel.AddPropagationLoss("ns3::FriisPropagationLossModel");
+  	// COST231-Hata is urban-only (supervisor 2026-06-15: "cost231 intended only
+  	// for urban"). LogDistance (NS-3 default path-loss exponent 3.0) is the
+  	// standard suburban/rural model. TxPower stays 41 dBm and the logical comm
+  	// range stays R_max_comm = 270 m (02_config_globals.h), so neighbour/LL/
+  	// detection gating and the 250 m RSU grid remain comparable across scenarios.
+  	// The model only reshapes path loss (SNR/PER realism); it is NOT an RF cutoff
+  	// — at 41 dBm with RxSensitivity −105 dBm the physical range is ~2 km, far
+  	// beyond the 270 m logical range, so no per-model TxPower re-tune is required.
+  	channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_172.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_174.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_176.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_180.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_182.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_184.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  }
+  if (mobility_scenario == 2)//open-highway mobility → Two-Ray Ground
+  {
+  	// Open highway has a strong ground-reflection (two-ray) channel. Frequency set
+  	// to the 5.9 GHz DSRC/WAVE band; HeightAboveZ = 1.5 m gives a realistic antenna
+  	// height (trace/RSU node z = 0, so the model's default height-0 must be lifted
+  	// or it degenerates). TxPower stays 41 dBm and R_max_comm stays 270 m (logical
+  	// range, see scenario-1 note) so coverage stays comparable across scenarios.
+  	channel.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	channel_172.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	channel_174.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	channel_176.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	channel_180.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	channel_182.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	channel_184.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
   }
   
   //Physical layer helper for wave
