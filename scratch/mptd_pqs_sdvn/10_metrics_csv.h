@@ -297,7 +297,7 @@ void log_ghost_identity(double sim_t, int rsu_id, int real_vid,
     }
 
     // Place N_ghost ghost vehicles evenly around the real vehicle at
-    // displacement_m radius (= R_max_comm * poisoning_intensity_theta = 150 m).
+    // displacement_m radius (= R_max_comm * poisoning_intensity_theta = 135 m).
     // Directions: 0°, 90°, 180°, 270°  (East, North, West, South).
     for (int i = 0; i < n_ghost; i++) {
         double angle_rad  = i * (2.0 * M_PI / n_ghost);

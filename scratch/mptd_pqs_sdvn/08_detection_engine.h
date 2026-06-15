@@ -418,7 +418,7 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     // Both conditions also require tag.GetIsPoisoned() (set by compromised RSU only).
     // Honest RSU beacons always have IsPoisoned=false → condition short-circuits → FP=0.
     // density_limit justification (paper Eq. 3.7 uses K_sybil + ρ_v × A_j):
-    // Plugging declared globals gives 5 + 0.01×π×300² ≈ 2832 — clearly calibrated for
+    // Plugging declared globals gives 5 + 0.01×π×270² ≈ 2295 — clearly calibrated for
     // a much denser network than our 16-vehicle topology. For this simulation, the
     // equivalent threshold is N_Vehicles/N_RSUs = 4 legitimate vehicles per RSU cell.
     // Any beacon count > 4 at a single RSU indicates ghost injection. This is the
@@ -2588,7 +2588,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // Step 3: Mark real beacon as poisoned (ground-truth provenance flag)
             tag.SetIsPoisoned(true);
             tag.SetAttackType(3);
-            double ghost_disp = R_max_comm * poisoning_intensity_theta; // 150 m
+            double ghost_disp = R_max_comm * poisoning_intensity_theta; // 270*0.5 = 135 m
             tpe_sq_sum += ghost_disp * ghost_disp;   // TPE: ghost displacement (Option B path)
             tpe_cnt++;
             cout << "[MP-S1-RSU" << rsu_idx << "] intercepting V" << vid
@@ -3131,11 +3131,11 @@ static uint32_t nearest_rsu_for_position(double px, double py)
 //
 // Parameters (fixed for this SDVN topology):
 //   T_MAX = 30 s   — LL cap for stopped/slow vehicles (> simTime=15 s)
-//   T_REF = 18 s   — 2×300/33.33 = traversal reference
+//   T_REF = 16.2 s — 2×270/33.33 = traversal reference
 //   δ     = 0.15   — hysteresis: 15% improvement required to trigger handoff
 // ─────────────────────────────────────────────────────────────────────────────
 static const double LL_T_MAX = 30.0;   // cap for LL when vehicle is stopped (s)
-static const double LL_T_REF = 18.0;   // 2*R_max_comm/s_max — traversal reference (s)
+static const double LL_T_REF = 16.2;   // 2*R_max_comm/s_max = 2*270/33.33 — traversal reference (s)
 static const double LL_DELTA = 0.15;   // hysteresis threshold (15 %)
 
 // Per-vehicle hysteresis state: last selected RSU index and score.

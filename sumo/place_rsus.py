@@ -27,7 +27,7 @@
 #   python3 sumo/place_rsus.py \
 #       --net   sumo/urban/urban.net.xml \
 #       --trace mobility/mobility_urban_150.tcl \
-#       --n_rsus 25 --range 300 \
+#       --n_rsus 25 --range 270 \
 #       --out   mobility/rsu_positions_urban.csv
 # =============================================================================
 import argparse
@@ -214,8 +214,8 @@ def main():
     ap.add_argument("--net", help="SUMO .net.xml road network (not needed in --grid mode)")
     ap.add_argument("--trace", required=True, help="ns-2 .tcl mobility trace")
     ap.add_argument("--n_rsus", type=int, help="number of RSUs (coverage-aware mode)")
-    ap.add_argument("--range", type=float, default=300.0,
-                    help="DSRC coverage radius in metres (default 300)")
+    ap.add_argument("--range", type=float, default=270.0,
+                    help="DSRC coverage radius in metres (default 270; 41 dBm DSRC)")
     ap.add_argument("--grid", metavar="ROWSxCOLS",
                     help="uniform-grid mode, e.g. 8x8 (overrides coverage-aware placement)")
     ap.add_argument("--spacing", type=float, default=250.0,
