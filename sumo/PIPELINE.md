@@ -131,12 +131,27 @@ change.
 | `--mobility_scenario` | Tag        | Map (OSM)            | `.tcl`                        | Vehicles | RSUs | Propagation model (`12_main.h`) |
 |-----------------------|------------|----------------------|-------------------------------|----------|------|---------------------------------|
 | `0`                   | `urban`    | Shinjuku, Tokyo      | `mobility_urban_150.tcl`      | 200      | 64   | COST231–Hata (urban-only)       |
-| `1`                   | `rural`    | Hohenwart, Germany   | `mobility_rural_90.tcl`       | 138      | 64   | Log-distance (exponent 3.0)     |
+| `1`                   | `rural`    | Hohenwart, Germany   | `mobility_rural_90.tcl`       | 138      | 44   | Log-distance (exponent 3.0)     |
 | `2`                   | `autobahn` | A9 autobahn, Germany | `mobility_autobahn_150.tcl`   | 200      | 23   | Two-ray ground (5.9 GHz, h=1.5 m)|
 
 Propagation is matched to the environment (supervisor directive 2026-06-15:
 COST231–Hata is urban-only). Transmit power (41 dBm) and the logical comm range
 `R_max_comm` (270 m) are held constant across scenarios.
+
+RSU layouts differ by map: urban uses a full 8×8 / 250 m grid (the dense grid
+sits on roads); autobahn places RSUs linearly along the corridor. Rural uses a
+**road-traced grid** — a 10×10 / 200 m lattice with the off-road cells dropped
+(`place_rsus.py --grid 10x10 --spacing 200 --on-road`), leaving 44 RSUs that
+follow the road shape at 100% coverage. The sparse rural map has too few real
+junctions for a coverage-aware fit, and a full grid floats RSUs over empty
+fields, so the on-road grid keeps grid alignment while hugging the roads.
+Regenerate with:
+
+```bash
+python3 sumo/place_rsus.py --trace mobility/mobility_rural_90.tcl \
+  --grid 10x10 --spacing 200 --range 270 --on-road \
+  --out mobility/rsu_positions_rural.csv
+```
 
 ### NetAnim run per scenario (emits `analytics/results/mptd_netanim_a<atk>_p<pct>.xml`)
 
@@ -150,7 +165,7 @@ export LD_LIBRARY_PATH="$PWD/build/lib:$LD_LIBRARY_PATH"
   --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 --skip_blockchain=true --attack_number=1 --attack_percentage=40 --simTime=15
 # rural
 ./build/scratch/mptd_pqs_sdvn/mptd_pqs_sdvn --mobility_source=1 --mobility_scenario=1 \
-  --maxspeed=90  --N_RSUs=64 --N_Vehicles=138 --skip_blockchain=true --attack_number=1 --attack_percentage=40 --simTime=15
+  --maxspeed=90  --N_RSUs=44 --N_Vehicles=138 --skip_blockchain=true --attack_number=1 --attack_percentage=40 --simTime=15
 # autobahn
 ./build/scratch/mptd_pqs_sdvn/mptd_pqs_sdvn --mobility_source=1 --mobility_scenario=2 \
   --maxspeed=150 --N_RSUs=23 --N_Vehicles=200 --skip_blockchain=true --attack_number=1 --attack_percentage=40 --simTime=15
