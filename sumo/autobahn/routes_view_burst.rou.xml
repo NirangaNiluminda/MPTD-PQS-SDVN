@@ -1,0 +1,17 @@
+<routes>
+    <vType id="car_passenger" vClass="passenger" maxSpeed="41.67" length="4.5" />
+    <vType id="bus_bus" vClass="bus" maxSpeed="27.78" length="12.0" />
+    <vType id="lorry_truck" vClass="truck" maxSpeed="25.00" length="7.5" />
+    <vType id="van_delivery" vClass="delivery" maxSpeed="33.33" length="5.5" />
+    <vType id="truck_truck" vClass="truck" maxSpeed="23.61" length="10.0" />
+    <flow id="f0_car" type="car_passenger" from="135586672#0" to="23805795" begin="0" end="5" number="50" departLane="free" departSpeed="max"/>
+    <flow id="f1_car" type="car_passenger" from="290401652" to="290401644#0" begin="0" end="5" number="50" departLane="free" departSpeed="max"/>
+    <flow id="f0_bus" type="bus_bus" from="135586672#0" to="23805795" begin="0" end="5" number="13" departLane="free" departSpeed="max"/>
+    <flow id="f1_bus" type="bus_bus" from="290401652" to="290401644#0" begin="0" end="5" number="12" departLane="free" departSpeed="max"/>
+    <flow id="f0_lorry" type="lorry_truck" from="135586672#0" to="23805795" begin="0" end="5" number="13" departLane="free" departSpeed="max"/>
+    <flow id="f1_lorry" type="lorry_truck" from="290401652" to="290401644#0" begin="0" end="5" number="12" departLane="free" departSpeed="max"/>
+    <flow id="f0_van" type="van_delivery" from="135586672#0" to="23805795" begin="0" end="5" number="13" departLane="free" departSpeed="max"/>
+    <flow id="f1_van" type="van_delivery" from="290401652" to="290401644#0" begin="0" end="5" number="12" departLane="free" departSpeed="max"/>
+    <flow id="f0_truck" type="truck_truck" from="135586672#0" to="23805795" begin="0" end="5" number="13" departLane="free" departSpeed="max"/>
+    <flow id="f1_truck" type="truck_truck" from="290401652" to="290401644#0" begin="0" end="5" number="12" departLane="free" departSpeed="max"/>
+</routes>

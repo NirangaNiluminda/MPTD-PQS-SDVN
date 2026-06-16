@@ -72,6 +72,84 @@ def parse_junctions(net_path):
     return tl, priority, other
 
 
+def parse_mainline_points(net_path):
+    """Return a flat list of (x,y) points sampled along highway.motorway edges.
+
+    Used by --line mode for the highway scenario: RSUs follow the carriageway
+    instead of a 2D grid. motorway_link (ramps) are excluded so RSUs track the
+    through-corridor, not the interchange loops.
+    """
+    pts = []
+    for _event, elem in ET.iterparse(net_path, events=("end",)):
+        if elem.tag != "edge":
+            continue
+        if (elem.get("type") or "") == "highway.motorway":
+            for lane in elem.findall("lane"):
+                for p in (lane.get("shape") or "").split():
+                    x, y = p.split(",")
+                    pts.append((float(x), float(y)))
+        elem.clear()
+    return pts
+
+
+def parse_edge_points(net_path):
+    """Return (x,y) points sampled along EVERY drivable road edge.
+
+    Sparse maps (e.g. rural) have few junctions — fewer than the requested RSU
+    count — which forces the coverage-aware cascade into a uniform-grid fallback
+    that floats RSUs over empty fields. Sampling points along the road edges
+    themselves gives a dense candidate pool that hugs the carriageways, so
+    farthest-point selection spreads RSUs *along the lanes* (following the road
+    shape) instead of on an abstract grid. Internal (lane-internal) edges are
+    skipped; we use one representative lane per edge to avoid double-counting
+    parallel carriageways.
+    """
+    pts = []
+    for _event, elem in ET.iterparse(net_path, events=("end",)):
+        if elem.tag != "edge":
+            continue
+        # skip internal/junction-connector edges (id starts with ':')
+        if (elem.get("function") or "") == "internal" or (elem.get("id") or "").startswith(":"):
+            elem.clear()
+            continue
+        lanes = elem.findall("lane")
+        if lanes:
+            for p in (lanes[0].get("shape") or "").split():
+                x, y = p.split(",")
+                pts.append((float(x), float(y)))
+        elem.clear()
+    return pts
+
+
+def line_overlay(mainline_pts, spacing):
+    """Place RSUs every `spacing` metres along the highway corridor centreline.
+
+    The mainline runs along one dominant axis (the longer bbox dimension). We
+    step along that axis at `spacing` intervals and put each RSU at the mean of
+    the other coordinate over nearby carriageway points — i.e. on the centreline
+    between the two carriageways, so one RSU covers both directions (they sit
+    well within the DSRC range of each other). Returns row-major list of (x,y)."""
+    if not mainline_pts:
+        return []
+    xs = [p[0] for p in mainline_pts]
+    ys = [p[1] for p in mainline_pts]
+    spanx, spany = max(xs) - min(xs), max(ys) - min(ys)
+    axis = 1 if spany >= spanx else 0     # 1 = step along Y, 0 = step along X
+    other = 1 - axis
+    lo = min(ys) if axis == 1 else min(xs)
+    hi = max(ys) if axis == 1 else max(xs)
+    half = spacing / 2.0
+    rsus = []
+    pos = lo
+    while pos <= hi + 1e-6:
+        near = [p for p in mainline_pts if abs(p[axis] - pos) <= half]
+        if near:
+            o = sum(p[other] for p in near) / len(near)
+            rsus.append((o, pos) if axis == 1 else (pos, o))
+        pos += spacing
+    return rsus
+
+
 _TCL_SETDEST = re.compile(r'setdest\s+([\d.eE+-]+)\s+([\d.eE+-]+)\s+([\d.eE+-]+)')
 _TCL_SETX = re.compile(r'set\s+X_\s+([\d.eE+-]+)')
 _TCL_SETY = re.compile(r'set\s+Y_\s+([\d.eE+-]+)')
@@ -218,8 +296,16 @@ def main():
                     help="DSRC coverage radius in metres (default 270; 41 dBm DSRC)")
     ap.add_argument("--grid", metavar="ROWSxCOLS",
                     help="uniform-grid mode, e.g. 8x8 (overrides coverage-aware placement)")
+    ap.add_argument("--line", action="store_true",
+                    help="highway mode: place RSUs linearly along the mainline "
+                         "(highway.motorway) at --spacing intervals; needs --net")
     ap.add_argument("--spacing", type=float, default=250.0,
-                    help="grid spacing in metres, H and V (default 250; used with --grid)")
+                    help="RSU spacing in metres (default 250; used with --grid and --line)")
+    ap.add_argument("--on-road", dest="on_road", action="store_true",
+                    help="(with --grid) keep only grid cells within --range of "
+                         "real traffic, so the grid traces the road shape (e.g. "
+                         "a T) instead of filling empty terrain. Drops floating "
+                         "off-road cells while preserving grid spacing/alignment.")
     ap.add_argument("--out", required=True, help="output CSV (rsu_id,x,y)")
     args = ap.parse_args()
 
@@ -229,18 +315,48 @@ def main():
         print("[place_rsus] ERROR: no vehicle positions parsed from trace", file=sys.stderr)
         return 2
 
-    # ── Grid mode (supervisor-mandated, 2026-06-12) ───────────────────────────
-    if args.grid:
-        rows, cols = (int(v) for v in args.grid.lower().split("x"))
-        rsus = grid_overlay(pts, rows, cols, args.spacing)
+    # ── Line mode (highway scenario): RSUs along the mainline carriageway ──────
+    if args.line:
+        if not args.net:
+            print("[place_rsus] ERROR: --line needs --net", file=sys.stderr)
+            return 2
+        mainline = parse_mainline_points(args.net)
+        if not mainline:
+            print("[place_rsus] ERROR: no highway.motorway edges in net "
+                  "(is this actually a highway map?)", file=sys.stderr)
+            return 2
+        rsus = line_overlay(mainline, args.spacing)
         cov = coverage_pct(rsus, pts, args.range)
         with open(args.out, "w", newline="") as fh:
             w = csv.writer(fh)
             w.writerow(["rsu_id", "x", "y"])
             for i, (x, y) in enumerate(rsus):
                 w.writerow([i, f"{x:.2f}", f"{y:.2f}"])
-        print(f"[place_rsus] GRID mode: {rows}x{cols} = {len(rsus)} RSUs, "
-              f"{args.spacing:.0f} m spacing, centred on trace -> {args.out}")
+        print(f"[place_rsus] LINE mode: {len(rsus)} RSUs along mainline, "
+              f"{args.spacing:.0f} m spacing -> {args.out}")
+        print(f"[place_rsus] MEASURED COVERAGE = {cov:.1f}% of vehicle-position "
+              f"samples within {args.range:.0f} m of an RSU")
+        return 0
+
+    # ── Grid mode (supervisor-mandated, 2026-06-12) ───────────────────────────
+    if args.grid:
+        rows, cols = (int(v) for v in args.grid.lower().split("x"))
+        rsus = grid_overlay(pts, rows, cols, args.spacing)
+        if args.on_road:
+            # Keep only grid cells that have real traffic within --range, so the
+            # surviving RSUs trace the road shape (e.g. a T) while staying on the
+            # exact grid lattice. Off-road cells over empty terrain are dropped.
+            kept = density_filter(rsus, pts, args.range)
+            rsus = [(x, y) for (x, y, _d) in kept]
+        cov = coverage_pct(rsus, pts, args.range)
+        with open(args.out, "w", newline="") as fh:
+            w = csv.writer(fh)
+            w.writerow(["rsu_id", "x", "y"])
+            for i, (x, y) in enumerate(rsus):
+                w.writerow([i, f"{x:.2f}", f"{y:.2f}"])
+        suffix = " (on-road: grid traces road shape)" if args.on_road else ""
+        print(f"[place_rsus] GRID mode: {rows}x{cols} -> {len(rsus)} RSUs, "
+              f"{args.spacing:.0f} m spacing, centred on trace{suffix} -> {args.out}")
         print(f"[place_rsus] MEASURED COVERAGE = {cov:.1f}% of vehicle-position "
               f"samples within {args.range:.0f} m of an RSU")
         return 0
@@ -269,6 +385,14 @@ def main():
     if len(pool) < want:
         pool += other
         tier = "all junctions"
+    if len(pool) < want:
+        # Sparse map: too few junctions for N_RSUs. Sample points along the road
+        # edges so RSUs follow the carriageways (road-shape-aware) rather than
+        # dropping to a uniform grid that floats over empty terrain.
+        edge_pts = parse_edge_points(args.net)
+        if edge_pts:
+            pool += edge_pts
+            tier += "+road-edge points"
     if len(pool) < args.n_rsus:
         pool = grid_candidates(pts, args.n_rsus)
         tier = "uniform grid (fallback)"

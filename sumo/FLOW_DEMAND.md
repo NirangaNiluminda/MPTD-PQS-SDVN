@@ -8,6 +8,44 @@ This is a SUMO-only data/config workflow. **No NS-3 C++ code is involved.**
 
 ---
 
+## 0. Update (2026-06-15): burst-spawn for screenshots (supervisor directive)
+
+For the **screenshot / NetAnim deliverable** the supervisor requires the *full*
+fleet to be **co-present** in one frame. The "spread departures over a window"
+demand in §2 ramps up gradually, so any single screenshot shows only a fraction
+of the fleet. The directive is the opposite: **spawn every vehicle at `t=0`**,
+let lane-insertion capacity drain the queue (this fill-in time is the
+**warmup**), then screenshot once the network is at full density.
+
+Each scenario therefore has a **burst-spawn view route file** and a
+`view.sumocfg`:
+
+| Scenario  | `sumo/<dir>/` | View config (`view.sumocfg` → route) | Fleet | Full-density (warmup) | Screenshot at |
+|-----------|---------------|--------------------------------------|-------|-----------------------|---------------|
+| Urban     | `urban/`      | `routes_view_burst.rou.xml`          | 200   | ≈5 s                  | t ≥ 5 s       |
+| Rural     | `rural/`      | `routes_view_burst.rou.xml`          | 138   | ≈55 s (133 by 20 s)   | t ≈ 30–55 s   |
+| Autobahn  | `autobahn/`   | `routes_view_burst.rou.xml`          | 200   | ≈69 s                 | t ≈ 70–120 s  |
+
+```bash
+cd /home/niranga/ns-allinone-3.35/ns-3.35/sumo
+sumo-gui -c urban/view.sumocfg      # let it run to ≥5 s, then screenshot
+sumo-gui -c rural/view.sumocfg      # run to ≈55 s
+sumo-gui -c autobahn/view.sumocfg   # run to ≈70 s
+```
+
+Why the warmup differs: urban has many fringe entry edges so all 200 enter
+within ~5 s; the rural network is sparse; the autobahn is a single ~7 km
+corridor whose two-lane on-ramps cap the insertion rate (so 200 take ~70 s to
+fill, after which they co-exist along the corridor without gridlock). The
+NS-3/NetAnim `.tcl` trace is already warmup-shifted (§ build_sumo_trace.sh
+step [5]), so NetAnim shows the full co-present fleet from its t=0.
+
+> The §2–§4 "spread over a window" workflow below is retained for the *flowing
+> demo / clip* use case; the burst-spawn views above are the ones used for the
+> full-fleet screenshots.
+
+---
+
 ## 1. Why the old scene was congested (and why it was NOT the map's fault)
 
 The OSM map / `urban.net.xml` describes **roads only** — it contains zero
