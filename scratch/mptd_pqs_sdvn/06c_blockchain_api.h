@@ -1005,6 +1005,34 @@ inline void CallCPDetectCheckAsync(
     mptd_fabric_invoke_async("CPDetectCheck", args);
 }
 
+// ── CallSCRSUFinalizeEpoch — RSU SC-Trust EMA (Eq rsu_trust / rsu_misbehave) ──
+// τ_{r_j}(t) = α·τ_{r_j}(t-1) + (1-α)·(1 - m_j(t)), where m_j is each RSU's
+// mean disagreement with the 2f+1 TRUSTED-quorum verdict over the vehicles it
+// reported on this epoch. Channel-wide: one call per epoch evaluates EVERY RSU
+// from the on-chain SUBM_<vid>_<epoch>_<rsu> records, applies the demote /
+// promote / revoke lifecycle, and is idempotent over the epoch. Synchronous;
+// returns the raw chaincode JSON (array of updated RSUTrustScore records).
+inline std::string CallSCRSUFinalizeEpoch(const std::string& epoch)
+{
+    if (skip_blockchain) return "";
+    std::vector<std::string> args = { epoch };
+    return mptd_fabric_invoke_sync("invoke", "SCRSUFinalizeEpoch", args);
+}
+
+// ── CallSCRSUFinalizeEpochAsync — fire-and-forget variant ────────────────────
+// Same chaincode function as CallSCRSUFinalizeEpoch but discards the returned
+// records. Scheduled once per epoch from inside the sim tick (after the
+// per-vehicle SUBM submissions for that epoch have landed) so blocking on the
+// orderer round-trip never stalls the simulation. Idempotent over the epoch —
+// re-firing just re-evaluates the same SUBM set. Bindable to
+// Simulator::Schedule via ns3::MakeBoundCallback.
+inline void CallSCRSUFinalizeEpochAsync(std::string epoch)
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    std::vector<std::string> args = { epoch };
+    mptd_fabric_invoke_async("SCRSUFinalizeEpoch", args);
+}
+
 // ── CallSCRevokeVote — Eq 3.58 BFT 2f+1 RSU vote ─────────────────────────────
 // One call per RSU that wishes to vote for revoking `vehicleID`. The
 // chaincode commits the immutable SCREVOKE_ record + emits "SCRevoke" event
