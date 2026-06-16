@@ -102,6 +102,45 @@ sizes are runtime values, never hardcoded.
 - Reads: `GetTrustScore`, `GetAllTrustScores`, `GetEpochSubmissions`,
   `GetControllerSubmission`.
 
+### 3.2.1 RSU SC-Trust lifecycle (paper §3.5.1, Eq rsu_trust / rsu_misbehave)
+
+Paper §3.5.1 mandates that a persistently anomalous **RSU**'s SC-Trust score
+decays and triggers BFT revocation — closing the gap where the old §3.5.5 text
+defined the trust EMA only for vehicles and controllers. Each RSU carries
+`RSUTRUST_<id>` (`τ_{r_j}`, seeded `τ_init = 1.0` at registration) and a
+`RegistrationRecord.RSUState ∈ {TRUSTED, CLIENT}`.
+
+- **Misbehaviour signal `m_j(t)`** — a compromised RSU is an endorser, not a
+  monitored vehicle, so its evidence is scored against its honest peers, not an
+  external detector. For each vehicle `r_j` reported on this epoch, its binary
+  flag is compared with the quorum verdict `q_i` (1 iff ≥ 2f+1 **distinct
+  TRUSTED** RSUs flagged that vehicle). `m_j(t)` = mean disagreement over those
+  vehicles. Computing `q_i` over the trusted set **only** is the anti-collusion
+  rule: a coalition of demoted RSUs can never form the quorum that scores its
+  peers.
+- **EMA** (reuses the vehicle form, Eq 3.55):
+  `τ_{r_j}(t) = α·τ_{r_j}(t−1) + (1−α)·(1 − m_j(t))`.
+- **Three-state machine** (reuses the vehicle `τ_th` / `T_rev`):
+  `TRUSTED` (endorses + carries quorum weight) → below `τ_th` demote to
+  `CLIENT` (may still submit evidence so it can recover, but **zero quorum
+  weight**, cannot endorse) → recover ≥ `τ_th` promote back to `TRUSTED`; below
+  `τ_th` for `T_rev` consecutive epochs → terminal `SC-Revoke` (`SCREVOKE_<rsu>`,
+  `Status → REVOKED`, event `RSURevoke`). Demote/promote emit `RSUDemoted` /
+  `RSUPromoted`.
+- **`SCRSUFinalizeEpoch(epoch)`** — channel-wide, one call per epoch; rebuilds
+  `q_i` + `m_j` from the on-chain `SUBM_*` set and applies the lifecycle to every
+  RSU. Idempotent over the epoch. Reads: `GetRSUTrustScore`,
+  `GetAllRSUTrustScores`.
+- **Quorum gating** — `isTrustedRSU()` excludes `CLIENT` RSUs from **every**
+  quorum count: SC-Register endorsements, SC-Revoke `2f+1` votes, CP-DETECT
+  `f+1` conflicts, and the vehicle-trust `mean ψ`. This is the chaincode-only
+  (option a) enforcement of trusted-only endorsement; the Fabric endorsement
+  policy stays `OR('RSUMSP.peer')`.
+- **Known limitation** — NS-3 RSUs emit `SUBM` only on anomaly, so `m_j`
+  currently captures **over-reporting** (flagging vehicles the quorum cleared).
+  **Under-reporting** (a missed detection the quorum caught) needs a per-vehicle
+  clean-verdict hook on the NS-3 side — documented follow-up.
+
 ### 3.3 CP-DETECT (Algorithm 8, Eq 3.64–3.67)
 
 `CPDetectCheck(vehicleID, epoch)` — compares the controller's anomaly verdict
@@ -164,6 +203,8 @@ consensus** (the conflict count), never by the controller itself (invariant 6).
 | Lightweight alert path | `08_detection_engine.h` ~2930 | `CallSCTrustSubmitEvidence(vid, rsu_idx, epoch, psi, h_b)` (signs internally) |
 | Controller evidence | `08_detection_engine.h` ~1936 | `CallSCControllerSubmitEvidence(vid, g_active_controller_idx, epoch, phi, h_X)` |
 | Cross-RSU revoke | `08_detection_engine.h` ~2840 | `CallSCRevokeVote(vid, rsu_idx, reason, ts)` |
+| Vehicle epoch finalize | `08_detection_engine.h` ~2958 | `CallSCTrustFinalizeEpochAsync(vid, epoch)` (+1 s, deduped per `vid\|epoch`) |
+| RSU epoch finalize | `08_detection_engine.h` ~2970 | `CallSCRSUFinalizeEpochAsync(epoch)` (+2 s, deduped per `epoch` — channel-wide RSU trust lifecycle) |
 | Shutdown | `mptd_export_blockchain_evidence()` | dump committed ledger → JSON (see §6) |
 
 The `Call*` wrappers (`06c_blockchain_api.h`) **drop any external signature
