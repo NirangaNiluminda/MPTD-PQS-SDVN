@@ -2958,6 +2958,26 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                         Simulator::Schedule(Seconds(1.0),
                             &CallSCTrustFinalizeEpochAsync, vid, epoch);
                     }
+
+                    // RSU SC-Trust finalize (Eq rsu_trust / rsu_misbehave) is
+                    // channel-wide — ONE call per epoch evaluates every RSU's
+                    // misbehaviour signal m_j against the 2f+1 trusted quorum,
+                    // so it is deduped on `epoch` ALONE (not vid|epoch). We
+                    // delay 2 s — one second after the per-vehicle finalizes —
+                    // so the full SUBM_<*>_<epoch>_<rsu> set for this epoch has
+                    // landed before the contract reconstructs q_i. Idempotent
+                    // on chain, so a converging re-fire is harmless.
+                    static std::unordered_set<std::string> g_rsu_finalize_scheduled;
+                    static std::mutex                       g_rsu_finalize_mu;
+                    bool rsu_first;
+                    {
+                        std::lock_guard<std::mutex> lk(g_rsu_finalize_mu);
+                        rsu_first = g_rsu_finalize_scheduled.insert(epoch).second;
+                    }
+                    if (rsu_first) {
+                        Simulator::Schedule(Seconds(2.0),
+                            &CallSCRSUFinalizeEpochAsync, epoch);
+                    }
                 }
             }
         }
