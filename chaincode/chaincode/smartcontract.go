@@ -72,6 +72,13 @@ const (
 
 	StatusActive  = "ACTIVE"
 	StatusRevoked = "REVOKED"
+	// StatusExcluded — a controller flagged by CP-DETECT (f+1 RSU conflict,
+	// Eq 3.64–3.67 / invariant 2). Distinct from REVOKED: exclusion removes a
+	// controller from the trusted set C_trusted so a successor takes over,
+	// whereas REVOKED is the terminal vehicle state from a 2f+1 SC-Revoke vote.
+	// An EXCLUDED controller's submissions bounce at requireActive, taking it
+	// out of consensus exactly as invariant 2 requires.
+	StatusExcluded = "EXCLUDED"
 
 	// τ_init at registration time. Paper §3.5.5 mentions τ_init without a
 	// numeric default; we set it to the fully-clean ceiling so SC-Trust's
@@ -178,6 +185,20 @@ type ControllerFlag struct {
 	FlaggedAt          string `json:"FlaggedAt"`
 }
 
+// ControllerReassignment — C_trusted reassignment record written when CP-DETECT
+// excludes a controller (Eq 3.64–3.67 / invariant 2). Key:
+// CTRLREASSIGN_<excludedController>_<epoch>.
+type ControllerReassignment struct {
+	ID                  string `json:"ID"`
+	ExcludedController  string `json:"ExcludedController"`
+	SuccessorController string `json:"SuccessorController"` // "" if no ACTIVE successor remains
+	Reason              string `json:"Reason"`
+	Epoch               string `json:"Epoch"`
+	ConflictCount       int    `json:"ConflictCount"`
+	ThresholdFP1        int    `json:"ThresholdFP1"`
+	At                  string `json:"At"`
+}
+
 // Endorser — one element of the endorsersJSON array passed to SCRegister.
 type Endorser struct {
 	RSUID  string `json:"rsuID"`
@@ -281,16 +302,46 @@ func verifyECDSAP256(pkHex, sigHex string, digest []byte) bool {
 	return ecdsa.VerifyASN1(pub, digest, sig)
 }
 
+// concatDigest returns SHA-256 over the ordered string concatenation of
+// `parts`. This is the one canonical hashing rule shared by every signed
+// payload in the contract — the NS-3 signer MUST hash the exact same string
+// arguments, in the same order, with no separators, or verification fails.
+func concatDigest(parts ...string) []byte {
+	h := sha256.New()
+	for _, p := range parts {
+		h.Write([]byte(p))
+	}
+	return h.Sum(nil)
+}
+
 // endorsementDigest returns SHA-256(vehicleID ‖ pkHex ‖ hKuHex). The string
 // concatenation is the canonical form NS-3 endorsement collectors hash, and
 // must stay byte-identical on both sides.
 func endorsementDigest(vehicleID, pkHex, hKuHex string) []byte {
-	h := sha256.New()
-	h.Write([]byte(vehicleID))
-	h.Write([]byte(pkHex))
-	h.Write([]byte(hKuHex))
-	out := h.Sum(nil)
-	return out
+	return concatDigest(vehicleID, pkHex, hKuHex)
+}
+
+// evidenceDigest — canonical digest the RSU signs for its σ_j^sub (Eq 3.61).
+// Binds the vehicle, the submitting RSU, the epoch, the anomaly score string
+// (verbatim, as transmitted), and the beacon hash h(b_i(t)). When the full-
+// mode TRS aggregate path is used, beaconHash carries the FHE ciphertext
+// digest h(Enc(A_ring)) so the signature binds the ciphertext per Eq 3.49.
+func evidenceDigest(vehicleID, rsuID, epoch, psiStr, beaconHash string) []byte {
+	return concatDigest(vehicleID, rsuID, epoch, psiStr, beaconHash)
+}
+
+// controllerEvidenceDigest — canonical digest the controller signs for its
+// σ_c^sub (Eq 3.62). Binds vehicle, controller, epoch, the controller anomaly
+// score Φ string (verbatim), and the beacon hash h(X_i(t)).
+func controllerEvidenceDigest(vehicleID, controllerID, epoch, phiStr, beaconHash string) []byte {
+	return concatDigest(vehicleID, controllerID, epoch, phiStr, beaconHash)
+}
+
+// revokeVoteDigest — canonical digest the RSU signs for its revocation vote
+// (Eq 3.63). Binds the target vehicle, the voting RSU, the reason, and the
+// caller-supplied timestamp so a vote cannot be replayed for another vehicle.
+func revokeVoteDigest(vehicleID, rsuID, reason, timestamp string) []byte {
+	return concatDigest(vehicleID, rsuID, reason, timestamp)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -639,6 +690,22 @@ func (s *SmartContract) SCTrustSubmitEvidence(ctx contractapi.TransactionContext
 		return err
 	}
 
+	// Eq 3.61 — verify σ_j^sub against the submitting RSU's on-chain P-256
+	// key over the canonical evidence digest. Strict reject mirrors the
+	// SCRegister endorsement gate: an unverifiable signature is dropped, so
+	// only genuinely-keyed RSU evidence ever reaches SC-Trust aggregation.
+	regRSU, err := s.getRegistration(ctx, rsuID)
+	if err != nil {
+		return fmt.Errorf("rsu registration lookup: %v", err)
+	}
+	if regRSU == nil {
+		return fmt.Errorf("rejected: rsu %s not registered", rsuID)
+	}
+	if !verifyECDSAP256(regRSU.PkHex, signature,
+		evidenceDigest(vehicleID, rsuID, epoch, psiStr, beaconHash)) {
+		return fmt.Errorf("rejected: invalid evidence signature for rsu %s", rsuID)
+	}
+
 	psi, err := strconv.ParseFloat(psiStr, 64)
 	if err != nil {
 		return fmt.Errorf("psi parse: %v", err)
@@ -674,6 +741,23 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 	}
 	if err := s.requireActive(ctx, controllerID, RoleController); err != nil {
 		return err
+	}
+
+	// Eq 3.62 — verify σ_c^sub against the controller's on-chain P-256 key.
+	// The controller writes evidence as a non-authoritative client (invariant
+	// 2): its submission is recorded and fed to CP-DETECT, but an unsigned or
+	// forged controller submission is rejected here before it can skew the
+	// f+1 conflict count.
+	regCtrl, err := s.getRegistration(ctx, controllerID)
+	if err != nil {
+		return fmt.Errorf("controller registration lookup: %v", err)
+	}
+	if regCtrl == nil {
+		return fmt.Errorf("rejected: controller %s not registered", controllerID)
+	}
+	if !verifyECDSAP256(regCtrl.PkHex, signature,
+		controllerEvidenceDigest(vehicleID, controllerID, epoch, phiStr, beaconHash)) {
+		return fmt.Errorf("rejected: invalid controller signature for %s", controllerID)
 	}
 
 	phi, err := strconv.ParseFloat(phiStr, 64)
@@ -859,6 +943,162 @@ func (s *SmartContract) GetAllTrustScores(ctx contractapi.TransactionContextInte
 // vehicle is clean, missing SUBMs are agreement, not conflict.
 //
 // Returns the ControllerFlag on flag-fire, or nil if conflict < f+1.
+// activeControllerExcluding returns the ID of the lowest-numbered controller
+// whose registration is ACTIVE, skipping `exclude`. This is the deterministic
+// head of the trusted set C_trusted (Eq 3.1). Returns "" when none remain.
+func (s *SmartContract) activeControllerExcluding(ctx contractapi.TransactionContextInterface,
+	exclude string) (string, error) {
+
+	iter, err := ctx.GetStub().GetStateByRange("REG_", "REG_~")
+	if err != nil {
+		return "", err
+	}
+	defer iter.Close()
+	best := ""
+	bestIdx := int(^uint(0) >> 1) // max int
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return "", e
+		}
+		var r RegistrationRecord
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return "", e
+		}
+		if r.Role != RoleController || r.Status != StatusActive || r.ID == exclude {
+			continue
+		}
+		// Numeric ordering of the CTRL_<idx> suffix; fall back to string
+		// compare when the suffix is non-numeric.
+		idx := bestIdx
+		if n := len("CTRL_"); len(r.ID) > n {
+			if v, e := strconv.Atoi(r.ID[n:]); e == nil {
+				idx = v
+			}
+		}
+		if idx < bestIdx || (idx == bestIdx && (best == "" || r.ID < best)) {
+			best = r.ID
+			bestIdx = idx
+		}
+	}
+	return best, nil
+}
+
+// excludeAndReassignController flips a CP-DETECT-flagged controller to EXCLUDED
+// and records the C_trusted reassignment to its successor (Eq 3.64–3.67 /
+// invariant 2). Idempotent: a controller already EXCLUDED yields no new record.
+// Returns the reassignment (nil if the controller was already excluded).
+func (s *SmartContract) excludeAndReassignController(ctx contractapi.TransactionContextInterface,
+	controllerID, epoch, reason string, conflict, thresholdFP1 string) (*ControllerReassignment, error) {
+
+	reg, err := s.getRegistration(ctx, controllerID)
+	if err != nil {
+		return nil, err
+	}
+	if reg == nil || reg.Role != RoleController {
+		return nil, nil // nothing to exclude
+	}
+	if reg.Status != StatusActive {
+		return nil, nil // already excluded/revoked — idempotent
+	}
+
+	reg.Status = StatusExcluded
+	rj, err := json.Marshal(reg)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.GetStub().PutState("REG_"+controllerID, rj); err != nil {
+		return nil, err
+	}
+
+	successor, err := s.activeControllerExcluding(ctx, controllerID)
+	if err != nil {
+		return nil, err
+	}
+
+	cInt, _ := strconv.Atoi(conflict)
+	tInt, _ := strconv.Atoi(thresholdFP1)
+	ra := ControllerReassignment{
+		ID:                  fmt.Sprintf("CTRLREASSIGN_%s_%s", controllerID, epoch),
+		ExcludedController:  controllerID,
+		SuccessorController: successor,
+		Reason:              reason,
+		Epoch:               epoch,
+		ConflictCount:       cInt,
+		ThresholdFP1:        tInt,
+		At:                  time.Now().Format(time.RFC3339),
+	}
+	raj, err := json.Marshal(ra)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.GetStub().PutState(ra.ID, raj); err != nil {
+		return nil, err
+	}
+	return &ra, nil
+}
+
+// GetActiveController returns the current head of C_trusted — the lowest-
+// numbered ACTIVE controller. Node-side evidence submitters query this to learn
+// which controller identity to submit under after a reassignment.
+func (s *SmartContract) GetActiveController(ctx contractapi.TransactionContextInterface) (string, error) {
+	id, err := s.activeControllerExcluding(ctx, "")
+	if err != nil {
+		return "", err
+	}
+	if id == "" {
+		return "", fmt.Errorf("no active controller in C_trusted")
+	}
+	return id, nil
+}
+
+// GetTrustedControllers lists every registered controller and its status — the
+// full C_trusted set plus any EXCLUDED members, for diagnostics / evidence.
+func (s *SmartContract) GetTrustedControllers(ctx contractapi.TransactionContextInterface) ([]*RegistrationRecord, error) {
+	iter, err := ctx.GetStub().GetStateByRange("REG_", "REG_~")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []*RegistrationRecord
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return nil, e
+		}
+		var r RegistrationRecord
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return nil, e
+		}
+		if r.Role == RoleController {
+			out = append(out, &r)
+		}
+	}
+	return out, nil
+}
+
+// GetControllerReassignments lists all C_trusted reassignment records.
+func (s *SmartContract) GetControllerReassignments(ctx contractapi.TransactionContextInterface) ([]*ControllerReassignment, error) {
+	iter, err := ctx.GetStub().GetStateByRange("CTRLREASSIGN_", "CTRLREASSIGN_~")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []*ControllerReassignment
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return nil, e
+		}
+		var r ControllerReassignment
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return nil, e
+		}
+		out = append(out, &r)
+	}
+	return out, nil
+}
+
 func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterface,
 	vehicleID, epoch string) (*ControllerFlag, error) {
 
@@ -939,9 +1179,27 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 	if err := ctx.GetStub().PutState(flag.ID, j); err != nil {
 		return nil, err
 	}
-	ctx.GetStub().SetEvent("CPDetectFlag", []byte(fmt.Sprintf(
-		`{"controllerID":"%s","vehicleID":"%s","epoch":"%s","conflict":%d,"threshold":%d}`,
-		cs.ControllerID, vehicleID, epoch, conflict, fP1)))
+
+	// Invariant 2 / Eq 3.64–3.67: the f+1 flag is the operational trigger to
+	// exclude the controller from C_trusted and activate the successor. RSU
+	// consensus (the conflict count) drives this, never the controller itself
+	// (invariant 6). A Fabric TX emits only one event, so we emit a single
+	// "ControllerReassign" carrying the flag context when a (new) exclusion
+	// happens, else the plain "CPDetectFlag".
+	ra, err := s.excludeAndReassignController(ctx, cs.ControllerID, epoch,
+		"cp_detect_conflict", strconv.Itoa(conflict), strconv.Itoa(fP1))
+	if err != nil {
+		return nil, err
+	}
+	if ra != nil {
+		ctx.GetStub().SetEvent("ControllerReassign", []byte(fmt.Sprintf(
+			`{"excluded":"%s","successor":"%s","vehicleID":"%s","epoch":"%s","conflict":%d,"threshold":%d}`,
+			ra.ExcludedController, ra.SuccessorController, vehicleID, epoch, conflict, fP1)))
+	} else {
+		ctx.GetStub().SetEvent("CPDetectFlag", []byte(fmt.Sprintf(
+			`{"controllerID":"%s","vehicleID":"%s","epoch":"%s","conflict":%d,"threshold":%d}`,
+			cs.ControllerID, vehicleID, epoch, conflict, fP1)))
+	}
 	return &flag, nil
 }
 
@@ -1002,6 +1260,22 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 	}
 	if err := s.requireActive(ctx, rsuID, RoleRSU); err != nil {
 		return "", err
+	}
+
+	// Eq 3.63 — verify the revocation vote signature against the voting RSU's
+	// on-chain P-256 key. Without this gate a single forged identity could
+	// stuff the 2f+1 tally; binding (vehicleID‖rsuID‖reason‖timestamp) also
+	// stops a valid vote being replayed against a different vehicle.
+	regRSU, err := s.getRegistration(ctx, rsuID)
+	if err != nil {
+		return "", fmt.Errorf("rsu registration lookup: %v", err)
+	}
+	if regRSU == nil {
+		return "", fmt.Errorf("rejected: rsu %s not registered", rsuID)
+	}
+	if !verifyECDSAP256(regRSU.PkHex, signature,
+		revokeVoteDigest(vehicleID, rsuID, reason, timestamp)) {
+		return "", fmt.Errorf("rejected: invalid revoke vote signature for rsu %s", rsuID)
 	}
 
 	cfg, err := s.GetNetworkConfig(ctx)
