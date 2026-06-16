@@ -79,3 +79,12 @@ analytics/ml/models/
 analytics/results/figures/
 analytics/results/sweep/
 analytics/results/logs/
+
+# ── Generated training datasets (per-scenario CSVs + zip bundle) — regeneratable
+#    by the Phase-A sims; not source, kept out of git. ──────────────────────────
+analytics/datasets/
+analytics/datasets.zip
+
+# ── Per-run logs inside the sim scratch dir (the top-level `scratch/*.log` rule
+#    above does not reach the mptd_pqs_sdvn/ subdir). ───────────────────────────
+scratch/mptd_pqs_sdvn/*.log
