@@ -1894,9 +1894,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         // same kinematics, so this hash matches its RSU
                         // counterpart on the same beacon.
                         //
-                        // σ_c^sub PLACEHOLDER: empty string. TASK ①-J swaps in
-                        // a real controller-keyed signature; chaincode accepts
-                        // it opaquely today.
+                        // σ_c^sub: controller-identity ECDSA P-256 (Eq 3.62),
+                        // produced inside CallSCControllerSubmitEvidence with
+                        // the controller's registered key and verified on submit
+                        // by the chaincode (smartcontract.go).
                         //
                         // A5 ablation (no blockchain) and routing_test mode
                         // both skip — matches the RSU-side guards.
@@ -1925,19 +1926,17 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                     ax, ay, 0.0,
                                     rw.timestamp[i]);
 
-                                // Single-controller sim: controllerID = 0. The
-                                // paper's Fig 3.9 has exactly one SDN controller,
-                                // and our sim mirrors that; if multi-controller
-                                // support lands later this becomes a per-thread
-                                // identifier read from a config global.
-                                const uint32_t controllerID = 0;
-
-                                // σ_c^sub placeholder; see comment above.
-                                std::string sigma_c_sub_hex = "";
+                                // Multi-controller C_trusted (Eq 3.1/3.60):
+                                // submit under the chain-authoritative ACTIVE
+                                // controller, not a hardcoded index. After a
+                                // CP-DETECT exclusion the chaincode reassigns
+                                // the head of C_trusted and a periodic
+                                // mptd_refresh_active_controller() advances this.
+                                const uint32_t controllerID = g_active_controller_idx;
 
                                 CallSCControllerSubmitEvidence(
                                     vid_i, controllerID, ctrl_epoch,
-                                    (double)fs.phi, h_X, sigma_c_sub_hex);
+                                    (double)fs.phi, h_X);
 
                                 // ── Schedule Eq 3.59 CP-DETECT (TASK ①-M) ────────
                                 // CPDetectCheck reads BOTH the just-written
@@ -2825,25 +2824,14 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // matching the legacy behaviour. This is the "no BC"
                     // baseline used by RQ6 (BC isolation comparison).
                     //
-                    // σ_j placeholder (empty string) until TASK ①-J plumbs
-                    // ITrsBackend per-RSU signature into the vote args.
+                    // The revoke-vote signature (Eq 3.63) is produced inside
+                    // CallSCRevokeVote with this RSU's registered P-256 key over
+                    // (vehId‖rsuId‖reason‖ts) and verified on submit by the
+                    // chaincode, so a forged identity cannot pad the 2f+1 tally.
                     bool revoked = false;
                     if (!routing_test && ablation_mode != 5) {
-                        // σ_j for the vote (TASK ①-J): bind to
-                        //   m_j = "<vid>|REVOKE|<ts:.6f>|<reason>"
-                        // using the same canonical helper. The chaincode
-                        // already accepts the signature opaquely; this
-                        // gives downstream verifiers a real Eq 3.47
-                        // partial that can be aggregated into a σ_TRS
-                        // proving the BFT vote was endorsed by the RSU
-                        // ring (paper §3.5.5 + §3.5.4 chain).
-                        std::vector<uint8_t> vote_msg = mptd_evidence_message(
-                            vid, "REVOKE", ts, "3_consecutive_anomalies");
-                        std::string vote_sig_hex =
-                            mptd_trs_partial_sign_hex(rsu_idx, vote_msg);
                         std::string vote_payload = CallSCRevokeVote(
-                            vid, rsu_idx, "3_consecutive_anomalies",
-                            vote_sig_hex, ts);
+                            vid, rsu_idx, "3_consecutive_anomalies", ts);
                         // Payload shape: {"voted":true,"votes":N,"threshold":T,"revoked":bool}
                         revoked = (vote_payload.find("\"revoked\":true")
                                    != std::string::npos);
@@ -2929,24 +2917,20 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 
                     std::string epoch = mptd_epoch_from_ts(ts);
 
-                    // ── σ_j^sub via ITrsBackend::partial_sign (TASK ①-J) ───
-                    // RSU r_j produces σ_j = s_j · H(m_j) (paper Eq 3.47) over
-                    // the canonical evidence bytes
-                    //   m_j = "<vid>|<epoch>|<ψ:.6f>|<h_b>"
-                    // hex-encoded for the chaincode string arg. Empty hex on
-                    // failure (g_trs_backend not initialised, A4 ablation,
-                    // or rsu_idx out of ring) — chaincode accepts opaquely
-                    // either way. Real σ_TRS aggregation across t partials
-                    // is done at the cloud per Eq 3.48 (evidence_sign_and_verify
-                    // in 06b1_trs_backend.h handles that pipeline).
-                    std::vector<uint8_t> sub_msg =
-                        mptd_evidence_message(vid, epoch, rsu_lw.psi, h_b);
-                    std::string sigma_sub_hex =
-                        mptd_trs_partial_sign_hex(rsu_idx, sub_msg);
-
+                    // ── σ_j^sub: RSU-identity ECDSA P-256 (Eq 3.61) ─────────
+                    // SC-Trust evidence is keyed by RSUID on chain (SUBM_<vid>_
+                    // <epoch>_<rsuID>), so there is no signer anonymity to
+                    // protect — the correct σ_j^sub is the submitting RSU's
+                    // registered Fabric-MSP P-256 signature, the same key class
+                    // SC-Register endorsements use. CallSCTrustSubmitEvidence
+                    // now produces it internally over the exact transmitted
+                    // strings, and the chaincode verifies it on submit
+                    // (smartcontract.go SCTrustSubmitEvidence). The privacy-
+                    // preserving threshold-ring σ_TRS (Eq 3.48) is a separate
+                    // construct over the FHE cloud aggregate, not this per-RSU
+                    // evidence auth — it stays in the 06b1 cloud pipeline.
                     CallSCTrustSubmitEvidence(
-                        vid, rsu_idx, epoch,
-                        rsu_lw.psi, h_b, sigma_sub_hex);
+                        vid, rsu_idx, epoch, rsu_lw.psi, h_b);
 
                     // ── Schedule Eq 3.55 finalization 1 s after submission ──
                     // SCTrustFinalizeEpoch aggregates all RSU witnesses of

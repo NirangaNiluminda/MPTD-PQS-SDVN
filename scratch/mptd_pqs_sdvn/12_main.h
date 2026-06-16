@@ -2086,6 +2086,13 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // ── Write MPTD-PQS metrics CSV (Stage 4) ─────────────────────────────────
   write_mptd_results_csv();
 
+  // ── Export on-chain trust/revoke/CRL audit trail (paper §3.5.5) ──────────
+  // Consolidated JSON snapshot of committed ledger state — the off-line
+  // evidence the trust/revocation analysis is computed from, and the hand-off
+  // for Hyperledger Explorer / IPFS. No-op under skip_blockchain / A5.
+  mptd_export_blockchain_evidence(
+      std::string(NS3_ROOT "/analytics/results/blockchain_evidence.json"));
+
   // ── MRTPA Attack Summary ──────────────────────────────────────────────────
   std::cout << "\n========================================" << std::endl;
   std::cout << " ATTACK SUMMARY" << std::endl;
