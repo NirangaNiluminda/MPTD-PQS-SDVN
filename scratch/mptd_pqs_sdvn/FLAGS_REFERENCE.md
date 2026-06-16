@@ -32,7 +32,7 @@ Booleans take `true`/`false`; everything else is a number.
 | `--enable_gat` | `-1` | int | Force GAT on(1)/off(0); **-1** = follow `ablation_mode`. |
 | `--enable_lstm_ae` | `-1` | int | Force LSTM-AE on(1)/off(0); **-1** = follow `ablation_mode`. |
 | `--trs_classical` | `0` | int | TRS scheme: **0**=PQ Dilithium/ML-DSA-44 (paper) · **1**=classical Shamir-Schnorr-P256 (RQ5 PBPO baseline). |
-| `--skip_blockchain` | `false` | bool | Skip Hyperledger Fabric + REST bring-up. **`true` on HPC / no-Docker**. |
+| `--skip_blockchain` | `false` | bool | Skip Hyperledger Fabric bring-up. **`false`** for the full blockchain run (HPC node has Docker + Explorer + IPFS). **`true`** only for training sweeps & ablation **A5** (`--ablation_mode=5`). See `BLOCKCHAIN_IMPLEMENTATION.md` + `fabric_net/README.md`. |
 | `--routing_test` | `true` | bool | **true** = MPTD-PQS detection mode (no SDN routing pipeline) · **false** = legacy SDN-routing experiment. See §2 — this one changes a LOT. |
 | `--routing_algorithm` | `0` | int | (only used when `routing_test=false`) SDN link-discovery algorithm 0–5. See §2. |
 | `--architecture` | `0` | int | 0=centralized · 1=distributed · 2=hybrid (legacy routing layer). |
@@ -182,7 +182,7 @@ For the FYP detection/evaluation work you normally only vary these:
 - `--ablation_mode` (which variant) · `--attack_number` (which attack) ·
   `--attack_percentage` (intensity)
 - `--mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200` (SUMO map, supervisor spec: 200 veh + 64 RSU)
-- `--skip_blockchain=true` on HPC · `--simTime`
+- `--skip_blockchain=false` for the full blockchain run (HPC has Docker); `=true` only for sweeps / A5 · `--simTime`
 - `--rsu_seed` for reproducibility · `--trs_classical=1` only for the RQ5 PBPO baseline
 
 Leave `--routing_test=true`, and ignore `--routing_algorithm / --lambda / --qf /

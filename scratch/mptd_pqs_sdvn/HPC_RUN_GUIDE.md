@@ -31,7 +31,9 @@ export LD_LIBRARY_PATH=$PWD/build/lib:$HOME/.local/lib:$LD_LIBRARY_PATH
 
 - `--mobility_source=1` → drive node motion from the **SUMO trace** (the `.tcl`).
 - `--N_RSUs=64` → the **8×8 grid** layout (see §2).
-- `--skip_blockchain=true` → no Docker/Fabric needed (see §1).
+- `--skip_blockchain=true` → this is the **lightweight / sweep** path (no Fabric).
+  For the **full blockchain run** use `--skip_blockchain=false` and bring up the
+  Fabric network first — the HPC node has Docker + Explorer + IPFS (see §1b).
 
 Everything else is explained below.
 
@@ -64,16 +66,35 @@ ls $HOME/.local/include/ | grep -Ei "oqs|openfhe|onnxruntime"
 
 ### 1b. Docker / Hyperledger Fabric (the blockchain layer)
 
-The full pipeline brings up **Hyperledger Fabric in Docker**. Most HPC clusters
-**do not allow Docker** (rootless / Singularity only). So on HPC always run with:
+The full pipeline brings up **Hyperledger Fabric in Docker**, with **Hyperledger
+Explorer** (ledger UI) and **IPFS** (off-chain raw-beacon store) alongside.
+
+> **The MPTD-PQS HPC lab node HAS Docker + Explorer + IPFS installed and running.**
+> The full end-to-end blockchain run (SC-Trust / SC-Revoke / CP-Detect, RQ6
+> consensus) is therefore done **on the HPC node** — this is the live-run target.
+
+Bring the network up with the dynamic topology generator (one Fabric peer per
+RSU + 5 controller-orderers — see `fabric_net/README.md`):
+
+```bash
+cd scratch/mptd_pqs_sdvn/fabric_net
+./gen_network.sh all 64 5     # urban: 64 RSU peers + 5 orderers, full bring-up
+```
+
+Then run the simulation **with the blockchain enabled** (note `=false`):
 
 ```
---skip_blockchain=true
+--skip_blockchain=false
 ```
 
-This skips Fabric + the REST API and runs pure detection/mobility. The
-blockchain-dependent results (SC-Trust/SC-Revoke evidence, RQ6 consensus) must
-be reproduced on a machine where Docker works — **not** the HPC node.
+`--skip_blockchain=true` is still used for the **training sweeps and ablation A5**
+(`--ablation_mode=5`, blockchain isolation) where Fabric is intentionally bypassed
+to keep the detection/mobility path fast — but it is no longer forced on HPC.
+
+At shutdown the run writes a consolidated ledger snapshot to
+`analytics/results/blockchain_evidence.json` (registrations, trust scores, the
+revoke records = CRL, CP-Detect flags, and any controller reassignments). The same
+committed ledger is browsable live in Hyperledger Explorer.
 
 ### 1c. Python (for the B2/B3 baselines)
 
@@ -355,6 +376,7 @@ cluster.
 | Output | Path |
 |--------|------|
 | Per-beacon / relay logs | `analytics/results/*.csv` (B2/B3 read `beacon_log.csv`) |
+| On-chain evidence (full run) | `analytics/results/blockchain_evidence.json` — registrations, trust scores, revoke records (CRL), CP-Detect flags, controller reassignments |
 | Frozen baseline models | `models_ercan_b2/*.joblib`, `models_sharma_b3/*.joblib` |
 | Baseline predictions | `live_results/*.csv` |
 | Sweep metrics | `analytics/results/sweep/metrics_a{N}_p{P}_s{S}_m{M}.csv` |
@@ -372,7 +394,7 @@ These are auto-generated and **gitignored** — copy them off the node yourself.
 | `error while loading shared libraries: liboqs.so` at run | `LD_LIBRARY_PATH` not exported (§4) |
 | 0 beacons received | check `--mobility_source=1` is set and the `.tcl` + CSV use the same coordinate frame (they do by default) |
 | `[AI-INIT] ... NO` but you expected full mode | ONNX models missing (§1d) — A2/A3/Full invalid; A1/B1 still fine |
-| Fabric / Docker errors at start | you forgot `--skip_blockchain=true` |
+| Fabric / Docker errors at start | for a full run, bring the network up first (`fabric_net/gen_network.sh all 64 5`, §1b); for a sweep/A1 run, pass `--skip_blockchain=true` |
 | `beacon_log.csv not found` (B2/B3) | run the NS-3 sim first (§5 Step 1), run Python from the project root |
 | B2/B3 accuracy looks impossibly perfect | you trained and predicted on the *same* run — use different `--RngRun` for RUN A vs RUN B (§5) |
 | `Model not found: ..._kNN.joblib` (live_predict) | you skipped Step 3, or the `<attack_num> <attack_pct>` args don't match a trained scenario |
