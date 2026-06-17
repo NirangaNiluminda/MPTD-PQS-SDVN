@@ -171,6 +171,13 @@ func seedSubm(fl *fakeLedger, veh, epoch, rsu string, psi float64) {
 	fl.m[id] = b
 }
 
+func seedRSUTrust(fl *fakeLedger, rsu string, score float64) {
+	rec := RSUTrustScore{ID: "RSUTRUST_" + rsu, RSUID: rsu, TrustScore: score,
+		State: RSUStateTrusted}
+	b, _ := json.Marshal(rec)
+	fl.m["RSUTRUST_"+rsu] = b
+}
+
 func seedCSub(fl *fakeLedger, veh, ctrl, epoch string, phi float64) {
 	id := fmt.Sprintf("CSUBM_%s_%s", veh, epoch)
 	rec := ControllerSubmission{ID: id, ControllerID: ctrl, VehicleID: veh, Epoch: epoch, Phi: phi}
@@ -689,6 +696,11 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
 		seedTrust(fl, "VEH_1", 1.0)
+		// Witness RSUs must be registered+trusted: SCTrustFinalizeEpoch
+		// excludes non-trusted RSU submissions from the aggregate (§3.5.1).
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedReg(fl, "RSU_1", RoleRSU, pk)
+		seedReg(fl, "RSU_2", RoleRSU, pk)
 		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.6)
 		seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.4)
 		seedSubm(fl, "VEH_1", "E1", "RSU_2", 0.5) // mean = 0.5
@@ -726,6 +738,7 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 		seedNetCfg(fl, 4, 0.0, 0.5, 2, 0.5) // alpha=0 → τ = 1-meanPsi
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
 		seedTrust(fl, "VEH_1", 1.0)
+		seedReg(fl, "RSU_0", RoleRSU, pk) // trusted witness (§3.5.1)
 		sc := SmartContract{}
 
 		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // τ=0.2 <0.5
@@ -747,6 +760,7 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 		seedNetCfg(fl, 4, 0.0, 0.5, 2, 0.5)
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
 		seedTrust(fl, "VEH_1", 0.2)
+		seedReg(fl, "RSU_0", RoleRSU, pk) // trusted witness (§3.5.1)
 		fl.m["SCTRUST_VEH_1"] = func() []byte {
 			r := SCTrustScore{ID: "SCTRUST_VEH_1", VehicleID: "VEH_1", TrustScore: 0.2, ConsecutiveLowEpochs: 1}
 			b, _ := json.Marshal(r)
@@ -1104,6 +1118,122 @@ func TestRevokeReads(t *testing.T) {
 		ok(t, err)
 		if len(recs) != 1 {
 			t.Errorf("revoke records=%d want 1", len(recs))
+		}
+	})
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §3.5.1 — RSU dynamic trust lifecycle: demotion (TRUSTED→CLIENT), terminal
+// SC-Revoke after T_rev consecutive-low epochs, and the BFT floor guard hold.
+// ═════════════════════════════════════════════════════════════════════════════
+
+func TestSCRSUFinalizeEpoch(t *testing.T) {
+	_, pk := genID(t)
+
+	// findRSU returns the RSUTrustScore for rsu from a finalize result slice.
+	findRSU := func(out []*RSUTrustScore, rsu string) *RSUTrustScore {
+		for _, r := range out {
+			if r.RSUID == rsu {
+				return r
+			}
+		}
+		return nil
+	}
+
+	t.Run("demotion TRUSTED→CLIENT below tau_th", func(t *testing.T) {
+		ctx, fl := newCtx()
+		// f=(4-1)/3=1 → floor=4. Register 5 trusted RSUs so demoting one
+		// keeps |R_trusted|-1 = 4 ≥ floor (no floor-guard interference).
+		seedNetCfg(fl, 4, 0.0, 0.5, 3, 0.5) // alpha=0 → τ = 1-m_j
+		for i := 0; i < 5; i++ {
+			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		}
+		seedRSUTrust(fl, "RSU_0", 1.0)
+		// RSU_0 is the lone flagger of VEH_99 → quorum verdict q=0 disagrees
+		// with its flag → m_0=1 → τ=0 < 0.5 → demote.
+		seedSubm(fl, "VEH_99", "E1", "RSU_0", 0.9)
+		sc := SmartContract{}
+		out, err := sc.SCRSUFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		r0 := findRSU(out, "RSU_0")
+		if r0 == nil || r0.State != RSUStateClient {
+			t.Fatalf("RSU_0 state=%v want CLIENT", r0)
+		}
+		approx(t, r0.TrustScore, 0.0)
+		reg, err := sc.GetRegistration(ctx, "RSU_0")
+		ok(t, err)
+		if reg.RSUState != RSUStateClient {
+			t.Errorf("REG RSUState=%s want CLIENT", reg.RSUState)
+		}
+		if reg.Status != StatusActive {
+			t.Errorf("demoted RSU should stay ACTIVE, got %s", reg.Status)
+		}
+	})
+
+	t.Run("T_rev consecutive-low → SC-Revoke + status REVOKED", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.0, 0.5, 2, 0.5) // T_rev=2
+		for i := 0; i < 5; i++ {
+			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		}
+		seedRSUTrust(fl, "RSU_0", 1.0)
+		sc := SmartContract{}
+
+		seedSubm(fl, "VEH_99", "E1", "RSU_0", 0.9) // m=1 → τ=0, consec=1 → demote
+		_, err := sc.SCRSUFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		seedSubm(fl, "VEH_99", "E2", "RSU_0", 0.9) // consec=2 ≥ T_rev → revoke
+		out, err := sc.SCRSUFinalizeEpoch(ctx, "E2")
+		ok(t, err)
+		r0 := findRSU(out, "RSU_0")
+		if r0 == nil || r0.ConsecutiveLowEpochs < 2 {
+			t.Fatalf("RSU_0=%v want consec≥2", r0)
+		}
+		reg, err := sc.GetRegistration(ctx, "RSU_0")
+		ok(t, err)
+		if reg.Status != StatusRevoked {
+			t.Errorf("REG Status=%s want REVOKED", reg.Status)
+		}
+		isRev, err := sc.IsRevoked(ctx, "RSU_0")
+		ok(t, err)
+		if isRev != "true" {
+			t.Errorf("IsRevoked(RSU_0)=%s want true", isRev)
+		}
+		recs, err := sc.GetAllRevokeRecords(ctx)
+		ok(t, err)
+		found := false
+		for _, r := range recs {
+			if r.RSUID == "RSU_0" && r.Reason == "rsu_trust_decay" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no rsu_trust_decay revoke record for RSU_0 (%d recs)", len(recs))
+		}
+	})
+
+	t.Run("BFT floor guard holds demotion as probationary", func(t *testing.T) {
+		ctx, fl := newCtx()
+		// Register EXACTLY floor (4) trusted RSUs: demoting one would drop
+		// |R_trusted| to 3 < floor=4, so the guard holds RSU_0 TRUSTED.
+		seedNetCfg(fl, 4, 0.0, 0.5, 3, 0.5)
+		for i := 0; i < 4; i++ {
+			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		}
+		seedRSUTrust(fl, "RSU_0", 1.0)
+		seedSubm(fl, "VEH_99", "E1", "RSU_0", 0.9) // wants out, but floor blocks
+		sc := SmartContract{}
+		out, err := sc.SCRSUFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		r0 := findRSU(out, "RSU_0")
+		if r0 == nil || r0.State != RSUStateTrusted || !r0.Probationary {
+			t.Fatalf("RSU_0=%v want TRUSTED+probationary", r0)
+		}
+		reg, err := sc.GetRegistration(ctx, "RSU_0")
+		ok(t, err)
+		if reg.RSUState == RSUStateClient || reg.Status != StatusActive {
+			t.Errorf("floor-held RSU must stay TRUSTED+ACTIVE, got state=%s status=%s",
+				reg.RSUState, reg.Status)
 		}
 	})
 }
