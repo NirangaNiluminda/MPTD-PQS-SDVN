@@ -32,8 +32,10 @@ export LD_LIBRARY_PATH=$PWD/build/lib:$HOME/.local/lib:$LD_LIBRARY_PATH
 - `--mobility_source=1` → drive node motion from the **SUMO trace** (the `.tcl`).
 - `--N_RSUs=64` → the **8×8 grid** layout (see §2).
 - `--skip_blockchain=true` → this is the **lightweight / sweep** path (no Fabric).
-  For the **full blockchain run** use `--skip_blockchain=false` and bring up the
-  Fabric network first — the HPC node has Docker + Explorer + IPFS (see §1b).
+  For the **full blockchain run** use `--routing_algorithm=4 --skip_blockchain=false`
+  (BOTH required — `routing_algorithm=4` is the on-chain master switch; without it
+  the ledger stays empty) and bring up the Fabric network first — the HPC node has
+  Docker + Explorer + IPFS (see §1b).
 
 Everything else is explained below.
 
@@ -81,11 +83,23 @@ cd scratch/mptd_pqs_sdvn/fabric_net
 ./gen_network.sh all 64 5     # urban: 64 RSU peers + 5 orderers, full bring-up
 ```
 
-Then run the simulation **with the blockchain enabled** (note `=false`):
+Then run the simulation **with the blockchain enabled**, passing BOTH on-chain
+flags (note `routing_algorithm=4` AND `skip_blockchain=false`):
 
 ```
---skip_blockchain=false
+--routing_algorithm=4 --skip_blockchain=false
 ```
+
+> ⛓️ **`--routing_algorithm=4` is mandatory for the live run.** It is the on-chain
+> master switch: `register_all_nodes()`, `initialize_blockchain()`, and the
+> controller/consortium SC-evidence submits are ALL gated on `routing_algorithm==4`
+> (`12_main.h:1594, 1713, 2071`), regardless of `routing_test`/`ablation_mode`. The
+> default `0` ("port-based") is a routing baseline that writes nothing on-chain, so
+> a run that forgets this flag completes normally but leaves `blockchain_evidence.json`
+> empty and adds no Explorer records. When the gen_network is already up,
+> `initialize_blockchain()` detects `peer0.rsu.example.com` and no-ops (it does not
+> rebuild the legacy test-network); registration flows through the gateway daemon
+> socket. See `FLAGS_REFERENCE.md` §2b.
 
 `--skip_blockchain=true` is still used for the **training sweeps and ablation A5**
 (`--ablation_mode=5`, blockchain isolation) where Fabric is intentionally bypassed
