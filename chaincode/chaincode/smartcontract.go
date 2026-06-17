@@ -459,11 +459,11 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 	}
 
 	// 5. Algorithm 7 line 6-8: 2f+1 BFT threshold (Eq 3.58 same constant).
-	cfg, err := s.GetNetworkConfig(ctx)
+	f, err := s.currentF(ctx)
 	if err != nil {
-		return fmt.Errorf("NetworkConfig: %v", err)
+		return fmt.Errorf("currentF: %v", err)
 	}
-	threshold := 2*fByzantine(cfg.NumRSUs) + 1
+	threshold := 2*f + 1
 	if validCount < threshold {
 		return fmt.Errorf("rejected: insufficient endorsements (got %d valid, need %d)",
 			validCount, threshold)
@@ -708,6 +708,25 @@ func (s *SmartContract) isTrustedRSU(ctx contractapi.TransactionContextInterface
 // in the same transaction are visible here, so a finalize loop that demotes RSUs
 // one at a time sees the shrinking count.
 func (s *SmartContract) countTrustedRSUs(ctx contractapi.TransactionContextInterface) (int, error) {
+	return s.countRSUs(ctx, true)
+}
+
+// registeredRSUMembership returns the live BFT membership size N: every
+// registered RSU that has not been permanently revoked (Status ACTIVE),
+// INCLUDING CLIENT-state RSUs — a demoted RSU is still a member; only SC-Revoke
+// removes it. This is the N that f = (N−1)/3 is derived from, so the fault bound
+// scales with the actual deployment (e.g. 64-RSU urban grid → f=21 vs 23-RSU
+// rural/highway line → f=7) instead of a fixed configured constant. Keeping
+// CLIENT RSUs in N means demotion does not lower f, so the 3f+1 floor retains
+// its meaning under demotion (only revocation reconfigures the membership).
+func (s *SmartContract) registeredRSUMembership(ctx contractapi.TransactionContextInterface) (int, error) {
+	return s.countRSUs(ctx, false)
+}
+
+// countRSUs scans REG_ and counts ACTIVE RSUs. If trustedOnly, restricts to the
+// trusted endorser set (RSUState empty or TRUSTED); otherwise counts all ACTIVE
+// members (incl. CLIENT). Same-transaction writes are visible.
+func (s *SmartContract) countRSUs(ctx contractapi.TransactionContextInterface, trustedOnly bool) (int, error) {
 	iter, err := ctx.GetStub().GetStateByRange("REG_", "REG_~")
 	if err != nil {
 		return 0, err
@@ -726,11 +745,25 @@ func (s *SmartContract) countTrustedRSUs(ctx contractapi.TransactionContextInter
 		if reg.Role != RoleRSU || reg.Status != StatusActive {
 			continue
 		}
-		if reg.RSUState == "" || reg.RSUState == RSUStateTrusted {
-			n++
+		if trustedOnly && !(reg.RSUState == "" || reg.RSUState == RSUStateTrusted) {
+			continue
 		}
+		n++
 	}
 	return n, nil
+}
+
+// currentF returns the live Byzantine fault bound f = (N−1)/3 derived from the
+// registered RSU membership (registeredRSUMembership). All BFT quorums
+// (SC-Register 2f+1, SC-Revoke 2f+1, CP-DETECT f+1, RSU floor 3f+1) use this so
+// the thresholds scale with the real deployment size rather than a hardcoded
+// count.
+func (s *SmartContract) currentF(ctx contractapi.TransactionContextInterface) (int, error) {
+	n, err := s.registeredRSUMembership(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return fByzantine(n), nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1292,7 +1325,11 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		}
 	}
 
-	implicitCleanVotes := cfg.NumRSUs - len(seenRSU)
+	membership, err := s.registeredRSUMembership(ctx)
+	if err != nil {
+		return nil, err
+	}
+	implicitCleanVotes := membership - len(seenRSU)
 	if implicitCleanVotes < 0 {
 		implicitCleanVotes = 0
 	}
@@ -1300,7 +1337,7 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		conflict += implicitCleanVotes
 	}
 
-	f := fByzantine(cfg.NumRSUs)
+	f := fByzantine(membership)
 	fP1 := f + 1
 	if conflict < fP1 {
 		return nil, nil
@@ -1423,11 +1460,6 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		return "", fmt.Errorf("rejected: invalid revoke vote signature for rsu %s", rsuID)
 	}
 
-	cfg, err := s.GetNetworkConfig(ctx)
-	if err != nil {
-		return "", err
-	}
-
 	voteID := fmt.Sprintf("VOTE_%s_%s", vehicleID, rsuID)
 	vote := RevokeVote{
 		ID:        voteID,
@@ -1477,7 +1509,10 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		seen[v.RSUID] = true
 	}
 	count := len(seen)
-	f := fByzantine(cfg.NumRSUs)
+	f, err := s.currentF(ctx)
+	if err != nil {
+		return "", err
+	}
 	threshold := 2*f + 1
 
 	revoked := false
@@ -1532,10 +1567,6 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 func (s *SmartContract) SCRevokeStatus(ctx contractapi.TransactionContextInterface,
 	vehicleID string) (string, error) {
 
-	cfg, err := s.GetNetworkConfig(ctx)
-	if err != nil {
-		return "", err
-	}
 	prefix := fmt.Sprintf("VOTE_%s_", vehicleID)
 	iter, err := ctx.GetStub().GetStateByRange(prefix, prefix+"~")
 	if err != nil {
@@ -1555,7 +1586,10 @@ func (s *SmartContract) SCRevokeStatus(ctx contractapi.TransactionContextInterfa
 		seen[v.RSUID] = true
 	}
 	isRev, _ := s.IsRevoked(ctx, vehicleID)
-	f := fByzantine(cfg.NumRSUs)
+	f, err := s.currentF(ctx)
+	if err != nil {
+		return "", err
+	}
 	threshold := 2*f + 1
 	return fmt.Sprintf(`{"votes":%d,"threshold":%d,"revoked":%s}`,
 		len(seen), threshold, isRev), nil
@@ -1633,7 +1667,11 @@ func (s *SmartContract) SCRSUFinalizeEpoch(ctx contractapi.TransactionContextInt
 	if err != nil {
 		return nil, fmt.Errorf("NetworkConfig: %v", err)
 	}
-	quorum := 2*fByzantine(cfg.NumRSUs) + 1
+	f, err := s.currentF(ctx)
+	if err != nil {
+		return nil, err
+	}
+	quorum := 2*f + 1
 
 	// Single pass over all submissions, filtered to this epoch. Keys are
 	// SUBM_<veh>_<epoch>_<rsu> (vehicle-first), so the epoch is not a
@@ -1761,7 +1799,11 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 	// transition resumes (ConsecutiveLowEpochs is preserved, not reset).
 	// Client-state RSUs are already outside R_trusted, so their revocation is
 	// never floor-blocked.
-	floor := 3*fByzantine(cfg.NumRSUs) + 1
+	f, err := s.currentF(ctx)
+	if err != nil {
+		return nil, err
+	}
+	floor := 3*f + 1
 	currentlyTrusted := reg.RSUState == "" || reg.RSUState == RSUStateTrusted
 	wantsOut := rec.ConsecutiveLowEpochs >= cfg.TRev || rec.TrustScore < cfg.TauThreshold
 	floorWouldBreak := false
