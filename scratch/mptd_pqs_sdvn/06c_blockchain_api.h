@@ -1033,6 +1033,75 @@ inline void CallSCRSUFinalizeEpochAsync(std::string epoch)
     mptd_fabric_invoke_async("SCRSUFinalizeEpoch", args);
 }
 
+// ── RsuTrustView / CallSCGetAllRSUTrustScores — live on-chain RSU trust read ──
+// Supports trust-ranked endorsing-peer selection (Sir's Task-4 revision,
+// 2026-06-16): rather than treating every RSU as an endorsing peer (expensive),
+// the registration/endorsement path draws its 2f+1 endorsers from the highest-
+// trust members of the on-chain trusted set R_trusted(t) (paper notation table;
+// endorser set = R_trusted(t)). This is a READ (EvaluateTransaction) — peer-
+// local, no orderer round-trip — so it is cheap enough for periodic (~1 Hz)
+// refresh. Returns one entry per registered RSU; `trusted` is false for
+// demoted CLIENT / revoked peers, which are excluded from selection.
+struct RsuTrustView {
+    uint32_t rsu_idx;   // parsed from "RSU_<idx>"
+    double   trust;     // τ_{r_j} ∈ [0,1]
+    bool     trusted;   // State == "TRUSTED" (CLIENT/REVOKED → false)
+};
+
+// Pull the quoted string value of `key` starting at/after `from` in `s`.
+// Returns "" when not found. Minimal scanner (no JSON lib in tree, matching the
+// hand-parse style of mptd_refresh_active_controller).
+inline std::string mptd_json_str_after(const std::string& s,
+                                        const std::string& key, size_t from)
+{
+    auto k = s.find(key, from);
+    if (k == std::string::npos) return "";
+    auto q1 = s.find('"', k + key.size());
+    if (q1 == std::string::npos) return "";
+    auto q2 = s.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return s.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Pull the numeric value of `key` (e.g. "TrustScore":) at/after `from`.
+inline double mptd_json_num_after(const std::string& s,
+                                  const std::string& key, size_t from)
+{
+    auto k = s.find(key, from);
+    if (k == std::string::npos) return 0.0;
+    size_t p = k + key.size();
+    return std::strtod(s.c_str() + p, nullptr);
+}
+
+inline std::vector<RsuTrustView> CallSCGetAllRSUTrustScores()
+{
+    std::vector<RsuTrustView> out;
+    if (skip_blockchain) return out;
+    std::string js = mptd_fabric_invoke_sync("query", "GetAllRSUTrustScores", {});
+    if (js.empty() || js == "null" || js == "[]") return out;
+
+    // Chaincode marshals RSUTrustScore in field order: ID, RSUID, TrustScore,
+    // State, … — so for each "RSUID":"RSU_<idx>" the matching TrustScore/State
+    // are the next occurrences. Scan object-by-object on the RSUID anchor.
+    size_t pos = 0;
+    while (true) {
+        auto idAnchor = js.find("\"RSUID\":\"RSU_", pos);
+        if (idAnchor == std::string::npos) break;
+        std::string rsuId = mptd_json_str_after(js, "\"RSUID\":", idAnchor);
+        RsuTrustView v{};
+        // parse idx from "RSU_<idx>"
+        auto us = rsuId.rfind('_');
+        v.rsu_idx = (us != std::string::npos)
+                        ? (uint32_t)std::strtoul(rsuId.c_str() + us + 1, nullptr, 10)
+                        : 0;
+        v.trust   = mptd_json_num_after(js, "\"TrustScore\":", idAnchor);
+        v.trusted = (mptd_json_str_after(js, "\"State\":", idAnchor) == "TRUSTED");
+        out.push_back(v);
+        pos = idAnchor + 12;   // advance past this anchor
+    }
+    return out;
+}
+
 // ── CallSCRevokeVote — Eq 3.58 BFT 2f+1 RSU vote ─────────────────────────────
 // One call per RSU that wishes to vote for revoking `vehicleID`. The
 // chaincode commits the immutable SCREVOKE_ record + emits "SCRevoke" event
