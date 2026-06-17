@@ -127,29 +127,23 @@ defined the trust EMA only for vehicles and controllers. Each RSU carries
   `τ_th` for `T_rev` consecutive epochs → terminal `SC-Revoke` (`SCREVOKE_<rsu>`,
   `Status → REVOKED`, event `RSURevoke`). Demote/promote emit `RSUDemoted` /
   `RSUPromoted`.
-- **Dynamic fault bound `f`** — `f = (N−1)/3` is derived from the **live
-  registered RSU membership** `N` (`registeredRSUMembership()` / `currentF()`),
-  not a hardcoded constant, so every BFT quorum scales with the actual
-  deployment: 64-RSU urban grid → `f=21`, 23-RSU rural/highway line → `f=7`.
-  `N` counts every `ACTIVE` (non-revoked) RSU **including `CLIENT`-state**
-  ones — a demoted RSU is still a member; only `SC-Revoke` reconfigures the
-  membership. This keeps `f` (and the `3f+1` floor) stable under demotion so
-  the floor retains its meaning. All of SC-Register `2f+1`, SC-Revoke `2f+1`,
-  CP-DETECT `f+1`, and the RSU floor `3f+1` now read this one live `f`.
 - **BFT floor guard** (paper §3.5.1, `|R_trusted(t)| ≥ 3f+1` at all times) —
   a demotion/revocation that would drop the trusted-RSU count below `3f+1`
-  is blocked: the RSU is retained as a **probationary** `TRUSTED` member
-  (`Probationary=true`, event `RSUProbationHold`) so it keeps its quorum
-  weight. `ConsecutiveLowEpochs` is preserved (not reset), so the pending
-  transition resumes once a replacement registers and lifts the count back
-  above the floor. `CLIENT` RSUs are already outside `R_trusted`, so their
+  is blocked: the RSU is retained as a **probationary**
+  `TRUSTED` member (`Probationary=true`, event `RSUProbationHold`) so it keeps
+  its quorum weight. `ConsecutiveLowEpochs` is preserved (not reset), so the
+  pending transition resumes once a replacement registers and lifts the count
+  back above the floor. `CLIENT` RSUs are already outside `R_trusted`, so their
   revocation is never floor-blocked. `countTrustedRSUs()` supplies the live
-  trusted count (same-transaction writes are visible, so a finalize loop that
-  demotes RSUs one at a time sees the shrinking set). **Note:** with the tight
-  bound `f = (N−1)/3`, for `N ≡ 1 (mod 3)` (e.g. the 64-RSU grid, `f=21`,
-  `3f+1=64`) the floor equals `N`, so zero demotions can commit until a fresh
-  RSU is registered/endorsed — inherent to a zero-slack trusted set. Non-`3k+1`
-  populations (e.g. rural `N=23`, `3f+1=22`) carry slack and demote normally.
+  count (same-transaction writes are visible, so a finalize loop that demotes
+  RSUs one at a time sees the shrinking set). **Fault bound `f` is FIXED at 1**
+  by framework design (paper `tab:set-blockchain`: `f=1`, `2f+1=3`, `n=4` ring),
+  so the floor is a constant `3f+1 = 4` in **every** deployment. The 64/44/23-RSU
+  grids (urban/rural/highway) are *mobility-coverage* topology, **not** the
+  consensus committee size — `f` does not scale with the grid. A constant floor
+  of 4 leaves ample slack against demotions in all grids, and keeps SC-Revoke's
+  `2f+1 = 3` trajectory-witness requirement reachable (a vehicle does contact 3
+  RSUs along its path within a window; it would never contact a grid-sized 43).
 - **`SCRSUFinalizeEpoch(epoch)`** — channel-wide, one call per epoch; rebuilds
   `q_i` + `m_j` from the on-chain `SUBM_*` set and applies the lifecycle to every
   RSU. Idempotent over the epoch. Reads: `GetRSUTrustScore`,
