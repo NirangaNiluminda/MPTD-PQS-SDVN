@@ -155,6 +155,7 @@ type RSUTrustScore struct {
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
+	Probationary         bool    `json:"Probationary,omitempty"` // held TRUSTED by the BFT floor guard despite low trust (paper §3.5.1)
 	UpdatedAt            string  `json:"UpdatedAt"`
 }
 
@@ -699,6 +700,37 @@ func (s *SmartContract) isTrustedRSU(ctx contractapi.TransactionContextInterface
 		return false
 	}
 	return reg.RSUState == "" || reg.RSUState == RSUStateTrusted
+}
+
+// countTrustedRSUs returns |R_trusted(t)|: the number of ACTIVE RSUs currently in
+// the trusted endorser set (RSUState empty or TRUSTED). Used by the BFT floor
+// guard (paper §3.5.1: |R_trusted(t)| ≥ 3f+1 at all times). Writes made earlier
+// in the same transaction are visible here, so a finalize loop that demotes RSUs
+// one at a time sees the shrinking count.
+func (s *SmartContract) countTrustedRSUs(ctx contractapi.TransactionContextInterface) (int, error) {
+	iter, err := ctx.GetStub().GetStateByRange("REG_", "REG_~")
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+	n := 0
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return 0, e
+		}
+		var reg RegistrationRecord
+		if e := json.Unmarshal(qr.Value, &reg); e != nil {
+			continue // non-registration value under REG_ range — skip
+		}
+		if reg.Role != RoleRSU || reg.Status != StatusActive {
+			continue
+		}
+		if reg.RSUState == "" || reg.RSUState == RSUStateTrusted {
+			n++
+		}
+	}
+	return n, nil
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1720,10 +1752,44 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 		rec.ConsecutiveLowEpochs = 0
 	}
 
+	// BFT floor guard (paper §3.5.1): |R_trusted(t)| ≥ 3f+1 must hold at all
+	// times. A transition OUT of the trusted set (demotion or revocation of a
+	// currently-trusted RSU) is blocked when it would drop the trusted count
+	// below the floor; the RSU is instead retained as a probationary TRUSTED
+	// member — keeping its quorum weight — until a replacement registers and
+	// lifts the count back above the floor, at which point the pending
+	// transition resumes (ConsecutiveLowEpochs is preserved, not reset).
+	// Client-state RSUs are already outside R_trusted, so their revocation is
+	// never floor-blocked.
+	floor := 3*fByzantine(cfg.NumRSUs) + 1
+	currentlyTrusted := reg.RSUState == "" || reg.RSUState == RSUStateTrusted
+	wantsOut := rec.ConsecutiveLowEpochs >= cfg.TRev || rec.TrustScore < cfg.TauThreshold
+	floorWouldBreak := false
+	if wantsOut && currentlyTrusted {
+		nTrusted, e := s.countTrustedRSUs(ctx)
+		if e != nil {
+			return nil, e
+		}
+		if nTrusted-1 < floor {
+			floorWouldBreak = true
+		}
+	}
+
 	// State machine. Persistent low trust → terminal SC-Revoke; otherwise
-	// demote/promote across the TRUSTED↔CLIENT boundary at τ_th.
+	// demote/promote across the TRUSTED↔CLIENT boundary at τ_th. The floor
+	// guard takes precedence over both demotion and revocation.
 	switch {
+	case floorWouldBreak:
+		rec.State = RSUStateTrusted
+		reg.RSUState = RSUStateTrusted
+		if !rec.Probationary {
+			rec.Probationary = true
+			ctx.GetStub().SetEvent("RSUProbationHold", []byte(fmt.Sprintf(
+				`{"rsuID":"%s","trust":%f,"consec":%d,"floor":%d,"epoch":"%s"}`,
+				rsuID, rec.TrustScore, rec.ConsecutiveLowEpochs, floor, epoch)))
+		}
 	case rec.ConsecutiveLowEpochs >= cfg.TRev:
+		rec.Probationary = false
 		rec.State = RSUStateClient
 		reg.RSUState = RSUStateClient
 		reg.Status = StatusRevoked
@@ -1744,6 +1810,7 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 			`{"rsuID":"%s","trust":%f,"consec":%d,"trev":%d}`,
 			rsuID, rec.TrustScore, rec.ConsecutiveLowEpochs, cfg.TRev)))
 	case rec.TrustScore < cfg.TauThreshold:
+		rec.Probationary = false
 		if rec.State != RSUStateClient {
 			rec.State = RSUStateClient
 			reg.RSUState = RSUStateClient
@@ -1752,6 +1819,7 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 				rsuID, rec.TrustScore, mj, epoch)))
 		}
 	default:
+		rec.Probationary = false
 		if rec.State == RSUStateClient {
 			rec.State = RSUStateTrusted
 			reg.RSUState = RSUStateTrusted

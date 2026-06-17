@@ -111,7 +111,7 @@ func loadConfig() config {
 	// Allowlist is comma-separated; defaults cover every event the chaincode
 	// currently emits. Override via FABRIC_GW_EVENTS_ALLOW="SCRevoke" etc.
 	allowRaw := envOr("FABRIC_GW_EVENTS_ALLOW",
-		"SCRevoke,TrustLow,CPDetectFlag,ControllerReassign,RSURevoke,RSUDemoted,RSUPromoted")
+		"SCRevoke,TrustLow,CPDetectFlag,ControllerReassign,RSURevoke,RSUDemoted,RSUPromoted,RSUProbationHold")
 	allow := []string{}
 	for _, s := range splitCSV(allowRaw) {
 		if s != "" {

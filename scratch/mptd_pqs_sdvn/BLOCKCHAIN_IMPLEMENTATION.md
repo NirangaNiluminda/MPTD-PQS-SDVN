@@ -127,6 +127,19 @@ defined the trust EMA only for vehicles and controllers. Each RSU carries
   `τ_th` for `T_rev` consecutive epochs → terminal `SC-Revoke` (`SCREVOKE_<rsu>`,
   `Status → REVOKED`, event `RSURevoke`). Demote/promote emit `RSUDemoted` /
   `RSUPromoted`.
+- **BFT floor guard** (paper §3.5.1, `|R_trusted(t)| ≥ 3f+1` at all times) —
+  a demotion/revocation that would drop the trusted-RSU count below `3f+1`
+  (`f = (N−1)/3`) is blocked: the RSU is retained as a **probationary**
+  `TRUSTED` member (`Probationary=true`, event `RSUProbationHold`) so it keeps
+  its quorum weight. `ConsecutiveLowEpochs` is preserved (not reset), so the
+  pending transition resumes once a replacement registers and lifts the count
+  back above the floor. `CLIENT` RSUs are already outside `R_trusted`, so their
+  revocation is never floor-blocked. `countTrustedRSUs()` supplies the live
+  count (same-transaction writes are visible, so a finalize loop that demotes
+  RSUs one at a time sees the shrinking set). **Note:** with the tight BFT
+  bound `f = (N−1)/3`, for `N ≡ 1 (mod 3)` (e.g. the 64-RSU grid, `f=21`,
+  `3f+1=64`) the floor equals `N`, so no demotion can commit until a fresh RSU
+  is registered/endorsed — by design for a zero-slack trusted set.
 - **`SCRSUFinalizeEpoch(epoch)`** — channel-wide, one call per epoch; rebuilds
   `q_i` + `m_j` from the on-chain `SUBM_*` set and applies the lifecycle to every
   RSU. Idempotent over the epoch. Reads: `GetRSUTrustScore`,
