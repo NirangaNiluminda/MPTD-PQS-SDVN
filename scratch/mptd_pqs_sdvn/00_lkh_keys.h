@@ -797,7 +797,7 @@ static bool lkh_verify_beacon_hmac(int veh_idx,
 
 // ── Convenience: veh_idx from NS-3 node ID ───────────────────────────────────
 static inline int lkh_veh_idx(uint32_t nid) {
-    return (nid >= 2) ? (int)(nid - 2) : -1;
+    return (g_first_vehicle_node_id > 0 && nid >= g_first_vehicle_node_id) ? (int)(nid - g_first_vehicle_node_id) : -1;
 }
 
 // ── Master init (call once from 12_main.h before Simulator::Run) ─────────────

@@ -1932,7 +1932,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 // CP-DETECT exclusion the chaincode reassigns
                                 // the head of C_trusted and a periodic
                                 // mptd_refresh_active_controller() advances this.
-                                const uint32_t controllerID = g_active_controller_idx;
+                                const uint32_t controllerID = node_controller_ID[vid_i];
 
                                 CallSCControllerSubmitEvidence(
                                     vid_i, controllerID, ctrl_epoch,

@@ -38,7 +38,9 @@
 #include <cstdio>      // snprintf for \uXXXX JSON escape
 #include <mutex>       // once-flag for libcurl global init + warn-once
 #include <atomic>      // ipfs_disabled latch
+#if __has_include(<curl/curl.h>)
 #include <curl/curl.h> // TASK ①-E: kubo HTTP API client for h(b_i(t)) CID
+#endif
 
 // NS-3 → Fabric Gateway daemon over AF_UNIX. A single-line JSON write to a
 // long-lived Go daemon that holds a persistent gRPC Gateway connection to the
@@ -463,11 +465,12 @@ static inline bool mptd_fabric_drain_events(std::vector<MptdFabricEvent>& out)
 // orderer round-trip (paper Invariant 3: the lightweight beacon path must
 // stay under T_b = 100 ms).
 static inline void mptd_fabric_invoke_async(
-    const std::string& fn, const std::vector<std::string>& args)
+    const std::string& fn, const std::vector<std::string>& args,
+    const std::string& identity = "")
 {
     std::string ignored;
     mptd_fabric_call_socket("invoke", fn, args,
-                            /*fire_and_forget=*/true, ignored);
+                            /*fire_and_forget=*/true, ignored, identity);
 }
 
 // ── Sync fabric_invoke (waits for endorsement + commit, returns payload) ─────
@@ -478,11 +481,12 @@ static inline void mptd_fabric_invoke_async(
 static inline std::string mptd_fabric_invoke_sync(
     const std::string& action,
     const std::string& fn,
-    const std::vector<std::string>& args)
+    const std::vector<std::string>& args,
+    const std::string& identity = "")
 {
     std::string payload;
     mptd_fabric_call_socket(action, fn, args,
-                            /*fire_and_forget=*/false, payload);
+                            /*fire_and_forget=*/false, payload, identity);
     return payload;
 }
 
@@ -512,11 +516,13 @@ static std::atomic<bool> g_ipfs_disabled{false};   // sticky on first failure
 static std::once_flag    g_ipfs_warn_once;
 
 static inline void mptd_curl_global_init_once() {
+#if __has_include(<curl/curl.h>)
     if (g_curl_inited.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(g_curl_init_mu);
     if (g_curl_inited.load(std::memory_order_relaxed)) return;
     curl_global_init(CURL_GLOBAL_DEFAULT);
     g_curl_inited.store(true, std::memory_order_release);
+#endif
 }
 
 // ── IPFS endpoint resolver (env override; default = local kubo) ──────────────
@@ -530,12 +536,14 @@ static inline const std::string& mptd_ipfs_endpoint() {
     return ep;
 }
 
+#if __has_include(<curl/curl.h>)
 // libcurl write callback — append response body into the std::string userp
 static size_t mptd_curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userp) {
     std::string* buf = static_cast<std::string*>(userp);
     buf->append(ptr, size * nmemb);
     return size * nmemb;
 }
+#endif
 
 // Minimal JSON-string field extractor — no full parser dependency.
 // Looks for `"key":"<value>"` and returns the value (no escape unwinding —
@@ -563,6 +571,7 @@ static inline bool mptd_json_field(const std::string& json,
 static inline bool mptd_ipfs_add(const std::string& payload,
                                  std::string& out_cid)
 {
+#if __has_include(<curl/curl.h>)
     if (g_ipfs_disabled.load(std::memory_order_acquire)) return false;
     mptd_curl_global_init_once();
 
@@ -621,6 +630,11 @@ static inline bool mptd_ipfs_add(const std::string& payload,
     }
     out_cid.swap(cid);
     return true;
+#else
+    (void)payload;
+    (void)out_cid;
+    return false;
+#endif
 }
 
 // ── Beacon hash h(b_i(t)) — Eq 3.56 commitment ───────────────────────────────
@@ -934,7 +948,7 @@ inline void CallSCControllerSubmitEvidence(
     std::vector<std::string> args = {
         vehId, ctrlId, epoch, phiStr, beaconHash, sig
     };
-    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args);
+    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args, "ctrl" + std::to_string(controllerID));
 }
 
 // ── CallSCTrustFinalizeEpoch — Eq 3.55 EMA + T_rev gate ──────────────────────
@@ -982,7 +996,7 @@ inline std::string CallCPDetectCheck(
     std::vector<std::string> args = {
         MakeVehId(vehicleID), epoch
     };
-    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args);
+    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args, "ctrl" + std::to_string(node_controller_ID[vehicleID]));
 }
 
 // ── CallCPDetectCheckAsync — fire-and-forget variant ─────────────────────────
@@ -1002,7 +1016,7 @@ inline void CallCPDetectCheckAsync(
     std::vector<std::string> args = {
         MakeVehId(vehicleID), epoch
     };
-    mptd_fabric_invoke_async("CPDetectCheck", args);
+    mptd_fabric_invoke_async("CPDetectCheck", args, "ctrl" + std::to_string(node_controller_ID[vehicleID]));
 }
 
 // ── CallSCRSUFinalizeEpoch — RSU SC-Trust EMA (Eq rsu_trust / rsu_misbehave) ──

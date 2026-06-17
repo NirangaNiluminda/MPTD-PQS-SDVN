@@ -56,7 +56,7 @@
 // The physical NS-3 controller_Node remains a single sim-only relay (CLAUDE.md
 // known deviation); the controller IDENTITY it submits under is the chain-
 // authoritative active controller (see node-side active-controller tracking).
-static constexpr uint32_t N_Controllers = 5;
+
 
 // ── initialize_blockchain() — start Hyperledger Fabric (§3.3.4) ──────────────
 void initialize_blockchain()

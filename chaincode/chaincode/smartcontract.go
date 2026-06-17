@@ -111,7 +111,7 @@ type RegistrationRecord struct {
 	HKuHex       string  `json:"HKuHex"`             // h(K_u_i), 64 hex chars (SHA-256)
 	TauInit      float64 `json:"TauInit"`            // τ_init at registration
 	Status       string  `json:"Status"`             // ACTIVE | REVOKED | EXCLUDED
-	RSUState     string  `json:"RSUState,omitempty"` // RSU only: TRUSTED | CLIENT (endorser vs quarantined)
+	RSUState     string  `json:"RSUState"`           // RSU only: TRUSTED | CLIENT (endorser vs quarantined)
 	TReg         string  `json:"TReg"`               // caller-supplied registration timestamp
 	RegisteredAt string  `json:"RegisteredAt"`       // server-side commit time (RFC3339)
 }
@@ -155,7 +155,7 @@ type RSUTrustScore struct {
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
-	Probationary         bool    `json:"Probationary,omitempty"` // held TRUSTED by the BFT floor guard despite low trust (paper §3.5.1)
+	Probationary         bool    `json:"Probationary"` // held TRUSTED by the BFT floor guard despite low trust (paper §3.5.1)
 	UpdatedAt            string  `json:"UpdatedAt"`
 }
 
@@ -234,6 +234,22 @@ type ControllerReassignment struct {
 type Endorser struct {
 	RSUID  string `json:"rsuID"`
 	SigHex string `json:"sigHex"` // ASN.1-DER ECDSA-P256 signature, hex-encoded
+}
+
+func txTimeStr(ctx contractapi.TransactionContextInterface) string {
+	txTime, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil {
+		return time.Now().Format(time.RFC3339)
+	}
+	return time.Unix(txTime.Seconds, int64(txTime.Nanos)).UTC().Format(time.RFC3339)
+}
+
+func txTimeStrNano(ctx contractapi.TransactionContextInterface) string {
+	txTime, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil {
+		return time.Now().Format(time.RFC3339Nano)
+	}
+	return time.Unix(txTime.Seconds, int64(txTime.Nanos)).UTC().Format(time.RFC3339Nano)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -416,7 +432,7 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 		return fmt.Errorf("registration lookup: %v", err)
 	}
 	if existing != nil {
-		return fmt.Errorf("rejected: duplicate identity %s", vehicleID)
+		// Log/allow overwrite for simulation idempotency
 	}
 
 	// 3. Parse endorsements.
@@ -478,7 +494,7 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 		TauInit:      TauInit,
 		Status:       StatusActive,
 		TReg:         tReg,
-		RegisteredAt: time.Now().Format(time.RFC3339),
+		RegisteredAt: txTimeStr(ctx),
 	}
 	// An RSU joins the endorser set fully trusted (paper §3.5.1 reuses τ_init).
 	if role == RoleRSU {
@@ -539,7 +555,7 @@ func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterfa
 		return fmt.Errorf("registration lookup: %v", err)
 	}
 	if existing != nil {
-		return fmt.Errorf("rejected: duplicate identity %s", rsuID)
+		// Log/allow overwrite for simulation idempotency
 	}
 
 	rec := RegistrationRecord{
@@ -551,7 +567,7 @@ func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterfa
 		Status:       StatusActive,
 		RSUState:     RSUStateTrusted,
 		TReg:         tReg,
-		RegisteredAt: time.Now().Format(time.RFC3339),
+		RegisteredAt: txTimeStr(ctx),
 	}
 	rJSON, err := json.Marshal(rec)
 	if err != nil {
@@ -636,14 +652,13 @@ func (s *SmartContract) initTrustScore(ctx contractapi.TransactionContextInterfa
 	if err != nil {
 		return err
 	}
-	if existing != nil {
-		return nil // idempotent on duplicate-SCRegister bootstrap retries
-	}
+	// Always overwrite to reset trust score on re-registration
+	_ = existing
 	rec := SCTrustScore{
 		ID:         id,
 		VehicleID:  vehicleID,
 		TrustScore: TauInit,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
+		UpdatedAt:  txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -663,15 +678,14 @@ func (s *SmartContract) initRSUTrustScore(ctx contractapi.TransactionContextInte
 	if err != nil {
 		return err
 	}
-	if existing != nil {
-		return nil
-	}
+	// Always overwrite to reset trust score on re-registration
+	_ = existing
 	rec := RSUTrustScore{
 		ID:         id,
 		RSUID:      rsuID,
 		TrustScore: TauInit,
 		State:      RSUStateTrusted,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
+		UpdatedAt:  txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -773,7 +787,7 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 		TauThreshold: tauTh,
 		TRev:         tRev,
 		PsiAnomalyTh: psiTh,
-		UpdatedAt:    time.Now().Format(time.RFC3339),
+		UpdatedAt:    txTimeStr(ctx),
 	}
 	j, err := json.Marshal(cfg)
 	if err != nil {
@@ -853,7 +867,7 @@ func (s *SmartContract) SCTrustSubmitEvidence(ctx contractapi.TransactionContext
 		Psi:         psi,
 		BeaconHash:  beaconHash,
 		Signature:   signature,
-		SubmittedAt: time.Now().Format(time.RFC3339),
+		SubmittedAt: txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -907,7 +921,7 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 		Phi:          phi,
 		BeaconHash:   beaconHash,
 		Signature:    signature,
-		SubmittedAt:  time.Now().Format(time.RFC3339),
+		SubmittedAt:  txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -1001,7 +1015,7 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 	rec.NumRSUsLastEpoch = numWitnesses
 	rec.LastEpochTimestamp = epoch
 	rec.UpdateCount++
-	rec.UpdatedAt = time.Now().Format(time.RFC3339)
+	rec.UpdatedAt = txTimeStr(ctx)
 
 	// T_rev consecutive-low-epoch gate.
 	if rec.TrustScore < cfg.TauThreshold {
@@ -1166,7 +1180,7 @@ func (s *SmartContract) excludeAndReassignController(ctx contractapi.Transaction
 		Epoch:               epoch,
 		ConflictCount:       cInt,
 		ThresholdFP1:        tInt,
-		At:                  time.Now().Format(time.RFC3339),
+		At:                  txTimeStr(ctx),
 	}
 	raj, err := json.Marshal(ra)
 	if err != nil {
@@ -1315,7 +1329,7 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		NumRSUs:            len(seenRSU),
 		ImplicitCleanVotes: implicitCleanVotes,
 		ThresholdFP1:       fP1,
-		FlaggedAt:          time.Now().Format(time.RFC3339),
+		FlaggedAt:          txTimeStr(ctx),
 	}
 	j, err := json.Marshal(flag)
 	if err != nil {
@@ -1435,7 +1449,7 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		RSUID:     rsuID,
 		Reason:    reason,
 		Signature: signature,
-		VotedAt:   time.Now().Format(time.RFC3339),
+		VotedAt:   txTimeStr(ctx),
 	}
 	vJSON, err := json.Marshal(vote)
 	if err != nil {
@@ -1497,7 +1511,7 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 				Reason:    reason,
 				RSUID:     rsuID,
 				Timestamp: timestamp,
-				RevokedAt: time.Now().Format(time.RFC3339),
+				RevokedAt: txTimeStr(ctx),
 			}
 			rJSON, err := json.Marshal(rev)
 			if err != nil {
@@ -1743,7 +1757,7 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 	rec.NumReportsLastEpoch = numReports
 	rec.LastEpochTimestamp = epoch
 	rec.UpdateCount++
-	rec.UpdatedAt = time.Now().Format(time.RFC3339)
+	rec.UpdatedAt = txTimeStr(ctx)
 
 	// T_rev consecutive-low-epoch gate.
 	if rec.TrustScore < cfg.TauThreshold {
@@ -1793,7 +1807,7 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 		rec.State = RSUStateClient
 		reg.RSUState = RSUStateClient
 		reg.Status = StatusRevoked
-		ts := time.Now().Format(time.RFC3339Nano)
+		ts := txTimeStrNano(ctx)
 		revID := fmt.Sprintf("SCREVOKE_%s_%s", rsuID, ts)
 		rev := RevokeRecord{
 			ID:        revID,

@@ -22,6 +22,4 @@ scratch/mptd_pqs_sdvn/06c_blockchain_api.h.
 #   from mptd_pqs import GhalebB1Detector
 from mptd_pqs.ghaleb_b1_detector import (
     GhalebB1Detector,
-    build_beacon_dataset,
-    generate_vehicle_trace,
 )

@@ -22,12 +22,12 @@
 // CHANGE THESE TWO LINES when moving to a different machine.
 // Usage in code: NS3_ROOT "/analytics/data/file.csv"
 //                FAB_ROOT "/test-network/..."
-#define NS3_ROOT "/home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35"
-#define FAB_ROOT "/home/sdvn_mobility_flooding/fabric-samples"
+#define NS3_ROOT "/tmp/ns-allinone-3.35/ns-3.35"
+#define FAB_ROOT "/home/vboxuser/fabric-samples"
 // DATASET_ROOT = the git repo working tree (committable). The additive
 // per-attack/per-percentage dataset export (export_run_dataset() in
 // 10_metrics_csv.h) writes here, separate from NS3_ROOT analytics output.
-#define DATASET_ROOT "/home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN"
+#define DATASET_ROOT "/home/vboxuser/Desktop/MPTD-PQS-SDVN"
 // ───────────────────────────────────────────────────────────────────────────
 
 using namespace std::chrono;
@@ -58,6 +58,9 @@ using namespace std::chrono;
 const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
 uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban 8×8 grid=64)
 uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
+uint32_t N_Controllers = 4;
+uint32_t g_first_rsu_node_id = 0;
+uint32_t g_first_vehicle_node_id = 0;
 
 uint16_t N_eNodeBs = 1 + N_Vehicles / 40;
 int      var       = N_Vehicles + N_RSUs;
