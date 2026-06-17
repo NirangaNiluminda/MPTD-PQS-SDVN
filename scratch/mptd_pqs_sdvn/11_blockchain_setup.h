@@ -61,8 +61,22 @@ static constexpr uint32_t N_Controllers = 5;
 // ── initialize_blockchain() — start Hyperledger Fabric (§3.3.4) ──────────────
 void initialize_blockchain()
 {
-    cout << "Initializing blockchain (Hyperledger Fabric test-network with CCAAS)" << endl;
+    cout << "Initializing blockchain (Hyperledger Fabric)" << endl;
     const char* fabric_dir   = FAB_ROOT "/test-network";
+
+    // Prefer the dynamic paper-scale network (fabric_net/gen_network.sh: 64 RSU
+    // peers + 5 controller-orderers, org rsu.example.com). When it is already up,
+    // the gateway daemon is pointed at it and node registration / SC-invokes go
+    // through the AF_UNIX socket — there is NOTHING to bring up here, and shelling
+    // out to the legacy org1 test-network would build the WRONG network and clash
+    // on the shared ports. So detect peer0.rsu.example.com and no-op.
+    std::string gen_cmd = "docker ps --filter name=peer0.rsu.example.com --format '{{.Names}}' 2>/dev/null";
+    if (execCmd(gen_cmd).find("peer0.rsu.example.com") != std::string::npos) {
+        cout << "[BLOCKCHAIN] gen_network (peer0.rsu.example.com) already running — "
+                "using existing 64-RSU network; legacy test-network bring-up skipped." << endl;
+        cout << "[BLOCKCHAIN] Initialization complete." << endl;
+        return;
+    }
 
     std::string check_cmd = "docker ps --filter name=peer0.org1 --format '{{.Names}}' 2>/dev/null";
     std::string result    = execCmd(check_cmd);
