@@ -29,13 +29,19 @@ coverage**. Repo: `chaincode/chaincode/smartcontract.go` (chaincode) +
 
 ---
 
-## 3. Demotion — low trust → CLIENT (loses endorse/vote rights)
+## 3. Two-threshold three-state lifecycle (paper §3.5.1: τ_warn > τ_min)
+
+Trust dynamics use **two** thresholds exactly as the paper §3.5.1 prose describes:
+`τ_warn` (probation entry) and the stricter `τ_min` (demotion + revocation gate).
+Defaults: `τ_warn = 0.5`, `τ_min = 0.3` (config-tunable via `SCInitNetworkConfig`).
 
 | Claim | Where | Proof |
 |-------|-------|-------|
-| EMA trust update `τ = α·τ + (1-α)(1-mⱼ)` | `smartcontract.go:1751` (`updateRSUTrust`) | code |
-| `τ < τ_th` → **TRUSTED → CLIENT** demotion | `smartcontract.go:1818` (`case rec.TrustScore < cfg.TauThreshold`) emits `RSUDemoted` | **test:** `TestSCRSUFinalizeEpoch/demotion_TRUSTED→CLIENT_below_tau_th` ✅ |
-| Only **TRUSTED** RSUs count toward quorum | `smartcontract.go:692` `isTrustedRSU()`; used in revoke tally `1462-1477` | code + test |
+| EMA trust update `τ = α·τ + (1-α)(1-mⱼ)` | `smartcontract.go:1741` (`updateRSUTrust`) | code |
+| `τ_min ≤ τ < τ_warn` → **probationary** TRUSTED (still endorses, flagged) | `smartcontract.go:1844` (`case rec.TrustScore < cfg.TauWarn`) emits `RSUProbation` | **test:** `TestSCRSUFinalizeEpoch/probation_band_tau_min<=tau<tau_warn_stays_TRUSTED+flagged` ✅ |
+| `τ < τ_min` → **TRUSTED → CLIENT** demotion | `smartcontract.go:1834` (`case rec.TrustScore < cfg.TauMin`) emits `RSUDemoted` | **test:** `TestSCRSUFinalizeEpoch/demotion_TRUSTED→CLIENT_below_tau_th` ✅ |
+| Vehicle probation flag at `τ_warn`, T_rev gate at `τ_min` | `smartcontract.go:1023-1024` (`SCTrustFinalizeEpoch`) | **test:** `TestSCTrustFinalizeEpoch` ✅ |
+| Only **TRUSTED** RSUs count toward quorum | `smartcontract.go:692` `isTrustedRSU()`; used in revoke tally | code + test |
 
 ---
 
@@ -43,10 +49,10 @@ coverage**. Repo: `chaincode/chaincode/smartcontract.go` (chaincode) +
 
 | Claim | Where | Proof |
 |-------|-------|-------|
-| `T_rev` consecutive low epochs → **SC-Revoke**, status REVOKED | `smartcontract.go:1788` (`case rec.ConsecutiveLowEpochs >= cfg.TRev`) emits `RSURevoke` | **test:** `TestSCRSUFinalizeEpoch/T_rev_consecutive-low_→_SC-Revoke_+_status_REVOKED` ✅ |
+| `τ < τ_min` for `T_rev` consecutive epochs → **SC-Revoke**, status REVOKED | `smartcontract.go:1812` (`case rec.ConsecutiveLowEpochs >= cfg.TRev`) emits `RSURevoke` | **test:** `TestSCRSUFinalizeEpoch/T_rev_consecutive-low_→_SC-Revoke_+_status_REVOKED` ✅ |
 | Vehicle revoke needs **2f+1 distinct RSU votes** | `smartcontract.go:1480` `threshold := 2*f + 1`; tally counts only TRUSTED voters | **test:** `TestSCRevokeVote/2f+1_distinct_votes_revoke_+_flip_status` ✅ |
 | Revoked identity is excluded from all future submissions | `requireActive` gate; `TestSCRevokeVote/vote_after_revoke_bounces_on_gate` ✅ | test |
-| **BFT floor guard**: never drop trusted set below 3f+1 | `smartcontract.go:1769` (`floorWouldBreak`) holds demotion as probationary | **test:** `TestSCRSUFinalizeEpoch/BFT_floor_guard_holds_demotion_as_probationary` ✅ |
+| **BFT floor guard**: never drop trusted set below 3f+1 | `smartcontract.go:1793` (`floorWouldBreak`) holds the would-be demotion as TRUSTED (`FloorHeld`) | **test:** `TestSCRSUFinalizeEpoch/BFT_floor_guard_holds_demotion_as_probationary` ✅ |
 
 ---
 

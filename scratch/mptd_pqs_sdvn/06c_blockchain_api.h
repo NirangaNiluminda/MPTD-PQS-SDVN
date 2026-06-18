@@ -13,8 +13,8 @@
 //   02_config_globals.h (use_pq_crypto, routing_algorithm, ablation_mode, …)
 //
 // Public API — paper §3.5.5 aligned:
-//   CallSCInitNetworkConfig()        — one-time network bootstrap (numRSUs, α, τ_th,
-//                                       T_rev, ψ_th)
+//   CallSCInitNetworkConfig()        — one-time network bootstrap (numRSUs, α,
+//                                       τ_warn, τ_min, T_rev, ψ_th)
 //   CallSCBootstrapRSU()             — Algorithm 7 genesis path for first RSUs
 //                                       (admin-only; no endorsement)
 //   CallSCRegister()                 — Algorithm 7 SC-Register: vehicle/RSU/controller
@@ -775,28 +775,30 @@ inline void mptd_refresh_active_controller()
 }
 
 // ── CallSCInitNetworkConfig — Eq 3.55/3.58/3.59 bootstrap ────────────────────
-// One-time per-run setup. Persists the trust EMA smoothing α, trust threshold
-// τ_th, T_rev consecutive-epoch gate, anomaly threshold ψ_th, and RSU set
+// One-time per-run setup. Persists the trust EMA smoothing α, probation
+// threshold τ_warn, revocation/demotion threshold τ_min, T_rev consecutive-epoch
+// gate, anomaly threshold ψ_th, and RSU set
 // size |R| (needed by SCRevokeVote to compute 2f+1 and by CPDetectCheck to
 // compute f+1). The chaincode falls back to safe defaults if this is never
 // called, but calling it explicitly is required to reproduce the paper's
 // evaluation tables.
 inline void CallSCInitNetworkConfig(
-    uint32_t numRSUs, double alpha, double tauThreshold,
+    uint32_t numRSUs, double alpha, double tauWarn, double tauMin,
     uint32_t tRev, double psiAnomalyTh)
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
         std::to_string(numRSUs),
         std::to_string(alpha),
-        std::to_string(tauThreshold),
+        std::to_string(tauWarn),
+        std::to_string(tauMin),
         std::to_string(tRev),
         std::to_string(psiAnomalyTh)
     };
     // Synchronous: init must commit before any evidence submission.
     std::string out = mptd_fabric_invoke_sync("invoke", "SCInitNetworkConfig", args);
     std::cout << "[SC-INIT] numRSUs=" << numRSUs
-              << " α=" << alpha << " τ_th=" << tauThreshold
+              << " α=" << alpha << " τ_warn=" << tauWarn << " τ_min=" << tauMin
               << " T_rev=" << tRev << " ψ_th=" << psiAnomalyTh
               << " → " << out;
 }
