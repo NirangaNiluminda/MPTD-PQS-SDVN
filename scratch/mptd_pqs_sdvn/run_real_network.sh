@@ -45,12 +45,6 @@ for atk in 1 2 3 4 5 6 7; do
     s="a${atk}_p${pct}"
     log "===== ${s} : held-out sim (mode 1, RngRun=2) ====="
     if run_sim "$atk" "$pct" 1 2; then
-    REAL_DIR="$PROJ/real_data/a${atk}_p${pct}"
-      mkdir -p "$REAL_DIR"
-      cp "$RES/beacon_log.csv"       "$REAL_DIR/" 2>/dev/null || true
-      cp "$RES/metrics.csv"          "$REAL_DIR/" 2>/dev/null || true
-      cp "$RES/tp_s1_poison_log.csv" "$REAL_DIR/" 2>/dev/null || true
-      cp "$RES/vehicle_tx_log.csv"   "$REAL_DIR/" 2>/dev/null || true
       ( cd "$PROJ" && NS3="$NS3" python3 global_heldout_eval.py predict "$atk" "$pct" 2>&1 | tail -8 ) \
         || log "  WARN predict failed ${s}"
     else
@@ -63,9 +57,3 @@ log "regenerating per-attack chart..."
 ( cd "$PROJ" && NS3="$NS3" python3 global_heldout_eval.py plot 2>&1 | tail -40 )
 log "===== HELD-OUT per-attack scoring DONE ====="
 log "Chart: $LIVE/global_heldout_perattack.png"
-log "===== running eval_on_real_and_plot.py ====="
-( cd "$PROJ" && python3 eval_on_real_and_plot.py \
-    "$PROJ/real_data" \
-    "$PROJ/models_global" \
-    "$PROJ/real_plots" 2>&1 )
-log "Plots saved to $PROJ/real_plots"

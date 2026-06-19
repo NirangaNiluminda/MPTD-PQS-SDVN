@@ -187,7 +187,21 @@ def main():
         print(f"== {label}: scoring real data with frozen model ==")
         clf = joblib.load(mpath)
         all_rows += baseline_rows(label, mod, clf, root)
-    all_rows += sim_rows(root)
+    # all_rows += sim_rows(root)
+    sim = sim_rows(root)
+    if not sim:
+        # fallback: read B1 + MPTD-PQS from global_heldout_results.csv
+        heldout_csv = os.path.join(PROJECT, "live_results", "global_heldout_results.csv")
+        if os.path.isfile(heldout_csv):
+            print("  metrics.csv not found in real_data — using global_heldout_results.csv for B1+MPTD-PQS")
+            hdf = pd.read_csv(heldout_csv)
+            hdf = hdf[hdf["method"].isin(["B1 Ghaleb (rule)", "MPTD-PQS (ours)"])]
+            for _, r in hdf.iterrows():
+                for metric, col in [("MCC","MCC"),("FPR","FPR"),("PARR","PARR")]:
+                    sim.append(dict(method=r["method"], attack=int(r["attack"]),
+                                    pct=int(r["pct"]), metric=metric,
+                                    mean=float(r[col]), ci95=0.0))
+    all_rows += sim
 
     res = pd.DataFrame(all_rows)
     csv = os.path.join(out_dir, "results_real.csv")

@@ -22,7 +22,7 @@
 // CHANGE THESE TWO LINES when moving to a different machine.
 // Usage in code: NS3_ROOT "/analytics/data/file.csv"
 //                FAB_ROOT "/test-network/..."
-#define NS3_ROOT "/home/niranga/ns-allinone-3.35/ns-3.35"
+#define NS3_ROOT "/home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35"
 #define FAB_ROOT "/home/niranga/fabric-samples"
 // ───────────────────────────────────────────────────────────────────────────
 
