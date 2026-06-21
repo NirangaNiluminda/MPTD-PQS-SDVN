@@ -119,6 +119,12 @@ type RegistrationRecord struct {
 }
 
 // NetworkConfig — channel-wide BFT parameters. Bootstrap via SCInitNetworkConfig.
+// defaultTWindowSec — T_w, the sliding-window length (sim seconds) over which
+// distinct RSU revocation witnesses accumulate toward the 2f+1 quorum (Eq 3.65).
+// Tunable default: change here (or backfill via a future SCInitNetworkConfig arg)
+// once empirical tuning settles. Kept as a config field so it is per-channel state.
+const defaultTWindowSec = 30.0
+
 type NetworkConfig struct {
 	ID           string  `json:"ID"`           // always "NETCFG"
 	NumRSUs      int     `json:"NumRSUs"`      // |R_total|
@@ -127,6 +133,7 @@ type NetworkConfig struct {
 	TauMin       float64 `json:"TauMin"`       // τ_min — demotion + T_rev revocation gate
 	TRev         int     `json:"TRev"`         // T_rev consecutive-epoch gate
 	PsiAnomalyTh float64 `json:"PsiAnomalyTh"` // ψ_th — anomaly cutoff
+	TWindowSec   float64 `json:"TWindowSec"`   // T_w — revocation-vote sliding window (Eq 3.65)
 	UpdatedAt    string  `json:"UpdatedAt"`
 }
 
@@ -188,13 +195,19 @@ type ControllerSubmission struct {
 	SubmittedAt  string  `json:"SubmittedAt"`
 }
 
-// RevokeVote — per-RSU vote (BFT 2f+1, Eq 3.58). Key: VOTE_<vehicleID>_<rsuID>.
+// RevokeVote — per-RSU vote (BFT 2f+1, Eq 3.65). Key: VOTE_<vehicleID>_<rsuID>.
+// One slot per (vehicle,RSU): a re-vote overwrites, so each RSU is counted at most
+// once toward the quorum (paper §3.5.5: "each RSU is counted at most once").
 type RevokeVote struct {
 	ID        string `json:"ID"`
 	VehicleID string `json:"VehicleID"`
 	RSUID     string `json:"RSUID"`
 	Reason    string `json:"Reason"`
 	Signature string `json:"Signature"`
+	// Timestamp — SIM-time (seconds) at which the RSU cast the vote. This is the
+	// field the sliding-window quorum (Eq 3.65, [t-T_w, t]) filters on. VotedAt
+	// below is wall-clock and is for audit only — it cannot do sim-window math.
+	Timestamp string `json:"Timestamp"`
 	VotedAt   string `json:"VotedAt"`
 }
 
@@ -786,6 +799,7 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 		TauMin:       tauMin,
 		TRev:         tRev,
 		PsiAnomalyTh: psiTh,
+		TWindowSec:   defaultTWindowSec, // T_w (Eq 3.65); no init arg yet — tune via const
 		UpdatedAt:    time.Now().Format(time.RFC3339),
 	}
 	j, err := json.Marshal(cfg)
@@ -810,12 +824,19 @@ func (s *SmartContract) GetNetworkConfig(ctx contractapi.TransactionContextInter
 			TauMin:       0.3,
 			TRev:         3,
 			PsiAnomalyTh: 0.5,
+			TWindowSec:   defaultTWindowSec,
 			UpdatedAt:    "default",
 		}, nil
 	}
 	var c NetworkConfig
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, err
+	}
+	// Backfill T_w for NETCFG records written before the field existed (or by a
+	// 6-arg SCInitNetworkConfig that predates it) so the window filter never
+	// degenerates to a zero-length window that drops every prior witness.
+	if c.TWindowSec <= 0 {
+		c.TWindowSec = defaultTWindowSec
 	}
 	return &c, nil
 }
@@ -1452,6 +1473,7 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		RSUID:     rsuID,
 		Reason:    reason,
 		Signature: signature,
+		Timestamp: timestamp, // sim-time; the window quorum (Eq 3.65) filters on this
 		VotedAt:   time.Now().Format(time.RFC3339),
 	}
 	vJSON, err := json.Marshal(vote)
@@ -1472,10 +1494,28 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 	}
 	defer iter.Close()
 	seen := make(map[string]bool)
+	// ── Sliding-window quorum (Eq 3.65): |{r_j ∈ R_trusted : ∃ t′∈[t-T_w, t],
+	// ψ_j(t′)>ψ_th}| ≥ 2f+1. Only votes whose SIM-time falls within the last
+	// T_w seconds count toward the quorum, so 2f+1 independent witnesses must
+	// accumulate *within the window* rather than over the whole run. "now" is
+	// the sim-time of the vote being cast in this TX.
+	windowNow, nowErr := strconv.ParseFloat(timestamp, 64)
+	windowLow := windowNow - cfg.TWindowSec
+	inWindow := func(v RevokeVote) bool {
+		if nowErr != nil {
+			return true // can't parse "now" → don't drop votes (degrade safe)
+		}
+		vt, e := strconv.ParseFloat(v.Timestamp, 64)
+		if e != nil {
+			return true // legacy vote without sim-time → include (conservative)
+		}
+		return vt >= windowLow && vt <= windowNow
+	}
 	// Only TRUSTED RSU votes carry quorum weight toward 2f+1 (§3.5.1 RSU
 	// lifecycle). The vote of a demoted (CLIENT) voter is still stored above
 	// for audit, but excluded from the tally — so seed the voter only if it
 	// is currently trusted (compensating for read-after-write within the TX).
+	// The just-cast vote's timestamp == windowNow, so it is in-window by definition.
 	if s.isTrustedRSU(ctx, rsuID) {
 		seen[rsuID] = true
 	}
@@ -1490,6 +1530,9 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		}
 		if !s.isTrustedRSU(ctx, v.RSUID) {
 			continue
+		}
+		if !inWindow(v) {
+			continue // witness outside [t-T_w, t] — expired, no quorum weight
 		}
 		seen[v.RSUID] = true
 	}
@@ -1546,6 +1589,10 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 }
 
 // SCRevokeStatus — diagnostics: vote count + threshold + revoked flag.
+// NOTE: this reports the RAW lifetime distinct-vote count (un-windowed), since it
+// takes no sim-time reference. The authoritative revocation decision in
+// SCRevokeVote applies the T_w sliding window (Eq 3.65); this count may therefore
+// exceed the in-window quorum and is for audit/inspection only.
 func (s *SmartContract) SCRevokeStatus(ctx contractapi.TransactionContextInterface,
 	vehicleID string) (string, error) {
 

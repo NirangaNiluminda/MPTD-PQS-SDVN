@@ -1094,6 +1094,62 @@ func TestSCRevokeVote(t *testing.T) {
 	})
 }
 
+// TestSCRevokeWindow exercises the sliding-window quorum (Eq 3.65): only votes
+// whose SIM-time falls within the last T_w seconds (default 30 s, backfilled by
+// GetNetworkConfig) count toward 2f+1. A witness older than T_w expires and must
+// not contribute, even though it stays on the ledger for audit.
+func TestSCRevokeWindow(t *testing.T) {
+	_, pk := genID(t)
+
+	setup := func() (*mocks.TransactionContext, SmartContract, map[string]*ecdsa.PrivateKey) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5) // f=1 → 2f+1 = 3; T_w backfills to 30
+		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		privs := map[string]*ecdsa.PrivateKey{}
+		for i := 0; i < 4; i++ {
+			id := fmt.Sprintf("RSU_%d", i)
+			privs[id] = seedRegKeyed(t, fl, id, RoleRSU)
+		}
+		return ctx, SmartContract{}, privs
+	}
+
+	t.Run("three witnesses within T_w revoke", func(t *testing.T) {
+		ctx, sc, privs := setup()
+		ok2 := func(_ string, e error) { ok(t, e) }
+		ok2(castVote(t, sc, ctx, privs["RSU_0"], "VEH_1", "RSU_0", "tp", "0.0"))
+		ok2(castVote(t, sc, ctx, privs["RSU_1"], "VEH_1", "RSU_1", "tp", "10.0"))
+		res, err := castVote(t, sc, ctx, privs["RSU_2"], "VEH_1", "RSU_2", "tp", "20.0")
+		ok(t, err)
+		if !strings.Contains(res, `"revoked":true`) {
+			t.Fatalf("3 in-window witnesses should revoke; got %s", res)
+		}
+	})
+
+	t.Run("expired witness does not count toward quorum", func(t *testing.T) {
+		ctx, sc, privs := setup()
+		// RSU_0 witnesses at t=0, then a long gap. By the time RSU_1/RSU_2 vote
+		// near t=100-110, RSU_0's vote (t=0) is far outside [now-30, now] and is
+		// dropped — so only 2 in-window witnesses remain and revocation must NOT
+		// fire (proves the window, vs. the old "count all votes forever" bug).
+		castVote(t, sc, ctx, privs["RSU_0"], "VEH_1", "RSU_0", "tp", "0.0")
+		castVote(t, sc, ctx, privs["RSU_1"], "VEH_1", "RSU_1", "tp", "100.0")
+		res, err := castVote(t, sc, ctx, privs["RSU_2"], "VEH_1", "RSU_2", "tp", "110.0")
+		ok(t, err)
+		if !strings.Contains(res, `"revoked":false`) {
+			t.Fatalf("expired RSU_0 must not pad the quorum; got %s", res)
+		}
+		if v, _ := sc.IsRevoked(ctx, "VEH_1"); v != "false" {
+			t.Error("vehicle revoked despite only 2 in-window witnesses")
+		}
+		// A 3rd fresh witness inside the window now completes the quorum.
+		res, err = castVote(t, sc, ctx, privs["RSU_3"], "VEH_1", "RSU_3", "tp", "115.0")
+		ok(t, err)
+		if !strings.Contains(res, `"revoked":true`) {
+			t.Fatalf("3 in-window witnesses (RSU_1/2/3) should revoke; got %s", res)
+		}
+	})
+}
+
 func TestRevokeReads(t *testing.T) {
 	_, pk := genID(t)
 	ctx, fl := newCtx()
