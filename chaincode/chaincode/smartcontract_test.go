@@ -129,8 +129,30 @@ func seedReg(fl *fakeLedger, id, role, pkHex string) {
 	fl.m["REG_"+id] = b
 }
 
-func seedNetCfg(fl *fakeLedger, n int, alpha, tauTh float64, tRev int, psiTh float64) {
-	cfg := NetworkConfig{ID: "NETCFG", NumRSUs: n, Alpha: alpha, TauThreshold: tauTh,
+// seedRegKeyed registers an ACTIVE node with a FRESH P-256 keypair and returns
+// the private key, so the test can produce signatures the chaincode actually
+// verifies (Eq 3.61–3.63 evidence/vote gates). seedReg alone reuses a shared pk
+// whose private key is discarded — fine for read-path tests, useless for the
+// signature-gated write paths.
+func seedRegKeyed(t *testing.T, fl *fakeLedger, id, role string) *ecdsa.PrivateKey {
+	t.Helper()
+	priv, pk := genID(t)
+	seedReg(fl, id, role, pk)
+	return priv
+}
+
+// castVote signs the canonical revokeVoteDigest with the voting RSU's key and
+// submits the vote, mirroring how the NS-3 CallSCRevokeVote wrapper folds
+// signing into the call so signed-bytes == transmitted-bytes.
+func castVote(t *testing.T, sc SmartContract, ctx *mocks.TransactionContext,
+	priv *ecdsa.PrivateKey, veh, rsu, reason, ts string) (string, error) {
+	t.Helper()
+	sig := signHex(t, priv, revokeVoteDigest(veh, rsu, reason, ts))
+	return sc.SCRevokeVote(ctx, veh, rsu, reason, sig, ts)
+}
+
+func seedNetCfg(fl *fakeLedger, n int, alpha, tauWarn, tauMin float64, tRev int, psiTh float64) {
+	cfg := NetworkConfig{ID: "NETCFG", NumRSUs: n, Alpha: alpha, TauWarn: tauWarn, TauMin: tauMin,
 		TRev: tRev, PsiAnomalyTh: psiTh, UpdatedAt: "seed"}
 	b, _ := json.Marshal(cfg)
 	fl.m["NETCFG"] = b
@@ -147,6 +169,13 @@ func seedSubm(fl *fakeLedger, veh, epoch, rsu string, psi float64) {
 	rec := EpochSubmission{ID: id, VehicleID: veh, RSUID: rsu, Epoch: epoch, Psi: psi}
 	b, _ := json.Marshal(rec)
 	fl.m[id] = b
+}
+
+func seedRSUTrust(fl *fakeLedger, rsu string, score float64) {
+	rec := RSUTrustScore{ID: "RSUTRUST_" + rsu, RSUID: rsu, TrustScore: score,
+		State: RSUStateTrusted}
+	b, _ := json.Marshal(rec)
+	fl.m["RSUTRUST_"+rsu] = b
 }
 
 func seedCSub(fl *fakeLedger, veh, ctrl, epoch string, phi float64) {
@@ -245,7 +274,7 @@ func buildEndorsers(t *testing.T, fl *fakeLedger, vehID, vehPk string, count int
 
 func TestSCRegister_Happy(t *testing.T) {
 	ctx, fl := newCtx()
-	seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5) // f=1 → threshold 2f+1 = 3
+	seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5) // f=1 → threshold 2f+1 = 3
 	sc := SmartContract{}
 	_, vehPk := genID(t)
 	endorsers := buildEndorsers(t, fl, "VEH_1", vehPk, 3)
@@ -271,7 +300,7 @@ func TestSCRegister_Rejections(t *testing.T) {
 
 	t.Run("invalid role", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		sc := SmartContract{}
 		err := sc.SCRegister(ctx, "VEH_1", "ALIEN", vehPk, hku64, "t", "[]")
 		errHas(t, err, "invalid role")
@@ -316,7 +345,7 @@ func TestSCRegister_Rejections(t *testing.T) {
 
 	t.Run("insufficient endorsements", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5) // need 3
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5) // need 3
 		sc := SmartContract{}
 		endorsers := buildEndorsers(t, fl, "VEH_1", vehPk, 2) // only 2
 		err := sc.SCRegister(ctx, "VEH_1", RoleVehicle, vehPk, hku64, "t", endorsers)
@@ -325,7 +354,7 @@ func TestSCRegister_Rejections(t *testing.T) {
 
 	t.Run("endorser not an RSU is ignored", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		sc := SmartContract{}
 		// 2 valid RSUs + 1 endorser registered as VEHICLE (must be skipped) → 2<3
 		digest := endorsementDigest("VEH_1", vehPk, hku64)
@@ -346,7 +375,7 @@ func TestSCRegister_Rejections(t *testing.T) {
 
 	t.Run("bad endorser signature is ignored", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		sc := SmartContract{}
 		digest := endorsementDigest("VEH_1", vehPk, hku64)
 		var es []Endorser
@@ -368,7 +397,7 @@ func TestSCRegister_Rejections(t *testing.T) {
 
 	t.Run("duplicate endorser RSU counted once", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		sc := SmartContract{}
 		digest := endorsementDigest("VEH_1", vehPk, hku64)
 		priv, pk := genID(t)
@@ -487,30 +516,39 @@ func TestNetworkConfig(t *testing.T) {
 	t.Run("init happy + read back", func(t *testing.T) {
 		ctx, _ := newCtx()
 		sc := SmartContract{}
-		ok(t, sc.SCInitNetworkConfig(ctx, "7", "0.4", "0.6", "2", "0.55"))
+		ok(t, sc.SCInitNetworkConfig(ctx, "7", "0.4", "0.6", "0.4", "2", "0.55"))
 		cfg, err := sc.GetNetworkConfig(ctx)
 		ok(t, err)
 		if cfg.NumRSUs != 7 || cfg.TRev != 2 {
 			t.Errorf("config not persisted: %+v", cfg)
 		}
 		approx(t, cfg.Alpha, 0.4)
+		approx(t, cfg.TauWarn, 0.6)
+		approx(t, cfg.TauMin, 0.4)
 		approx(t, cfg.PsiAnomalyTh, 0.55)
 	})
 
 	t.Run("numRSUs too small", func(t *testing.T) {
 		ctx, _ := newCtx()
 		sc := SmartContract{}
-		errHas(t, sc.SCInitNetworkConfig(ctx, "3", "0.3", "0.5", "3", "0.5"), "too small")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "3", "0.3", "0.5", "0.3", "3", "0.5"), "too small")
+	})
+
+	t.Run("tau_min above tau_warn rejected", func(t *testing.T) {
+		ctx, _ := newCtx()
+		sc := SmartContract{}
+		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.4", "0.6", "3", "0.5"), "must be ≤")
 	})
 
 	t.Run("parse errors", func(t *testing.T) {
 		ctx, _ := newCtx()
 		sc := SmartContract{}
-		errHas(t, sc.SCInitNetworkConfig(ctx, "x", "0.3", "0.5", "3", "0.5"), "numRSUs parse")
-		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "x", "0.5", "3", "0.5"), "alpha parse")
-		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "x", "3", "0.5"), "tauTh parse")
-		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.5", "x", "0.5"), "tRev parse")
-		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.5", "3", "x"), "psiTh parse")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "x", "0.3", "0.5", "0.3", "3", "0.5"), "numRSUs parse")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "x", "0.5", "0.3", "3", "0.5"), "alpha parse")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "x", "0.3", "3", "0.5"), "tauWarn parse")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.5", "x", "3", "0.5"), "tauMin parse")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.5", "0.3", "x", "0.5"), "tRev parse")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.5", "0.3", "3", "x"), "psiTh parse")
 	})
 
 	t.Run("defaults when absent", func(t *testing.T) {
@@ -534,15 +572,42 @@ func TestSCTrustSubmitEvidence(t *testing.T) {
 	t.Run("happy", func(t *testing.T) {
 		ctx, fl := newCtx()
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		seedReg(fl, "RSU_0", RoleRSU, pk)
+		rsuPriv := seedRegKeyed(t, fl, "RSU_0", RoleRSU)
 		sc := SmartContract{}
-		ok(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "0.7", "h", "sig"))
+		sig := signHex(t, rsuPriv, evidenceDigest("VEH_1", "RSU_0", "E1", "0.7", "h"))
+		ok(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "0.7", "h", sig))
 		if fl.m["SUBM_VEH_1_E1_RSU_0"] == nil {
 			t.Fatal("evidence not written")
 		}
 		var rec EpochSubmission
 		json.Unmarshal(fl.m["SUBM_VEH_1_E1_RSU_0"], &rec)
 		approx(t, rec.Psi, 0.7)
+	})
+
+	t.Run("invalid evidence signature rejected", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		rsuPriv := seedRegKeyed(t, fl, "RSU_0", RoleRSU)
+		sc := SmartContract{}
+		// valid sig but over a DIFFERENT psi than transmitted → digest mismatch
+		sig := signHex(t, rsuPriv, evidenceDigest("VEH_1", "RSU_0", "E1", "0.1", "h"))
+		errHas(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "0.7", "h", sig),
+			"invalid evidence signature")
+		if fl.m["SUBM_VEH_1_E1_RSU_0"] != nil {
+			t.Error("evidence must not be written when signature fails")
+		}
+	})
+
+	t.Run("evidence signed by foreign key rejected", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		seedRegKeyed(t, fl, "RSU_0", RoleRSU)
+		sc := SmartContract{}
+		// a well-formed sig from some OTHER key — not RSU_0's registered key
+		foreign, _ := genID(t)
+		sig := signHex(t, foreign, evidenceDigest("VEH_1", "RSU_0", "E1", "0.7", "h"))
+		errHas(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "0.7", "h", sig),
+			"invalid evidence signature")
 	})
 
 	t.Run("vehicle not registered", func(t *testing.T) {
@@ -573,9 +638,12 @@ func TestSCTrustSubmitEvidence(t *testing.T) {
 	t.Run("bad psi", func(t *testing.T) {
 		ctx, fl := newCtx()
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		seedReg(fl, "RSU_0", RoleRSU, pk)
+		rsuPriv := seedRegKeyed(t, fl, "RSU_0", RoleRSU)
 		sc := SmartContract{}
-		errHas(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "NaNx", "h", "s"),
+		// sign the (malformed) psi string verbatim so we pass the sig gate and
+		// reach the float parse, which is what this case asserts.
+		sig := signHex(t, rsuPriv, evidenceDigest("VEH_1", "RSU_0", "E1", "NaNx", "h"))
+		errHas(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "NaNx", "h", sig),
 			"psi parse")
 	})
 }
@@ -586,9 +654,10 @@ func TestSCControllerSubmitEvidence(t *testing.T) {
 	t.Run("happy", func(t *testing.T) {
 		ctx, fl := newCtx()
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		seedReg(fl, "CTRL_0", RoleController, pk)
+		ctrlPriv := seedRegKeyed(t, fl, "CTRL_0", RoleController)
 		sc := SmartContract{}
-		ok(t, sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E1", "0.8", "h", "s"))
+		sig := signHex(t, ctrlPriv, controllerEvidenceDigest("VEH_1", "CTRL_0", "E1", "0.8", "h"))
+		ok(t, sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E1", "0.8", "h", sig))
 		if fl.m["CSUBM_VEH_1_E1"] == nil {
 			t.Fatal("controller evidence not written")
 		}
@@ -602,12 +671,24 @@ func TestSCControllerSubmitEvidence(t *testing.T) {
 			"CTRL_0 is not registered")
 	})
 
+	t.Run("invalid controller signature rejected", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		seedRegKeyed(t, fl, "CTRL_0", RoleController)
+		sc := SmartContract{}
+		foreign, _ := genID(t)
+		sig := signHex(t, foreign, controllerEvidenceDigest("VEH_1", "CTRL_0", "E1", "0.8", "h"))
+		errHas(t, sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E1", "0.8", "h", sig),
+			"invalid controller signature")
+	})
+
 	t.Run("bad phi", func(t *testing.T) {
 		ctx, fl := newCtx()
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		seedReg(fl, "CTRL_0", RoleController, pk)
+		ctrlPriv := seedRegKeyed(t, fl, "CTRL_0", RoleController)
 		sc := SmartContract{}
-		errHas(t, sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E1", "xx", "h", "s"),
+		sig := signHex(t, ctrlPriv, controllerEvidenceDigest("VEH_1", "CTRL_0", "E1", "xx", "h"))
+		errHas(t, sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E1", "xx", "h", sig),
 			"phi parse")
 	})
 }
@@ -621,9 +702,14 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 
 	t.Run("EMA over 3 RSU witnesses", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
 		seedTrust(fl, "VEH_1", 1.0)
+		// Witness RSUs must be registered+trusted: SCTrustFinalizeEpoch
+		// excludes non-trusted RSU submissions from the aggregate (§3.5.1).
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedReg(fl, "RSU_1", RoleRSU, pk)
+		seedReg(fl, "RSU_2", RoleRSU, pk)
 		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.6)
 		seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.4)
 		seedSubm(fl, "VEH_1", "E1", "RSU_2", 0.5) // mean = 0.5
@@ -640,7 +726,7 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 
 	t.Run("no submissions errors", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
 		seedTrust(fl, "VEH_1", 1.0)
 		sc := SmartContract{}
@@ -650,7 +736,7 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 
 	t.Run("unregistered vehicle rejected", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		sc := SmartContract{}
 		_, err := sc.SCTrustFinalizeEpoch(ctx, "VEH_1", "E1")
 		errHas(t, err, "not registered")
@@ -658,9 +744,10 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 
 	t.Run("T_rev consecutive-low gate increments", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.0, 0.5, 2, 0.5) // alpha=0 → τ = 1-meanPsi
+		seedNetCfg(fl, 4, 0.0, 0.5, 0.3, 2, 0.5) // alpha=0 → τ = 1-meanPsi
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
 		seedTrust(fl, "VEH_1", 1.0)
+		seedReg(fl, "RSU_0", RoleRSU, pk) // trusted witness (§3.5.1)
 		sc := SmartContract{}
 
 		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // τ=0.2 <0.5
@@ -679,9 +766,10 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 
 	t.Run("trust recovery resets consec counter", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.0, 0.5, 2, 0.5)
+		seedNetCfg(fl, 4, 0.0, 0.5, 0.3, 2, 0.5)
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
 		seedTrust(fl, "VEH_1", 0.2)
+		seedReg(fl, "RSU_0", RoleRSU, pk) // trusted witness (§3.5.1)
 		fl.m["SCTRUST_VEH_1"] = func() []byte {
 			r := SCTrustScore{ID: "SCTRUST_VEH_1", VehicleID: "VEH_1", TrustScore: 0.2, ConsecutiveLowEpochs: 1}
 			b, _ := json.Marshal(r)
@@ -730,7 +818,7 @@ func TestTrustReads(t *testing.T) {
 func TestCPDetectCheck(t *testing.T) {
 	t.Run("no controller submission → nil", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		sc := SmartContract{}
 		flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
 		ok(t, err)
@@ -741,7 +829,7 @@ func TestCPDetectCheck(t *testing.T) {
 
 	t.Run("controller-anom vs implicit-clean RSUs fires flag", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5) // f=1 → f+1 = 2
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)        // f=1 → f+1 = 2
 		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.8) // Φ>ψ_th → cAnom=true
 		// no RSU SUBMs → 4 implicit clean votes → conflict=4 ≥ 2
 		sc := SmartContract{}
@@ -760,7 +848,7 @@ func TestCPDetectCheck(t *testing.T) {
 
 	t.Run("controller-clean minor disagreement → no flag", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5) // f+1 = 2
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)        // f+1 = 2
 		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // cAnom=false
 		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8)  // 1 RSU disagrees
 		sc := SmartContract{}
@@ -774,7 +862,7 @@ func TestCPDetectCheck(t *testing.T) {
 
 func TestControllerFlagReads(t *testing.T) {
 	ctx, fl := newCtx()
-	seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+	seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.9)
 	sc := SmartContract{}
 	_, err := sc.CPDetectCheck(ctx, "VEH_1", "E1") // fires a flag
@@ -794,25 +882,158 @@ func TestControllerFlagReads(t *testing.T) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
+// Multi-controller C_trusted set — CP-DETECT exclusion + reassignment
+// (invariant 2 / Eq 3.64–3.67). The 5 logical controllers CTRL_0..CTRL_4 form
+// the trusted set; the lowest-numbered ACTIVE member is the head. A CP-DETECT
+// f+1 conflict EXCLUDES the offending controller and hands C_trusted to the
+// next ACTIVE member — driven by RSU consensus, never the controller itself.
+// ═════════════════════════════════════════════════════════════════════════════
+
+func seedControllers(fl *fakeLedger, n int) {
+	_, pk := genIDStatic()
+	for i := 0; i < n; i++ {
+		seedReg(fl, fmt.Sprintf("CTRL_%d", i), RoleController, pk)
+	}
+}
+
+// genIDStatic mirrors genID but without *testing.T, for non-asserting seeds.
+func genIDStatic() (*ecdsa.PrivateKey, string) {
+	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	raw := elliptic.Marshal(elliptic.P256(), priv.PublicKey.X, priv.PublicKey.Y)
+	return priv, hex.EncodeToString(raw)
+}
+
+func TestActiveControllerSelection(t *testing.T) {
+	t.Run("head is lowest-numbered ACTIVE controller", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedControllers(fl, 5)
+		sc := SmartContract{}
+		id, err := sc.GetActiveController(ctx)
+		ok(t, err)
+		if id != "CTRL_0" {
+			t.Errorf("active controller=%s want CTRL_0", id)
+		}
+	})
+
+	t.Run("excluded head skipped for successor", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedControllers(fl, 5)
+		// Manually flip CTRL_0 to EXCLUDED.
+		var reg RegistrationRecord
+		json.Unmarshal(fl.m["REG_CTRL_0"], &reg)
+		reg.Status = StatusExcluded
+		b, _ := json.Marshal(reg)
+		fl.m["REG_CTRL_0"] = b
+		sc := SmartContract{}
+		id, err := sc.GetActiveController(ctx)
+		ok(t, err)
+		if id != "CTRL_1" {
+			t.Errorf("successor=%s want CTRL_1", id)
+		}
+	})
+
+	t.Run("no active controller errors", func(t *testing.T) {
+		ctx, _ := newCtx()
+		sc := SmartContract{}
+		_, err := sc.GetActiveController(ctx)
+		errHas(t, err, "no active controller")
+	})
+
+	t.Run("GetTrustedControllers lists all", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedControllers(fl, 5)
+		sc := SmartContract{}
+		all, err := sc.GetTrustedControllers(ctx)
+		ok(t, err)
+		if len(all) != 5 {
+			t.Errorf("trusted controllers=%d want 5", len(all))
+		}
+	})
+}
+
+func TestCPDetectExcludesAndReassigns(t *testing.T) {
+	ctx, fl := newCtx()
+	seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5) // f=1 → f+1 = 2
+	seedControllers(fl, 5)              // CTRL_0..CTRL_4 ACTIVE
+	_, vpk := genIDStatic()
+	seedReg(fl, "VEH_1", RoleVehicle, vpk) // so evidence reaches the controller gate
+	// CTRL_0 (current head) flags an anomaly the RSUs implicitly clean-vote
+	// against → conflict ≥ f+1 → exclude CTRL_0, hand off to CTRL_1.
+	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.9)
+	sc := SmartContract{}
+
+	flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
+	ok(t, err)
+	if flag == nil {
+		t.Fatal("expected CP-DETECT flag to fire")
+	}
+
+	// CTRL_0 must now be EXCLUDED and bounce at requireActive.
+	var reg RegistrationRecord
+	json.Unmarshal(fl.m["REG_CTRL_0"], &reg)
+	if reg.Status != StatusExcluded {
+		t.Errorf("CTRL_0 status=%s want EXCLUDED", reg.Status)
+	}
+
+	// C_trusted head must roll over to CTRL_1.
+	head, err := sc.GetActiveController(ctx)
+	ok(t, err)
+	if head != "CTRL_1" {
+		t.Errorf("new head=%s want CTRL_1", head)
+	}
+
+	// A reassignment record must be written, naming excluded + successor.
+	ras, err := sc.GetControllerReassignments(ctx)
+	ok(t, err)
+	if len(ras) != 1 {
+		t.Fatalf("reassignments=%d want 1", len(ras))
+	}
+	if ras[0].ExcludedController != "CTRL_0" || ras[0].SuccessorController != "CTRL_1" {
+		t.Errorf("reassignment excluded=%s successor=%s want CTRL_0→CTRL_1",
+			ras[0].ExcludedController, ras[0].SuccessorController)
+	}
+	if ras[0].ConflictCount < ras[0].ThresholdFP1 {
+		t.Errorf("conflict %d < threshold %d", ras[0].ConflictCount, ras[0].ThresholdFP1)
+	}
+
+	// An EXCLUDED controller's evidence must bounce at requireActive.
+	err2 := sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E2", "0.9", "h", "s")
+	errHas(t, err2, "status=EXCLUDED")
+
+	// Idempotence: re-running CP-DETECT for a new epoch under the now-EXCLUDED
+	// CTRL_0 writes no second reassignment record.
+	seedCSub(fl, "VEH_2", "CTRL_0", "E2", 0.9)
+	_, err = sc.CPDetectCheck(ctx, "VEH_2", "E2")
+	ok(t, err)
+	ras2, err := sc.GetControllerReassignments(ctx)
+	ok(t, err)
+	if len(ras2) != 1 {
+		t.Errorf("reassignments after idempotent re-run=%d want 1", len(ras2))
+	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
 // Eq 3.58 — SC-Revoke BFT 2f+1 vote
 // ═════════════════════════════════════════════════════════════════════════════
 
 func TestSCRevokeVote(t *testing.T) {
 	_, pk := genID(t)
 
-	setup := func() (*mocks.TransactionContext, *fakeLedger, SmartContract) {
+	setup := func() (*mocks.TransactionContext, *fakeLedger, SmartContract, map[string]*ecdsa.PrivateKey) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5) // f=1 → 2f+1 = 3
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5) // f=1 → 2f+1 = 3
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		privs := map[string]*ecdsa.PrivateKey{}
 		for i := 0; i < 4; i++ {
-			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+			id := fmt.Sprintf("RSU_%d", i)
+			privs[id] = seedRegKeyed(t, fl, id, RoleRSU)
 		}
-		return ctx, fl, SmartContract{}
+		return ctx, fl, SmartContract{}, privs
 	}
 
 	t.Run("below threshold does not revoke", func(t *testing.T) {
-		ctx, fl, sc := setup()
-		res, err := sc.SCRevokeVote(ctx, "VEH_1", "RSU_0", "tp", "sig", "ts1")
+		ctx, fl, sc, privs := setup()
+		res, err := castVote(t, sc, ctx, privs["RSU_0"], "VEH_1", "RSU_0", "tp", "ts1")
 		ok(t, err)
 		if !strings.Contains(res, `"revoked":false`) {
 			t.Errorf("unexpected result: %s", res)
@@ -823,12 +1044,21 @@ func TestSCRevokeVote(t *testing.T) {
 		_ = fl
 	})
 
+	t.Run("invalid vote signature rejected", func(t *testing.T) {
+		ctx, _, sc, privs := setup()
+		// RSU_1's key signing a vote claimed to come from RSU_0 → digest binds
+		// RSU_0, so verification against RSU_0's registered key fails.
+		sig := signHex(t, privs["RSU_1"], revokeVoteDigest("VEH_1", "RSU_0", "tp", "ts"))
+		_, err := sc.SCRevokeVote(ctx, "VEH_1", "RSU_0", "tp", sig, "ts")
+		errHas(t, err, "invalid revoke vote signature")
+	})
+
 	t.Run("2f+1 distinct votes revoke + flip status", func(t *testing.T) {
-		ctx, fl, sc := setup()
+		ctx, fl, sc, privs := setup()
 		ok2 := func(_ string, e error) { ok(t, e) }
-		ok2(sc.SCRevokeVote(ctx, "VEH_1", "RSU_0", "tp", "s", "ts"))
-		ok2(sc.SCRevokeVote(ctx, "VEH_1", "RSU_1", "tp", "s", "ts"))
-		res, err := sc.SCRevokeVote(ctx, "VEH_1", "RSU_2", "tp", "s", "ts")
+		ok2(castVote(t, sc, ctx, privs["RSU_0"], "VEH_1", "RSU_0", "tp", "ts"))
+		ok2(castVote(t, sc, ctx, privs["RSU_1"], "VEH_1", "RSU_1", "tp", "ts"))
+		res, err := castVote(t, sc, ctx, privs["RSU_2"], "VEH_1", "RSU_2", "tp", "ts")
 		ok(t, err)
 		if !strings.Contains(res, `"revoked":true`) {
 			t.Fatalf("expected revoked true, got %s", res)
@@ -844,17 +1074,17 @@ func TestSCRevokeVote(t *testing.T) {
 	})
 
 	t.Run("vote after revoke bounces on gate", func(t *testing.T) {
-		ctx, _, sc := setup()
-		sc.SCRevokeVote(ctx, "VEH_1", "RSU_0", "tp", "s", "ts")
-		sc.SCRevokeVote(ctx, "VEH_1", "RSU_1", "tp", "s", "ts")
-		sc.SCRevokeVote(ctx, "VEH_1", "RSU_2", "tp", "s", "ts") // revokes
-		_, err := sc.SCRevokeVote(ctx, "VEH_1", "RSU_3", "tp", "s", "ts")
+		ctx, _, sc, privs := setup()
+		castVote(t, sc, ctx, privs["RSU_0"], "VEH_1", "RSU_0", "tp", "ts")
+		castVote(t, sc, ctx, privs["RSU_1"], "VEH_1", "RSU_1", "tp", "ts")
+		castVote(t, sc, ctx, privs["RSU_2"], "VEH_1", "RSU_2", "tp", "ts") // revokes
+		_, err := castVote(t, sc, ctx, privs["RSU_3"], "VEH_1", "RSU_3", "tp", "ts")
 		errHas(t, err, "status=REVOKED")
 	})
 
 	t.Run("unregistered vehicle / rsu rejected", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		sc := SmartContract{}
 		_, err := sc.SCRevokeVote(ctx, "VEH_1", "RSU_0", "tp", "s", "ts")
 		errHas(t, err, "VEH_1 is not registered")
@@ -867,15 +1097,17 @@ func TestSCRevokeVote(t *testing.T) {
 func TestRevokeReads(t *testing.T) {
 	_, pk := genID(t)
 	ctx, fl := newCtx()
-	seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+	seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 	seedReg(fl, "VEH_1", RoleVehicle, pk)
+	privs := map[string]*ecdsa.PrivateKey{}
 	for i := 0; i < 4; i++ {
-		seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		id := fmt.Sprintf("RSU_%d", i)
+		privs[id] = seedRegKeyed(t, fl, id, RoleRSU)
 	}
 	sc := SmartContract{}
 
 	t.Run("SCRevokeStatus pre-revoke", func(t *testing.T) {
-		sc.SCRevokeVote(ctx, "VEH_1", "RSU_0", "tp", "s", "ts")
+		castVote(t, sc, ctx, privs["RSU_0"], "VEH_1", "RSU_0", "tp", "ts")
 		st, err := sc.SCRevokeStatus(ctx, "VEH_1")
 		ok(t, err)
 		if !strings.Contains(st, `"votes":1`) || !strings.Contains(st, `"threshold":3`) {
@@ -884,8 +1116,8 @@ func TestRevokeReads(t *testing.T) {
 	})
 
 	t.Run("GetRevokeVotes + GetAllRevokeRecords", func(t *testing.T) {
-		sc.SCRevokeVote(ctx, "VEH_1", "RSU_1", "tp", "s", "ts")
-		sc.SCRevokeVote(ctx, "VEH_1", "RSU_2", "tp", "s", "ts") // now revoked
+		castVote(t, sc, ctx, privs["RSU_1"], "VEH_1", "RSU_1", "tp", "ts")
+		castVote(t, sc, ctx, privs["RSU_2"], "VEH_1", "RSU_2", "tp", "ts") // now revoked
 		votes, err := sc.GetRevokeVotes(ctx, "VEH_1")
 		ok(t, err)
 		if len(votes) != 3 {
@@ -895,6 +1127,147 @@ func TestRevokeReads(t *testing.T) {
 		ok(t, err)
 		if len(recs) != 1 {
 			t.Errorf("revoke records=%d want 1", len(recs))
+		}
+	})
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// §3.5.1 — RSU dynamic trust lifecycle: demotion (TRUSTED→CLIENT), terminal
+// SC-Revoke after T_rev consecutive-low epochs, and the BFT floor guard hold.
+// ═════════════════════════════════════════════════════════════════════════════
+
+func TestSCRSUFinalizeEpoch(t *testing.T) {
+	_, pk := genID(t)
+
+	// findRSU returns the RSUTrustScore for rsu from a finalize result slice.
+	findRSU := func(out []*RSUTrustScore, rsu string) *RSUTrustScore {
+		for _, r := range out {
+			if r.RSUID == rsu {
+				return r
+			}
+		}
+		return nil
+	}
+
+	t.Run("demotion TRUSTED→CLIENT below tau_th", func(t *testing.T) {
+		ctx, fl := newCtx()
+		// f=(4-1)/3=1 → floor=4. Register 5 trusted RSUs so demoting one
+		// keeps |R_trusted|-1 = 4 ≥ floor (no floor-guard interference).
+		seedNetCfg(fl, 4, 0.0, 0.5, 0.3, 3, 0.5) // alpha=0 → τ = 1-m_j
+		for i := 0; i < 5; i++ {
+			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		}
+		seedRSUTrust(fl, "RSU_0", 1.0)
+		// RSU_0 is the lone flagger of VEH_99 → quorum verdict q=0 disagrees
+		// with its flag → m_0=1 → τ=0 < 0.5 → demote.
+		seedSubm(fl, "VEH_99", "E1", "RSU_0", 0.9)
+		sc := SmartContract{}
+		out, err := sc.SCRSUFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		r0 := findRSU(out, "RSU_0")
+		if r0 == nil || r0.State != RSUStateClient {
+			t.Fatalf("RSU_0 state=%v want CLIENT", r0)
+		}
+		approx(t, r0.TrustScore, 0.0)
+		reg, err := sc.GetRegistration(ctx, "RSU_0")
+		ok(t, err)
+		if reg.RSUState != RSUStateClient {
+			t.Errorf("REG RSUState=%s want CLIENT", reg.RSUState)
+		}
+		if reg.Status != StatusActive {
+			t.Errorf("demoted RSU should stay ACTIVE, got %s", reg.Status)
+		}
+	})
+
+	t.Run("probation band tau_min<=tau<tau_warn stays TRUSTED+flagged", func(t *testing.T) {
+		ctx, fl := newCtx()
+		// alpha=1 → τ frozen at the seeded value (m_j weight is (1-α)=0), so we
+		// can land RSU_0 squarely in the probation band [0.3, 0.5).
+		seedNetCfg(fl, 4, 1.0, 0.5, 0.3, 3, 0.5)
+		for i := 0; i < 5; i++ {
+			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		}
+		seedRSUTrust(fl, "RSU_0", 0.4)
+		seedSubm(fl, "VEH_99", "E1", "RSU_0", 0.9)
+		sc := SmartContract{}
+		out, err := sc.SCRSUFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		r0 := findRSU(out, "RSU_0")
+		if r0 == nil || r0.State != RSUStateTrusted || !r0.Probationary || r0.FloorHeld {
+			t.Fatalf("RSU_0=%v want TRUSTED+Probationary (not floor-held)", r0)
+		}
+		reg, err := sc.GetRegistration(ctx, "RSU_0")
+		ok(t, err)
+		if reg.RSUState != RSUStateTrusted || reg.Status != StatusActive {
+			t.Errorf("probationary RSU must stay TRUSTED+ACTIVE, got state=%s status=%s",
+				reg.RSUState, reg.Status)
+		}
+	})
+
+	t.Run("T_rev consecutive-low → SC-Revoke + status REVOKED", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.0, 0.5, 0.3, 2, 0.5) // T_rev=2
+		for i := 0; i < 5; i++ {
+			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		}
+		seedRSUTrust(fl, "RSU_0", 1.0)
+		sc := SmartContract{}
+
+		seedSubm(fl, "VEH_99", "E1", "RSU_0", 0.9) // m=1 → τ=0, consec=1 → demote
+		_, err := sc.SCRSUFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		seedSubm(fl, "VEH_99", "E2", "RSU_0", 0.9) // consec=2 ≥ T_rev → revoke
+		out, err := sc.SCRSUFinalizeEpoch(ctx, "E2")
+		ok(t, err)
+		r0 := findRSU(out, "RSU_0")
+		if r0 == nil || r0.ConsecutiveLowEpochs < 2 {
+			t.Fatalf("RSU_0=%v want consec≥2", r0)
+		}
+		reg, err := sc.GetRegistration(ctx, "RSU_0")
+		ok(t, err)
+		if reg.Status != StatusRevoked {
+			t.Errorf("REG Status=%s want REVOKED", reg.Status)
+		}
+		isRev, err := sc.IsRevoked(ctx, "RSU_0")
+		ok(t, err)
+		if isRev != "true" {
+			t.Errorf("IsRevoked(RSU_0)=%s want true", isRev)
+		}
+		recs, err := sc.GetAllRevokeRecords(ctx)
+		ok(t, err)
+		found := false
+		for _, r := range recs {
+			if r.RSUID == "RSU_0" && r.Reason == "rsu_trust_decay" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("no rsu_trust_decay revoke record for RSU_0 (%d recs)", len(recs))
+		}
+	})
+
+	t.Run("BFT floor guard holds demotion as probationary", func(t *testing.T) {
+		ctx, fl := newCtx()
+		// Register EXACTLY floor (4) trusted RSUs: demoting one would drop
+		// |R_trusted| to 3 < floor=4, so the guard holds RSU_0 TRUSTED.
+		seedNetCfg(fl, 4, 0.0, 0.5, 0.3, 3, 0.5)
+		for i := 0; i < 4; i++ {
+			seedReg(fl, fmt.Sprintf("RSU_%d", i), RoleRSU, pk)
+		}
+		seedRSUTrust(fl, "RSU_0", 1.0)
+		seedSubm(fl, "VEH_99", "E1", "RSU_0", 0.9) // wants out, but floor blocks
+		sc := SmartContract{}
+		out, err := sc.SCRSUFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		r0 := findRSU(out, "RSU_0")
+		if r0 == nil || r0.State != RSUStateTrusted || !r0.FloorHeld {
+			t.Fatalf("RSU_0=%v want TRUSTED+floor-held", r0)
+		}
+		reg, err := sc.GetRegistration(ctx, "RSU_0")
+		ok(t, err)
+		if reg.RSUState == RSUStateClient || reg.Status != StatusActive {
+			t.Errorf("floor-held RSU must stay TRUSTED+ACTIVE, got state=%s status=%s",
+				reg.RSUState, reg.Status)
 		}
 	})
 }
@@ -1019,7 +1392,7 @@ func TestCorruptStateUnmarshal(t *testing.T) {
 	})
 	t.Run("CSUBM_ (CPDetectCheck)", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		fl.m["CSUBM_VEH_1_E1"] = bad
 		if _, err := sc.CPDetectCheck(ctx, "VEH_1", "E1"); err == nil {
 			t.Fatal("expected unmarshal error on corrupt CSUBM in CP-DETECT")
@@ -1039,7 +1412,7 @@ func TestPutStateErrorsPropagate(t *testing.T) {
 	t.Run("SCInitNetworkConfig", func(t *testing.T) {
 		ctx, _ := newCtx()
 		failPut(ctx)
-		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.5", "3", "0.5"), "commit refused")
+		errHas(t, sc.SCInitNetworkConfig(ctx, "4", "0.3", "0.5", "0.3", "3", "0.5"), "commit refused")
 	})
 	t.Run("SCBootstrapRSU", func(t *testing.T) {
 		ctx, _ := newCtx()
@@ -1048,7 +1421,7 @@ func TestPutStateErrorsPropagate(t *testing.T) {
 	})
 	t.Run("SCRegister", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 3, 0.5)
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 		_, vehPk := genID(t)
 		endorsers := buildEndorsers(t, fl, "VEH_1", vehPk, 3)
 		failPut(ctx)
@@ -1057,16 +1430,18 @@ func TestPutStateErrorsPropagate(t *testing.T) {
 	t.Run("SCTrustSubmitEvidence", func(t *testing.T) {
 		ctx, fl := newCtx()
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		seedReg(fl, "RSU_0", RoleRSU, pk)
-		failPut(ctx)
-		errHas(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "0.7", "h", "s"), "commit refused")
+		rsuPriv := seedRegKeyed(t, fl, "RSU_0", RoleRSU)
+		sig := signHex(t, rsuPriv, evidenceDigest("VEH_1", "RSU_0", "E1", "0.7", "h"))
+		failPut(ctx) // sig must pass so PutState is reached
+		errHas(t, sc.SCTrustSubmitEvidence(ctx, "VEH_1", "RSU_0", "E1", "0.7", "h", sig), "commit refused")
 	})
 	t.Run("SCControllerSubmitEvidence", func(t *testing.T) {
 		ctx, fl := newCtx()
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		seedReg(fl, "CTRL_0", RoleController, pk)
+		ctrlPriv := seedRegKeyed(t, fl, "CTRL_0", RoleController)
+		sig := signHex(t, ctrlPriv, controllerEvidenceDigest("VEH_1", "CTRL_0", "E1", "0.8", "h"))
 		failPut(ctx)
-		errHas(t, sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E1", "0.8", "h", "s"), "commit refused")
+		errHas(t, sc.SCControllerSubmitEvidence(ctx, "VEH_1", "CTRL_0", "E1", "0.8", "h", sig), "commit refused")
 	})
 }
 

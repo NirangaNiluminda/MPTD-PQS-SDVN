@@ -121,9 +121,70 @@ To run that *same* 200-vehicle demand inside NS-3 you would:
 
 ---
 
+## Three mobility scenarios (urban / rural / highway)
+
+The pipeline now produces **three** scenarios, selected at NS-3 run time by
+`--mobility_scenario`. Detection thresholds and the attack model are identical
+across all three; only the map, fleet, RSU layout, and radio propagation model
+change.
+
+| `--mobility_scenario` | Tag        | Map (OSM)            | `.tcl`                        | Vehicles | RSUs | Propagation model (`12_main.h`) |
+|-----------------------|------------|----------------------|-------------------------------|----------|------|---------------------------------|
+| `0`                   | `urban`    | Shinjuku, Tokyo      | `mobility_urban_150.tcl`      | 200      | 64   | COST231–Hata (urban-only)       |
+| `1`                   | `rural`    | Hohenwart, Germany   | `mobility_rural_90.tcl`       | 138      | 44   | Log-distance (exponent 3.0)     |
+| `2`                   | `autobahn` | A9 autobahn, Germany | `mobility_autobahn_150.tcl`   | 200      | 23   | Two-ray ground (5.9 GHz, h=1.5 m)|
+
+Propagation is matched to the environment (supervisor directive 2026-06-15:
+COST231–Hata is urban-only). Transmit power (41 dBm) and the logical comm range
+`R_max_comm` (270 m) are held constant across scenarios.
+
+RSU layouts differ by map: urban uses a full 8×8 / 250 m grid (the dense grid
+sits on roads); autobahn places RSUs linearly along the corridor. Rural uses a
+**road-traced grid** — a 10×10 / 200 m lattice with the off-road cells dropped
+(`place_rsus.py --grid 10x10 --spacing 200 --on-road`), leaving 44 RSUs that
+follow the road shape at 100% coverage. The sparse rural map has too few real
+junctions for a coverage-aware fit, and a full grid floats RSUs over empty
+fields, so the on-road grid keeps grid alignment while hugging the roads.
+Regenerate with:
+
+```bash
+python3 sumo/place_rsus.py --trace mobility/mobility_rural_90.tcl \
+  --grid 10x10 --spacing 200 --range 270 --on-road \
+  --out mobility/rsu_positions_rural.csv
+```
+
+### NetAnim run per scenario (emits `analytics/results/mptd_netanim_a<atk>_p<pct>.xml`)
+
+Run the built binary with `LD_LIBRARY_PATH` set (or via `./waf --run`):
+
+```bash
+cd /home/niranga/ns-allinone-3.35/ns-3.35
+export LD_LIBRARY_PATH="$PWD/build/lib:$LD_LIBRARY_PATH"
+# urban
+./build/scratch/mptd_pqs_sdvn/mptd_pqs_sdvn --mobility_source=1 --mobility_scenario=0 \
+  --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 --skip_blockchain=true --attack_number=1 --attack_percentage=40 --simTime=15
+# rural
+./build/scratch/mptd_pqs_sdvn/mptd_pqs_sdvn --mobility_source=1 --mobility_scenario=1 \
+  --maxspeed=90  --N_RSUs=44 --N_Vehicles=138 --skip_blockchain=true --attack_number=1 --attack_percentage=40 --simTime=15
+# autobahn
+./build/scratch/mptd_pqs_sdvn/mptd_pqs_sdvn --mobility_source=1 --mobility_scenario=2 \
+  --maxspeed=150 --N_RSUs=23 --N_Vehicles=200 --skip_blockchain=true --attack_number=1 --attack_percentage=40 --simTime=15
+```
+
+### SUMO screenshots (full-fleet, burst-spawn)
+
+Each scenario has a `view.sumocfg` pointing at a **burst-spawn** route file
+(`routes_view_burst.rou.xml`) — all vehicles depart at `t=0`, fill the network
+over a warmup, then sit co-present. Open in sumo-gui, run to the warmup time,
+then screenshot (urban ≈5 s, rural ≈55 s, autobahn ≈70 s). See `FLOW_DEMAND.md` §0.
+
+---
+
 ## Summary
 
 - OSM gives roads, SUMO adds vehicles + movement, NS-3 replays the `.tcl`.
 - Everything is script-generated; nothing is hand-authored.
-- **`build_sumo_trace.sh`** → the NS-3 trajectory (`.tcl`).
+- **`build_sumo_trace.sh`** → the NS-3 trajectory (`.tcl`); three scenarios via
+  `REGIME`/`TAG` (urban, rural, autobahn).
 - **`gen_flow_demand.sh`** → the busy, flowing SUMO-GUI demo scene.
+- **`<scenario>/view.sumocfg`** → full-fleet burst-spawn SUMO screenshots.

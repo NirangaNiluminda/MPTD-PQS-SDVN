@@ -13,8 +13,8 @@
 //   02_config_globals.h (use_pq_crypto, routing_algorithm, ablation_mode, …)
 //
 // Public API — paper §3.5.5 aligned:
-//   CallSCInitNetworkConfig()        — one-time network bootstrap (numRSUs, α, τ_th,
-//                                       T_rev, ψ_th)
+//   CallSCInitNetworkConfig()        — one-time network bootstrap (numRSUs, α,
+//                                       τ_warn, τ_min, T_rev, ψ_th)
 //   CallSCBootstrapRSU()             — Algorithm 7 genesis path for first RSUs
 //                                       (admin-only; no endorsement)
 //   CallSCRegister()                 — Algorithm 7 SC-Register: vehicle/RSU/controller
@@ -745,29 +745,60 @@ inline std::string MakeVehId(uint32_t nid)        { return "VEH_"  + std::to_str
 inline std::string MakeRsuId(uint32_t rsu_idx)    { return "RSU_"  + std::to_string(rsu_idx); }
 inline std::string MakeCtrlId(uint32_t ctrl_idx)  { return "CTRL_" + std::to_string(ctrl_idx); }
 
+// ── Active controller in C_trusted (paper Eq 3.1 / 3.60) ─────────────────────
+// The node submits controller evidence under the chain-authoritative ACTIVE
+// controller, not a hardcoded index. Starts at 0 (CTRL_0 = initial head of
+// C_trusted); a CP-DETECT exclusion + chaincode reassignment advances it, and
+// mptd_refresh_active_controller() re-reads the on-chain head so the next
+// submission uses the successor. An excluded controller's submissions would
+// otherwise bounce at requireActive — refreshing keeps the control plane live.
+static uint32_t g_active_controller_idx = 0;
+
+// mptd_refresh_active_controller — query GetActiveController and update the
+// cached index from the returned "CTRL_<idx>" string. No-op under
+// skip_blockchain. Cheap enough for periodic (≈1 Hz) refresh; never on the
+// per-beacon hot path.
+inline void mptd_refresh_active_controller()
+{
+    if (skip_blockchain) return;
+    std::string out = mptd_fabric_invoke_sync("query", "GetActiveController", {});
+    // Payload is the raw chaincode string (possibly JSON-quoted). Pull the
+    // integer suffix after the LAST "CTRL_".
+    auto pos = out.rfind("CTRL_");
+    if (pos == std::string::npos) return;
+    pos += 5;
+    uint32_t v = 0; bool any = false;
+    while (pos < out.size() && out[pos] >= '0' && out[pos] <= '9') {
+        v = v * 10 + (uint32_t)(out[pos] - '0'); any = true; ++pos;
+    }
+    if (any) g_active_controller_idx = v;
+}
+
 // ── CallSCInitNetworkConfig — Eq 3.55/3.58/3.59 bootstrap ────────────────────
-// One-time per-run setup. Persists the trust EMA smoothing α, trust threshold
-// τ_th, T_rev consecutive-epoch gate, anomaly threshold ψ_th, and RSU set
+// One-time per-run setup. Persists the trust EMA smoothing α, probation
+// threshold τ_warn, revocation/demotion threshold τ_min, T_rev consecutive-epoch
+// gate, anomaly threshold ψ_th, and RSU set
 // size |R| (needed by SCRevokeVote to compute 2f+1 and by CPDetectCheck to
 // compute f+1). The chaincode falls back to safe defaults if this is never
 // called, but calling it explicitly is required to reproduce the paper's
 // evaluation tables.
 inline void CallSCInitNetworkConfig(
-    uint32_t numRSUs, double alpha, double tauThreshold,
+    uint32_t numRSUs, double alpha, double tauWarn, double tauMin,
     uint32_t tRev, double psiAnomalyTh)
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
         std::to_string(numRSUs),
         std::to_string(alpha),
-        std::to_string(tauThreshold),
+        std::to_string(tauWarn),
+        std::to_string(tauMin),
         std::to_string(tRev),
         std::to_string(psiAnomalyTh)
     };
     // Synchronous: init must commit before any evidence submission.
     std::string out = mptd_fabric_invoke_sync("invoke", "SCInitNetworkConfig", args);
     std::cout << "[SC-INIT] numRSUs=" << numRSUs
-              << " α=" << alpha << " τ_th=" << tauThreshold
+              << " α=" << alpha << " τ_warn=" << tauWarn << " τ_min=" << tauMin
               << " T_rev=" << tRev << " ψ_th=" << psiAnomalyTh
               << " → " << out;
 }
@@ -834,23 +865,50 @@ inline SCResult CallSCRegister(
     return {ok, payload};
 }
 
-// ── CallSCTrustSubmitEvidence — Eq 3.56 RSU evidence tuple ───────────────────
+// ── G1 evidence/vote signers (defined in 11_blockchain_setup.h) ──────────────
+// Forward-declared here so the Call* wrappers can sign σ over the SAME string
+// args they transmit. The signer hashes (id‖…) identically to the chaincode
+// digest helpers (smartcontract.go evidenceDigest / controllerEvidenceDigest /
+// revokeVoteDigest) and signs with the node's registered P-256 key. Defining
+// them in 11 (which owns g_node_ec_keys, populated at SC-Register time) keeps
+// this header free of the EC keystore while still letting the wrapper produce a
+// chaincode-verifiable signature in one place — eliminating any risk that the
+// signed bytes drift from the transmitted bytes.
+std::string mptd_sign_evidence_hex(const std::string& vehId,
+                                   const std::string& rsuId,
+                                   const std::string& epoch,
+                                   const std::string& psiStr,
+                                   const std::string& beaconHash);
+std::string mptd_sign_controller_evidence_hex(const std::string& vehId,
+                                              const std::string& ctrlId,
+                                              const std::string& epoch,
+                                              const std::string& phiStr,
+                                              const std::string& beaconHash);
+std::string mptd_sign_revoke_vote_hex(const std::string& vehId,
+                                      const std::string& rsuId,
+                                      const std::string& reason,
+                                      const std::string& tsStr);
+
+// ── CallSCTrustSubmitEvidence — Eq 3.56/3.61 RSU evidence tuple ──────────────
 // E_j(t) = (vehicleID, ψ_j^(i)(t), epoch, h(b_i(t)), σ_j^sub)
 // One call per RSU witness per beacon; SCTrustFinalizeEpoch later aggregates
 // them per Eq 3.55. Async because this is on the beacon-alert hot path.
+//
+// σ_j^sub is now produced HERE with the submitting RSU's registered P-256 key
+// over the exact transmitted strings (Eq 3.61) — the chaincode verifies it on
+// submit (smartcontract.go SCTrustSubmitEvidence). No caller-supplied sig.
 inline void CallSCTrustSubmitEvidence(
     uint32_t vehicleID, uint32_t rsuID, const std::string& epoch,
-    double psi, const std::string& beaconHash,
-    const std::string& signatureHex)
+    double psi, const std::string& beaconHash)
 {
     MPTD_BLOCKCHAIN_GUARD();
+    std::string vehId  = MakeVehId(vehicleID);
+    std::string rsuId  = MakeRsuId(rsuID);
+    std::string psiStr = std::to_string(psi);
+    std::string sig = mptd_sign_evidence_hex(vehId, rsuId, epoch,
+                                             psiStr, beaconHash);
     std::vector<std::string> args = {
-        MakeVehId(vehicleID),
-        MakeRsuId(rsuID),
-        epoch,
-        std::to_string(psi),
-        beaconHash,
-        signatureHex
+        vehId, rsuId, epoch, psiStr, beaconHash, sig
     };
     mptd_fabric_invoke_async("SCTrustSubmitEvidence", args);
 }
@@ -860,19 +918,23 @@ inline void CallSCTrustSubmitEvidence(
 // Written by the SDN controller (peer #2 in the Fabric organization mapping)
 // as an UNTRUSTED submission — CPDetectCheck (Eq 3.59) decides whether to
 // honour it. Async for the same reason as the RSU side.
+// σ_c^sub is now produced HERE with the controller's registered P-256 key over
+// the exact transmitted strings (Eq 3.62) — verified on submit by the chaincode
+// (smartcontract.go SCControllerSubmitEvidence). The controller still writes as
+// a non-authoritative client (invariant 2); the signature only proves the
+// submission genuinely came from a registered controller identity.
 inline void CallSCControllerSubmitEvidence(
     uint32_t vehicleID, uint32_t controllerID, const std::string& epoch,
-    double phi, const std::string& beaconHash,
-    const std::string& signatureHex)
+    double phi, const std::string& beaconHash)
 {
     MPTD_BLOCKCHAIN_GUARD();
+    std::string vehId  = MakeVehId(vehicleID);
+    std::string ctrlId = MakeCtrlId(controllerID);
+    std::string phiStr = std::to_string(phi);
+    std::string sig = mptd_sign_controller_evidence_hex(vehId, ctrlId, epoch,
+                                                        phiStr, beaconHash);
     std::vector<std::string> args = {
-        MakeVehId(vehicleID),
-        MakeCtrlId(controllerID),
-        epoch,
-        std::to_string(phi),
-        beaconHash,
-        signatureHex
+        vehId, ctrlId, epoch, phiStr, beaconHash, sig
     };
     mptd_fabric_invoke_async("SCControllerSubmitEvidence", args);
 }
@@ -945,24 +1007,124 @@ inline void CallCPDetectCheckAsync(
     mptd_fabric_invoke_async("CPDetectCheck", args);
 }
 
+// ── CallSCRSUFinalizeEpoch — RSU SC-Trust EMA (Eq rsu_trust / rsu_misbehave) ──
+// τ_{r_j}(t) = α·τ_{r_j}(t-1) + (1-α)·(1 - m_j(t)), where m_j is each RSU's
+// mean disagreement with the 2f+1 TRUSTED-quorum verdict over the vehicles it
+// reported on this epoch. Channel-wide: one call per epoch evaluates EVERY RSU
+// from the on-chain SUBM_<vid>_<epoch>_<rsu> records, applies the demote /
+// promote / revoke lifecycle, and is idempotent over the epoch. Synchronous;
+// returns the raw chaincode JSON (array of updated RSUTrustScore records).
+inline std::string CallSCRSUFinalizeEpoch(const std::string& epoch)
+{
+    if (skip_blockchain) return "";
+    std::vector<std::string> args = { epoch };
+    return mptd_fabric_invoke_sync("invoke", "SCRSUFinalizeEpoch", args);
+}
+
+// ── CallSCRSUFinalizeEpochAsync — fire-and-forget variant ────────────────────
+// Same chaincode function as CallSCRSUFinalizeEpoch but discards the returned
+// records. Scheduled once per epoch from inside the sim tick (after the
+// per-vehicle SUBM submissions for that epoch have landed) so blocking on the
+// orderer round-trip never stalls the simulation. Idempotent over the epoch —
+// re-firing just re-evaluates the same SUBM set. Bindable to
+// Simulator::Schedule via ns3::MakeBoundCallback.
+inline void CallSCRSUFinalizeEpochAsync(std::string epoch)
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    std::vector<std::string> args = { epoch };
+    mptd_fabric_invoke_async("SCRSUFinalizeEpoch", args);
+}
+
+// ── RsuTrustView / CallSCGetAllRSUTrustScores — live on-chain RSU trust read ──
+// Supports trust-ranked endorsing-peer selection (Sir's Task-4 revision,
+// 2026-06-16): rather than treating every RSU as an endorsing peer (expensive),
+// the registration/endorsement path draws its 2f+1 endorsers from the highest-
+// trust members of the on-chain trusted set R_trusted(t) (paper notation table;
+// endorser set = R_trusted(t)). This is a READ (EvaluateTransaction) — peer-
+// local, no orderer round-trip — so it is cheap enough for periodic (~1 Hz)
+// refresh. Returns one entry per registered RSU; `trusted` is false for
+// demoted CLIENT / revoked peers, which are excluded from selection.
+struct RsuTrustView {
+    uint32_t rsu_idx;   // parsed from "RSU_<idx>"
+    double   trust;     // τ_{r_j} ∈ [0,1]
+    bool     trusted;   // State == "TRUSTED" (CLIENT/REVOKED → false)
+};
+
+// Pull the quoted string value of `key` starting at/after `from` in `s`.
+// Returns "" when not found. Minimal scanner (no JSON lib in tree, matching the
+// hand-parse style of mptd_refresh_active_controller).
+inline std::string mptd_json_str_after(const std::string& s,
+                                        const std::string& key, size_t from)
+{
+    auto k = s.find(key, from);
+    if (k == std::string::npos) return "";
+    auto q1 = s.find('"', k + key.size());
+    if (q1 == std::string::npos) return "";
+    auto q2 = s.find('"', q1 + 1);
+    if (q2 == std::string::npos) return "";
+    return s.substr(q1 + 1, q2 - q1 - 1);
+}
+
+// Pull the numeric value of `key` (e.g. "TrustScore":) at/after `from`.
+inline double mptd_json_num_after(const std::string& s,
+                                  const std::string& key, size_t from)
+{
+    auto k = s.find(key, from);
+    if (k == std::string::npos) return 0.0;
+    size_t p = k + key.size();
+    return std::strtod(s.c_str() + p, nullptr);
+}
+
+inline std::vector<RsuTrustView> CallSCGetAllRSUTrustScores()
+{
+    std::vector<RsuTrustView> out;
+    if (skip_blockchain) return out;
+    std::string js = mptd_fabric_invoke_sync("query", "GetAllRSUTrustScores", {});
+    if (js.empty() || js == "null" || js == "[]") return out;
+
+    // Chaincode marshals RSUTrustScore in field order: ID, RSUID, TrustScore,
+    // State, … — so for each "RSUID":"RSU_<idx>" the matching TrustScore/State
+    // are the next occurrences. Scan object-by-object on the RSUID anchor.
+    size_t pos = 0;
+    while (true) {
+        auto idAnchor = js.find("\"RSUID\":\"RSU_", pos);
+        if (idAnchor == std::string::npos) break;
+        std::string rsuId = mptd_json_str_after(js, "\"RSUID\":", idAnchor);
+        RsuTrustView v{};
+        // parse idx from "RSU_<idx>"
+        auto us = rsuId.rfind('_');
+        v.rsu_idx = (us != std::string::npos)
+                        ? (uint32_t)std::strtoul(rsuId.c_str() + us + 1, nullptr, 10)
+                        : 0;
+        v.trust   = mptd_json_num_after(js, "\"TrustScore\":", idAnchor);
+        v.trusted = (mptd_json_str_after(js, "\"State\":", idAnchor) == "TRUSTED");
+        out.push_back(v);
+        pos = idAnchor + 12;   // advance past this anchor
+    }
+    return out;
+}
+
 // ── CallSCRevokeVote — Eq 3.58 BFT 2f+1 RSU vote ─────────────────────────────
 // One call per RSU that wishes to vote for revoking `vehicleID`. The
 // chaincode commits the immutable SCREVOKE_ record + emits "SCRevoke" event
 // only when distinct votes reach 2f+1. Synchronous so callers can react to
 // the returned `revoked` flag (e.g. trigger LKH rekey on the local RSU when
 // its own vote was the deciding one).
+// The vote signature is now produced HERE with the voting RSU's registered
+// P-256 key over (vehId‖rsuId‖reason‖tsStr) (Eq 3.63) — verified on submit by
+// the chaincode (smartcontract.go SCRevokeVote) so a forged identity cannot
+// pad the 2f+1 tally.
 inline std::string CallSCRevokeVote(
     uint32_t vehicleID, uint32_t rsuID,
-    const std::string& reason, const std::string& signatureHex,
-    double timestamp)
+    const std::string& reason, double timestamp)
 {
     if (skip_blockchain) return "";
+    std::string vehId = MakeVehId(vehicleID);
+    std::string rsuId = MakeRsuId(rsuID);
+    std::string tsStr = std::to_string(timestamp);
+    std::string sig = mptd_sign_revoke_vote_hex(vehId, rsuId, reason, tsStr);
     std::vector<std::string> args = {
-        MakeVehId(vehicleID),
-        MakeRsuId(rsuID),
-        reason,
-        signatureHex,
-        std::to_string(timestamp)
+        vehId, rsuId, reason, sig, tsStr
     };
     return mptd_fabric_invoke_sync("invoke", "SCRevokeVote", args);
 }

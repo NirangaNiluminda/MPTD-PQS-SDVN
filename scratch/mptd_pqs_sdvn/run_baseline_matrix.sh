@@ -1,0 +1,100 @@
+#!/usr/bin/env bash
+# =============================================================================
+# run_baseline_matrix.sh — full B1/B2/B3 vs MPTD-PQS(A1) baseline matrix
+#
+# For every scenario (attack x pct) on the 64-RSU grid:
+#   PHASE A  RngRun=1 mode=1  -> training data  -> analytics/datasets/aN_pP/
+#   TRAIN    freeze B2 (Ercan) + B3 (Sharma) .joblib models  (once)
+#   PHASE B  RngRun=2 mode=1  -> held-out beacon_log + MPTD-PQS A1 metrics (m1)
+#            predict B2/B3 on held-out -> live_results/{ercan,sharma}_aN_pP.csv
+#            RngRun=2 mode=6  -> B1 (Ghaleb) metrics (m6)
+#   PLOT     plot_baselines_real.py per scenario
+#
+# No leakage: train on RngRun=1, score on RngRun=2.
+# Resumable-ish: the sim overwrites its own metrics CSV each run.
+# =============================================================================
+set -uo pipefail
+
+NS3="${NS3:-$HOME/ns-allinone-3.35/ns-3.35}"
+PROJ="${PROJ:-$HOME/Niranga/MPTD-PQS-SDVN}"
+cd "$NS3"
+export LD_LIBRARY_PATH="$PWD/build/lib:$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
+
+ATTACKS=(1 2 3 4 5 6 7)
+PCTS=(30 60 90)
+SIMTIME=30
+SPEED=60                       # default trace tag -> metrics_..._s60_*.csv
+
+RES="$NS3/analytics/results"
+DATASETS="$NS3/analytics/datasets"
+B2DIR="$NS3/models_ercan_b2"
+B3DIR="$NS3/models_sharma_b3"
+LIVE="$PROJ/live_results"
+SIMLOG="$NS3/scratch/mptd_pqs_sdvn/sim_live.log"   # full NS-3 console of the CURRENT run
+mkdir -p "$RES/sweep" "$DATASETS" "$B2DIR" "$B3DIR" "$LIVE"
+
+ts() { date '+%H:%M:%S'; }
+log() { echo "[$(ts)] $*"; }
+
+run_sim() {  # atk pct mode rng
+  # Truncate the live log and stream this run's full NS-3 console into it.
+  # Follow it with:  tail -F scratch/mptd_pqs_sdvn/sim_live.log
+  {
+    echo "=========================================================="
+    echo "[$(ts)] SIM a$1_p$2  mode=$3  RngRun=$4"
+    echo "=========================================================="
+  } > "$SIMLOG"
+  ./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+    --skip_blockchain=true --ablation_mode=$3 --attack_number=$1 \
+    --attack_percentage=$2 --maxspeed=$SPEED --simTime=$SIMTIME --RngRun=$4" \
+    >> "$SIMLOG" 2>&1
+}
+
+log "build check..."
+./waf build >/dev/null 2>&1 && log "build OK" || { log "BUILD FAILED — abort"; exit 1; }
+
+# ── PHASE A: training data ──────────────────────────────────────────────────
+log "===== PHASE A: training data (RngRun=1, mode=1) ====="
+for atk in "${ATTACKS[@]}"; do for pct in "${PCTS[@]}"; do
+  log "[A] a${atk}_p${pct}"
+  if run_sim "$atk" "$pct" 1 1; then
+    d="$DATASETS/a${atk}_p${pct}"; mkdir -p "$d"
+    cp "$RES/beacon_log.csv" "$d/" 2>/dev/null || log "  WARN: no beacon_log for a${atk}_p${pct}"
+    for f in tp_s1_poison_log.csv vehicle_tx_log.csv ghost_identity_log.csv; do
+      cp "$RES/$f" "$d/" 2>/dev/null || true
+    done
+  else
+    log "  FAILED a${atk}_p${pct} (RUN A)"
+  fi
+done; done
+
+# ── TRAIN + FREEZE (once) ───────────────────────────────────────────────────
+log "===== TRAIN + FREEZE B2/B3 ====="
+python3 mptd_pqs/ercan_b2_train_save.py  "$DATASETS" "$B2DIR"  2>&1 | tail -5
+python3 mptd_pqs/sharma_b3_train_save.py "$DATASETS" "$B3DIR"  2>&1 | tail -5
+
+# ── PHASE B: held-out scoring ───────────────────────────────────────────────
+log "===== PHASE B: held-out (RngRun=2) — A1 metrics + B2/B3 predict + B1 ====="
+for atk in "${ATTACKS[@]}"; do for pct in "${PCTS[@]}"; do
+  log "[B m1] a${atk}_p${pct}"
+  if run_sim "$atk" "$pct" 1 2; then
+    python3 mptd_pqs/ercan_b2_live_predict.py  "$RES/beacon_log.csv" "$atk" "$pct" "$B2DIR" \
+      "$LIVE/ercan_a${atk}_p${pct}.csv"  >/dev/null 2>&1 || log "  WARN: B2 predict failed a${atk}_p${pct}"
+    python3 mptd_pqs/sharma_b3_live_predict.py "$RES/beacon_log.csv" "$atk" "$pct" "$B3DIR" \
+      "$LIVE/sharma_a${atk}_p${pct}.csv" >/dev/null 2>&1 || log "  WARN: B3 predict failed a${atk}_p${pct}"
+  else
+    log "  FAILED a${atk}_p${pct} (RUN B m1)"
+  fi
+  log "[B m6] a${atk}_p${pct}  (B1 Ghaleb)"
+  run_sim "$atk" "$pct" 6 2 || log "  FAILED a${atk}_p${pct} (RUN B m6)"
+done; done
+
+# ── PLOTS ───────────────────────────────────────────────────────────────────
+log "===== PLOTS ====="
+cd "$PROJ"
+for atk in "${ATTACKS[@]}"; do for pct in "${PCTS[@]}"; do
+  python3 plot_baselines_real.py "$atk" "$pct" "live_results/baseline_a${atk}_p${pct}.png" \
+    2>&1 | tail -3 || log "  plot failed a${atk}_p${pct}"
+done; done
+
+log "===== MATRIX COMPLETE ====="

@@ -19,11 +19,11 @@ Booleans take `true`/`false`; everything else is a number.
 | Flag | Default | Type | One-line meaning |
 |------|---------|------|------------------|
 | `--N_RSUs` | `4` | uint | Active RSU count. **64** for the SUMO 8×8 grid. Clamped to `MAX_RSUS=64`. |
-| `--N_Vehicles` | `16` | uint | Active vehicle count. **~135** for the SUMO urban trace. Clamped to capacity (`total_size`). |
+| `--N_Vehicles` | `16` | uint | Active vehicle count. **200** for the supervisor-spec SUMO urban trace (`urban_150`); the older `urban_60` trace has 135. Clamped to capacity (`total_size`). |
 | `--simTime` | `15.0` | double | Seconds of simulated time. |
 | `--mobility_source` | `0` | int | **0**=hardcoded 16-veh · **1**=SUMO `.tcl` trace (paper) · **2**=live TraCI (reserved). |
 | `--mobility_scenario` | `0` | int | **0**=urban · **1**=non-urban/rural · **2**=highway/autobahn. Selects the trace + RSU-CSV tag. |
-| `--maxspeed` | `60` | int | Speed tag (km/h) → picks `mobility_<scenario>_<maxspeed>.tcl`. Only `urban_60` & `urban_150` exist today. |
+| `--maxspeed` | `60` | int | Speed tag (km/h) → picks `mobility_<scenario>_<maxspeed>.tcl`. `urban_60` (135 veh) & `urban_150` (200 veh, supervisor spec — use this) exist today. |
 | `--attack_number` | `1` | int | Which attack signature 1–7 (TP-S*/MP-S*). See §3. |
 | `--attack_percentage` | `40` | int | % of nodes that are malicious (0–100, **avoid 100**). The "how many attackers" knob. |
 | `--sybil_registration_pct` | `0` | int | Attack-3 only: % of vehicles pre-registered as Sybil at startup (0 = ghost-ID mode). |
@@ -32,9 +32,9 @@ Booleans take `true`/`false`; everything else is a number.
 | `--enable_gat` | `-1` | int | Force GAT on(1)/off(0); **-1** = follow `ablation_mode`. |
 | `--enable_lstm_ae` | `-1` | int | Force LSTM-AE on(1)/off(0); **-1** = follow `ablation_mode`. |
 | `--trs_classical` | `0` | int | TRS scheme: **0**=PQ Dilithium/ML-DSA-44 (paper) · **1**=classical Shamir-Schnorr-P256 (RQ5 PBPO baseline). |
-| `--skip_blockchain` | `false` | bool | Skip Hyperledger Fabric + REST bring-up. **`true` on HPC / no-Docker**. |
+| `--skip_blockchain` | `false` | bool | Skip the live Hyperledger Fabric writes. **`false`** for the full blockchain run (HPC node has Docker + Explorer + IPFS). **`true`** only for training sweeps & ablation **A5** (`--ablation_mode=5`). Has effect ONLY together with `--routing_algorithm=4` (see that row + §2b). See `BLOCKCHAIN_IMPLEMENTATION.md` + `fabric_net/README.md`. |
 | `--routing_test` | `true` | bool | **true** = MPTD-PQS detection mode (no SDN routing pipeline) · **false** = legacy SDN-routing experiment. See §2 — this one changes a LOT. |
-| `--routing_algorithm` | `0` | int | (only used when `routing_test=false`) SDN link-discovery algorithm 0–5. See §2. |
+| `--routing_algorithm` | `0` | int | **Two distinct jobs.** (a) When `routing_test=false`: selects the SDN link-discovery algorithm 0–5 (§2). (b) **Regardless of `routing_test`: it is ALSO the master switch for the on-chain blockchain path** — `register_all_nodes()`, `initialize_blockchain()`, and the controller/consortium SC-evidence submits are ALL gated on `routing_algorithm == 4` (`12_main.h:1594, 1713, 2071`). **For ANY live blockchain run you MUST set `--routing_algorithm=4`**, or the ledger stays empty. See §2b. |
 | `--architecture` | `0` | int | 0=centralized · 1=distributed · 2=hybrid (legacy routing layer). |
 | `--experiment_number` | `0` | int | Sub-experiment index (legacy routing layer; `5` triggers a special grid layout). |
 | `--lambda` | `10` | int | Flow-size selector for the legacy routing/traffic generator. |
@@ -67,8 +67,11 @@ This is the mode for all attack-detection / metric work.
   detection/crypto/blockchain stack.
 - **NetAnim labels** reflect the MPTD-PQS roles ("SDN CONTROLLER (MPTD-PQS)",
   management = "DSRC-RSU relay", cloud = "FHE aggregate sink").
-- `--routing_algorithm`, `--lambda`, `--qf`, `--architecture`,
-  `--experiment_number`, `--link_lifetime_threshold` are **ignored** here.
+- `--lambda`, `--qf`, `--architecture`, `--experiment_number`,
+  `--link_lifetime_threshold` are **ignored** here.
+- **`--routing_algorithm` is NOT ignored.** Even with `routing_test=true` (so the
+  SDN link-discovery switch never runs), `routing_algorithm` still acts as the
+  on-chain master switch: only `=4` triggers the blockchain path. See §2b.
 
 ### `--routing_test=false` — legacy SDN-routing experiment ⚠️ not the FYP path
 
@@ -95,6 +98,56 @@ algorithm:
 > ablations, the 3 baselines) keep **`--routing_test=true`** (the default). Only
 > set it to `false` if you are deliberately testing the inherited SDN-routing
 > code.
+
+---
+
+## 2b. `--routing_algorithm=4` — the on-chain master switch ⛓️
+
+This is the flag people forget, and forgetting it produces a **silently empty
+ledger**. The entire live-blockchain path is gated on `routing_algorithm == 4`,
+*independently of* `routing_test` and `ablation_mode`:
+
+| Code site | What it does | Gate |
+|---|---|---|
+| `12_main.h:1594` | `initialize_blockchain()` (ensures Fabric is up) | `routing_algorithm==4 && !skip_blockchain` |
+| `12_main.h:2071` | `register_all_nodes()` — boot-time SC-Register of every RSU/vehicle/controller | `routing_algorithm==4` (then `skip_blockchain` short-circuits inside) |
+| `12_main.h:1713` | builds + submits the controller / consortium SC-evidence each window | `routing_algorithm==4` |
+
+So the on-chain controls are **two nested switches**:
+
+```
+routing_algorithm==4 ?        ← is this the proposed method, which HAS a chain?
+   └── skip_blockchain==false ? ← do I actually write to live Fabric, or stub it?
+```
+
+- `routing_algorithm=0` (the default, "port-based") is a **routing baseline with
+  no blockchain by design** — it writes nothing on-chain no matter what
+  `skip_blockchain` is. The baselines (0,1,2,3,5) are *supposed* to have no chain;
+  that is part of the paper's comparison.
+- `routing_algorithm=4` is the **proposed MPTD-PQS method** (routing overlay
+  `run_proposed_LLDP`); it is the ONLY value that registers nodes and submits
+  evidence on-chain.
+
+**Therefore:**
+
+| You want… | flags |
+|---|---|
+| metrics only, no chain (sweeps / A5) | `--routing_algorithm=0 --skip_blockchain=true` (or just omit both) |
+| the proposed method, chain bypassed (clean blockchain-ablation OFF arm) | `--routing_algorithm=4 --skip_blockchain=true` |
+| **the live blockchain run** (Explorer + IPFS deliverable) | **`--routing_algorithm=4 --skip_blockchain=false`** |
+
+> **Clean blockchain ablation:** to isolate the blockchain's effect, hold the
+> routing fixed at `=4` and toggle ONLY `skip_blockchain`. Comparing default `=0`
+> (no chain) against `=4` (chain) confounds the routing protocol with the
+> blockchain and is **not** a valid ablation.
+
+> **`initialize_blockchain()` and the running gen_network:** when the paper-scale
+> `fabric_net/gen_network.sh` network (`peer0.rsu.example.com` + 5 orderers) is
+> already up, `initialize_blockchain()` detects it and no-ops — it does NOT rebuild
+> the legacy `test-network`. Node registration and SC-invokes flow through the
+> gateway daemon's AF_UNIX socket to that existing network. So the live-run order
+> is: (1) `gen_network.sh all 64 5`, (2) start the gateway daemon, (3) run the sim
+> with `--routing_algorithm=4 --skip_blockchain=false`.
 
 ---
 
@@ -146,20 +199,26 @@ Python post-processors run on the simulation output (see `HPC_RUN_GUIDE.md` §5)
 
 **MPTD-PQS A1 on the SUMO 64-RSU grid (the standard run):**
 ```bash
-./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 \
   --skip_blockchain=true --routing_test=true --ablation_mode=1 \
   --attack_number=2 --attack_percentage=20 --simTime=30"
 ```
 
-**Full mode (all AI + crypto + blockchain — needs Docker + ONNX models):**
+**Full mode (all AI + crypto + LIVE blockchain — needs Docker + ONNX models):**
 ```bash
-./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+# bring the network up first:  cd fabric_net && ./gen_network.sh all 64 5
+# and start the gateway daemon (see BLOCKCHAIN_IMPLEMENTATION.md), THEN:
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 \
+  --routing_algorithm=4 --skip_blockchain=false \
   --ablation_mode=0 --attack_number=2 --attack_percentage=20 --simTime=30"
 ```
+> `--routing_algorithm=4` is **mandatory** here — it is the on-chain master switch
+> (§2b). Without it the run completes but `blockchain_evidence.json` is empty and
+> Explorer shows no new records.
 
 **B1 SOTA baseline (Ghaleb LTT, in-sim):**
 ```bash
-./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+./waf --run "mptd_pqs_sdvn --mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200 \
   --skip_blockchain=true --ablation_mode=6 \
   --attack_number=2 --attack_percentage=20 --simTime=30"
 ```
@@ -181,10 +240,11 @@ For the FYP detection/evaluation work you normally only vary these:
 
 - `--ablation_mode` (which variant) · `--attack_number` (which attack) ·
   `--attack_percentage` (intensity)
-- `--mobility_source=1 --N_RSUs=64 --N_Vehicles=135` (SUMO map, fixed)
-- `--skip_blockchain=true` on HPC · `--simTime`
+- `--mobility_source=1 --maxspeed=150 --N_RSUs=64 --N_Vehicles=200` (SUMO map, supervisor spec: 200 veh + 64 RSU)
+- For the **live blockchain run**: `--routing_algorithm=4 --skip_blockchain=false` (both required, §2b). For metrics-only sweeps / A5 leave `routing_algorithm=0` and pass `--skip_blockchain=true` · `--simTime`
 - `--rsu_seed` for reproducibility · `--trs_classical=1` only for the RQ5 PBPO baseline
 
-Leave `--routing_test=true`, and ignore `--routing_algorithm / --lambda / --qf /
---architecture / --experiment_number / --link_lifetime_threshold` unless you are
-running the inherited SDN-routing code.
+Leave `--routing_test=true`. Ignore `--lambda / --qf / --architecture /
+--experiment_number / --link_lifetime_threshold` unless you are running the
+inherited SDN-routing code. **Do NOT ignore `--routing_algorithm`** — set it to
+`4` whenever you want on-chain records, `0` otherwise (§2b).

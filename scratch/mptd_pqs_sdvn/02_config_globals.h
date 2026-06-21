@@ -23,7 +23,11 @@
 // Usage in code: NS3_ROOT "/analytics/data/file.csv"
 //                FAB_ROOT "/test-network/..."
 #define NS3_ROOT "/home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35"
-#define FAB_ROOT "/home/niranga/fabric-samples"
+#define FAB_ROOT "/home/sdvn_mobility_flooding/fabric-samples"
+// DATASET_ROOT = the git repo working tree (committable). The additive
+// per-attack/per-percentage dataset export (export_run_dataset() in
+// 10_metrics_csv.h) writes here, separate from NS3_ROOT analytics output.
+#define DATASET_ROOT "/home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN"
 // ───────────────────────────────────────────────────────────────────────────
 
 using namespace std::chrono;
@@ -200,7 +204,7 @@ bool g_trs_classical_baseline = false;
 // ── BSM Beacon Parameters (IEEE 802.11p, §3.4.4 Eq. 3.9) ──────────────────
 // b_i(t) = (p_i(t), s_i(t), θ_i(t), a_i(t), t, ID_i)
 double T_b = 0.1;           // Beacon broadcast interval: 100ms (IEEE 802.11p)
-double R_max_comm = 300.0;  // Max V2V/V2I communication range (m)
+double R_max_comm = 270.0;  // Max V2V/V2I communication range (m); 41 dBm DSRC link-lifetime calibration
 
 // ── Trajectory Poisoning Detection Thresholds (§3.4.4) ────────────────────
 // TP-S1: Kinematic position feasibility
