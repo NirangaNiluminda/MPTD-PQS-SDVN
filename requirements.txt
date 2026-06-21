@@ -1,0 +1,8 @@
+# Pinned for loading the frozen models in models_global/.
+# scikit-learn MUST be 1.5.2 (models were pickled with this version);
+# other versions can silently corrupt RandomForest predictions.
+scikit-learn==1.5.2
+scipy>=1.10
+pandas>=1.5
+matplotlib>=3.6
+joblib>=1.3

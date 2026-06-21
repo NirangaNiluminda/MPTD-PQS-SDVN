@@ -13,11 +13,11 @@
 set -uo pipefail
 
 NS3="${NS3:-$HOME/ns-allinone-3.35/ns-3.35}"
-PROJ="${PROJ:-$HOME/Niranga/MPTD-PQS-SDVN}"
+PROJ="${PROJ:-$HOME/Desktop/G11/MPTD-PQS-SDVN}"
 cd "$NS3"
 export LD_LIBRARY_PATH="$PWD/build/lib:$HOME/.local/lib:${LD_LIBRARY_PATH:-}"
 
-SIMTIME=30
+SIMTIME=10
 SPEED=60
 RES="$NS3/analytics/results"
 LIVE="$PROJ/live_results"
@@ -30,7 +30,7 @@ log() { echo "[$(ts)] $*"; }
 
 run_sim() {  # atk pct mode rng
   { echo "=========="; echo "[$(ts)] SIM a$1_p$2 mode=$3 RngRun=$4"; echo "=========="; } > "$SIMLOG"
-  ./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=135 \
+  ./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=200 \
     --skip_blockchain=true --ablation_mode=$3 --attack_number=$1 \
     --attack_percentage=$2 --maxspeed=$SPEED --simTime=$SIMTIME --RngRun=$4" \
     >> "$SIMLOG" 2>&1
@@ -40,11 +40,17 @@ run_sim() {  # atk pct mode rng
 rm -f "$RESULTS_CSV"
 
 log "===== HELD-OUT per-attack scoring (frozen global models) START ====="
-for atk in 1 2 3; do
-  for pct in 30 60 90; do
+for atk in 1 2 3 4 5 6 7; do
+  for pct in 0 20 40 60 80 100; do
     s="a${atk}_p${pct}"
     log "===== ${s} : held-out sim (mode 1, RngRun=2) ====="
     if run_sim "$atk" "$pct" 1 2; then
+    REAL_DIR="$PROJ/real_data/a${atk}_p${pct}"
+      mkdir -p "$REAL_DIR"
+      cp "$RES/beacon_log.csv"       "$REAL_DIR/" 2>/dev/null || true
+      cp "$RES/metrics.csv"          "$REAL_DIR/" 2>/dev/null || true
+      cp "$RES/tp_s1_poison_log.csv" "$REAL_DIR/" 2>/dev/null || true
+      cp "$RES/vehicle_tx_log.csv"   "$REAL_DIR/" 2>/dev/null || true
       ( cd "$PROJ" && NS3="$NS3" python3 global_heldout_eval.py predict "$atk" "$pct" 2>&1 | tail -8 ) \
         || log "  WARN predict failed ${s}"
     else
@@ -57,3 +63,9 @@ log "regenerating per-attack chart..."
 ( cd "$PROJ" && NS3="$NS3" python3 global_heldout_eval.py plot 2>&1 | tail -40 )
 log "===== HELD-OUT per-attack scoring DONE ====="
 log "Chart: $LIVE/global_heldout_perattack.png"
+log "===== running eval_on_real_and_plot.py ====="
+( cd "$PROJ" && python3 eval_on_real_and_plot.py \
+    "$PROJ/real_data" \
+    "$PROJ/models_global" \
+    "$PROJ/real_plots" 2>&1 )
+log "Plots saved to $PROJ/real_plots"

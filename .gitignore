@@ -15,10 +15,18 @@ mptd_pqs/**/*.pyc
 !mptd_pqs_pipeline.py
 !attack_comparison.py
 !mptd_pqs_results.json
-!plot_baselines_real.py
 !global_baseline_eval.py
 !global_heldout_eval.py
 !GLOBAL_BASELINE_README.md
+# ── Baseline hand-off (train-here / eval-on-real-data-there) ──────────────────
+!train_global_models.py
+!eval_on_real_and_plot.py
+!README_HANDOFF.md
+!requirements.txt
+
+# Frozen trained models — committed so the teammate gets them from the branch
+!models_global/
+!models_global/**
 
 # ── Mobility trace files ──────────────────────────────────────────────────────
 !mobility/

@@ -1,0 +1,15 @@
+{
+  "ercan": [
+    "recv_pos_x",
+    "recv_pos_y",
+    "speed_ms",
+    "d_recv_pos_x",
+    "d_recv_pos_y",
+    "d_speed_ms",
+    "dist_decl",
+    "speed_diff",
+    "aoa",
+    "d_hat",
+    "delta_d"
+  ]
+}

@@ -33,7 +33,6 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from mptd_pqs.sharma_b3_detector import SharmaB3Detector, extract_features_from_ns3
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -344,10 +343,7 @@ def main():
         )
 
     # Add your code here
-    feat_df = extract_features_from_ns3("analytics/results/rsu_relay_log.csv")
-    det = SharmaB3Detector(seed=42, with_plausibility=True)
-    b3_results = det.run(feat_df)
-
+    
     print("\n" + "=" * 60)
     print("  MPTD-PQS Pipeline Complete")
     print("=" * 60)
