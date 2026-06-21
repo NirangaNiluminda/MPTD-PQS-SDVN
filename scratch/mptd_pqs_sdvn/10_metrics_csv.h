@@ -624,11 +624,11 @@ double compute_FPR_full()
 
 // PARR: Poisoning Attack Rejection Rate (Eq. 4.3)
 // Fraction of poisoned blockchain submissions correctly rejected by the TRS layer.
-// A "TRS rejection" occurs when a vehicle accumulates ≥ REVOKE_THRESHOLD (3)
-// consecutive detection events — the ring signature quorum refuses to countersign.
-// Unlike DR = TP/(TP+FN) (per-beacon detection rate), PARR measures the blockchain
-// enforcement outcome: an attacker must sustain 3+ catches before being revoked.
-// In short simulations PARR < DR; over longer runs PARR approaches DR.
+// A "TRS rejection" is counted per poisoned beacon flagged by the RSU lightweight
+// detector (flag=1, Eq 3.67). This is the per-beacon witness signal that feeds the
+// BFT revocation quorum (2f+1 distinct trusted RSUs within window T_w, Eq 3.65).
+// Unlike DR = TP/(TP+FN) (overall per-beacon detection rate), PARR is scoped to the
+// poisoned-beacon population and reflects the TRS-layer rejection outcome.
 double compute_PARR()
 {
     if (parr_poisoned_total == 0) return 0.0;
@@ -756,7 +756,7 @@ void print_mptd_metrics()
               << "  (TRS blockchain rejection; "
               << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned revoked)" << std::endl;
     // R8.4: per-beacon TRS verify outcomes (Paper §3.5.4 Algorithm 6).
-    // Distinct from PARR (which is REVOKE_THRESHOLD-driven, post-3-strikes).
+    // Distinct from PARR (per-flagged-poisoned-beacon, Eq 3.67 / 4.3).
     // These counters reflect the real Shamir-Schnorr partial_sign+aggregate+verify chain
     // booked into the PBPO_Full window per evidence message m_j (Eq. 3.46).
     std::cout << "  TRS-verify: " << g_trs_verified_count << " ok / "

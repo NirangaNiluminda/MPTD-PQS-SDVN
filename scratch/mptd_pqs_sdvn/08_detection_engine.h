@@ -82,13 +82,23 @@ void log_unregistered_beacon_reject(uint32_t vid, uint32_t rsu_id, double sim_t,
 // PBPO timing accumulator (defined in 02_config_globals.h)
 // pbpo_time_sum_ms and pbpo_cnt are global — updated directly here.
 
-// ── Stage 6: consecutive anomaly counter per vehicle (revoke after 3) ─────────
-static int consecutive_anomaly_count[total_size + 2] = {};
-static const int REVOKE_THRESHOLD = 3;
+// ── Stage 6: paper-conformant revocation voting (paper §3.5.5, Eq 3.65 / 3.67) ─
+// The paper casts an RSU's revocation vote on a SINGLE flag (flag_i^{rsu,j} =
+// 1[ψ_j^(i)(t) > ψ_th], Eq 3.67); false-positive robustness comes from requiring
+// 2f+1 DISTINCT trusted-RSU witnesses inside the sliding window T_w (Eq 3.65),
+// NOT from one RSU flagging 3 times in a row. The legacy 3-consecutive counter
+// (REVOKE_THRESHOLD=3) had no basis in the paper and is removed.
+//
+// To avoid re-submitting the same idempotent vote on every 100 ms beacon, a
+// per-(RSU,vehicle) refresh guard rate-limits vote SUBMISSION only (an anti-spam
+// network concern) — it does NOT gate detection or metrics. The same RSU re-votes
+// only after VOTE_REFRESH_SEC of continued flagging; distinct RSUs are unaffected.
+static const double VOTE_REFRESH_SEC = 15.0;   // ~T_w/2 (T_w default 30 s, chaincode side)
+static std::map<uint64_t, double> last_revoke_vote_ts;  // key = (rsu_idx<<32)|vid
 
 // ============================================================
 // send_lkh_rekey_to_vehicles() — Real NS-3 rekey packet transmission
-// Called after revocation (consecutive_anomaly_count ≥ REVOKE_THRESHOLD).
+// Called after revocation (BFT 2f+1 distinct-witness quorum, Eq 3.65).
 //
 // Steps (§3.5.2, Eq.3.33–3.34):
 //   1. lkh_rekey_on_revoke() regenerates keys on the revoked vehicle's path
@@ -2056,7 +2066,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     pbpo_cnt++;
 
     // ── R4.a: SC-Trust + SC-Revoke moved RSU-side (paper invariant #1) ────────
-    // CallSCTrust / CallSCRevoke / consecutive_anomaly_count[] / parr_trs_rejected
+    // CallSCTrust / CallSCRevoke (vote-on-first-flag, Eq 3.67) / parr_trs_rejected
     // now live in handle_readone() — see the "R4.a: SC-Trust + SC-Revoke at RSU"
     // block above. Per paper invariant #1 the RSU is the authoritative submitter
     // to the blockchain (no controller relay); the controller's role here is now
@@ -2773,8 +2783,9 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // Per paper invariant #1, RSU → blockchain is DIRECT — these smart-contract
         // calls must originate at the RSU, not the controller. Algorithm 1 line 5-6
         // gates SC-Trust on the lightweight composite-score breach (ψ > ψ_th, i.e.
-        // rsu_lw.anomalous). SC-Revoke fires when the consecutive-anomaly counter
-        // reaches REVOKE_THRESHOLD (TRS "reject" vote per Eq.3.34).
+        // rsu_lw.anomalous). SC-Revoke casts ONE BFT vote the instant this RSU
+        // flags the vehicle (flag=1, Eq 3.67); the 2f+1-distinct-witness quorum
+        // (Eq 3.65) is decided chaincode-side within the sliding window T_w.
         //
         // For attacks 5/7 (controller-as-attacker) the RSU's view is HONEST — the
         // data plane is clean and no SC call fires here. That is correct: SC-Trust
@@ -2787,42 +2798,53 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // moves here with the revoke event.
         if (vid < (uint32_t)(total_size + 2)) {
             if (rsu_lw.detected) {
-                consecutive_anomaly_count[vid]++;
-                if (consecutive_anomaly_count[vid] >= REVOKE_THRESHOLD) {
-                    if (tag.GetIsPoisoned()) parr_trs_rejected++; // PARR numerator (Eq.4.3)
-                    consecutive_anomaly_count[vid] = 0;           // reset after TRS reject
+                double ts = Simulator::Now().GetSeconds();
 
-                    double ts = Simulator::Now().GetSeconds();
+                // ── PARR numerator (Eq 4.3) ──────────────────────────────────
+                // A poisoned beacon flagged by this RSU's lightweight detector
+                // (flag=1, Eq 3.67) is a TRS-layer rejection. Counted per flagged
+                // poisoned beacon, in lockstep with parr_poisoned_total — NOT
+                // throttled by the vote refresh guard below (that is a network
+                // anti-spam concern, not a detection metric).
+                if (tag.GetIsPoisoned()) parr_trs_rejected++; // PARR numerator (Eq.4.3)
 
-                    // ── Eq 3.58 SC-Revoke BFT (TASK ①-N) ──────────────────────
-                    // Paper §3.5.5 Eq 3.58: revocation requires ≥ 2f+1 distinct
-                    // RSU votes (with NumRSUs=4, f=1 → threshold=3). Replaces
-                    // the legacy single-RSU CallSCRevoke that immediately
-                    // committed SCREVOKE on the first RSU to hit
-                    // REVOKE_THRESHOLD — violating BFT consensus invariant 6.
+                // ── Per-(RSU,vehicle) vote refresh guard (anti-spam only) ────
+                // The RSU is a revocation witness the instant it flags the
+                // vehicle (Eq 3.67); it need not re-broadcast the same idempotent
+                // vote on every 100 ms beacon. Rate-limit SUBMISSION to once per
+                // VOTE_REFRESH_SEC of continued flagging. This does NOT weaken the
+                // 2f+1 quorum (Eq 3.65): distinct RSUs each still contribute one
+                // witness — only redundant re-sends from the SAME RSU are coalesced.
+                uint64_t guard_key = ((uint64_t)rsu_idx << 32) | (uint64_t)vid;
+                auto vit = last_revoke_vote_ts.find(guard_key);
+                bool should_vote = (vit == last_revoke_vote_ts.end())
+                                   || (ts - vit->second >= VOTE_REFRESH_SEC);
+                if (should_vote) {
+                    last_revoke_vote_ts[guard_key] = ts;
+
+                    // ── Eq 3.65 SC-Revoke BFT ────────────────────────────────
+                    // Revocation requires ≥ 2f+1 DISTINCT trusted-RSU witnesses
+                    // accumulated within the sliding window T_w (Eq 3.65;
+                    // NumRSUs=4 → f=1 → threshold=3). This RSU casts ONE vote on
+                    // its first flag (Eq 3.67); the chaincode tallies distinct
+                    // trusted voters whose votes fall in [t-T_w, t] and commits
+                    // SCREVOKE once the quorum is met. The vote is idempotent per
+                    // (vehicle,RSU): VOTE_<vid>_<rsuID> is overwritten, so the
+                    // same RSU is counted at most once toward the quorum.
                     //
                     // Flow per RSU:
-                    //   1. RSU r_j casts SCRevokeVote (sync — needs the
-                    //      revoked-quorum bit back to decide whether to rekey).
-                    //   2. Chaincode stores VOTE_<vid>_<rsuID> (idempotent
-                    //      per RSU) and counts distinct votes.
-                    //   3. When count ≥ 2f+1, chaincode commits
-                    //      SCREVOKE_<vid>_<ts> + emits "SCRevoke" event AND
-                    //      returns "revoked":true in the payload.
+                    //   1. RSU r_j casts SCRevokeVote (sync — needs the revoked
+                    //      bit back to decide whether to rekey).
+                    //   2. Chaincode stores VOTE_<vid>_<rsuID> (idempotent per
+                    //      RSU) and counts the distinct trusted voters in-window.
+                    //   3. When count ≥ 2f+1, chaincode commits SCREVOKE_<vid>_<ts>
+                    //      + emits "SCRevoke" event AND returns "revoked":true.
                     //   4. Only when revoked=true does THIS RSU fire LKH rekey
-                    //      locally. Other RSUs learn from the "SCRevoke"
-                    //      Fabric event — wiring that listener is a separate
-                    //      task (Fabric Gateway C++ gRPC client).
+                    //      locally. Other RSUs learn from the "SCRevoke" Fabric
+                    //      event (Fabric Gateway C++ gRPC client — separate task).
                     //
-                    // Latency tradeoff: CallSCRevokeVote is sync (~1-2s
-                    // orderer round-trip per call). Acceptable because revoke
-                    // is a rare event (3 consecutive anomalies on the same
-                    // RSU↔vehicle path); not in the beacon-rate hot path.
-                    //
-                    // A5 ablation / routing_test fallback: no chaincode
-                    // available → fall back to per-RSU unilateral revoke,
-                    // matching the legacy behaviour. This is the "no BC"
-                    // baseline used by RQ6 (BC isolation comparison).
+                    // A5 ablation / routing_test fallback: no chaincode → per-RSU
+                    // unilateral revoke (RQ6 BC-isolation baseline).
                     //
                     // The revoke-vote signature (Eq 3.63) is produced inside
                     // CallSCRevokeVote with this RSU's registered P-256 key over
@@ -2831,14 +2853,14 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     bool revoked = false;
                     if (!routing_test && ablation_mode != 5) {
                         std::string vote_payload = CallSCRevokeVote(
-                            vid, rsu_idx, "3_consecutive_anomalies", ts);
+                            vid, rsu_idx, "lw_anomaly_flag", ts);
                         // Payload shape: {"voted":true,"votes":N,"threshold":T,"revoked":bool}
                         revoked = (vote_payload.find("\"revoked\":true")
                                    != std::string::npos);
                         cout << "[SC-REVOKE-VOTE-RSU" << rsu_idx << "] V" << (vid - 2)
                              << " ts=" << std::fixed << std::setprecision(3) << ts
                              << " payload=" << vote_payload
-                             << " (paper §3.5.5 Eq 3.58 BFT 2f+1)" << endl;
+                             << " (paper §3.5.5 Eq 3.65 BFT 2f+1, window T_w)" << endl;
                     } else {
                         // A5 / routing_test: no BC consensus — local revoke
                         revoked = true;
@@ -2851,10 +2873,10 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 
                     // LKH rekey (Eq.3.34): N_rekey = log₂|V_j| unicasts to
                     // remaining vehicles. Fires only when BFT quorum was hit
-                    // (Eq 3.58) OR the no-BC fallback authorized local revoke.
+                    // (Eq 3.65) OR the no-BC fallback authorized local revoke.
                     if (revoked && rsu_idx < N_RSUs) {
                         cout << "[LKH-REVOKE-RSU" << rsu_idx << "] V" << (vid - 2)
-                             << " revoked (Eq.3.58 BFT) → group rekey (Eq.3.34)"
+                             << " revoked (Eq.3.65 BFT) → group rekey (Eq.3.34)"
                              << endl;
                         // Phase 1C-b: route through dedup wrapper so the event
                         // drainer (which fires on the same SCRevoke event a
@@ -2866,9 +2888,9 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                         mptd_arm_event_drainer_once();
                     }
                 }
-            } else {
-                consecutive_anomaly_count[vid] = 0;
             }
+            // No consecutive-flag counter to reset: the paper (Eq 3.65/3.67) has
+            // none — robustness is the 2f+1 distinct-witness quorum, not repetition.
 
             // SC-Trust: per-beacon ψ submission when composite score breaches threshold.
             // Algorithm 1 line 5-6 says "if ψ_i(t) > ψ_th" → gated on rsu_lw.anomalous

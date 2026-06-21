@@ -338,8 +338,8 @@ uint32_t tdee_gt_count [MAX_RSUS] = {};
 uint32_t tdee_est_count[MAX_RSUS] = {};
 
 // ── PARR: TRS blockchain rejection accumulators (paper Eq. 4.3) ─────────────
-// parr_trs_rejected  = poisoned beacons where vehicle hit TRS revoke threshold
-//                      (≥ REVOKE_THRESHOLD=3 consecutive detections → ring sig refuses)
+// parr_trs_rejected  = poisoned beacons flagged by the RSU lightweight detector
+//                      (flag=1, Eq 3.67 → counted as a TRS-layer rejection)
 // parr_poisoned_total = total poisoned beacons submitted to the blockchain ledger
 // PARR = parr_trs_rejected / parr_poisoned_total   (distinct from DR = TP/(TP+FN))
 uint32_t parr_trs_rejected   = 0;
