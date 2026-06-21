@@ -42,6 +42,7 @@
 #include <unordered_set>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <filesystem>   // export_run_dataset(): per-attack committable dataset copy
 
 // ── Confusion matrix counters ─────────────────────────────────────────────────
 // TN: not poisoned AND not detected
@@ -815,6 +816,82 @@ void print_mptd_metrics()
     std::cout << "──────────────────────────────────────────────────────" << std::endl;
 }
 
+// ── Additive per-attack dataset export (committable) ──────────────────────────
+// PURPOSE: the NS3_ROOT/analytics/results/*.csv files are TRUNCATED each run, so
+// looping all 7 attacks leaves only the last attack's logs. This function copies
+// the *current run's* relevant CSVs into a per-run folder under the git repo
+// (DATASET_ROOT) so each attack×percentage combination is preserved AND committable.
+//
+// Layout:  DATASET_ROOT/analytics/datasets/a{N}_p{P}/
+//   beacon_log.csv            — ALWAYS (universal clean-vs-poison per-beacon rows)
+//   <attacker-type file>.csv  — only the file relevant to this attack's attacker class
+//   metrics.csv               — this run's summary (copy of the sweep metrics_* file)
+//
+// Attacker-class → relevant detail file (see attacker_class_for() in 02_config_globals.h):
+//   1 TP-S1 (compromised RSU)      → tp_s1_poison_log.csv
+//   2 TP-S2 (malicious vehicle)    → vehicle_tx_log.csv
+//   3 MP-S1 (compromised RSU)      → ghost_identity_log.csv
+//   4 MP-S2 (malicious vehicle)    → vehicle_tx_log.csv
+//   5 TP-S3 (malicious controller) → (none — captured in beacon_log.csv only)
+//   6 MP-S3 (MITM)                 → mitm_intercept_log.csv
+//   7 MP-S4 (malicious controller) → controller_poison_log.csv
+//
+// Reason files are filtered: e.g. a malicious-vehicle attack leaves RSU-side logs
+// clean/irrelevant, so we only copy the file that shows that attacker poisoning
+// its own data. This keeps each folder focused on the attack it represents.
+//
+// Uses std::filesystem (C++17, enabled by the scratch wscript -std=c++17). Each
+// copy is guarded by exists() so a missing log never aborts the run.
+static void export_run_dataset(const std::string &metrics_src)
+{
+    namespace fs = std::filesystem;
+
+    // Per-attack detail file relevant to this run's attacker class. Empty = none.
+    std::string detail;
+    switch (attack_number) {
+        case 1: detail = "tp_s1_poison_log.csv";     break;  // TP-S1, compromised RSU
+        case 2: detail = "vehicle_tx_log.csv";        break;  // TP-S2, malicious vehicle
+        case 3: detail = "ghost_identity_log.csv";    break;  // MP-S1, compromised RSU
+        case 4: detail = "vehicle_tx_log.csv";        break;  // MP-S2, malicious vehicle
+        case 5: detail = "";                          break;  // TP-S3, controller (beacon_log only)
+        case 6: detail = "mitm_intercept_log.csv";    break;  // MP-S3, MITM
+        case 7: detail = "controller_poison_log.csv"; break;  // MP-S4, malicious controller
+        default: detail = "";                         break;
+    }
+
+    const std::string results = NS3_ROOT "/analytics/results";
+
+    std::ostringstream dir;
+    dir << DATASET_ROOT "/analytics/datasets/a"
+        << attack_number << "_p" << attack_percentage;
+    const std::string dest = dir.str();
+
+    std::error_code ec;
+    fs::create_directories(dest, ec);
+    if (ec) {
+        std::cout << "  Dataset     : SKIPPED (mkdir failed: " << ec.message()
+                  << ") " << dest << std::endl;
+        return;
+    }
+
+    const auto cp = [&](const std::string &src, const std::string &dst) {
+        std::error_code e;
+        if (fs::exists(src)) {
+            fs::copy_file(src, dst, fs::copy_options::overwrite_existing, e);
+        }
+    };
+
+    // 1) Universal per-beacon log (clean + poisoned rows) — always.
+    cp(results + "/beacon_log.csv", dest + "/beacon_log.csv");
+    // 2) Attacker-type-specific detail log — only when one applies.
+    if (!detail.empty())
+        cp(results + "/" + detail, dest + "/" + detail);
+    // 3) This run's summary metrics, stored under a stable name inside the folder.
+    cp(metrics_src, dest + "/metrics.csv");
+
+    std::cout << "  Dataset     : " << dest << std::endl;
+}
+
 // ── Master results CSV — one row per simulation run ───────────────────────────
 // Output: analytics/results/sweep/metrics_a{N}_p{P}_s{S}.csv
 //   N = attack_number (1-7)
@@ -905,6 +982,9 @@ void write_mptd_results_csv()
     print_mptd_metrics();
     std::cout << "  Results CSV : " << fname.str() << std::endl;
     std::cout << "  Beacon log  : " NS3_ROOT "/analytics/results/beacon_log.csv" << std::endl;
+
+    // Additive, committable per-attack dataset snapshot (keeps every attack×pct run).
+    export_run_dataset(fname.str());
 }
 
 #endif // MPTD_PQS_METRICS_CSV_H

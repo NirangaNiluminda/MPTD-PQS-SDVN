@@ -38,20 +38,46 @@
 #include <sstream>
 #include <vector>
 #include <map>
+#include <set>
 #include <string>
 #include <cstdint>
 #include <cstdlib>
+#include <fstream>
 
-// Paper Fig 3.9 / invariant 2: exactly one SDN controller. The chaincode side
-// uses N_RSUs (NetworkConfig) for the 2f+1 / f+1 BFT math; controllers are
-// treated as a single non-authoritative peer regardless.
-static constexpr uint32_t N_Controllers = 1;
+// Paper C_trusted set (Eq 3.1 / 3.60): the trusted-controller set. Fig 3.9
+// draws a single SDN controller for clarity, but the framework defines a SET of
+// trusted controllers so that a controller compromised per CP-DETECT (f+1 RSU
+// conflict, Eq 3.64–3.67) can be EXCLUDED and a successor activated — the
+// blockchain-authoritative reassignment owned by the chaincode (GetActive-
+// Controller / CTRLREASSIGN records). N_Controllers registers that logical set
+// on chain (CTRL_0..CTRL_{N-1}); CTRL_0 is the initial active controller.
+//
+// This is distinct from the 5 Raft *orderer* nodes (gen_network.sh) — those are
+// the ledger ordering service; C_trusted is the control-plane decision set.
+// The physical NS-3 controller_Node remains a single sim-only relay (CLAUDE.md
+// known deviation); the controller IDENTITY it submits under is the chain-
+// authoritative active controller (see node-side active-controller tracking).
+static constexpr uint32_t N_Controllers = 5;
 
 // ── initialize_blockchain() — start Hyperledger Fabric (§3.3.4) ──────────────
 void initialize_blockchain()
 {
-    cout << "Initializing blockchain (Hyperledger Fabric test-network with CCAAS)" << endl;
+    cout << "Initializing blockchain (Hyperledger Fabric)" << endl;
     const char* fabric_dir   = FAB_ROOT "/test-network";
+
+    // Prefer the dynamic paper-scale network (fabric_net/gen_network.sh: 64 RSU
+    // peers + 5 controller-orderers, org rsu.example.com). When it is already up,
+    // the gateway daemon is pointed at it and node registration / SC-invokes go
+    // through the AF_UNIX socket — there is NOTHING to bring up here, and shelling
+    // out to the legacy org1 test-network would build the WRONG network and clash
+    // on the shared ports. So detect peer0.rsu.example.com and no-op.
+    std::string gen_cmd = "docker ps --filter name=peer0.rsu.example.com --format '{{.Names}}' 2>/dev/null";
+    if (execCmd(gen_cmd).find("peer0.rsu.example.com") != std::string::npos) {
+        cout << "[BLOCKCHAIN] gen_network (peer0.rsu.example.com) already running — "
+                "using existing 64-RSU network; legacy test-network bring-up skipped." << endl;
+        cout << "[BLOCKCHAIN] Initialization complete." << endl;
+        return;
+    }
 
     std::string check_cmd = "docker ps --filter name=peer0.org1 --format '{{.Names}}' 2>/dev/null";
     std::string result    = execCmd(check_cmd);
@@ -367,21 +393,38 @@ static std::string ecdsa_sign_hex(EC_KEY* k,
     return hex_encode(der.data(), der.size());
 }
 
+// concat_digest — SHA-256 over the ordered raw-UTF-8 concatenation of `parts`
+// (no separators). The one canonical hashing rule shared with chaincode
+// concatDigest(); every signed payload below uses it so both sides agree.
+static std::vector<uint8_t> concat_digest(std::initializer_list<std::string> parts)
+{
+    SHA256_CTX c;
+    SHA256_Init(&c);
+    for (const std::string& p : parts) SHA256_Update(&c, p.data(), p.size());
+    uint8_t out[SHA256_DIGEST_LENGTH];
+    SHA256_Final(out, &c);
+    return std::vector<uint8_t>(out, out + SHA256_DIGEST_LENGTH);
+}
+
 // endorsement_digest — must stay byte-identical to chaincode endorsementDigest
-// (smartcontract.go endorsementDigest): SHA-256(id || pkHex || hKuHex), with
-// the string args concatenated as raw UTF-8 bytes (no separators).
+// (smartcontract.go endorsementDigest): SHA-256(id || pkHex || hKuHex).
 static std::vector<uint8_t> endorsement_digest(const std::string& id,
                                                 const std::string& pkHex,
                                                 const std::string& hKuHex)
 {
-    SHA256_CTX c;
-    SHA256_Init(&c);
-    SHA256_Update(&c, id.data(),     id.size());
-    SHA256_Update(&c, pkHex.data(),  pkHex.size());
-    SHA256_Update(&c, hKuHex.data(), hKuHex.size());
-    uint8_t out[SHA256_DIGEST_LENGTH];
-    SHA256_Final(out, &c);
-    return std::vector<uint8_t>(out, out + SHA256_DIGEST_LENGTH);
+    return concat_digest({id, pkHex, hKuHex});
+}
+
+// node_sign_hex — sign `digest` with node `id`'s registered P-256 key from
+// g_node_ec_keys. Returns "" if the key is absent (node not registered) so the
+// chaincode's strict verify rejects the submission rather than silently
+// accepting forged evidence.
+static std::string node_sign_hex(const std::string& id,
+                                 const std::vector<uint8_t>& digest)
+{
+    auto it = g_node_ec_keys.find(id);
+    if (it == g_node_ec_keys.end() || !it->second) return "";
+    return ecdsa_sign_hex(it->second, digest.data(), digest.size());
 }
 
 // derive_controller_k_u — paper §3.5.5 / Algorithm 7 hKuHex source for the
@@ -404,7 +447,10 @@ static std::string derive_controller_h_ku(uint32_t ctrl_idx)
 
 // random_endorser_sample — uniformly draw 2f+1 distinct RSU indices from
 // [0, n_rsus). Returns empty vector when n_rsus < 2f+1 (caller should
-// surface the registration failure per decision #5).
+// surface the registration failure per decision #5). This is the BOOTSTRAP
+// path (Sir 2026-06-16: "initially you can have everyone as peers … as nodes
+// trust scores are just initialized") and the A4/ablation fallback when
+// trust-ranked selection is disabled.
 static std::vector<uint32_t> random_endorser_sample(uint32_t n_rsus,
                                                      uint32_t need,
                                                      uint64_t seed)
@@ -420,6 +466,94 @@ static std::vector<uint32_t> random_endorser_sample(uint32_t n_rsus,
     return all;
 }
 
+// ── Trust-ranked endorsing-peer selection (Sir Task-4 revision, 2026-06-16) ───
+// Paper-aligned with the notation-table endorser set R_trusted(t): pick the
+// 2f+1 endorsers from the HIGHEST-trust members of the on-chain trusted set
+// rather than uniformly at random over every RSU. This is "Option A" — it
+// changes WHICH trusted RSUs are asked to endorse; it does NOT remove peers
+// from the Fabric network (that is the heavier Option B, deliberately not
+// taken because gating runtime evidence/votes to a global committee would
+// break the 2f+1 SC-Revoke trajectory-witness reachability — flagged to the
+// supervisor as the open architectural question). Toggleable for ablation.
+static bool     g_trust_peer_selection      = true;  // false → uniform random
+static double   g_committee_refresh_interval = 1.0;  // seconds between refreshes
+// Live snapshot maintained by refresh_endorsement_committee(); read by the
+// selector. Empty before the first refresh / at boot → selector falls back to
+// random_endorser_sample (correct bootstrap behaviour).
+static std::map<uint32_t, double> g_rsu_trust_cache;   // rsu_idx → τ
+static std::set<uint32_t>         g_rsu_trusted_set;    // rsu_idx with State==TRUSTED
+static std::vector<uint32_t>      g_endorsement_committee;  // last selected top-2f+1
+
+// select_endorsers_trust_ranked — top-`need` TRUSTED RSUs by descending trust,
+// with a deterministic random tie-break among equal scores (so the all-equal
+// boot case degrades to a uniform random pick, exactly the bootstrap rule).
+// Falls back to random_endorser_sample when trust ranking is disabled or no
+// live trust snapshot exists yet.
+static std::vector<uint32_t> select_endorsers_trust_ranked(uint32_t n_rsus,
+                                                           uint32_t need,
+                                                           uint64_t seed)
+{
+    if (!g_trust_peer_selection || g_rsu_trusted_set.empty())
+        return random_endorser_sample(n_rsus, need, seed);
+
+    // Candidate pool: trusted RSUs within the addressable index range.
+    std::vector<uint32_t> pool;
+    pool.reserve(g_rsu_trusted_set.size());
+    for (uint32_t idx : g_rsu_trusted_set)
+        if (idx < n_rsus) pool.push_back(idx);
+    if (pool.size() < need)
+        return random_endorser_sample(n_rsus, need, seed);  // not enough trusted
+
+    // Shuffle first so equal-trust ties break uniformly, then stable-sort by
+    // trust descending. std::sort is not stable, so pre-shuffle + stable_sort.
+    std::mt19937_64 rng(seed);
+    std::shuffle(pool.begin(), pool.end(), rng);
+    std::stable_sort(pool.begin(), pool.end(),
+                     [](uint32_t a, uint32_t b) {
+                         double ta = g_rsu_trust_cache.count(a) ? g_rsu_trust_cache[a] : 0.0;
+                         double tb = g_rsu_trust_cache.count(b) ? g_rsu_trust_cache[b] : 0.0;
+                         return ta > tb;
+                     });
+    pool.resize(need);
+    return pool;
+}
+
+// refresh_endorsement_committee — query live on-chain RSU trust scores, rebuild
+// the trusted-set snapshot, and recompute the top-2f+1 endorsement committee.
+// Logged each cycle as the "active endorsing peer set" (Sir: peer selection
+// occasionally at runtime based on trust score). Cheap read (evaluate); no-op
+// under skip_blockchain or when trust selection is disabled. Reschedules itself.
+static void refresh_endorsement_committee()
+{
+    if (skip_blockchain || !g_trust_peer_selection) return;
+
+    auto views = CallSCGetAllRSUTrustScores();
+    if (!views.empty()) {
+        g_rsu_trust_cache.clear();
+        g_rsu_trusted_set.clear();
+        for (const auto& v : views) {
+            g_rsu_trust_cache[v.rsu_idx] = v.trust;
+            if (v.trusted) g_rsu_trusted_set.insert(v.rsu_idx);
+        }
+        const uint32_t need = 2 * /*paper fixed f=*/1u + 1u;   // 2f+1 = 3
+        g_endorsement_committee = select_endorsers_trust_ranked(
+            N_RSUs, need, (uint64_t)(Simulator::Now().GetNanoSeconds()));
+
+        std::ostringstream cs;
+        for (size_t i = 0; i < g_endorsement_committee.size(); ++i) {
+            uint32_t idx = g_endorsement_committee[i];
+            cs << (i ? "," : "") << MakeRsuId(idx)
+               << "(" << g_rsu_trust_cache[idx] << ")";
+        }
+        std::cout << "[PEER-SELECT] t=" << Simulator::Now().GetSeconds()
+                  << " trusted=" << g_rsu_trusted_set.size() << "/" << views.size()
+                  << " committee[2f+1]={" << cs.str() << "}\n";
+    }
+
+    Simulator::Schedule(Seconds(g_committee_refresh_interval),
+                        &refresh_endorsement_committee);
+}
+
 // build_endorsements_json — for the registering node, ask `need` RSUs to
 // each ECDSA-sign the endorsement digest. Returns the JSON array string
 // expected by SCRegister.endorsersJSON (smartcontract.go Endorser type).
@@ -430,7 +564,9 @@ static std::string build_endorsements_json(const std::string& target_id,
                                             uint32_t need,
                                             uint64_t seed)
 {
-    auto sample = random_endorser_sample(n_rsus, need, seed);
+    // Trust-ranked endorser pick from R_trusted(t) (Sir Task-4 revision); falls
+    // back to uniform random at boot / when disabled (see selector).
+    auto sample = select_endorsers_trust_ranked(n_rsus, need, seed);
     if (sample.empty()) return "";
 
     std::vector<uint8_t> digest = endorsement_digest(target_id, target_pk_hex,
@@ -552,6 +688,66 @@ static bool register_one(const std::string& id, const std::string& role,
 
 } // namespace mptd_scregister
 
+// ── G1 evidence/vote signers (global scope) ──────────────────────────────────
+// Produce σ over the EXACT strings the Call* wrappers transmit, hashed
+// identically to the chaincode digest helpers (smartcontract.go evidenceDigest
+// / controllerEvidenceDigest / revokeVoteDigest), signed with the node's
+// registered P-256 key. Forward-declared in 06c_blockchain_api.h so the
+// wrappers can sign without header-order coupling; defined here because they
+// need g_node_ec_keys (populated at SC-Register time). They delegate to the
+// namespaced concat_digest / node_sign_hex helpers.
+
+// σ_j^sub (Eq 3.61): RSU `rsuId` signs SHA-256(vehId‖rsuId‖epoch‖psiStr‖beaconHash).
+std::string mptd_sign_evidence_hex(const std::string& vehId,
+                                   const std::string& rsuId,
+                                   const std::string& epoch,
+                                   const std::string& psiStr,
+                                   const std::string& beaconHash)
+{
+    return mptd_scregister::node_sign_hex(rsuId,
+        mptd_scregister::concat_digest({vehId, rsuId, epoch, psiStr, beaconHash}));
+}
+
+// σ_c^sub (Eq 3.62): controller `ctrlId` signs SHA-256(vehId‖ctrlId‖epoch‖phiStr‖beaconHash).
+std::string mptd_sign_controller_evidence_hex(const std::string& vehId,
+                                              const std::string& ctrlId,
+                                              const std::string& epoch,
+                                              const std::string& phiStr,
+                                              const std::string& beaconHash)
+{
+    return mptd_scregister::node_sign_hex(ctrlId,
+        mptd_scregister::concat_digest({vehId, ctrlId, epoch, phiStr, beaconHash}));
+}
+
+// revoke vote sig (Eq 3.63): RSU `rsuId` signs SHA-256(vehId‖rsuId‖reason‖tsStr).
+std::string mptd_sign_revoke_vote_hex(const std::string& vehId,
+                                      const std::string& rsuId,
+                                      const std::string& reason,
+                                      const std::string& tsStr)
+{
+    return mptd_scregister::node_sign_hex(rsuId,
+        mptd_scregister::concat_digest({vehId, rsuId, reason, tsStr}));
+}
+
+// mptd_active_controller_refresh_loop — self-rescheduling C_trusted refresh.
+// Re-reads the on-chain active controller every `period` seconds so node-side
+// evidence follows a CP-DETECT reassignment during the run. Queries are
+// evaluate-only (no ordering round-trip), so a ~1 Hz cadence is cheap and never
+// touches the per-beacon hot path.
+static void mptd_active_controller_refresh_loop(double period)
+{
+    if (skip_blockchain) return;
+    uint32_t prev = g_active_controller_idx;
+    mptd_refresh_active_controller();
+    if (g_active_controller_idx != prev) {
+        std::cout << "[C-TRUSTED] active controller reassigned CTRL_" << prev
+                  << " → CTRL_" << g_active_controller_idx
+                  << " @t=" << Simulator::Now().GetSeconds() << "s\n";
+    }
+    Simulator::Schedule(Seconds(period),
+                        &mptd_active_controller_refresh_loop, period);
+}
+
 // ── register_all_nodes() — paper §3.5.5 Algorithm 7 boot-time registration ───
 // Run ONCE, after lkh_init_all() and before Simulator::Run(). Skips silently
 // when skip_blockchain=true (training-sweep mode).
@@ -576,9 +772,16 @@ void register_all_nodes()
     }
 
     const uint32_t n_rsus = N_RSUs;
-    // Eq 3.58 / chaincode fByzantine: f = (n_rsus - 1) / 3, threshold = 2f+1.
-    const uint32_t f             = (n_rsus > 0) ? (n_rsus - 1) / 3 : 0;
-    const uint32_t need_endorsers = 2 * f + 1;
+    // BFT fault bound f is FIXED at 1 by framework design (paper
+    // tab:set-blockchain: f=1, 2f+1=3, n=4 ring) across ALL deployments — the
+    // 64/44/23-RSU grids are mobility-coverage topology, NOT the consensus
+    // committee size. The chaincode SCRegister threshold is
+    // 2·fByzantine(NumRSUs)+1 = 3 at the default NumRSUs=4, so sending exactly 3
+    // endorsers satisfies it. Previously this derived f=(n_rsus-1)/3 locally,
+    // which gathered 2f+1=43 endorsers in the urban grid — "selecting [nearly]
+    // everyone as peers", the computational waste Sir flagged (2026-06-16).
+    const uint32_t f             = 1;
+    const uint32_t need_endorsers = 2 * f + 1;   // = 3
     const uint32_t max_retries    = 3;
     const double   t_reg          = Simulator::Now().GetSeconds();
 
@@ -667,7 +870,104 @@ void register_all_nodes()
 
     std::cout << "[SC-REGISTER] boot-time registration complete: "
               << rsu_ok << " RSUs + " << veh_ok << " vehicles + "
-              << ctrl_ok << " controllers\n";
+              << ctrl_ok << " controllers (C_trusted size " << ctrl_ok << ")\n";
+
+    // Seed the active-controller cache from C_trusted's on-chain head so the
+    // detection engine submits controller evidence under the authoritative
+    // active identity (CTRL_0 initially; advances on CP-DETECT reassignment).
+    mptd_refresh_active_controller();
+    std::cout << "[C-TRUSTED] active controller = CTRL_"
+              << g_active_controller_idx << "\n";
+
+    // Track reassignments during the run (1 Hz, control-path only).
+    Simulator::Schedule(Seconds(1.0), &mptd_active_controller_refresh_loop, 1.0);
+
+    // Trust-ranked endorsing-peer selection (Sir Task-4 revision, 2026-06-16):
+    // start the periodic committee refresh so the active endorser set tracks the
+    // on-chain trust scores as the lifecycle demotes/promotes RSUs at runtime.
+    // No-op when trust selection is disabled (A4/ablation) or skip_blockchain.
+    if (g_trust_peer_selection) {
+        std::cout << "[PEER-SELECT] trust-ranked endorser selection ENABLED "
+                  << "(refresh every " << g_committee_refresh_interval << "s)\n";
+        Simulator::Schedule(Seconds(g_committee_refresh_interval),
+                            &refresh_endorsement_committee);
+    } else {
+        std::cout << "[PEER-SELECT] trust-ranked selection DISABLED "
+                  << "— uniform random endorsers (ablation)\n";
+    }
+}
+
+// ── mptd_export_blockchain_evidence() — paper §3.5.5 audit-trail dump ─────────
+// Run ONCE after Simulator::Destroy(), before process exit. Queries the
+// committed ledger for every authoritative on-chain artifact and writes a
+// single consolidated JSON evidence file. This is the off-line audit trail the
+// paper's trust/revocation analysis (Eq 3.55–3.63) is computed from, and the
+// hand-off point for Hyperledger Explorer (which reads the same ledger) and
+// IPFS (which holds the off-chain raw beacons referenced by h(b_i(t))).
+//
+// Each section is the RAW chaincode JSON response (the GetAll* queries return
+// JSON arrays via contractapi marshalling), embedded verbatim so the file is a
+// faithful snapshot of ledger state — no lossy C++ re-parsing. The queries are
+// evaluate-only (no ordering round-trip) so this is safe to run post-Destroy
+// against the still-live Fabric peers.
+//
+// Sections (paper mapping):
+//   registrations          — SC-Register identities (Alg 7, Eq 3.63)
+//   active_controller       — current head of C_trusted (Eq 3.1/3.60)
+//   trusted_controllers     — full C_trusted set incl. EXCLUDED members
+//   controller_reassignments— CP-DETECT exclusions (Eq 3.64–3.67, invariant 2)
+//   controller_flags        — CP-DETECT f+1 conflict flags
+//   trust_scores            — SC-Trust EMA τ_i(t) (Eq 3.55/3.59)
+//   revoke_records          — SC-Revoke 2f+1 commits = the CRL (Eq 3.58/3.61)
+static void mptd_export_blockchain_evidence(const std::string& out_path)
+{
+    if (skip_blockchain) {
+        std::cout << "[BC-EXPORT] skip_blockchain=true — no on-chain evidence to export\n";
+        return;
+    }
+
+    // Query helper: returns the raw JSON payload, or "null"/"[]" defaults so the
+    // emitted file is always valid JSON even when a query fails or is empty.
+    auto q = [](const std::string& fn,
+                const std::vector<std::string>& args,
+                const std::string& empty_default) -> std::string {
+        std::string out = mptd_fabric_invoke_sync("query", fn, args);
+        // Trim whitespace; treat an empty/whitespace reply as the default.
+        size_t a = out.find_first_not_of(" \t\r\n");
+        if (a == std::string::npos) return empty_default;
+        size_t b = out.find_last_not_of(" \t\r\n");
+        return out.substr(a, b - a + 1);
+    };
+
+    const std::string active     = q("GetActiveController",        {}, "\"\"");
+    const std::string trustedCs  = q("GetTrustedControllers",      {}, "[]");
+    const std::string reassigns  = q("GetControllerReassignments", {}, "[]");
+    const std::string flags      = q("GetAllControllerFlags",      {}, "[]");
+    const std::string regs       = q("GetAllRegistrations",        {}, "[]");
+    const std::string trust      = q("GetAllTrustScores",          {}, "[]");
+    const std::string revokes    = q("GetAllRevokeRecords",        {}, "[]");
+
+    std::ofstream f(out_path, std::ios::trunc);
+    if (!f.is_open()) {
+        std::cerr << "[BC-EXPORT] FATAL: cannot open " << out_path << " for writing\n";
+        return;
+    }
+    f << "{\n";
+    f << "  \"exported_at_sim_seconds\": " << Simulator::Now().GetSeconds() << ",\n";
+    f << "  \"n_rsus\": "        << N_RSUs        << ",\n";
+    f << "  \"n_vehicles\": "    << N_Vehicles    << ",\n";
+    f << "  \"n_controllers\": " << N_Controllers << ",\n";
+    f << "  \"active_controller\": "        << active    << ",\n";
+    f << "  \"trusted_controllers\": "      << trustedCs << ",\n";
+    f << "  \"controller_reassignments\": " << reassigns << ",\n";
+    f << "  \"controller_flags\": "         << flags     << ",\n";
+    f << "  \"registrations\": "            << regs      << ",\n";
+    f << "  \"trust_scores\": "             << trust     << ",\n";
+    f << "  \"revoke_records\": "           << revokes   << "\n";
+    f << "}\n";
+    f.close();
+
+    std::cout << "[BC-EXPORT] on-chain evidence written → " << out_path << "\n";
 }
 
 // ── test_boolean() — debug: print per-node attack state ──────────────────────
