@@ -86,7 +86,9 @@ public:
             lbcrypto::CCParams<lbcrypto::CryptoContextBFVRNS> params;
             params.SetPlaintextModulus(plaintext_modulus);
             params.SetMultiplicativeDepth(mult_depth);
-            // Default security: HEStd_128_classic. Default ring dim auto-selected.
+            // NIST Level 5 (supervisor requirement 2026-06): 256-bit
+            // post-quantum security, consistent with the threshold backend.
+            params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
 
             ctx_ = lbcrypto::GenCryptoContext(params);
             ctx_->Enable(lbcrypto::PKE);
@@ -202,7 +204,7 @@ public:
     bool        ready()        const { return ready_;       }
     uint32_t    ring_dim()     const { return ring_dim_;    }
     uint32_t    plaintext_modulus() const { return pt_mod_; }
-    const char* scheme_name()  const { return "OpenFHE BFV-RNS (HEStd_128_classic, mult_depth=1)"; }
+    const char* scheme_name()  const { return "OpenFHE BFV-RNS (HEStd_256_quantum NIST L5, mult_depth=1)"; }
     const std::string& last_error() const { return last_error_; }
 
 private:
@@ -291,6 +293,10 @@ public:
             // to the number of parties (extra modulus headroom for flooding noise).
             params.SetMultipartyMode(lbcrypto::NOISE_FLOODING_MULTIPARTY);
             params.SetThresholdNumOfParties(n_parties_);
+            // NIST Level 5 (supervisor requirement 2026-06): 256-bit
+            // post-quantum security. Paper Table 3.13. OpenFHE auto-selects
+            // a ring dimension large enough to meet HEStd_256_quantum.
+            params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
 
             ctx_ = lbcrypto::GenCryptoContext(params);
             ctx_->Enable(lbcrypto::PKE);
@@ -447,7 +453,7 @@ public:
     uint32_t    ring_dim()           const { return ring_dim_;   }
     uint32_t    num_parties()        const { return n_parties_;  }
     uint32_t    threshold()          const { return threshold_;  }
-    const char* scheme_name()        const { return "OpenFHE BFV-RNS threshold (t,n+1) with aborts"; }
+    const char* scheme_name()        const { return "OpenFHE BFV-RNS threshold (t,n+1) with aborts, HEStd_256_quantum (NIST L5)"; }
     const std::string& last_error()  const { return last_error_; }
 
 private:

@@ -608,7 +608,9 @@ public:
 // ────────────────────────────────────────────────────────────────────────────
 class DilithiumTrsBackend : public ITrsBackend {
 public:
-    explicit DilithiumTrsBackend(const char* alg = OQS_SIG_alg_ml_dsa_44) {
+    // NIST Level 5 default (supervisor requirement 2026-06): ML-DSA-87
+    // (Dilithium5, FIPS 204, category 5). Matches paper Table 3.13.
+    explicit DilithiumTrsBackend(const char* alg = OQS_SIG_alg_ml_dsa_87) {
         sig_ = OQS_SIG_new(alg);
         if (sig_)
             snprintf(name_, sizeof(name_),
