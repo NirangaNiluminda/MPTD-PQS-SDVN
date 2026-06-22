@@ -230,8 +230,12 @@ static void mptd_drain_and_dispatch_fabric_events()
         double now = Simulator::Now().GetSeconds();
         for (const auto& ev : events) {
             if (ev.name != "SCRevoke") {
-                // TrustLow / CPDetectFlag are observed only — no rekey trigger.
-                // Surface them at debug volume so the operator can correlate
+                // CPDetectFlag (and any other non-revoke event) is observed only
+                // — no rekey trigger. NOTE: the slow trust-decay path now also
+                // emits "SCRevoke" (paper §3.5.5 p.72 RevocationRequest), so it
+                // is handled below alongside the fast 2f+1 path — it no longer
+                // arrives as the old observed-only "TrustLow" signal.
+                // Surface the rest at debug volume so the operator can correlate
                 // chain events with NS-3 timeline.
                 std::cout << "[FABRIC-EVT] " << ev.name
                           << " vid=" << ev.vehicle_id
