@@ -247,7 +247,7 @@ static bool init_fhe_backend(uint32_t plaintext_modulus = 65537,
 // Party indexing: 0..n-1 = RSU ring members, n = Cloud (the mandatory LEAD party
 // at decryption, Eq 3.53). Decryption coalition D must include the Cloud plus
 // ≥ t-1 RSUs (Eq 3.55–3.56); absent RSUs' secret keys are reconstructed from ≥ t
-// Shamir shares (OpenFHE "Threshold FHE with aborts", Eq 3.54).
+// Shamir shares (OpenFHE "Threshold FHE with aborts, HEStd_256_quantum (NIST L5)", Eq 3.54).
 //
 // Equation map:
 //   Eq 3.54  ThGen(1^λ, n+1, t)  → init(): chained MultipartyKeyGen + ShareKeys
@@ -293,6 +293,7 @@ public:
             // to the number of parties (extra modulus headroom for flooding noise).
             params.SetMultipartyMode(lbcrypto::NOISE_FLOODING_MULTIPARTY);
             params.SetThresholdNumOfParties(n_parties_);
+            params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
             // NIST Level 5 (supervisor requirement 2026-06): 256-bit
             // post-quantum security. Paper Table 3.13. OpenFHE auto-selects
             // a ring dimension large enough to meet HEStd_256_quantum.
@@ -394,7 +395,7 @@ public:
     // field-wise aggregate vector. Single decryption path shared with the scalar
     // helper above. present_rsus: RSU indices contributing their own partial;
     // Cloud (lead) is added automatically and is mandatory (Eq 3.53). Absent
-    // RSUs' keys are recovered from ≥ t Shamir shares (Algorithm 7 "with aborts").
+    // RSUs' keys are recovered from ≥ t Shamir shares (Algorithm 7 "with aborts, HEStd_256_quantum (NIST L5)").
     bool threshold_decrypt_vec(const Ciphertext &ct,
                                const std::vector<uint32_t> &present_rsus,
                                size_t len, std::vector<int64_t> &out) const
