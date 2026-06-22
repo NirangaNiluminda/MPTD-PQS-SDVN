@@ -783,6 +783,38 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 			t.Errorf("consec=%d want 0 after recovery", rec.ConsecutiveLowEpochs)
 		}
 	})
+
+	// Slow-path revocation (paper §3.5.5 p.72): τ < τ_min for T_rev consecutive
+	// epochs must trigger a DIRECT revocation (SCREVOKE_ record + REG_ REVOKED),
+	// not a dead-end re-vote. Was previously an observed-only "TrustLow" no-op.
+	t.Run("T_rev gate commits direct slow-path revocation", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.0, 0.5, 0.3, 2, 0.5) // alpha=0 → τ=1-meanPsi; T_rev=2
+		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		seedTrust(fl, "VEH_1", 1.0)
+		seedReg(fl, "RSU_0", RoleRSU, pk) // trusted witness (§3.5.1)
+		sc := SmartContract{}
+
+		// Epoch 1: τ=0.2 < τ_min → consec=1, not yet revoked.
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8)
+		_, err := sc.SCTrustFinalizeEpoch(ctx, "VEH_1", "E1")
+		ok(t, err)
+		if isRev, _ := sc.IsRevoked(ctx, "VEH_1"); isRev != "false" {
+			t.Fatalf("revoked too early after 1 low epoch: %s", isRev)
+		}
+
+		// Epoch 2: consec=2 ≥ T_rev → DIRECT revocation must commit.
+		seedSubm(fl, "VEH_1", "E2", "RSU_0", 0.8)
+		_, err = sc.SCTrustFinalizeEpoch(ctx, "VEH_1", "E2")
+		ok(t, err)
+		if isRev, _ := sc.IsRevoked(ctx, "VEH_1"); isRev != "true" {
+			t.Fatalf("slow-path revocation did not commit at T_rev gate: %s", isRev)
+		}
+		// Registration must be flipped to REVOKED so further submissions bounce.
+		seedSubm(fl, "VEH_1", "E3", "RSU_0", 0.8)
+		_, err = sc.SCTrustFinalizeEpoch(ctx, "VEH_1", "E3")
+		errHas(t, err, "status=REVOKED")
+	})
 }
 
 func TestTrustReads(t *testing.T) {

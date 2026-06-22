@@ -952,13 +952,17 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Eq 3.55 — SC-Trust finalize per-epoch
+// Eq 3.59 — SC-Trust finalize per-epoch
 // ─────────────────────────────────────────────────────────────────────────────
 
 // SCTrustFinalizeEpoch — aggregate the RSU submissions for one (vehicle,
-// epoch) and update τ_i per Eq 3.55. Increments the ConsecutiveLowEpochs
-// counter when τ_i < τ_th, emits "TrustLow" once ConsecutiveLowEpochs ≥
-// T_rev so RSUs begin voting on SC-Revoke.
+// epoch) and update τ_i per Eq 3.59. Increments the ConsecutiveLowEpochs
+// counter when τ_i < τ_min and, once ConsecutiveLowEpochs ≥ T_rev, issues a
+// DIRECT slow-path revocation (paper §3.5.5 p.72 "RevocationRequest to
+// SC-Revoke"): commits the SCREVOKE_ record, flips REG_ status to REVOKED, and
+// emits "SCRevoke". This mirrors the vehicle fast path (SCRevokeVote) and the
+// RSU trust-decay path (SCRSUFinalizeEpoch) — the old observed-only "TrustLow"
+// re-vote signal was a dead end for low-and-slow attackers and is removed.
 //
 // Lazy materialisation is gone — SCTRUST_<vehicleID> is created at
 // SCRegister time, so a missing row means the vehicle is unregistered and
@@ -1030,7 +1034,7 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 		return nil, err
 	}
 
-	// Eq 3.55: τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - meanPsi).
+	// Eq 3.59: τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - meanPsi).
 	rec.TrustScore = cfg.Alpha*rec.TrustScore + (1-cfg.Alpha)*(1-meanPsi)
 	rec.MeanPsi = meanPsi
 	rec.NumRSUsLastEpoch = numWitnesses
@@ -1048,10 +1052,57 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 		rec.ConsecutiveLowEpochs = 0
 	}
 
+	// Slow-path revocation (paper §3.5.5, p.72): "if τ_i(t) remains below τ_min
+	// for T_rev consecutive epochs, SC-Trust emits a RevocationRequest event to
+	// SC-Revoke." This is a DIRECT revocation request — NOT a re-vote: a
+	// low-and-slow attacker whose per-beacon ψ stays just under ψ_th never
+	// produces the flags Path-1 voting (Eq 3.65/3.67) needs, so routing back to
+	// voting would be a dead end. We therefore commit the same revocation state
+	// the fast path produces (SCREVOKE_ record + REG_ status flip + "SCRevoke"
+	// event for the CRL-Update/LKH-rekey fan-out), keeping vehicle and RSU
+	// trust-decay paths symmetric (cf. SCRSUFinalizeEpoch).
 	if rec.ConsecutiveLowEpochs >= cfg.TRev {
-		ctx.GetStub().SetEvent("TrustLow", []byte(fmt.Sprintf(
-			`{"vehicleID":"%s","epoch":"%s","trust":%f,"consec":%d,"trev":%d}`,
-			vehicleID, epoch, rec.TrustScore, rec.ConsecutiveLowEpochs, cfg.TRev)))
+		// Idempotency: only the first finalize that trips the gate commits the
+		// revocation (mirrors the fast path's pre-write existence check).
+		chkPrefix := fmt.Sprintf("SCREVOKE_%s_", vehicleID)
+		chk, e2 := ctx.GetStub().GetStateByRange(chkPrefix, chkPrefix+"~")
+		if e2 != nil {
+			return nil, e2
+		}
+		already := chk.HasNext()
+		chk.Close()
+		if !already {
+			revID := fmt.Sprintf("SCREVOKE_%s_%s", vehicleID, epoch)
+			rev := RevokeRecord{
+				ID:        revID,
+				VehicleID: vehicleID,
+				Reason:    "trust_decay",
+				RSUID:     "SC-TRUST", // contract-driven slow path, no single voting RSU
+				Timestamp: epoch,
+				RevokedAt: time.Now().Format(time.RFC3339),
+			}
+			if rj, e := json.Marshal(rev); e == nil {
+				if err := ctx.GetStub().PutState(revID, rj); err != nil {
+					return nil, err
+				}
+			}
+			// Flip registration status to REVOKED so subsequent evidence / vote
+			// submissions for this vehicle bounce at requireActive.
+			if regData, e := ctx.GetStub().GetState("REG_" + vehicleID); e == nil && regData != nil {
+				var reg RegistrationRecord
+				if e := json.Unmarshal(regData, &reg); e == nil {
+					reg.Status = StatusRevoked
+					if rj, e := json.Marshal(reg); e == nil {
+						_ = ctx.GetStub().PutState("REG_"+vehicleID, rj)
+					}
+				}
+			}
+			// "SCRevoke" (not the old observed-only "TrustLow") so the NS-3 event
+			// drainer drives the CRL-Update/LKH rekey, identical to the fast path.
+			ctx.GetStub().SetEvent("SCRevoke", []byte(fmt.Sprintf(
+				`{"vehicleID":"%s","reason":"trust_decay","epoch":"%s","trust":%f,"consec":%d,"trev":%d}`,
+				vehicleID, epoch, rec.TrustScore, rec.ConsecutiveLowEpochs, cfg.TRev)))
+		}
 	}
 
 	j, err := json.Marshal(rec)
