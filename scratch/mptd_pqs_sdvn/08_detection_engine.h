@@ -3015,6 +3015,28 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                         Simulator::Schedule(Seconds(2.0),
                             &CallSCRSUFinalizeEpochAsync, epoch);
                     }
+
+                    // Controller SC-Trust finalize (Eq 3.60 EMA / Eq 3.68
+                    // directional conflict) is ALSO channel-wide — ONE call per
+                    // epoch evaluates every controller's τ_ck(t) over its
+                    // R^obs_ck(t) RSU set, so it is deduped on `epoch` ALONE.
+                    // Delayed 3 s — one second after the RSU finalize — so the
+                    // full CSUBM_<*>_<epoch> + SUBM_<*>_<epoch>_<rsu> sets for
+                    // this epoch have landed before the contract reconstructs
+                    // conflict_j over the co-observed vehicles. Idempotent on
+                    // chain (re-fire just re-evaluates the same submission set),
+                    // so a converging re-fire is harmless.
+                    static std::unordered_set<std::string> g_ctrl_finalize_scheduled;
+                    static std::mutex                       g_ctrl_finalize_mu;
+                    bool ctrl_first;
+                    {
+                        std::lock_guard<std::mutex> lk(g_ctrl_finalize_mu);
+                        ctrl_first = g_ctrl_finalize_scheduled.insert(epoch).second;
+                    }
+                    if (ctrl_first) {
+                        Simulator::Schedule(Seconds(3.0),
+                            &CallSCControllerFinalizeEpochAsync, epoch);
+                    }
                 }
             }
         }

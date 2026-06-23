@@ -1102,6 +1102,57 @@ inline void CallSCRSUFinalizeEpochAsync(std::string epoch)
     mptd_fabric_invoke_async("SCRSUFinalizeEpoch", args);
 }
 
+// ── CallSCSetRSUController — on-chain c_assigned(r_j) (Eq 3.60 / Table 3.2) ───
+// Records the controller c_k that RSU r_j is assigned to, on-chain, so the
+// SC-Trust controller-trust EMA can reconstruct R^obs_ck(t) = { r_j ∈ R_trusted
+// : c_assigned(r_j) = c_k } (Table 3.2). Called once per RSU at network boot
+// (after both the RSU and the controller are SC-Registered) and re-issued
+// whenever an RSU rolls over to a surviving controller after a revocation
+// (paper p.75, Fig 3.11 step 11d). Synchronous so the on-chain assignment is
+// committed before the first SCControllerFinalizeEpoch reads it. Idempotent.
+inline SCResult CallSCSetRSUController(uint32_t rsuID, uint32_t controllerID)
+{
+    if (skip_blockchain) return {true, ""};   // bypass path
+    std::vector<std::string> args = {
+        MakeRsuId(rsuID),
+        MakeCtrlId(controllerID)
+    };
+    std::string payload;
+    bool ok = mptd_fabric_call_socket("invoke", "SCSetRSUController", args,
+                                       /*fire_and_forget=*/false, payload, "");
+    return {ok, payload};
+}
+
+// ── CallSCControllerFinalizeEpoch — controller SC-Trust EMA (Eq 3.60/3.68) ───
+// τ_ck(t) = α·τ_ck(t-1) + (1-α)(1 - (1/|R^obs_ck|)Σ_{r_j∈R^obs_ck} conflict_j(t)),
+// with the DIRECTIONAL conflict indicator conflict_j(t) = (1-flag^ctrl)·flag^rsu_j
+// (Eq 3.68) — fires only when the controller SUPPRESSED an anomaly its assigned
+// RSUs flagged (controller benign Φ≤ψ_th while RSU ψ>ψ_th); superior controller
+// detection is NOT penalised (paper p.74). Channel-wide: one call per epoch
+// evaluates EVERY controller from the on-chain CSUBM_/SUBM_ records and the
+// c_assigned map, applies the T_rev-epoch τ_min revoke gate (SC-Revoke
+// ControllerRevoked + C_trusted update, Eq 3.1), and is idempotent over the
+// epoch. Synchronous; returns raw chaincode JSON (array of ControllerTrustScore).
+inline std::string CallSCControllerFinalizeEpoch(const std::string& epoch)
+{
+    if (skip_blockchain) return "";
+    std::vector<std::string> args = { epoch };
+    return mptd_fabric_invoke_sync("invoke", "SCControllerFinalizeEpoch", args);
+}
+
+// ── CallSCControllerFinalizeEpochAsync — fire-and-forget variant ─────────────
+// Same chaincode function as CallSCControllerFinalizeEpoch but discards the
+// returned records. Scheduled once per epoch from inside the sim tick (after
+// the per-vehicle CSUBM/SUBM submissions for that epoch have landed) so
+// blocking on the orderer round-trip never stalls the simulation. Idempotent
+// over the epoch. Bindable to Simulator::Schedule via ns3::MakeBoundCallback.
+inline void CallSCControllerFinalizeEpochAsync(std::string epoch)
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    std::vector<std::string> args = { epoch };
+    mptd_fabric_invoke_async("SCControllerFinalizeEpoch", args);
+}
+
 // ── RsuTrustView / CallSCGetAllRSUTrustScores — live on-chain RSU trust read ──
 // Supports trust-ranked endorsing-peer selection (Sir's Task-4 revision,
 // 2026-06-16): rather than treating every RSU as an endorsing peer (expensive),

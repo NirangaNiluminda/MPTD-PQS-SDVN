@@ -784,6 +784,10 @@ static void mptd_active_controller_refresh_loop(double period)
                           << " → CTRL_" << nc
                           << " @t=" << Simulator::Now().GetSeconds() << "s\n";
                 rsu_controller_ID[r] = nc;
+                // Persist the new c_assigned(r_j) on-chain so SC-Trust's
+                // R^obs_ck(t) reconstruction (Table 3.2) follows the rollover
+                // (paper p.75). Sync invoke — cheap at the ~1 Hz refresh cadence.
+                CallSCSetRSUController(r, nc);
             }
         }
     }
@@ -911,6 +915,20 @@ void register_all_nodes()
     }
     std::cout << "[SC-REGISTER] controllers registered: " << ctrl_ok << "/"
               << N_Controllers << "\n";
+
+    // ── 4. Initial c_assigned(r_j) → on-chain (Eq 3.60 / Table 3.2) ──────────
+    // Now that both the RSUs and the controllers are SC-Registered, publish each
+    // RSU's boot-time controller assignment (from assign_controllers()' even
+    // partition in rsu_controller_ID[]) on-chain so SC-Trust can reconstruct
+    // R^obs_ck(t) = { r_j ∈ R_trusted : c_assigned(r_j)=c_k } (Table 3.2) for the
+    // controller-trust EMA. Sync invokes at boot only — off the per-beacon path.
+    uint32_t cassign_ok = 0;
+    for (uint32_t r = 0; r < n_rsus && r < uint32_t(total_size); ++r) {
+        uint32_t cidx = rsu_controller_ID[r];
+        if (CallSCSetRSUController(r, cidx).ok) cassign_ok++;
+    }
+    std::cout << "[SC-REGISTER] c_assigned published on-chain: " << cassign_ok
+              << "/" << n_rsus << " RSUs\n";
 
     std::cout << "[SC-REGISTER] boot-time registration complete: "
               << rsu_ok << " RSUs + " << veh_ok << " vehicles + "
