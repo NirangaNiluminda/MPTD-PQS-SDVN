@@ -89,11 +89,13 @@ const (
 	// Eq eq:rsu_trust / eq:rsu_misbehave). Distinct from RegistrationRecord.Status:
 	//   • TRUSTED — RSU is an endorser; its evidence carries quorum weight in
 	//     the 2f+1 SC-Revoke / SC-Register / CP-DETECT counts.
-	//   • CLIENT  — demoted/quarantined (τ_{r_j} < τ_th). It may still SUBMIT
+	//   • CLIENT  — demoted/quarantined (τ_{r_j} < τ_min). It may still SUBMIT
 	//     evidence so its score can recover, but those submissions carry ZERO
-	//     quorum weight and it may not endorse. Recovery (τ ≥ τ_th) promotes
+	//     quorum weight and it may not endorse. Recovery (τ ≥ τ_min) promotes
 	//     it back to TRUSTED. Sustained low trust over T_rev windows escalates
 	//     to a terminal RegistrationRecord.Status = REVOKED via SC-Revoke.
+	// A TRUSTED RSU with τ_min ≤ τ < τ_warn is flagged PROBATIONARY: it keeps
+	// endorser/quorum status but is under watch (RSUTrustScore.Probationary).
 	RSUStateTrusted = "TRUSTED"
 	RSUStateClient  = "CLIENT"
 )
@@ -117,13 +119,21 @@ type RegistrationRecord struct {
 }
 
 // NetworkConfig — channel-wide BFT parameters. Bootstrap via SCInitNetworkConfig.
+// defaultTWindowSec — T_w, the sliding-window length (sim seconds) over which
+// distinct RSU revocation witnesses accumulate toward the 2f+1 quorum (Eq 3.65).
+// Tunable default: change here (or backfill via a future SCInitNetworkConfig arg)
+// once empirical tuning settles. Kept as a config field so it is per-channel state.
+const defaultTWindowSec = 30.0
+
 type NetworkConfig struct {
 	ID           string  `json:"ID"`           // always "NETCFG"
 	NumRSUs      int     `json:"NumRSUs"`      // |R_total|
 	Alpha        float64 `json:"Alpha"`        // EMA factor in Eq 3.55
-	TauThreshold float64 `json:"TauThreshold"` // τ_th — trust floor for T_rev gate
+	TauWarn      float64 `json:"TauWarn"`      // τ_warn — probation entry (paper §3.5.1)
+	TauMin       float64 `json:"TauMin"`       // τ_min — demotion + T_rev revocation gate
 	TRev         int     `json:"TRev"`         // T_rev consecutive-epoch gate
 	PsiAnomalyTh float64 `json:"PsiAnomalyTh"` // ψ_th — anomaly cutoff
+	TWindowSec   float64 `json:"TWindowSec"`   // T_w — revocation-vote sliding window (Eq 3.65)
 	UpdatedAt    string  `json:"UpdatedAt"`
 }
 
@@ -135,7 +145,8 @@ type SCTrustScore struct {
 	TrustScore           float64 `json:"TrustScore"`           // τ_i ∈ [0,1]; higher = more trusted
 	MeanPsi              float64 `json:"MeanPsi"`              // (1/|R|)·Σ ψ_j^{(i)}(t) from last finalised epoch
 	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R| of last finalised epoch
-	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for T_rev gate
+	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for T_rev gate (τ < τ_min)
+	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_i < τ_warn — reduced routing priority (paper §3.5.1)
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
 	UpdatedAt            string  `json:"UpdatedAt"`
@@ -152,10 +163,11 @@ type RSUTrustScore struct {
 	State                string  `json:"State"`                // TRUSTED | CLIENT (mirrors REG_.RSUState)
 	MeanMisbehave        float64 `json:"MeanMisbehave"`        // m_j(t) from last finalised epoch (Eq eq:rsu_misbehave)
 	NumReportsLastEpoch  int     `json:"NumReportsLastEpoch"`  // |V_j(t)| of last finalised epoch
-	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate
+	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate (τ < τ_min)
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
-	Probationary         bool    `json:"Probationary"` // held TRUSTED by the BFT floor guard despite low trust (paper §3.5.1)
+	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_{r_j} < τ_warn — still TRUSTED/endorsing but under watch (paper §3.5.1)
+	FloorHeld            bool    `json:"FloorHeld,omitempty"`    // τ < τ_min but held TRUSTED by the BFT 3f+1 floor guard
 	UpdatedAt            string  `json:"UpdatedAt"`
 }
 
@@ -183,13 +195,19 @@ type ControllerSubmission struct {
 	SubmittedAt  string  `json:"SubmittedAt"`
 }
 
-// RevokeVote — per-RSU vote (BFT 2f+1, Eq 3.58). Key: VOTE_<vehicleID>_<rsuID>.
+// RevokeVote — per-RSU vote (BFT 2f+1, Eq 3.65). Key: VOTE_<vehicleID>_<rsuID>.
+// One slot per (vehicle,RSU): a re-vote overwrites, so each RSU is counted at most
+// once toward the quorum (paper §3.5.5: "each RSU is counted at most once").
 type RevokeVote struct {
 	ID        string `json:"ID"`
 	VehicleID string `json:"VehicleID"`
 	RSUID     string `json:"RSUID"`
 	Reason    string `json:"Reason"`
 	Signature string `json:"Signature"`
+	// Timestamp — SIM-time (seconds) at which the RSU cast the vote. This is the
+	// field the sliding-window quorum (Eq 3.65, [t-T_w, t]) filters on. VotedAt
+	// below is wall-clock and is for audit only — it cannot do sim-window math.
+	Timestamp string `json:"Timestamp"`
 	VotedAt   string `json:"VotedAt"`
 }
 
@@ -238,7 +256,7 @@ type Endorser struct {
 
 func txTimeStr(ctx contractapi.TransactionContextInterface) string {
 	txTime, err := ctx.GetStub().GetTxTimestamp()
-	if err != nil {
+	if err != nil || txTime == nil {
 		return time.Now().Format(time.RFC3339)
 	}
 	return time.Unix(txTime.Seconds, int64(txTime.Nanos)).UTC().Format(time.RFC3339)
@@ -246,7 +264,7 @@ func txTimeStr(ctx contractapi.TransactionContextInterface) string {
 
 func txTimeStrNano(ctx contractapi.TransactionContextInterface) string {
 	txTime, err := ctx.GetStub().GetTxTimestamp()
-	if err != nil {
+	if err != nil || txTime == nil {
 		return time.Now().Format(time.RFC3339Nano)
 	}
 	return time.Unix(txTime.Seconds, int64(txTime.Nanos)).UTC().Format(time.RFC3339Nano)
@@ -432,7 +450,12 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 		return fmt.Errorf("registration lookup: %v", err)
 	}
 	if existing != nil {
-		// Log/allow overwrite for simulation idempotency
+		// Algorithm 8 lines 2-3: reject duplicate identity. Allowing overwrite
+		// would let a near-revocation identity re-register and reset its trust
+		// (paper §3.5.1 invariant). Sim idempotency must be handled caller-side
+		// by not re-registering already-registered nodes — never by weakening
+		// this gate.
+		return fmt.Errorf("rejected: duplicate identity %s", vehicleID)
 	}
 
 	// 3. Parse endorsements.
@@ -555,7 +578,9 @@ func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterfa
 		return fmt.Errorf("registration lookup: %v", err)
 	}
 	if existing != nil {
-		// Log/allow overwrite for simulation idempotency
+		// Reject duplicate identity (paper §3.5.1): re-bootstrap must not reset
+		// an RSU's trust/lifecycle state. Caller-side must avoid re-bootstrapping.
+		return fmt.Errorf("rejected: duplicate identity %s", rsuID)
 	}
 
 	rec := RegistrationRecord{
@@ -652,8 +677,11 @@ func (s *SmartContract) initTrustScore(ctx contractapi.TransactionContextInterfa
 	if err != nil {
 		return err
 	}
-	// Always overwrite to reset trust score on re-registration
-	_ = existing
+	if existing != nil {
+		return nil // idempotent on duplicate-SCRegister bootstrap retries; never
+		// reset an existing trust score (paper §3.5.1 — would let a decaying
+		// vehicle escape revocation by re-registering).
+	}
 	rec := SCTrustScore{
 		ID:         id,
 		VehicleID:  vehicleID,
@@ -678,8 +706,9 @@ func (s *SmartContract) initRSUTrustScore(ctx contractapi.TransactionContextInte
 	if err != nil {
 		return err
 	}
-	// Always overwrite to reset trust score on re-registration
-	_ = existing
+	if existing != nil {
+		return nil // idempotent; never reset an existing RSU trust score (§3.5.1)
+	}
 	rec := RSUTrustScore{
 		ID:         id,
 		RSUID:      rsuID,
@@ -752,9 +781,9 @@ func (s *SmartContract) countTrustedRSUs(ctx contractapi.TransactionContextInter
 // ─────────────────────────────────────────────────────────────────────────────
 
 // SCInitNetworkConfig — bootstrap or update channel-wide BFT parameters.
-// Args: numRSUs, alpha, tauTh, T_rev, psiAnomalyTh (all strings).
+// Args: numRSUs, alpha, tauWarn, tauMin, T_rev, psiAnomalyTh (all strings).
 func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextInterface,
-	numRSUsStr, alphaStr, tauThStr, tRevStr, psiThStr string) error {
+	numRSUsStr, alphaStr, tauWarnStr, tauMinStr, tRevStr, psiThStr string) error {
 
 	numRSUs, err := strconv.Atoi(numRSUsStr)
 	if err != nil {
@@ -767,9 +796,16 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 	if err != nil {
 		return fmt.Errorf("alpha parse: %v", err)
 	}
-	tauTh, err := strconv.ParseFloat(tauThStr, 64)
+	tauWarn, err := strconv.ParseFloat(tauWarnStr, 64)
 	if err != nil {
-		return fmt.Errorf("tauTh parse: %v", err)
+		return fmt.Errorf("tauWarn parse: %v", err)
+	}
+	tauMin, err := strconv.ParseFloat(tauMinStr, 64)
+	if err != nil {
+		return fmt.Errorf("tauMin parse: %v", err)
+	}
+	if tauMin > tauWarn {
+		return fmt.Errorf("τ_min=%g must be ≤ τ_warn=%g (paper §3.5.1)", tauMin, tauWarn)
 	}
 	tRev, err := strconv.Atoi(tRevStr)
 	if err != nil {
@@ -784,10 +820,12 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 		ID:           "NETCFG",
 		NumRSUs:      numRSUs,
 		Alpha:        alpha,
-		TauThreshold: tauTh,
+		TauWarn:      tauWarn,
+		TauMin:       tauMin,
 		TRev:         tRev,
 		PsiAnomalyTh: psiTh,
-		UpdatedAt:    txTimeStr(ctx),
+		TWindowSec:   defaultTWindowSec, // T_w (Eq 3.65); no init arg yet — tune via const
+		UpdatedAt:    txTimeStr(ctx),    // deterministic tx timestamp (GetTxTimestamp)
 	}
 	j, err := json.Marshal(cfg)
 	if err != nil {
@@ -807,15 +845,23 @@ func (s *SmartContract) GetNetworkConfig(ctx contractapi.TransactionContextInter
 			ID:           "NETCFG",
 			NumRSUs:      4,
 			Alpha:        0.3,
-			TauThreshold: 0.5,
+			TauWarn:      0.5,
+			TauMin:       0.3,
 			TRev:         3,
 			PsiAnomalyTh: 0.5,
+			TWindowSec:   defaultTWindowSec,
 			UpdatedAt:    "default",
 		}, nil
 	}
 	var c NetworkConfig
 	if err := json.Unmarshal(data, &c); err != nil {
 		return nil, err
+	}
+	// Backfill T_w for NETCFG records written before the field existed (or by a
+	// 6-arg SCInitNetworkConfig that predates it) so the window filter never
+	// degenerates to a zero-length window that drops every prior witness.
+	if c.TWindowSec <= 0 {
+		c.TWindowSec = defaultTWindowSec
 	}
 	return &c, nil
 }
@@ -931,13 +977,17 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Eq 3.55 — SC-Trust finalize per-epoch
+// Eq 3.59 — SC-Trust finalize per-epoch
 // ─────────────────────────────────────────────────────────────────────────────
 
 // SCTrustFinalizeEpoch — aggregate the RSU submissions for one (vehicle,
-// epoch) and update τ_i per Eq 3.55. Increments the ConsecutiveLowEpochs
-// counter when τ_i < τ_th, emits "TrustLow" once ConsecutiveLowEpochs ≥
-// T_rev so RSUs begin voting on SC-Revoke.
+// epoch) and update τ_i per Eq 3.59. Increments the ConsecutiveLowEpochs
+// counter when τ_i < τ_min and, once ConsecutiveLowEpochs ≥ T_rev, issues a
+// DIRECT slow-path revocation (paper §3.5.5 p.72 "RevocationRequest to
+// SC-Revoke"): commits the SCREVOKE_ record, flips REG_ status to REVOKED, and
+// emits "SCRevoke". This mirrors the vehicle fast path (SCRevokeVote) and the
+// RSU trust-decay path (SCRSUFinalizeEpoch) — the old observed-only "TrustLow"
+// re-vote signal was a dead end for low-and-slow attackers and is removed.
 //
 // Lazy materialisation is gone — SCTRUST_<vehicleID> is created at
 // SCRegister time, so a missing row means the vehicle is unregistered and
@@ -1009,7 +1059,7 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 		return nil, err
 	}
 
-	// Eq 3.55: τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - meanPsi).
+	// Eq 3.59: τ_i(t) = α·τ_i(t-1) + (1-α)·(1 - meanPsi).
 	rec.TrustScore = cfg.Alpha*rec.TrustScore + (1-cfg.Alpha)*(1-meanPsi)
 	rec.MeanPsi = meanPsi
 	rec.NumRSUsLastEpoch = numWitnesses
@@ -1017,17 +1067,67 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 	rec.UpdateCount++
 	rec.UpdatedAt = txTimeStr(ctx)
 
-	// T_rev consecutive-low-epoch gate.
-	if rec.TrustScore < cfg.TauThreshold {
+	// Three-state lifecycle (paper §3.5.1). Probation at τ_warn (reduced routing
+	// priority, still active); the T_rev revocation gate counts epochs below the
+	// stricter τ_min.
+	rec.Probationary = rec.TrustScore < cfg.TauWarn && rec.TrustScore >= cfg.TauMin
+	if rec.TrustScore < cfg.TauMin {
 		rec.ConsecutiveLowEpochs++
 	} else {
 		rec.ConsecutiveLowEpochs = 0
 	}
 
+	// Slow-path revocation (paper §3.5.5, p.72): "if τ_i(t) remains below τ_min
+	// for T_rev consecutive epochs, SC-Trust emits a RevocationRequest event to
+	// SC-Revoke." This is a DIRECT revocation request — NOT a re-vote: a
+	// low-and-slow attacker whose per-beacon ψ stays just under ψ_th never
+	// produces the flags Path-1 voting (Eq 3.65/3.67) needs, so routing back to
+	// voting would be a dead end. We therefore commit the same revocation state
+	// the fast path produces (SCREVOKE_ record + REG_ status flip + "SCRevoke"
+	// event for the CRL-Update/LKH-rekey fan-out), keeping vehicle and RSU
+	// trust-decay paths symmetric (cf. SCRSUFinalizeEpoch).
 	if rec.ConsecutiveLowEpochs >= cfg.TRev {
-		ctx.GetStub().SetEvent("TrustLow", []byte(fmt.Sprintf(
-			`{"vehicleID":"%s","epoch":"%s","trust":%f,"consec":%d,"trev":%d}`,
-			vehicleID, epoch, rec.TrustScore, rec.ConsecutiveLowEpochs, cfg.TRev)))
+		// Idempotency: only the first finalize that trips the gate commits the
+		// revocation (mirrors the fast path's pre-write existence check).
+		chkPrefix := fmt.Sprintf("SCREVOKE_%s_", vehicleID)
+		chk, e2 := ctx.GetStub().GetStateByRange(chkPrefix, chkPrefix+"~")
+		if e2 != nil {
+			return nil, e2
+		}
+		already := chk.HasNext()
+		chk.Close()
+		if !already {
+			revID := fmt.Sprintf("SCREVOKE_%s_%s", vehicleID, epoch)
+			rev := RevokeRecord{
+				ID:        revID,
+				VehicleID: vehicleID,
+				Reason:    "trust_decay",
+				RSUID:     "SC-TRUST", // contract-driven slow path, no single voting RSU
+				Timestamp: epoch,
+				RevokedAt: time.Now().Format(time.RFC3339),
+			}
+			if rj, e := json.Marshal(rev); e == nil {
+				if err := ctx.GetStub().PutState(revID, rj); err != nil {
+					return nil, err
+				}
+			}
+			// Flip registration status to REVOKED so subsequent evidence / vote
+			// submissions for this vehicle bounce at requireActive.
+			if regData, e := ctx.GetStub().GetState("REG_" + vehicleID); e == nil && regData != nil {
+				var reg RegistrationRecord
+				if e := json.Unmarshal(regData, &reg); e == nil {
+					reg.Status = StatusRevoked
+					if rj, e := json.Marshal(reg); e == nil {
+						_ = ctx.GetStub().PutState("REG_"+vehicleID, rj)
+					}
+				}
+			}
+			// "SCRevoke" (not the old observed-only "TrustLow") so the NS-3 event
+			// drainer drives the CRL-Update/LKH rekey, identical to the fast path.
+			ctx.GetStub().SetEvent("SCRevoke", []byte(fmt.Sprintf(
+				`{"vehicleID":"%s","reason":"trust_decay","epoch":"%s","trust":%f,"consec":%d,"trev":%d}`,
+				vehicleID, epoch, rec.TrustScore, rec.ConsecutiveLowEpochs, cfg.TRev)))
+		}
 	}
 
 	j, err := json.Marshal(rec)
@@ -1449,7 +1549,8 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		RSUID:     rsuID,
 		Reason:    reason,
 		Signature: signature,
-		VotedAt:   txTimeStr(ctx),
+		Timestamp: timestamp,       // sim-time; the window quorum (Eq 3.65) filters on this
+		VotedAt:   txTimeStr(ctx), // deterministic tx timestamp (GetTxTimestamp)
 	}
 	vJSON, err := json.Marshal(vote)
 	if err != nil {
@@ -1469,10 +1570,28 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 	}
 	defer iter.Close()
 	seen := make(map[string]bool)
+	// ── Sliding-window quorum (Eq 3.65): |{r_j ∈ R_trusted : ∃ t′∈[t-T_w, t],
+	// ψ_j(t′)>ψ_th}| ≥ 2f+1. Only votes whose SIM-time falls within the last
+	// T_w seconds count toward the quorum, so 2f+1 independent witnesses must
+	// accumulate *within the window* rather than over the whole run. "now" is
+	// the sim-time of the vote being cast in this TX.
+	windowNow, nowErr := strconv.ParseFloat(timestamp, 64)
+	windowLow := windowNow - cfg.TWindowSec
+	inWindow := func(v RevokeVote) bool {
+		if nowErr != nil {
+			return true // can't parse "now" → don't drop votes (degrade safe)
+		}
+		vt, e := strconv.ParseFloat(v.Timestamp, 64)
+		if e != nil {
+			return true // legacy vote without sim-time → include (conservative)
+		}
+		return vt >= windowLow && vt <= windowNow
+	}
 	// Only TRUSTED RSU votes carry quorum weight toward 2f+1 (§3.5.1 RSU
 	// lifecycle). The vote of a demoted (CLIENT) voter is still stored above
 	// for audit, but excluded from the tally — so seed the voter only if it
 	// is currently trusted (compensating for read-after-write within the TX).
+	// The just-cast vote's timestamp == windowNow, so it is in-window by definition.
 	if s.isTrustedRSU(ctx, rsuID) {
 		seen[rsuID] = true
 	}
@@ -1487,6 +1606,9 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		}
 		if !s.isTrustedRSU(ctx, v.RSUID) {
 			continue
+		}
+		if !inWindow(v) {
+			continue // witness outside [t-T_w, t] — expired, no quorum weight
 		}
 		seen[v.RSUID] = true
 	}
@@ -1543,6 +1665,10 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 }
 
 // SCRevokeStatus — diagnostics: vote count + threshold + revoked flag.
+// NOTE: this reports the RAW lifetime distinct-vote count (un-windowed), since it
+// takes no sim-time reference. The authoritative revocation decision in
+// SCRevokeVote applies the T_w sliding window (Eq 3.65); this count may therefore
+// exceed the in-window quorum and is for audit/inspection only.
 func (s *SmartContract) SCRevokeStatus(ctx contractapi.TransactionContextInterface,
 	vehicleID string) (string, error) {
 
@@ -1722,11 +1848,13 @@ func (s *SmartContract) SCRSUFinalizeEpoch(ctx contractapi.TransactionContextInt
 }
 
 // updateRSUTrust applies the EMA update and the three-state lifecycle for one
-// RSU given its per-epoch misbehaviour signal m_j. Mirrors the vehicle path:
-// the single configured τ_th (cfg.TauThreshold) is the demotion floor and the
-// T_rev gate, so RSUs and vehicles share thresholds exactly (paper §3.5.1 reuses
-// the vehicle parameters). Returns the updated record, or nil if the RSU is
-// already revoked / has no trust row.
+// RSU given its per-epoch misbehaviour signal m_j. Mirrors the vehicle path and
+// the paper's two-threshold scheme (§3.5.1): while τ ≥ τ_warn the RSU is a
+// healthy TRUSTED endorser; τ_min ≤ τ < τ_warn flags it PROBATIONARY (still
+// TRUSTED/endorsing, under watch); τ < τ_min demotes it to CLIENT (no quorum
+// weight, may not endorse, may still submit to recover); τ < τ_min sustained
+// for T_rev windows escalates to terminal SC-Revoke. Returns the updated
+// record, or nil if the RSU is already revoked / has no trust row.
 func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterface,
 	rsuID string, mj float64, numReports int, epoch string, cfg *NetworkConfig) (*RSUTrustScore, error) {
 
@@ -1759,8 +1887,8 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 	rec.UpdateCount++
 	rec.UpdatedAt = txTimeStr(ctx)
 
-	// T_rev consecutive-low-epoch gate.
-	if rec.TrustScore < cfg.TauThreshold {
+	// T_rev consecutive-low-epoch gate, keyed on the stricter τ_min floor.
+	if rec.TrustScore < cfg.TauMin {
 		rec.ConsecutiveLowEpochs++
 	} else {
 		rec.ConsecutiveLowEpochs = 0
@@ -1777,7 +1905,7 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 	// never floor-blocked.
 	floor := 3*fByzantine(cfg.NumRSUs) + 1
 	currentlyTrusted := reg.RSUState == "" || reg.RSUState == RSUStateTrusted
-	wantsOut := rec.ConsecutiveLowEpochs >= cfg.TRev || rec.TrustScore < cfg.TauThreshold
+	wantsOut := rec.TrustScore < cfg.TauMin // demotion or revocation territory
 	floorWouldBreak := false
 	if wantsOut && currentlyTrusted {
 		nTrusted, e := s.countTrustedRSUs(ctx)
@@ -1789,21 +1917,24 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 		}
 	}
 
-	// State machine. Persistent low trust → terminal SC-Revoke; otherwise
-	// demote/promote across the TRUSTED↔CLIENT boundary at τ_th. The floor
-	// guard takes precedence over both demotion and revocation.
+	// State machine (paper §3.5.1 two-threshold scheme). Order: floor guard >
+	// terminal revoke (τ < τ_min for T_rev) > demote (τ < τ_min) > probation
+	// (τ_min ≤ τ < τ_warn, stays TRUSTED) > healthy. The floor guard takes
+	// precedence so |R_trusted| never drops below 3f+1.
 	switch {
 	case floorWouldBreak:
 		rec.State = RSUStateTrusted
 		reg.RSUState = RSUStateTrusted
-		if !rec.Probationary {
-			rec.Probationary = true
+		rec.Probationary = false
+		if !rec.FloorHeld {
+			rec.FloorHeld = true
 			ctx.GetStub().SetEvent("RSUProbationHold", []byte(fmt.Sprintf(
 				`{"rsuID":"%s","trust":%f,"consec":%d,"floor":%d,"epoch":"%s"}`,
 				rsuID, rec.TrustScore, rec.ConsecutiveLowEpochs, floor, epoch)))
 		}
 	case rec.ConsecutiveLowEpochs >= cfg.TRev:
 		rec.Probationary = false
+		rec.FloorHeld = false
 		rec.State = RSUStateClient
 		reg.RSUState = RSUStateClient
 		reg.Status = StatusRevoked
@@ -1823,8 +1954,9 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 		ctx.GetStub().SetEvent("RSURevoke", []byte(fmt.Sprintf(
 			`{"rsuID":"%s","trust":%f,"consec":%d,"trev":%d}`,
 			rsuID, rec.TrustScore, rec.ConsecutiveLowEpochs, cfg.TRev)))
-	case rec.TrustScore < cfg.TauThreshold:
+	case rec.TrustScore < cfg.TauMin:
 		rec.Probationary = false
+		rec.FloorHeld = false
 		if rec.State != RSUStateClient {
 			rec.State = RSUStateClient
 			reg.RSUState = RSUStateClient
@@ -1832,8 +1964,28 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 				`{"rsuID":"%s","trust":%f,"mj":%f,"epoch":"%s"}`,
 				rsuID, rec.TrustScore, mj, epoch)))
 		}
+	case rec.TrustScore < cfg.TauWarn:
+		// Probationary trusted: still endorses, flagged. A CLIENT that has
+		// recovered to ≥ τ_min is promoted back to TRUSTED here.
+		rec.FloorHeld = false
+		rec.State = RSUStateTrusted
+		if reg.RSUState == RSUStateClient {
+			reg.RSUState = RSUStateTrusted
+			ctx.GetStub().SetEvent("RSUPromoted", []byte(fmt.Sprintf(
+				`{"rsuID":"%s","trust":%f,"epoch":"%s"}`,
+				rsuID, rec.TrustScore, epoch)))
+		} else {
+			reg.RSUState = RSUStateTrusted
+		}
+		if !rec.Probationary {
+			rec.Probationary = true
+			ctx.GetStub().SetEvent("RSUProbation", []byte(fmt.Sprintf(
+				`{"rsuID":"%s","trust":%f,"mj":%f,"epoch":"%s"}`,
+				rsuID, rec.TrustScore, mj, epoch)))
+		}
 	default:
 		rec.Probationary = false
+		rec.FloorHeld = false
 		if rec.State == RSUStateClient {
 			rec.State = RSUStateTrusted
 			reg.RSUState = RSUStateTrusted

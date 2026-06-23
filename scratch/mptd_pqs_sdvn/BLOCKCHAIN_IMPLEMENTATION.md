@@ -183,6 +183,48 @@ the CRL**. Reads: `SCRevokeStatus`, `IsRevoked`, `GetRevokeVotes`,
 BFT constant (shared C++ ↔ Go): `fByzantine(n) = (n−1)/3` (0 if n<4); revoke
 needs `2f+1`, CP-Detect / controller exclusion needs `f+1`.
 
+### 3.5 Trust-ranked endorsing-peer selection (Sir Task-4 revision, 2026-06-16)
+
+Supervisor directive: *"peer selection occasionally at runtime based on trust
+score rather than selecting everyone as peers, which is computationally
+expensive and suboptimal."* Implemented as **Option A** — change **which**
+trusted RSUs are asked to endorse, **not** which RSUs are Fabric peers (Option B,
+live channel reconfig, deliberately **not** taken; see caveat below).
+
+Paper alignment: the notation table defines the endorser set as
+`R_trusted(t)` ("trusted-RSU endorser set at time `t`"), so drawing the `2f+1`
+endorsers from the highest-trust members of the on-chain trusted set is a
+refinement of an underspecified selection rule, **not** a contradiction (SC-Register
+text says "neighbouring `2f+1`"; this ranks within the trusted set). Flagged to
+the supervisor per his "inform me if your modeling differs" instruction.
+
+- **Selection** (`select_endorsers_trust_ranked`, `11_blockchain_setup.h`) — top
+  `2f+1` TRUSTED RSUs by descending `τ`, with a pre-shuffle + `stable_sort` so
+  equal scores break **uniformly at random**. CLIENT/REVOKED RSUs are excluded.
+- **Bootstrap rule** (Sir: *"initially … as nodes trust scores are just
+  initialized"*) — before the first live snapshot / at boot every RSU carries
+  `τ_init` (all equal), so the selector falls back to `random_endorser_sample`
+  (uniform random). Registration is boot-time, so it uses this fallback; the
+  ranking takes effect as the lifecycle spreads the scores at runtime.
+- **Runtime refresh** (`refresh_endorsement_committee`, ~1 Hz, control-path
+  only) — queries live scores via `CallSCGetAllRSUTrustScores` (evaluate-only,
+  no orderer round-trip), rebuilds `g_rsu_trusted_set` + `g_rsu_trust_cache`,
+  recomputes the top-`2f+1` committee, and logs it as `[PEER-SELECT] … committee[2f+1]={…}`.
+- **Endorser count fixed to paper `f=1`** — `register_all_nodes` now sends
+  `2f+1 = 3` endorsers (was `2·(N−1)/3+1`, i.e. 43 in the 64-RSU urban grid —
+  the "selecting everyone" waste Sir flagged). Chaincode SCRegister threshold is
+  `2·fByzantine(NumRSUs)+1 = 3` at the default `NumRSUs=4`, so 3 satisfies it.
+- **Ablation toggle** — `g_trust_peer_selection` (default `true`); set `false`
+  for the A4/baseline run → uniform random endorsers, no refresh loop.
+
+> **Caveat (open question for supervisor).** Option A ranks **who endorses**;
+> it does **not** gate runtime evidence/revoke votes to a global committee.
+> Doing so (a literal "only the committee are peers" reading) would break the
+> `2f+1` SC-Revoke **trajectory-witness reachability** — a vehicle is flagged by
+> whichever RSUs it physically passes, not a globally-fixed top-trust set — which
+> is exactly the reachability the fixed `f=1` realignment restored. That heavier
+> change is held pending supervisor confirmation.
+
 ---
 
 ## 4. Multi-controller `C_trusted` set (Eq 3.1 / 3.60, invariant 2)

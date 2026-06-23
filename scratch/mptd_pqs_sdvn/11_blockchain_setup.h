@@ -38,6 +38,7 @@
 #include <sstream>
 #include <vector>
 #include <map>
+#include <set>
 #include <string>
 #include <cstdint>
 #include <cstdlib>
@@ -61,8 +62,22 @@
 // ── initialize_blockchain() — start Hyperledger Fabric (§3.3.4) ──────────────
 void initialize_blockchain()
 {
-    cout << "Initializing blockchain (Hyperledger Fabric test-network with CCAAS)" << endl;
+    cout << "Initializing blockchain (Hyperledger Fabric)" << endl;
     const char* fabric_dir   = FAB_ROOT "/test-network";
+
+    // Prefer the dynamic paper-scale network (fabric_net/gen_network.sh: 64 RSU
+    // peers + 5 controller-orderers, org rsu.example.com). When it is already up,
+    // the gateway daemon is pointed at it and node registration / SC-invokes go
+    // through the AF_UNIX socket — there is NOTHING to bring up here, and shelling
+    // out to the legacy org1 test-network would build the WRONG network and clash
+    // on the shared ports. So detect peer0.rsu.example.com and no-op.
+    std::string gen_cmd = "docker ps --filter name=peer0.rsu.example.com --format '{{.Names}}' 2>/dev/null";
+    if (execCmd(gen_cmd).find("peer0.rsu.example.com") != std::string::npos) {
+        cout << "[BLOCKCHAIN] gen_network (peer0.rsu.example.com) already running — "
+                "using existing 64-RSU network; legacy test-network bring-up skipped." << endl;
+        cout << "[BLOCKCHAIN] Initialization complete." << endl;
+        return;
+    }
 
     std::string check_cmd = "docker ps --filter name=peer0.org1 --format '{{.Names}}' 2>/dev/null";
     std::string result    = execCmd(check_cmd);
@@ -432,7 +447,10 @@ static std::string derive_controller_h_ku(uint32_t ctrl_idx)
 
 // random_endorser_sample — uniformly draw 2f+1 distinct RSU indices from
 // [0, n_rsus). Returns empty vector when n_rsus < 2f+1 (caller should
-// surface the registration failure per decision #5).
+// surface the registration failure per decision #5). This is the BOOTSTRAP
+// path (Sir 2026-06-16: "initially you can have everyone as peers … as nodes
+// trust scores are just initialized") and the A4/ablation fallback when
+// trust-ranked selection is disabled.
 static std::vector<uint32_t> random_endorser_sample(uint32_t n_rsus,
                                                      uint32_t need,
                                                      uint64_t seed)
@@ -448,6 +466,94 @@ static std::vector<uint32_t> random_endorser_sample(uint32_t n_rsus,
     return all;
 }
 
+// ── Trust-ranked endorsing-peer selection (Sir Task-4 revision, 2026-06-16) ───
+// Paper-aligned with the notation-table endorser set R_trusted(t): pick the
+// 2f+1 endorsers from the HIGHEST-trust members of the on-chain trusted set
+// rather than uniformly at random over every RSU. This is "Option A" — it
+// changes WHICH trusted RSUs are asked to endorse; it does NOT remove peers
+// from the Fabric network (that is the heavier Option B, deliberately not
+// taken because gating runtime evidence/votes to a global committee would
+// break the 2f+1 SC-Revoke trajectory-witness reachability — flagged to the
+// supervisor as the open architectural question). Toggleable for ablation.
+static bool     g_trust_peer_selection      = true;  // false → uniform random
+static double   g_committee_refresh_interval = 1.0;  // seconds between refreshes
+// Live snapshot maintained by refresh_endorsement_committee(); read by the
+// selector. Empty before the first refresh / at boot → selector falls back to
+// random_endorser_sample (correct bootstrap behaviour).
+static std::map<uint32_t, double> g_rsu_trust_cache;   // rsu_idx → τ
+static std::set<uint32_t>         g_rsu_trusted_set;    // rsu_idx with State==TRUSTED
+static std::vector<uint32_t>      g_endorsement_committee;  // last selected top-2f+1
+
+// select_endorsers_trust_ranked — top-`need` TRUSTED RSUs by descending trust,
+// with a deterministic random tie-break among equal scores (so the all-equal
+// boot case degrades to a uniform random pick, exactly the bootstrap rule).
+// Falls back to random_endorser_sample when trust ranking is disabled or no
+// live trust snapshot exists yet.
+static std::vector<uint32_t> select_endorsers_trust_ranked(uint32_t n_rsus,
+                                                           uint32_t need,
+                                                           uint64_t seed)
+{
+    if (!g_trust_peer_selection || g_rsu_trusted_set.empty())
+        return random_endorser_sample(n_rsus, need, seed);
+
+    // Candidate pool: trusted RSUs within the addressable index range.
+    std::vector<uint32_t> pool;
+    pool.reserve(g_rsu_trusted_set.size());
+    for (uint32_t idx : g_rsu_trusted_set)
+        if (idx < n_rsus) pool.push_back(idx);
+    if (pool.size() < need)
+        return random_endorser_sample(n_rsus, need, seed);  // not enough trusted
+
+    // Shuffle first so equal-trust ties break uniformly, then stable-sort by
+    // trust descending. std::sort is not stable, so pre-shuffle + stable_sort.
+    std::mt19937_64 rng(seed);
+    std::shuffle(pool.begin(), pool.end(), rng);
+    std::stable_sort(pool.begin(), pool.end(),
+                     [](uint32_t a, uint32_t b) {
+                         double ta = g_rsu_trust_cache.count(a) ? g_rsu_trust_cache[a] : 0.0;
+                         double tb = g_rsu_trust_cache.count(b) ? g_rsu_trust_cache[b] : 0.0;
+                         return ta > tb;
+                     });
+    pool.resize(need);
+    return pool;
+}
+
+// refresh_endorsement_committee — query live on-chain RSU trust scores, rebuild
+// the trusted-set snapshot, and recompute the top-2f+1 endorsement committee.
+// Logged each cycle as the "active endorsing peer set" (Sir: peer selection
+// occasionally at runtime based on trust score). Cheap read (evaluate); no-op
+// under skip_blockchain or when trust selection is disabled. Reschedules itself.
+static void refresh_endorsement_committee()
+{
+    if (skip_blockchain || !g_trust_peer_selection) return;
+
+    auto views = CallSCGetAllRSUTrustScores();
+    if (!views.empty()) {
+        g_rsu_trust_cache.clear();
+        g_rsu_trusted_set.clear();
+        for (const auto& v : views) {
+            g_rsu_trust_cache[v.rsu_idx] = v.trust;
+            if (v.trusted) g_rsu_trusted_set.insert(v.rsu_idx);
+        }
+        const uint32_t need = 2 * /*paper fixed f=*/1u + 1u;   // 2f+1 = 3
+        g_endorsement_committee = select_endorsers_trust_ranked(
+            N_RSUs, need, (uint64_t)(Simulator::Now().GetNanoSeconds()));
+
+        std::ostringstream cs;
+        for (size_t i = 0; i < g_endorsement_committee.size(); ++i) {
+            uint32_t idx = g_endorsement_committee[i];
+            cs << (i ? "," : "") << MakeRsuId(idx)
+               << "(" << g_rsu_trust_cache[idx] << ")";
+        }
+        std::cout << "[PEER-SELECT] t=" << Simulator::Now().GetSeconds()
+                  << " trusted=" << g_rsu_trusted_set.size() << "/" << views.size()
+                  << " committee[2f+1]={" << cs.str() << "}\n";
+    }
+
+    Simulator::Schedule(Seconds(g_committee_refresh_interval),
+                        &refresh_endorsement_committee);
+}
+
 // build_endorsements_json — for the registering node, ask `need` RSUs to
 // each ECDSA-sign the endorsement digest. Returns the JSON array string
 // expected by SCRegister.endorsersJSON (smartcontract.go Endorser type).
@@ -458,7 +564,9 @@ static std::string build_endorsements_json(const std::string& target_id,
                                             uint32_t need,
                                             uint64_t seed)
 {
-    auto sample = random_endorser_sample(n_rsus, need, seed);
+    // Trust-ranked endorser pick from R_trusted(t) (Sir Task-4 revision); falls
+    // back to uniform random at boot / when disabled (see selector).
+    auto sample = select_endorsers_trust_ranked(n_rsus, need, seed);
     if (sample.empty()) return "";
 
     std::vector<uint8_t> digest = endorsement_digest(target_id, target_pk_hex,
@@ -664,9 +772,16 @@ void register_all_nodes()
     }
 
     const uint32_t n_rsus = N_RSUs;
-    // Eq 3.58 / chaincode fByzantine: f = (n_rsus - 1) / 3, threshold = 2f+1.
-    const uint32_t f             = (n_rsus > 0) ? (n_rsus - 1) / 3 : 0;
-    const uint32_t need_endorsers = 2 * f + 1;
+    // BFT fault bound f is FIXED at 1 by framework design (paper
+    // tab:set-blockchain: f=1, 2f+1=3, n=4 ring) across ALL deployments — the
+    // 64/44/23-RSU grids are mobility-coverage topology, NOT the consensus
+    // committee size. The chaincode SCRegister threshold is
+    // 2·fByzantine(NumRSUs)+1 = 3 at the default NumRSUs=4, so sending exactly 3
+    // endorsers satisfies it. Previously this derived f=(n_rsus-1)/3 locally,
+    // which gathered 2f+1=43 endorsers in the urban grid — "selecting [nearly]
+    // everyone as peers", the computational waste Sir flagged (2026-06-16).
+    const uint32_t f             = 1;
+    const uint32_t need_endorsers = 2 * f + 1;   // = 3
     const uint32_t max_retries    = 3;
     const double   t_reg          = Simulator::Now().GetSeconds();
 
@@ -766,6 +881,20 @@ void register_all_nodes()
 
     // Track reassignments during the run (1 Hz, control-path only).
     Simulator::Schedule(Seconds(1.0), &mptd_active_controller_refresh_loop, 1.0);
+
+    // Trust-ranked endorsing-peer selection (Sir Task-4 revision, 2026-06-16):
+    // start the periodic committee refresh so the active endorser set tracks the
+    // on-chain trust scores as the lifecycle demotes/promotes RSUs at runtime.
+    // No-op when trust selection is disabled (A4/ablation) or skip_blockchain.
+    if (g_trust_peer_selection) {
+        std::cout << "[PEER-SELECT] trust-ranked endorser selection ENABLED "
+                  << "(refresh every " << g_committee_refresh_interval << "s)\n";
+        Simulator::Schedule(Seconds(g_committee_refresh_interval),
+                            &refresh_endorsement_committee);
+    } else {
+        std::cout << "[PEER-SELECT] trust-ranked selection DISABLED "
+                  << "— uniform random endorsers (ablation)\n";
+    }
 }
 
 // ── mptd_export_blockchain_evidence() — paper §3.5.5 audit-trail dump ─────────

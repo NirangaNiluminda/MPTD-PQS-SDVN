@@ -307,6 +307,7 @@ EOF
       - CHAINCODE_AS_A_SERVICE_BUILDER_CONFIG={"peername":"peer${i}rsu"}
       - CORE_CHAINCODE_EXECUTETIMEOUT=300s
     volumes:
+      - ${FAB_ROOT}/config:/etc/hyperledger/peercfg
       - ${pd}:/etc/hyperledger/fabric
       - peer${i}.${ORG_DOMAIN}:/var/hyperledger/production
     working_dir: /root

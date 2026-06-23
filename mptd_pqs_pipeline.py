@@ -33,7 +33,6 @@ import sys
 from collections import defaultdict
 from typing import Dict, List, Optional
 
-from mptd_pqs.sharma_b3_detector import SharmaB3Detector, extract_features_from_ns3
 
 # Add project root to path
 sys.path.insert(0, os.path.dirname(__file__))
@@ -342,11 +341,6 @@ def main():
             results_by_pct[ref_pct],
             output_path=os.path.join(args.output_dir, "mptd_pqs_baseline.png")
         )
-
-    # Add your code here
-    feat_df = extract_features_from_ns3("/tmp/ns-allinone-3.35/ns-3.35/analytics/results/rsu_relay_log.csv")
-    det = SharmaB3Detector(seed=42, with_plausibility=True)
-    b3_results = det.run(feat_df)
 
     print("\n" + "=" * 60)
     print("  MPTD-PQS Pipeline Complete")
