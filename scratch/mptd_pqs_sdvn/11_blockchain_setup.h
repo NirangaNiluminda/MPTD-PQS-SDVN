@@ -199,6 +199,21 @@ void assign_controllers()
         cout << "node " << i << " controller id " << node_controller_ID[i]
              << " consortium id " << assigned_consortium_ID[i] << endl;
     }
+
+    // ── c_assigned(r_j): RSU→controller assignment (paper §3.1 / Table 3.2) ──
+    // The paper defines controller assignment over RSUs (geo-proximity / load
+    // balance), and R^obs_ck (Eq 3.60) over the RSUs assigned to c_k — NOT over
+    // vehicles. Sim default: an even contiguous partition of the N_RSUs RSU
+    // indices across the N_Controllers controllers. With sequentially-placed
+    // RSUs this is the geo-proximity init (adjacent RSUs share a controller);
+    // for the 4-RSU / 4-controller test net it is the identity map (RSU r→c r).
+    // SUMO 64-RSU / 4-controller runs give 16 RSUs per controller.
+    for (uint32_t r = 0; r < N_RSUs && r < uint32_t(total_size); ++r) {
+        rsu_controller_ID[r] = (N_Controllers > 0)
+                                 ? (r * N_Controllers) / N_RSUs
+                                 : 0;
+        cout << "RSU " << r << " c_assigned CTRL_" << rsu_controller_ID[r] << endl;
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

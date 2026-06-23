@@ -1943,13 +1943,19 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                     ax, ay, 0.0,
                                     rw.timestamp[i]);
 
-                                // Multi-controller C_trusted (Eq 3.1/3.60):
-                                // submit under the chain-authoritative ACTIVE
-                                // controller, not a hardcoded index. After a
-                                // CP-DETECT exclusion the chaincode reassigns
-                                // the head of C_trusted and a periodic
-                                // mptd_refresh_active_controller() advances this.
-                                const uint32_t controllerID = node_controller_ID[vid_i];
+                                // Controller identity = c_assigned(r_j) of the
+                                // RSU that owns this window (paper §3.1 /
+                                // Table 3.2 / Eq 3.64). The paper assigns
+                                // controllers over RSUs, not vehicles, and the
+                                // controller's evidence E_c(t) is its verdict on
+                                // the windows of the RSUs it manages
+                                // (R^obs_ck, Eq 3.60) — so the closing RSU's
+                                // assigned controller submits, NOT a per-vehicle
+                                // index. rsu_controller_ID[] is reassigned on a
+                                // CP-DETECT/EMA controller revocation, so an
+                                // excluded controller's RSUs roll over to a
+                                // trusted successor (no manual failover, p.75).
+                                const uint32_t controllerID = rsu_controller_ID[rsu_id];
 
                                 CallSCControllerSubmitEvidence(
                                     vid_i, controllerID, ctrl_epoch,
