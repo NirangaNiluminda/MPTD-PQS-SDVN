@@ -2016,7 +2016,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 }
                                 if (cp_first) {
                                     Simulator::Schedule(Seconds(0.5),
-                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch);
+                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch,
+                                        controllerID);
                                 }
                             }
                         }
