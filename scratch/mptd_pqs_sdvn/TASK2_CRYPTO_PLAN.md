@@ -94,7 +94,7 @@ baseline for PBPO TRS-vs-ECDSA (Eq 4.7 / RQ5); PARR counter (Eq 4.3); cloud-side
   `add_many`. Integer-quantize (×100 speeds, ×1000 positions). Round-trip validated by
   selftest THFHE-1/2 (encrypt→⊕→threshold-decrypt).
 - **P3 — PQ-TRS via Dilithium (Eq 3.48–3.51) — DONE (D1 = option (c)).**
-  `DilithiumTrsBackend` (liboqs ML-DSA-44) signs the **ciphertext** m = Enc(A_ring)‖t‖ID_S‖h(S).
+  `DilithiumTrsBackend` (liboqs ML-DSA-87) signs the **ciphertext** m = Enc(A_ring)‖t‖ID_S‖h(S).
   `aggregate` = bundle of t partial sigs; `verify_threshold` = "≥t distinct valid".
   `ClassicalTrsBackend` retained for the ECDSA/A4 baseline (RQ5) behind `--trs_classical`.
   Validated by selftest TRS-2a/2c/2e/2f, PIPE-1/2.
@@ -121,7 +121,7 @@ satisfies PARR (sound t-of-n predicate) + PBPO (real PQ latency).
 - (a) real lattice threshold sig (research-grade, not in liboqs) and (b) lattice ring sig +
   separate threshold (not in liboqs) — both out of timeline; rejected.
 
-**D2 — ML-DSA security level. LOCKED = ML-DSA-44** (lightest; matches the 100 ms-budget
+**D2 — ML-DSA security level. LOCKED = ML-DSA-87** (lightest; matches the 100 ms-budget
 framing; pk=1312B sig=2420B). 65/87 stronger but slower → would hurt PBPO. User confirmed
 2026-06-06.
 
@@ -145,7 +145,7 @@ locks rewritten for threshold (t,n+1) BFV + PQ-Dilithium bundle. Memory
 
 **Algorithm 6 (PQ-FHE-TRS) and Algorithm 7 (THRESH-DEC) are wired end-to-end. Build clean,
 selftest 19/19. No stubs, no hardcoded crypto, no simulated primitives — all OpenFHE 1.5.1
-BFV-RNS + liboqs 0.15.0 ML-DSA-44 + LKH HMAC-SHA256.**
+BFV-RNS + liboqs 0.15.0 ML-DSA-87 + LKH HMAC-SHA256.**
 
 ### 7.1 Where each piece lives
 - **`06b2_fhe_backend.h`** — `ThresholdBfvBackend`. New primitives:
@@ -157,7 +157,7 @@ BFV-RNS + liboqs 0.15.0 ML-DSA-44 + LKH HMAC-SHA256.**
     ≥t−1 RSU partials (Eq 3.55) → MultipartyDecryptLead/Main/Fusion (Eq 3.56), Shamir
     abort-recovery. `threshold_decrypt_int` now delegates to it.
   - Quantization constants: `SPEED_SCALE=100`, `POS_SCALE=1000`.
-- **`06b1_trs_backend.h`** — `DilithiumTrsBackend` (ML-DSA-44, D1 bundle) +
+- **`06b1_trs_backend.h`** — `DilithiumTrsBackend` (ML-DSA-87, D1 bundle) +
   `ClassicalTrsBackend` (Shamir-Schnorr-P256, RQ5 baseline). Both behind `ITrsBackend`.
 - **`08_detection_engine.h`** — the orchestrator:
   - `struct FullModeCryptoResult` + globals `g_fullcrypto_runs`, `g_fullcrypto_time_sum_ms`.

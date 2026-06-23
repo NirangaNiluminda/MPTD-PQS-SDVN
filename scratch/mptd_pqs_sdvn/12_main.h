@@ -1635,7 +1635,6 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 					  Simulator::Schedule(Seconds(t+0.034800),update_flows);
 					  
 					  Simulator::Schedule(Seconds(t+0.034900+(2*(flows+1)*0.000050)),filter_flows);
-					  Simulator::Schedule(Seconds(t+0.034900+(2*(flows+1)*0.000050)),LDA_security, " is_controller=true create_security_manager_con=true netsize=2 node_id=0 generate_dig_rsa_key_pair=true generate_own_aes_key=true sign_data=true verify_signature=true initiate_session1=true initiate_session2=true create_hmac_global=true create_hmac_set1=true create_hmac_set2=true verify_key_expiry=true is_node=true pid=1 get_rsa_keys=true encrypt_rsa=true set_aes_key_for_pair=true encrypt_controller_data=true decrypt_controller_data=true generate_global_HMAC_secret_key=true get_digital_public_key=true get_session_HMAC_1=true get_session_HMAC_2=true create_global_HMAC_node=true decrypt_rsa=true get_aes_keys=true encrypt_aes_node_pair=true decrypt_aes_node_pair=true");
 					  Simulator::Schedule(Seconds(t+0.034900), reset_LLDP_received_count);
 ///*					  
 					  switch(routing_algorithm)

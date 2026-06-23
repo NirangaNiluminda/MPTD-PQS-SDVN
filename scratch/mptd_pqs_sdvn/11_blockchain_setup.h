@@ -122,7 +122,7 @@ void initialize_crypto_backends()
     lkh_init_master_keys();
 
     // TRS: ring size n=4, threshold t=3 (matches 3-RSU + 1-ctrl peer setup).
-    // Full-mode default is the paper-correct PQ scheme (Dilithium / ML-DSA-44,
+    // Full-mode default is the paper-correct PQ scheme Dilithium / ML-DSA-87,
     // Eq 3.49); --trs_classical=1 selects the classical Shamir-Schnorr-P256
     // signing-latency baseline for RQ5 (paper §3.5.4, behind ITrsBackend).
     const TrsScheme trs_scheme = g_trs_classical_baseline
