@@ -1878,16 +1878,19 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         // E_c(t) = (vehicleID, Φ_i(t), epoch, h(X_i(t)), σ_c^sub)
                         //
                         // Submitted UNCONDITIONALLY on every fused row (not
-                        // gated on fs.anomalous). Eq 3.59 (CP-DETECT) compares
-                        // the controller's binary verdict against each RSU's
-                        // verdict via XOR on (Φ > ψ_th)/(ψ_j > ψ_th); the
-                        // chaincode does its own threshold check on the raw Φ
-                        // value, so submitting Φ regardless of anomaly is
-                        // correct. More importantly, gating on fs.anomalous
+                        // gated on fs.anomalous). CP-DETECT (Eq 3.66–3.68)
+                        // compares the controller's binary verdict against each
+                        // RSU's verdict via the DIRECTIONAL conflict
+                        // (1−flag^ctrl)·flag^rsu — a conflict counts only when
+                        // the controller says benign while an RSU says anomaly
+                        // (controller suppression); the chaincode does its own
+                        // threshold check on the raw Φ value, so submitting Φ
+                        // regardless of anomaly is correct. More importantly,
+                        // gating on fs.anomalous
                         // would HIDE the malicious-controller attack pattern
                         // — a compromised controller that lies "clean" on
                         // genuine anomalies would never submit, and CPDetectCheck
-                        // returns nil when no CSUBM exists, defeating Eq 3.59.
+                        // returns nil when no CSUBM exists, defeating Eq 3.68.
                         //
                         // Paper invariant #2 (controller as untrusted peer):
                         // this is the controller's UNTRUSTED submission. The
@@ -1952,13 +1955,15 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                     vid_i, controllerID, ctrl_epoch,
                                     (double)fs.phi, h_X);
 
-                                // ── Schedule Eq 3.59 CP-DETECT (TASK ①-M) ────────
+                                // ── Schedule Eq 3.66–3.69 CP-DETECT (TASK ①-M) ──
                                 // CPDetectCheck reads BOTH the just-written
                                 // CSUBM_<vid>_<epoch> AND the per-RSU SUBM_*
-                                // records for the same epoch, then XORs each
-                                // RSU's anomaly verdict against the controller's
-                                // — if ≥ f+1 RSUs disagree, the controller is
-                                // flagged (CFLAG_ record + "CPDetectFlag" event).
+                                // records for the same epoch, then applies the
+                                // DIRECTIONAL conflict (1−flag^ctrl)·flag^rsu to
+                                // each RSU — if ≥ f+1 trusted RSUs flag anomaly
+                                // while the controller said benign (suppression),
+                                // the controller is flagged (CFLAG_ record +
+                                // "CPDetectFlag" event).
                                 //
                                 // Why 0.5 s delay:
                                 //   - CSUBM and SUBM are both written via the
@@ -1981,20 +1986,19 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 //   an orderer round-trip — keep it to one call.
                                 //   Set is process-local; cleared on next run.
                                 //
-                                // KNOWN GAP (TASK ①-M-followup): when ALL RSUs
-                                // see the same vehicle as CLEAN (rsu_lw.anomalous
-                                // false → no SUBM written per TASK ①-I gating),
-                                // CPDetectCheck on chain returns nil because
-                                // len(seenRSU)==0, so a malicious controller
-                                // that hallucinates an anomaly on clean traffic
-                                // is currently undetected. Two fix paths:
-                                //  (a) RSU submits SUBM per beacon regardless of
-                                //      anomaly (paper-strict but high volume), or
-                                //  (b) chaincode treats len(seenRSU)==0 as
-                                //      unanimous "no anomaly" and counts it as
-                                //      cfg.NumRSUs implicit conflicts when the
-                                //      controller said anomaly. Deferred — both
-                                //      paths need separate eval impact analysis.
+                                // BY DESIGN (Eq 3.68, §3.5.5 p.74): when ALL RSUs
+                                // see the vehicle as CLEAN (no SUBM written per
+                                // TASK ①-I gating) the directional conflict is 0
+                                // for every RSU, so a controller flagging an
+                                // anomaly the RSUs missed is NOT penalised — the
+                                // paper treats that as the controller "performing
+                                // superior detection" (full-mode catching what
+                                // lightweight rules miss, invariant 4). CP-DETECT
+                                // targets controller SUPPRESSION (says benign
+                                // while RSUs flag), not over-reporting. The old
+                                // "implicit clean votes count as conflicts when
+                                // the controller says anomaly" behaviour was an
+                                // Eq-3.68 violation and has been removed.
                                 static std::unordered_set<std::string> g_cpdetect_scheduled;
                                 static std::mutex                       g_cpdetect_mu;
                                 std::string cp_key =

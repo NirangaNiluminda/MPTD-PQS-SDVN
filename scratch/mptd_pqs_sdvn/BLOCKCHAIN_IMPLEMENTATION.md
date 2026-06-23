@@ -158,11 +158,16 @@ defined the trust EMA only for vehicles and controllers. Each RSU carries
   **Under-reporting** (a missed detection the quorum caught) needs a per-vehicle
   clean-verdict hook on the NS-3 side — documented follow-up.
 
-### 3.3 CP-DETECT (Algorithm 8, Eq 3.64–3.67)
+### 3.3 CP-DETECT (Algorithm 9, Eq 3.66–3.69)
 
 `CPDetectCheck(vehicleID, epoch)` — compares the controller's anomaly verdict
-(`Φ > ψ_th`) against the RSU verdicts for the same epoch. RSUs with no submission
-count as **implicit clean** votes. If `conflict ≥ f+1` it:
+(`flag^ctrl = 1[Φ > ψ_th]`) against each RSU verdict (`flag^rsu_j = 1[ψ_j > ψ_th]`)
+for the same epoch via the **directional** conflict `(1−flag^ctrl)·flag^rsu_j`
+(Eq 3.68): a conflict counts **only** when the controller says benign while an RSU
+flags anomaly (controller suppression). The reverse — the controller catching an
+anomaly the lightweight RSU rules miss — is superior full-mode detection and is
+**not** penalised (so RSUs with no submission, `flag^rsu_j = 0`, never contribute).
+If `conflict ≥ f+1` it:
 1. writes a `CFLAG_<ctrl>_<veh>_<epoch>` flag, **and**
 2. calls `excludeAndReassignController` (see §4), **and**
 3. emits exactly one event — `ControllerReassign` if a new exclusion happened,

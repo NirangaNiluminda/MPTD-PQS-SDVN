@@ -844,7 +844,7 @@ func TestTrustReads(t *testing.T) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Algorithm 8 / Eq 3.59 — CP-DETECT
+// Algorithm 9 / Eq 3.66–3.69 — CP-DETECT (directional conflict)
 // ═════════════════════════════════════════════════════════════════════════════
 
 func TestCPDetectCheck(t *testing.T) {
@@ -859,16 +859,37 @@ func TestCPDetectCheck(t *testing.T) {
 		}
 	})
 
-	t.Run("controller-anom vs implicit-clean RSUs fires flag", func(t *testing.T) {
+	// Eq 3.68 is directional: controller-anomalous + RSUs-clean is the controller
+	// performing SUPERIOR detection and must NOT be penalised → conflict=0, no flag.
+	t.Run("controller-anom vs clean RSUs → NO flag (Eq 3.68 superior detection)", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)        // f=1 → f+1 = 2
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)   // f=1 → f+1 = 2
 		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.8) // Φ>ψ_th → cAnom=true
-		// no RSU SUBMs → 4 implicit clean votes → conflict=4 ≥ 2
+		// no RSU SUBMs → all RSUs clean (flag^rsu=0) → conflict=0 (directional)
+		sc := SmartContract{}
+		flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
+		ok(t, err)
+		if flag != nil {
+			t.Error("controller catching an anomaly RSUs missed must not be flagged (Eq 3.68)")
+		}
+	})
+
+	// Suppression case: controller says benign while ≥ f+1 trusted RSUs say
+	// anomalous → conflict ≥ f+1 → flag fires (Eq 3.68 + Eq 3.69).
+	t.Run("controller-clean suppresses f+1 anomalous RSUs → flag fires", func(t *testing.T) {
+		ctx, fl := newCtx()
+		_, pk := genIDStatic()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)   // f=1 → f+1 = 2
+		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // cAnom=false
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedReg(fl, "RSU_1", RoleRSU, pk)
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // anomalous
+		seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.8) // anomalous → conflict=2 ≥ 2
 		sc := SmartContract{}
 		flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
 		ok(t, err)
 		if flag == nil {
-			t.Fatal("expected flag to fire")
+			t.Fatal("expected flag to fire on controller suppression")
 		}
 		if flag.ConflictCount < flag.ThresholdFP1 {
 			t.Errorf("conflict %d < threshold %d", flag.ConflictCount, flag.ThresholdFP1)
@@ -880,9 +901,11 @@ func TestCPDetectCheck(t *testing.T) {
 
 	t.Run("controller-clean minor disagreement → no flag", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)        // f+1 = 2
+		_, pk := genIDStatic()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)   // f+1 = 2
 		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // cAnom=false
-		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8)  // 1 RSU disagrees
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // 1 RSU disagrees → conflict=1
 		sc := SmartContract{}
 		flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
 		ok(t, err)
@@ -894,8 +917,13 @@ func TestCPDetectCheck(t *testing.T) {
 
 func TestControllerFlagReads(t *testing.T) {
 	ctx, fl := newCtx()
+	_, pk := genIDStatic()
 	seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
-	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.9)
+	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // controller benign (suppression)
+	seedReg(fl, "RSU_0", RoleRSU, pk)
+	seedReg(fl, "RSU_1", RoleRSU, pk)
+	seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // anomalous
+	seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.8) // anomalous → conflict=2 ≥ f+1
 	sc := SmartContract{}
 	_, err := sc.CPDetectCheck(ctx, "VEH_1", "E1") // fires a flag
 	ok(t, err)
@@ -989,9 +1017,14 @@ func TestCPDetectExcludesAndReassigns(t *testing.T) {
 	seedControllers(fl, 5)              // CTRL_0..CTRL_4 ACTIVE
 	_, vpk := genIDStatic()
 	seedReg(fl, "VEH_1", RoleVehicle, vpk) // so evidence reaches the controller gate
-	// CTRL_0 (current head) flags an anomaly the RSUs implicitly clean-vote
-	// against → conflict ≥ f+1 → exclude CTRL_0, hand off to CTRL_1.
-	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.9)
+	// CTRL_0 (current head) SUPPRESSES an alert: it says benign while ≥ f+1
+	// trusted RSUs flag anomalous → directional conflict ≥ f+1 (Eq 3.68/3.69)
+	// → exclude CTRL_0, hand off to CTRL_1.
+	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // cAnom=false (suppression)
+	seedReg(fl, "RSU_0", RoleRSU, vpk)
+	seedReg(fl, "RSU_1", RoleRSU, vpk)
+	seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // anomalous
+	seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.8) // anomalous → conflict=2 ≥ 2
 	sc := SmartContract{}
 
 	flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")

@@ -1182,21 +1182,28 @@ func (s *SmartContract) GetAllTrustScores(ctx contractapi.TransactionContextInte
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Algorithm 8 / Eq 3.59 — CP-DETECT
+// Algorithm 9 / Eq 3.66–3.69 — CP-DETECT
 // ─────────────────────────────────────────────────────────────────────────────
 
 // CPDetectCheck — counts RSU disagreements with the controller for one
-// (vehicleID, epoch). Disagreement is the binary classifier mismatch:
+// (vehicleID, epoch). Per paper Eq 3.66–3.68 (§3.5.5, p.74) the conflict is
+// DIRECTIONAL, not a symmetric XOR:
 //
-//	conflict_j  =  (Φ_i > ψ_th) XOR (ψ_j^{(i)} > ψ_th)
+//	flag^ctrl   = 1[Φ_i(t) > ψ_th]                 (Eq 3.66)
+//	flag^rsu_j  = 1[ψ_j^{(i)}(t) > ψ_th]           (Eq 3.67)
+//	conflict_j  = (1 − flag^ctrl) · flag^rsu_j     (Eq 3.68)
 //
-// Plus implicit clean votes: RSUs that did NOT submit a SUBM are reporting
-// ψ_j ≤ ψ_th (the NS-3 RSU gating contract — only writes SUBM on anomaly).
-// When the controller flags the vehicle as anomalous (cAnom=true) those
-// implicit clean votes count as conflicts; when the controller agrees the
-// vehicle is clean, missing SUBMs are agreement, not conflict.
+// A conflict fires ONLY when the controller says benign (flag^ctrl=0) while
+// an RSU says anomalous (flag^rsu_j=1) — i.e. the controller is SUPPRESSING
+// an alert the RSU caught. The paper is explicit that the reverse case (the
+// controller flagging an anomaly the lightweight RSU rules miss) is the
+// controller "performing superior detection and must not be penalised", so it
+// contributes 0. Consequently RSUs that did NOT submit a SUBM (flag^rsu_j=0,
+// the NS-3 gating contract) ALWAYS contribute 0 regardless of the controller's
+// verdict; implicitCleanVotes is retained for telemetry only and never enters
+// the conflict sum.
 //
-// Returns the ControllerFlag on flag-fire, or nil if conflict < f+1.
+// Returns the ControllerFlag on flag-fire, or nil if conflict < f+1 (Eq 3.69).
 // activeControllerExcluding returns the ID of the lowest-numbered controller
 // whose registration is ACTIVE, skipping `exclude`. This is the deterministic
 // head of the trusted set C_trusted (Eq 3.1). Returns "" when none remain.
@@ -1401,17 +1408,21 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		}
 		seenRSU[sub.RSUID] = true
 		rAnom := sub.Psi > cfg.PsiAnomalyTh
-		if cAnom != rAnom {
+		// Eq 3.68 directional conflict: (1−flag^ctrl)·flag^rsu_j. Fires only
+		// when the controller says benign (cAnom=false) and this RSU says
+		// anomalous (rAnom=true). The reverse (controller anomalous, RSU clean)
+		// is superior controller detection and must NOT be counted (p.74).
+		if !cAnom && rAnom {
 			conflict++
 		}
 	}
 
+	// implicitCleanVotes = RSUs that wrote no SUBM (flag^rsu_j=0, NS-3 gating).
+	// Under Eq 3.68 these contribute 0 to the conflict sum unconditionally; we
+	// keep the count for telemetry/audit only — it is NOT added to `conflict`.
 	implicitCleanVotes := cfg.NumRSUs - len(seenRSU)
 	if implicitCleanVotes < 0 {
 		implicitCleanVotes = 0
-	}
-	if cAnom && implicitCleanVotes > 0 {
-		conflict += implicitCleanVotes
 	}
 
 	f := fByzantine(cfg.NumRSUs)
