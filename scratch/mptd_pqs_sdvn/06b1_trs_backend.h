@@ -113,11 +113,9 @@
 #include <openssl/obj_mac.h>
 #pragma GCC diagnostic pop
 
-#include <cstdio>
-// liboqs (Open Quantum Safe) — real CRYSTALS-Dilithium / ML-DSA single-signer
-// primitives for the post-quantum TRS backend (paper §3.5.4 Eq 3.49). Header at
-// $HOME/.local/include/oqs/oqs.h; lib liboqs.so under $HOME/.local/lib (wscript).
+#if __has_include(<oqs/oqs.h>)
 #include <oqs/oqs.h>
+#endif
 
 // ────────────────────────────────────────────────────────────────────────────
 // ITrsBackend — abstract crypto-agile threshold ring signature interface.
@@ -606,6 +604,7 @@ public:
 // pks layout: pks[0] = ring descriptor ("MLDSA"‖n‖t, provenance only — NOT a
 // master key), pks[1..n] = per-signer ML-DSA public keys (1-indexed = signer id).
 // ────────────────────────────────────────────────────────────────────────────
+#if __has_include(<oqs/oqs.h>)
 class DilithiumTrsBackend : public ITrsBackend {
 public:
     explicit DilithiumTrsBackend(const char* alg = OQS_SIG_alg_ml_dsa_44) {
@@ -724,6 +723,7 @@ private:
         return true;
     }
 };
+#endif
 
 // Selects the active TRS backend. Full mode (paper §3.5.4 Eq 3.49) uses the
 // Dilithium PQ-TRS; Classical is retained for the A4 ablation and the
@@ -738,8 +738,14 @@ static bool init_trs_backend(uint32_t n = 4, uint32_t t = 3,
                              TrsScheme scheme = TrsScheme::Classical)
 {
     if (g_trs_ready) return true;
-    if (scheme == TrsScheme::Dilithium)
+    if (scheme == TrsScheme::Dilithium) {
+#if __has_include(<oqs/oqs.h>)
         g_trs_backend = std::unique_ptr<ITrsBackend>(new DilithiumTrsBackend());
+#else
+        std::cerr << "[WARNING] liboqs header <oqs/oqs.h> not found. Falling back to ClassicalTrsBackend." << std::endl;
+        g_trs_backend = std::unique_ptr<ITrsBackend>(new ClassicalTrsBackend());
+#endif
+    }
     else
         g_trs_backend = std::unique_ptr<ITrsBackend>(new ClassicalTrsBackend());
     // ring_n/t must be visible to aggregate()'s "use first t partials" logic

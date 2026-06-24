@@ -1878,16 +1878,19 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         // E_c(t) = (vehicleID, Φ_i(t), epoch, h(X_i(t)), σ_c^sub)
                         //
                         // Submitted UNCONDITIONALLY on every fused row (not
-                        // gated on fs.anomalous). Eq 3.59 (CP-DETECT) compares
-                        // the controller's binary verdict against each RSU's
-                        // verdict via XOR on (Φ > ψ_th)/(ψ_j > ψ_th); the
-                        // chaincode does its own threshold check on the raw Φ
-                        // value, so submitting Φ regardless of anomaly is
-                        // correct. More importantly, gating on fs.anomalous
+                        // gated on fs.anomalous). CP-DETECT (Eq 3.66–3.68)
+                        // compares the controller's binary verdict against each
+                        // RSU's verdict via the DIRECTIONAL conflict
+                        // (1−flag^ctrl)·flag^rsu — a conflict counts only when
+                        // the controller says benign while an RSU says anomaly
+                        // (controller suppression); the chaincode does its own
+                        // threshold check on the raw Φ value, so submitting Φ
+                        // regardless of anomaly is correct. More importantly,
+                        // gating on fs.anomalous
                         // would HIDE the malicious-controller attack pattern
                         // — a compromised controller that lies "clean" on
                         // genuine anomalies would never submit, and CPDetectCheck
-                        // returns nil when no CSUBM exists, defeating Eq 3.59.
+                        // returns nil when no CSUBM exists, defeating Eq 3.68.
                         //
                         // Paper invariant #2 (controller as untrusted peer):
                         // this is the controller's UNTRUSTED submission. The
@@ -1940,25 +1943,33 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                     ax, ay, 0.0,
                                     rw.timestamp[i]);
 
-                                // Multi-controller C_trusted (Eq 3.1/3.60):
-                                // submit under the chain-authoritative ACTIVE
-                                // controller, not a hardcoded index. After a
-                                // CP-DETECT exclusion the chaincode reassigns
-                                // the head of C_trusted and a periodic
-                                // mptd_refresh_active_controller() advances this.
-                                const uint32_t controllerID = g_active_controller_idx;
+                                // Controller identity = c_assigned(r_j) of the
+                                // RSU that owns this window (paper §3.1 /
+                                // Table 3.2 / Eq 3.64). The paper assigns
+                                // controllers over RSUs, not vehicles, and the
+                                // controller's evidence E_c(t) is its verdict on
+                                // the windows of the RSUs it manages
+                                // (R^obs_ck, Eq 3.60) — so the closing RSU's
+                                // assigned controller submits, NOT a per-vehicle
+                                // index. rsu_controller_ID[] is reassigned on a
+                                // CP-DETECT/EMA controller revocation, so an
+                                // excluded controller's RSUs roll over to a
+                                // trusted successor (no manual failover, p.75).
+                                const uint32_t controllerID = rsu_controller_ID[rsu_id];
 
                                 CallSCControllerSubmitEvidence(
                                     vid_i, controllerID, ctrl_epoch,
                                     (double)fs.phi, h_X);
 
-                                // ── Schedule Eq 3.59 CP-DETECT (TASK ①-M) ────────
+                                // ── Schedule Eq 3.66–3.69 CP-DETECT (TASK ①-M) ──
                                 // CPDetectCheck reads BOTH the just-written
                                 // CSUBM_<vid>_<epoch> AND the per-RSU SUBM_*
-                                // records for the same epoch, then XORs each
-                                // RSU's anomaly verdict against the controller's
-                                // — if ≥ f+1 RSUs disagree, the controller is
-                                // flagged (CFLAG_ record + "CPDetectFlag" event).
+                                // records for the same epoch, then applies the
+                                // DIRECTIONAL conflict (1−flag^ctrl)·flag^rsu to
+                                // each RSU — if ≥ f+1 trusted RSUs flag anomaly
+                                // while the controller said benign (suppression),
+                                // the controller is flagged (CFLAG_ record +
+                                // "CPDetectFlag" event).
                                 //
                                 // Why 0.5 s delay:
                                 //   - CSUBM and SUBM are both written via the
@@ -1981,20 +1992,19 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 //   an orderer round-trip — keep it to one call.
                                 //   Set is process-local; cleared on next run.
                                 //
-                                // KNOWN GAP (TASK ①-M-followup): when ALL RSUs
-                                // see the same vehicle as CLEAN (rsu_lw.anomalous
-                                // false → no SUBM written per TASK ①-I gating),
-                                // CPDetectCheck on chain returns nil because
-                                // len(seenRSU)==0, so a malicious controller
-                                // that hallucinates an anomaly on clean traffic
-                                // is currently undetected. Two fix paths:
-                                //  (a) RSU submits SUBM per beacon regardless of
-                                //      anomaly (paper-strict but high volume), or
-                                //  (b) chaincode treats len(seenRSU)==0 as
-                                //      unanimous "no anomaly" and counts it as
-                                //      cfg.NumRSUs implicit conflicts when the
-                                //      controller said anomaly. Deferred — both
-                                //      paths need separate eval impact analysis.
+                                // BY DESIGN (Eq 3.68, §3.5.5 p.74): when ALL RSUs
+                                // see the vehicle as CLEAN (no SUBM written per
+                                // TASK ①-I gating) the directional conflict is 0
+                                // for every RSU, so a controller flagging an
+                                // anomaly the RSUs missed is NOT penalised — the
+                                // paper treats that as the controller "performing
+                                // superior detection" (full-mode catching what
+                                // lightweight rules miss, invariant 4). CP-DETECT
+                                // targets controller SUPPRESSION (says benign
+                                // while RSUs flag), not over-reporting. The old
+                                // "implicit clean votes count as conflicts when
+                                // the controller says anomaly" behaviour was an
+                                // Eq-3.68 violation and has been removed.
                                 static std::unordered_set<std::string> g_cpdetect_scheduled;
                                 static std::mutex                       g_cpdetect_mu;
                                 std::string cp_key =
@@ -2006,7 +2016,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 }
                                 if (cp_first) {
                                     Simulator::Schedule(Seconds(0.5),
-                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch);
+                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch,
+                                        controllerID);
                                 }
                             }
                         }
@@ -3003,6 +3014,28 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     if (rsu_first) {
                         Simulator::Schedule(Seconds(2.0),
                             &CallSCRSUFinalizeEpochAsync, epoch);
+                    }
+
+                    // Controller SC-Trust finalize (Eq 3.60 EMA / Eq 3.68
+                    // directional conflict) is ALSO channel-wide — ONE call per
+                    // epoch evaluates every controller's τ_ck(t) over its
+                    // R^obs_ck(t) RSU set, so it is deduped on `epoch` ALONE.
+                    // Delayed 3 s — one second after the RSU finalize — so the
+                    // full CSUBM_<*>_<epoch> + SUBM_<*>_<epoch>_<rsu> sets for
+                    // this epoch have landed before the contract reconstructs
+                    // conflict_j over the co-observed vehicles. Idempotent on
+                    // chain (re-fire just re-evaluates the same submission set),
+                    // so a converging re-fire is harmless.
+                    static std::unordered_set<std::string> g_ctrl_finalize_scheduled;
+                    static std::mutex                       g_ctrl_finalize_mu;
+                    bool ctrl_first;
+                    {
+                        std::lock_guard<std::mutex> lk(g_ctrl_finalize_mu);
+                        ctrl_first = g_ctrl_finalize_scheduled.insert(epoch).second;
+                    }
+                    if (ctrl_first) {
+                        Simulator::Schedule(Seconds(3.0),
+                            &CallSCControllerFinalizeEpochAsync, epoch);
                     }
                 }
             }

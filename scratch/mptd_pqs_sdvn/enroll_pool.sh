@@ -46,7 +46,7 @@ set -euo pipefail
 FABRIC_TN_DIR="${FABRIC_TN_DIR:-/home/niranga/fabric-samples/test-network}"
 POOL_SIZE="${FABRIC_CA_POOL_SIZE:-32}"
 RSU_COUNT="${FABRIC_CA_RSU_COUNT:-4}"
-CTRL_COUNT="${FABRIC_CA_CTRL_COUNT:-1}"
+CTRL_COUNT="${FABRIC_CA_CTRL_COUNT:-4}"
 
 CA_NAME="ca-org1"
 CA_URL_HOST="localhost:7054"

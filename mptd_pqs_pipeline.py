@@ -56,8 +56,8 @@ from mptd_pqs.metrics_visualization import plot_all, plot_ablation, plot_baselin
 
 # Default paths (can be overridden via CLI)
 SIM_DIR     = os.path.dirname(os.path.abspath(__file__))  # Current directory
-NS3_BINARY  = os.path.join(SIM_DIR, "build/scratch/lda_attack_scenario1")
-LIB_PATH    = os.path.join(SIM_DIR, "build/lib")
+NS3_BINARY  = "/tmp/ns-allinone-3.35/ns-3.35/build/scratch/mptd_pqs_sdvn/mptd_pqs_sdvn"
+LIB_PATH    = "/tmp/ns-allinone-3.35/ns-3.35/build/lib"
 SIM_TIME    = 15
 ATTACK_PCTS = [0, 50, 80, 100]
 
@@ -342,8 +342,6 @@ def main():
             output_path=os.path.join(args.output_dir, "mptd_pqs_baseline.png")
         )
 
-    # Add your code here
-    
     print("\n" + "=" * 60)
     print("  MPTD-PQS Pipeline Complete")
     print("=" * 60)

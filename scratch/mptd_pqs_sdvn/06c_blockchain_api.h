@@ -33,12 +33,17 @@
 #include <sstream>
 #include <iomanip>
 #include <cstdint>
+#include <vector>      // mptd_query_trusted_controllers result set
+#include <algorithm>   // std::sort over C_trusted indices
+#include <cctype>      // isdigit — CTRL_<idx> suffix parse
 #include <cstdlib>     // getenv — IPFS endpoint override
 #include <cstring>     // memcpy for sockaddr_un.sun_path (Phase 1B socket client)
 #include <cstdio>      // snprintf for \uXXXX JSON escape
 #include <mutex>       // once-flag for libcurl global init + warn-once
 #include <atomic>      // ipfs_disabled latch
+#if __has_include(<curl/curl.h>)
 #include <curl/curl.h> // TASK ①-E: kubo HTTP API client for h(b_i(t)) CID
+#endif
 
 // NS-3 → Fabric Gateway daemon over AF_UNIX. A single-line JSON write to a
 // long-lived Go daemon that holds a persistent gRPC Gateway connection to the
@@ -463,11 +468,12 @@ static inline bool mptd_fabric_drain_events(std::vector<MptdFabricEvent>& out)
 // orderer round-trip (paper Invariant 3: the lightweight beacon path must
 // stay under T_b = 100 ms).
 static inline void mptd_fabric_invoke_async(
-    const std::string& fn, const std::vector<std::string>& args)
+    const std::string& fn, const std::vector<std::string>& args,
+    const std::string& identity = "")
 {
     std::string ignored;
     mptd_fabric_call_socket("invoke", fn, args,
-                            /*fire_and_forget=*/true, ignored);
+                            /*fire_and_forget=*/true, ignored, identity);
 }
 
 // ── Sync fabric_invoke (waits for endorsement + commit, returns payload) ─────
@@ -478,11 +484,12 @@ static inline void mptd_fabric_invoke_async(
 static inline std::string mptd_fabric_invoke_sync(
     const std::string& action,
     const std::string& fn,
-    const std::vector<std::string>& args)
+    const std::vector<std::string>& args,
+    const std::string& identity = "")
 {
     std::string payload;
     mptd_fabric_call_socket(action, fn, args,
-                            /*fire_and_forget=*/false, payload);
+                            /*fire_and_forget=*/false, payload, identity);
     return payload;
 }
 
@@ -512,11 +519,13 @@ static std::atomic<bool> g_ipfs_disabled{false};   // sticky on first failure
 static std::once_flag    g_ipfs_warn_once;
 
 static inline void mptd_curl_global_init_once() {
+#if __has_include(<curl/curl.h>)
     if (g_curl_inited.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(g_curl_init_mu);
     if (g_curl_inited.load(std::memory_order_relaxed)) return;
     curl_global_init(CURL_GLOBAL_DEFAULT);
     g_curl_inited.store(true, std::memory_order_release);
+#endif
 }
 
 // ── IPFS endpoint resolver (env override; default = local kubo) ──────────────
@@ -530,12 +539,14 @@ static inline const std::string& mptd_ipfs_endpoint() {
     return ep;
 }
 
+#if __has_include(<curl/curl.h>)
 // libcurl write callback — append response body into the std::string userp
 static size_t mptd_curl_write_cb(char* ptr, size_t size, size_t nmemb, void* userp) {
     std::string* buf = static_cast<std::string*>(userp);
     buf->append(ptr, size * nmemb);
     return size * nmemb;
 }
+#endif
 
 // Minimal JSON-string field extractor — no full parser dependency.
 // Looks for `"key":"<value>"` and returns the value (no escape unwinding —
@@ -563,6 +574,7 @@ static inline bool mptd_json_field(const std::string& json,
 static inline bool mptd_ipfs_add(const std::string& payload,
                                  std::string& out_cid)
 {
+#if __has_include(<curl/curl.h>)
     if (g_ipfs_disabled.load(std::memory_order_acquire)) return false;
     mptd_curl_global_init_once();
 
@@ -621,6 +633,11 @@ static inline bool mptd_ipfs_add(const std::string& payload,
     }
     out_cid.swap(cid);
     return true;
+#else
+    (void)payload;
+    (void)out_cid;
+    return false;
+#endif
 }
 
 // ── Beacon hash h(b_i(t)) — Eq 3.56 commitment ───────────────────────────────
@@ -772,6 +789,46 @@ inline void mptd_refresh_active_controller()
         v = v * 10 + (uint32_t)(out[pos] - '0'); any = true; ++pos;
     }
     if (any) g_active_controller_idx = v;
+}
+
+// mptd_query_trusted_controllers — query GetTrustedControllers and return the
+// sorted set of ACTIVE controller indices = C_trusted(t) (paper Eq 3.1). An
+// EXCLUDED/REVOKED controller is omitted, so callers can detect when an RSU's
+// c_assigned has left the trusted set and must roll over (paper p.75). Returns
+// empty under skip_blockchain or on a failed/unparsable query — the caller then
+// keeps its prior assignment (fail-safe: never reassign on a transient query
+// miss).
+//
+// Parser note: RegistrationRecord marshals fields in struct order (…ID … Status…
+// — see 109-119 of smartcontract.go), so the first "Status":"…" that follows a
+// given "ID":"CTRL_<idx>" belongs to that record. We pair them on that ordering
+// rather than pulling in a full JSON dependency.
+inline std::vector<uint32_t> mptd_query_trusted_controllers()
+{
+    std::vector<uint32_t> trusted;
+    if (skip_blockchain) return trusted;
+    std::string out = mptd_fabric_invoke_sync("query", "GetTrustedControllers", {});
+    const std::string idTok  = "\"ID\":\"CTRL_";
+    const std::string stTok  = "\"Status\":\"";
+    size_t pos = 0;
+    while ((pos = out.find(idTok, pos)) != std::string::npos) {
+        size_t p = pos + idTok.size();
+        uint32_t idx = 0; bool any = false;
+        while (p < out.size() && isdigit((unsigned char)out[p])) {
+            idx = idx * 10 + (uint32_t)(out[p] - '0'); any = true; ++p;
+        }
+        size_t sp = out.find(stTok, p);
+        bool active = false;
+        if (sp != std::string::npos) {
+            sp += stTok.size();
+            active = (out.compare(sp, 6, "ACTIVE") == 0);
+        }
+        if (any && active) trusted.push_back(idx);
+        pos = p;
+    }
+    std::sort(trusted.begin(), trusted.end());
+    trusted.erase(std::unique(trusted.begin(), trusted.end()), trusted.end());
+    return trusted;
 }
 
 // ── CallSCInitNetworkConfig — Eq 3.55/3.58/3.59 bootstrap ────────────────────
@@ -936,7 +993,7 @@ inline void CallSCControllerSubmitEvidence(
     std::vector<std::string> args = {
         vehId, ctrlId, epoch, phiStr, beaconHash, sig
     };
-    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args);
+    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args, "ctrl" + std::to_string(controllerID));
 }
 
 // ── CallSCTrustFinalizeEpoch — Eq 3.55 EMA + T_rev gate ──────────────────────
@@ -973,18 +1030,26 @@ inline void CallSCTrustFinalizeEpochAsync(
     mptd_fabric_invoke_async("SCTrustFinalizeEpoch", args);
 }
 
-// ── CallCPDetectCheck — Eq 3.59 controller/RSU mismatch detection ────────────
+// ── CallCPDetectCheck — Eq 3.66–3.69 directional controller/RSU conflict ─────
 // Compares controller Φ vs each RSU's ψ against ψ_th; flags the controller
-// when ≥ f+1 RSUs disagree with its anomaly call. Returns raw payload
-// (empty string if no flag was written).
+// when ≥ f+1 trusted RSUs see anomaly while the controller said benign
+// (suppression). Returns raw payload (empty string if no flag was written).
+//
+// `controllerID` is c_assigned(r_j) of the RSU whose window is being checked —
+// the SAME controller that submitted CSUBM (see CallSCControllerSubmitEvidence).
+// The chaincode derives the scrutinised controller from the CSUBM record, so
+// this argument only selects the Fabric client identity that signs the tx; we
+// route it through the window's owning controller (which follows a CP-DETECT/EMA
+// reassignment via rsu_controller_ID[]) to keep the submitter on the same
+// attribution axis as the evidence (paper §3.1 / Table 3.2).
 inline std::string CallCPDetectCheck(
-    uint32_t vehicleID, const std::string& epoch)
+    uint32_t vehicleID, const std::string& epoch, uint32_t controllerID)
 {
     if (skip_blockchain) return "";
     std::vector<std::string> args = {
         MakeVehId(vehicleID), epoch
     };
-    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args);
+    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args, "ctrl" + std::to_string(controllerID));
 }
 
 // ── CallCPDetectCheckAsync — fire-and-forget variant ─────────────────────────
@@ -998,13 +1063,15 @@ inline std::string CallCPDetectCheck(
 // content. Designed to be bindable directly to Simulator::Schedule via
 // ns3::MakeBoundCallback.
 inline void CallCPDetectCheckAsync(
-    uint32_t vehicleID, std::string epoch)
+    uint32_t vehicleID, std::string epoch, uint32_t controllerID)
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
         MakeVehId(vehicleID), epoch
     };
-    mptd_fabric_invoke_async("CPDetectCheck", args);
+    // controllerID = c_assigned(r_j) of the window's RSU (matches CSUBM
+    // submitter; follows reassignment via rsu_controller_ID[]).
+    mptd_fabric_invoke_async("CPDetectCheck", args, "ctrl" + std::to_string(controllerID));
 }
 
 // ── CallSCRSUFinalizeEpoch — RSU SC-Trust EMA (Eq rsu_trust / rsu_misbehave) ──
@@ -1033,6 +1100,57 @@ inline void CallSCRSUFinalizeEpochAsync(std::string epoch)
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = { epoch };
     mptd_fabric_invoke_async("SCRSUFinalizeEpoch", args);
+}
+
+// ── CallSCSetRSUController — on-chain c_assigned(r_j) (Eq 3.60 / Table 3.2) ───
+// Records the controller c_k that RSU r_j is assigned to, on-chain, so the
+// SC-Trust controller-trust EMA can reconstruct R^obs_ck(t) = { r_j ∈ R_trusted
+// : c_assigned(r_j) = c_k } (Table 3.2). Called once per RSU at network boot
+// (after both the RSU and the controller are SC-Registered) and re-issued
+// whenever an RSU rolls over to a surviving controller after a revocation
+// (paper p.75, Fig 3.11 step 11d). Synchronous so the on-chain assignment is
+// committed before the first SCControllerFinalizeEpoch reads it. Idempotent.
+inline SCResult CallSCSetRSUController(uint32_t rsuID, uint32_t controllerID)
+{
+    if (skip_blockchain) return {true, ""};   // bypass path
+    std::vector<std::string> args = {
+        MakeRsuId(rsuID),
+        MakeCtrlId(controllerID)
+    };
+    std::string payload;
+    bool ok = mptd_fabric_call_socket("invoke", "SCSetRSUController", args,
+                                       /*fire_and_forget=*/false, payload, "");
+    return {ok, payload};
+}
+
+// ── CallSCControllerFinalizeEpoch — controller SC-Trust EMA (Eq 3.60/3.68) ───
+// τ_ck(t) = α·τ_ck(t-1) + (1-α)(1 - (1/|R^obs_ck|)Σ_{r_j∈R^obs_ck} conflict_j(t)),
+// with the DIRECTIONAL conflict indicator conflict_j(t) = (1-flag^ctrl)·flag^rsu_j
+// (Eq 3.68) — fires only when the controller SUPPRESSED an anomaly its assigned
+// RSUs flagged (controller benign Φ≤ψ_th while RSU ψ>ψ_th); superior controller
+// detection is NOT penalised (paper p.74). Channel-wide: one call per epoch
+// evaluates EVERY controller from the on-chain CSUBM_/SUBM_ records and the
+// c_assigned map, applies the T_rev-epoch τ_min revoke gate (SC-Revoke
+// ControllerRevoked + C_trusted update, Eq 3.1), and is idempotent over the
+// epoch. Synchronous; returns raw chaincode JSON (array of ControllerTrustScore).
+inline std::string CallSCControllerFinalizeEpoch(const std::string& epoch)
+{
+    if (skip_blockchain) return "";
+    std::vector<std::string> args = { epoch };
+    return mptd_fabric_invoke_sync("invoke", "SCControllerFinalizeEpoch", args);
+}
+
+// ── CallSCControllerFinalizeEpochAsync — fire-and-forget variant ─────────────
+// Same chaincode function as CallSCControllerFinalizeEpoch but discards the
+// returned records. Scheduled once per epoch from inside the sim tick (after
+// the per-vehicle CSUBM/SUBM submissions for that epoch have landed) so
+// blocking on the orderer round-trip never stalls the simulation. Idempotent
+// over the epoch. Bindable to Simulator::Schedule via ns3::MakeBoundCallback.
+inline void CallSCControllerFinalizeEpochAsync(std::string epoch)
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    std::vector<std::string> args = { epoch };
+    mptd_fabric_invoke_async("SCControllerFinalizeEpoch", args);
 }
 
 // ── RsuTrustView / CallSCGetAllRSUTrustScores — live on-chain RSU trust read ──

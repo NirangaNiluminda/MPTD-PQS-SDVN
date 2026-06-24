@@ -113,7 +113,13 @@ type RegistrationRecord struct {
 	HKuHex       string  `json:"HKuHex"`             // h(K_u_i), 64 hex chars (SHA-256)
 	TauInit      float64 `json:"TauInit"`            // τ_init at registration
 	Status       string  `json:"Status"`             // ACTIVE | REVOKED | EXCLUDED
-	RSUState     string  `json:"RSUState,omitempty"` // RSU only: TRUSTED | CLIENT (endorser vs quarantined)
+	RSUState     string  `json:"RSUState"`           // RSU only: TRUSTED | CLIENT (endorser vs quarantined)
+	// AssignedController — RSU only: c_assigned(r_j), the controller this RSU is
+	// assigned to (paper §3.1 / Table 3.2). Defines the controller observation set
+	// R^obs_ck(t) = {r_j ∈ R_trusted(t) : c_assigned(r_j)=c_k} that SCControllerFinalizeEpoch
+	// averages the directional conflict over (Eq 3.60). Set by SCSetRSUController at
+	// setup and rewritten on every CP-DETECT/EMA controller reassignment (p.75).
+	AssignedController string `json:"AssignedController,omitempty"`
 	TReg         string  `json:"TReg"`               // caller-supplied registration timestamp
 	RegisteredAt string  `json:"RegisteredAt"`       // server-side commit time (RFC3339)
 }
@@ -168,6 +174,25 @@ type RSUTrustScore struct {
 	UpdateCount          int     `json:"UpdateCount"`
 	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_{r_j} < τ_warn — still TRUSTED/endorsing but under watch (paper §3.5.1)
 	FloorHeld            bool    `json:"FloorHeld,omitempty"`    // τ < τ_min but held TRUSTED by the BFT 3f+1 floor guard
+	UpdatedAt            string  `json:"UpdatedAt"`
+}
+
+// ControllerTrustScore — per-controller EMA trust score τ_ck(t) (paper Eq 3.60,
+// the SLOW trust-decay path, distinct from the FAST binary CP-DETECT flag_c of
+// Eq 3.69). Driven by the mean directional conflict indicator conflict_j(t)
+// (Eq 3.68) over the controller observation set R^obs_ck(t). Created at
+// controller SC-Register with TrustScore = TauInit; updated by
+// SCControllerFinalizeEpoch. Key: CTRUST_<controllerID>.
+type ControllerTrustScore struct {
+	ID                   string  `json:"ID"`
+	ControllerID         string  `json:"ControllerID"`
+	TrustScore           float64 `json:"TrustScore"`           // τ_ck ∈ [0,1]; higher = more trusted
+	MeanConflict         float64 `json:"MeanConflict"`         // (1/|R^obs_ck|)·Σ conflict_j(t) from last finalised epoch (Eq 3.60)
+	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R^obs_ck(t)| of last finalised epoch
+	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate (τ < τ_min)
+	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_ck < τ_warn — under watch, still in C_trusted
+	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
+	UpdateCount          int     `json:"UpdateCount"`
 	UpdatedAt            string  `json:"UpdatedAt"`
 }
 
@@ -252,6 +277,22 @@ type ControllerReassignment struct {
 type Endorser struct {
 	RSUID  string `json:"rsuID"`
 	SigHex string `json:"sigHex"` // ASN.1-DER ECDSA-P256 signature, hex-encoded
+}
+
+func txTimeStr(ctx contractapi.TransactionContextInterface) string {
+	txTime, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil || txTime == nil {
+		return time.Now().Format(time.RFC3339)
+	}
+	return time.Unix(txTime.Seconds, int64(txTime.Nanos)).UTC().Format(time.RFC3339)
+}
+
+func txTimeStrNano(ctx contractapi.TransactionContextInterface) string {
+	txTime, err := ctx.GetStub().GetTxTimestamp()
+	if err != nil || txTime == nil {
+		return time.Now().Format(time.RFC3339Nano)
+	}
+	return time.Unix(txTime.Seconds, int64(txTime.Nanos)).UTC().Format(time.RFC3339Nano)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -434,6 +475,11 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 		return fmt.Errorf("registration lookup: %v", err)
 	}
 	if existing != nil {
+		// Algorithm 8 lines 2-3: reject duplicate identity. Allowing overwrite
+		// would let a near-revocation identity re-register and reset its trust
+		// (paper §3.5.1 invariant). Sim idempotency must be handled caller-side
+		// by not re-registering already-registered nodes — never by weakening
+		// this gate.
 		return fmt.Errorf("rejected: duplicate identity %s", vehicleID)
 	}
 
@@ -496,7 +542,7 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 		TauInit:      TauInit,
 		Status:       StatusActive,
 		TReg:         tReg,
-		RegisteredAt: time.Now().Format(time.RFC3339),
+		RegisteredAt: txTimeStr(ctx),
 	}
 	// An RSU joins the endorser set fully trusted (paper §3.5.1 reuses τ_init).
 	if role == RoleRSU {
@@ -520,6 +566,11 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 		}
 	case RoleRSU:
 		if err := s.initRSUTrustScore(ctx, vehicleID); err != nil {
+			return err
+		}
+	case RoleController:
+		// Controllers get CTRUST_<id> (Eq 3.60 SLOW trust-decay path).
+		if err := s.initControllerTrustScore(ctx, vehicleID); err != nil {
 			return err
 		}
 	}
@@ -557,6 +608,8 @@ func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterfa
 		return fmt.Errorf("registration lookup: %v", err)
 	}
 	if existing != nil {
+		// Reject duplicate identity (paper §3.5.1): re-bootstrap must not reset
+		// an RSU's trust/lifecycle state. Caller-side must avoid re-bootstrapping.
 		return fmt.Errorf("rejected: duplicate identity %s", rsuID)
 	}
 
@@ -569,7 +622,7 @@ func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterfa
 		Status:       StatusActive,
 		RSUState:     RSUStateTrusted,
 		TReg:         tReg,
-		RegisteredAt: time.Now().Format(time.RFC3339),
+		RegisteredAt: txTimeStr(ctx),
 	}
 	rJSON, err := json.Marshal(rec)
 	if err != nil {
@@ -588,6 +641,53 @@ func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterfa
 	ctx.GetStub().SetEvent("Registered",
 		[]byte(fmt.Sprintf(`{"ID":"%s","role":"%s","tReg":"%s","bootstrap":true}`,
 			rsuID, RoleRSU, tReg)))
+	return nil
+}
+
+// SCSetRSUController records c_assigned(r_j) on-chain (paper §3.1 / Table 3.2):
+// it sets RSU `rsuID`'s AssignedController field to `controllerID` so
+// SCControllerFinalizeEpoch can build the observation set
+// R^obs_ck = {r_j ∈ R_trusted : c_assigned(r_j)=c_k} (Eq 3.60). The sim calls
+// this at setup (after assign_controllers) and on every CP-DETECT/EMA controller
+// reassignment, when orphaned RSUs roll over to a trusted controller (p.75).
+//
+// Validates that rsuID is a registered RSU and controllerID is a registered
+// controller. We do NOT require the controller to be ACTIVE: at setup all
+// controllers are ACTIVE, and a reassignment always passes a trusted target, so
+// a stale/excluded target only ever arises from a buggy caller — which we reject.
+// Idempotent: re-setting the same value is a no-op write.
+//
+// Args: rsuID, controllerID
+func (s *SmartContract) SCSetRSUController(ctx contractapi.TransactionContextInterface,
+	rsuID, controllerID string) error {
+
+	reg, err := s.getRegistration(ctx, rsuID)
+	if err != nil {
+		return err
+	}
+	if reg == nil || reg.Role != RoleRSU {
+		return fmt.Errorf("rejected: %s is not a registered RSU", rsuID)
+	}
+	creg, err := s.getRegistration(ctx, controllerID)
+	if err != nil {
+		return err
+	}
+	if creg == nil || creg.Role != RoleController {
+		return fmt.Errorf("rejected: %s is not a registered controller", controllerID)
+	}
+	if reg.AssignedController == controllerID {
+		return nil // idempotent
+	}
+	reg.AssignedController = controllerID
+	rj, err := json.Marshal(reg)
+	if err != nil {
+		return err
+	}
+	if err := ctx.GetStub().PutState("REG_"+rsuID, rj); err != nil {
+		return err
+	}
+	ctx.GetStub().SetEvent("RSUControllerAssigned", []byte(fmt.Sprintf(
+		`{"rsuID":"%s","controllerID":"%s"}`, rsuID, controllerID)))
 	return nil
 }
 
@@ -655,13 +755,15 @@ func (s *SmartContract) initTrustScore(ctx contractapi.TransactionContextInterfa
 		return err
 	}
 	if existing != nil {
-		return nil // idempotent on duplicate-SCRegister bootstrap retries
+		return nil // idempotent on duplicate-SCRegister bootstrap retries; never
+		// reset an existing trust score (paper §3.5.1 — would let a decaying
+		// vehicle escape revocation by re-registering).
 	}
 	rec := SCTrustScore{
 		ID:         id,
 		VehicleID:  vehicleID,
 		TrustScore: TauInit,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
+		UpdatedAt:  txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -682,14 +784,43 @@ func (s *SmartContract) initRSUTrustScore(ctx contractapi.TransactionContextInte
 		return err
 	}
 	if existing != nil {
-		return nil
+		return nil // idempotent; never reset an existing RSU trust score (§3.5.1)
 	}
 	rec := RSUTrustScore{
 		ID:         id,
 		RSUID:      rsuID,
 		TrustScore: TauInit,
 		State:      RSUStateTrusted,
-		UpdatedAt:  time.Now().Format(time.RFC3339),
+		UpdatedAt:  txTimeStr(ctx),
+	}
+	j, err := json.Marshal(rec)
+	if err != nil {
+		return err
+	}
+	return ctx.GetStub().PutState(id, j)
+}
+
+// initControllerTrustScore seeds CTRUST_<controllerID> with TrustScore = TauInit.
+// Called at controller registration (SCRegister) so SCControllerFinalizeEpoch
+// (Eq 3.60) can assume the row already exists. Idempotent — never resets an
+// existing score (a decaying controller must not escape revocation by
+// re-registering, §3.5.1).
+func (s *SmartContract) initControllerTrustScore(ctx contractapi.TransactionContextInterface,
+	controllerID string) error {
+
+	id := "CTRUST_" + controllerID
+	existing, err := ctx.GetStub().GetState(id)
+	if err != nil {
+		return err
+	}
+	if existing != nil {
+		return nil
+	}
+	rec := ControllerTrustScore{
+		ID:           id,
+		ControllerID: controllerID,
+		TrustScore:   TauInit,
+		UpdatedAt:    txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -800,7 +931,7 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 		TRev:         tRev,
 		PsiAnomalyTh: psiTh,
 		TWindowSec:   defaultTWindowSec, // T_w (Eq 3.65); no init arg yet — tune via const
-		UpdatedAt:    time.Now().Format(time.RFC3339),
+		UpdatedAt:    txTimeStr(ctx),    // deterministic tx timestamp (GetTxTimestamp)
 	}
 	j, err := json.Marshal(cfg)
 	if err != nil {
@@ -888,7 +1019,7 @@ func (s *SmartContract) SCTrustSubmitEvidence(ctx contractapi.TransactionContext
 		Psi:         psi,
 		BeaconHash:  beaconHash,
 		Signature:   signature,
-		SubmittedAt: time.Now().Format(time.RFC3339),
+		SubmittedAt: txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -942,7 +1073,7 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 		Phi:          phi,
 		BeaconHash:   beaconHash,
 		Signature:    signature,
-		SubmittedAt:  time.Now().Format(time.RFC3339),
+		SubmittedAt:  txTimeStr(ctx),
 	}
 	j, err := json.Marshal(rec)
 	if err != nil {
@@ -1040,7 +1171,7 @@ func (s *SmartContract) SCTrustFinalizeEpoch(ctx contractapi.TransactionContextI
 	rec.NumRSUsLastEpoch = numWitnesses
 	rec.LastEpochTimestamp = epoch
 	rec.UpdateCount++
-	rec.UpdatedAt = time.Now().Format(time.RFC3339)
+	rec.UpdatedAt = txTimeStr(ctx)
 
 	// Three-state lifecycle (paper §3.5.1). Probation at τ_warn (reduced routing
 	// priority, still active); the T_rev revocation gate counts epochs below the
@@ -1157,21 +1288,28 @@ func (s *SmartContract) GetAllTrustScores(ctx contractapi.TransactionContextInte
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Algorithm 8 / Eq 3.59 — CP-DETECT
+// Algorithm 9 / Eq 3.66–3.69 — CP-DETECT
 // ─────────────────────────────────────────────────────────────────────────────
 
 // CPDetectCheck — counts RSU disagreements with the controller for one
-// (vehicleID, epoch). Disagreement is the binary classifier mismatch:
+// (vehicleID, epoch). Per paper Eq 3.66–3.68 (§3.5.5, p.74) the conflict is
+// DIRECTIONAL, not a symmetric XOR:
 //
-//	conflict_j  =  (Φ_i > ψ_th) XOR (ψ_j^{(i)} > ψ_th)
+//	flag^ctrl   = 1[Φ_i(t) > ψ_th]                 (Eq 3.66)
+//	flag^rsu_j  = 1[ψ_j^{(i)}(t) > ψ_th]           (Eq 3.67)
+//	conflict_j  = (1 − flag^ctrl) · flag^rsu_j     (Eq 3.68)
 //
-// Plus implicit clean votes: RSUs that did NOT submit a SUBM are reporting
-// ψ_j ≤ ψ_th (the NS-3 RSU gating contract — only writes SUBM on anomaly).
-// When the controller flags the vehicle as anomalous (cAnom=true) those
-// implicit clean votes count as conflicts; when the controller agrees the
-// vehicle is clean, missing SUBMs are agreement, not conflict.
+// A conflict fires ONLY when the controller says benign (flag^ctrl=0) while
+// an RSU says anomalous (flag^rsu_j=1) — i.e. the controller is SUPPRESSING
+// an alert the RSU caught. The paper is explicit that the reverse case (the
+// controller flagging an anomaly the lightweight RSU rules miss) is the
+// controller "performing superior detection and must not be penalised", so it
+// contributes 0. Consequently RSUs that did NOT submit a SUBM (flag^rsu_j=0,
+// the NS-3 gating contract) ALWAYS contribute 0 regardless of the controller's
+// verdict; implicitCleanVotes is retained for telemetry only and never enters
+// the conflict sum.
 //
-// Returns the ControllerFlag on flag-fire, or nil if conflict < f+1.
+// Returns the ControllerFlag on flag-fire, or nil if conflict < f+1 (Eq 3.69).
 // activeControllerExcluding returns the ID of the lowest-numbered controller
 // whose registration is ACTIVE, skipping `exclude`. This is the deterministic
 // head of the trusted set C_trusted (Eq 3.1). Returns "" when none remain.
@@ -1255,7 +1393,7 @@ func (s *SmartContract) excludeAndReassignController(ctx contractapi.Transaction
 		Epoch:               epoch,
 		ConflictCount:       cInt,
 		ThresholdFP1:        tInt,
-		At:                  time.Now().Format(time.RFC3339),
+		At:                  txTimeStr(ctx),
 	}
 	raj, err := json.Marshal(ra)
 	if err != nil {
@@ -1376,17 +1514,21 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		}
 		seenRSU[sub.RSUID] = true
 		rAnom := sub.Psi > cfg.PsiAnomalyTh
-		if cAnom != rAnom {
+		// Eq 3.68 directional conflict: (1−flag^ctrl)·flag^rsu_j. Fires only
+		// when the controller says benign (cAnom=false) and this RSU says
+		// anomalous (rAnom=true). The reverse (controller anomalous, RSU clean)
+		// is superior controller detection and must NOT be counted (p.74).
+		if !cAnom && rAnom {
 			conflict++
 		}
 	}
 
+	// implicitCleanVotes = RSUs that wrote no SUBM (flag^rsu_j=0, NS-3 gating).
+	// Under Eq 3.68 these contribute 0 to the conflict sum unconditionally; we
+	// keep the count for telemetry/audit only — it is NOT added to `conflict`.
 	implicitCleanVotes := cfg.NumRSUs - len(seenRSU)
 	if implicitCleanVotes < 0 {
 		implicitCleanVotes = 0
-	}
-	if cAnom && implicitCleanVotes > 0 {
-		conflict += implicitCleanVotes
 	}
 
 	f := fByzantine(cfg.NumRSUs)
@@ -1404,7 +1546,7 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		NumRSUs:            len(seenRSU),
 		ImplicitCleanVotes: implicitCleanVotes,
 		ThresholdFP1:       fP1,
-		FlaggedAt:          time.Now().Format(time.RFC3339),
+		FlaggedAt:          txTimeStr(ctx),
 	}
 	j, err := json.Marshal(flag)
 	if err != nil {
@@ -1524,8 +1666,8 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 		RSUID:     rsuID,
 		Reason:    reason,
 		Signature: signature,
-		Timestamp: timestamp, // sim-time; the window quorum (Eq 3.65) filters on this
-		VotedAt:   time.Now().Format(time.RFC3339),
+		Timestamp: timestamp,       // sim-time; the window quorum (Eq 3.65) filters on this
+		VotedAt:   txTimeStr(ctx), // deterministic tx timestamp (GetTxTimestamp)
 	}
 	vJSON, err := json.Marshal(vote)
 	if err != nil {
@@ -1608,7 +1750,7 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 				Reason:    reason,
 				RSUID:     rsuID,
 				Timestamp: timestamp,
-				RevokedAt: time.Now().Format(time.RFC3339),
+				RevokedAt: txTimeStr(ctx),
 			}
 			rJSON, err := json.Marshal(rev)
 			if err != nil {
@@ -1860,7 +2002,7 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 	rec.NumReportsLastEpoch = numReports
 	rec.LastEpochTimestamp = epoch
 	rec.UpdateCount++
-	rec.UpdatedAt = time.Now().Format(time.RFC3339)
+	rec.UpdatedAt = txTimeStr(ctx)
 
 	// T_rev consecutive-low-epoch gate, keyed on the stricter τ_min floor.
 	if rec.TrustScore < cfg.TauMin {
@@ -1913,7 +2055,7 @@ func (s *SmartContract) updateRSUTrust(ctx contractapi.TransactionContextInterfa
 		rec.State = RSUStateClient
 		reg.RSUState = RSUStateClient
 		reg.Status = StatusRevoked
-		ts := time.Now().Format(time.RFC3339Nano)
+		ts := txTimeStrNano(ctx)
 		revID := fmt.Sprintf("SCREVOKE_%s_%s", rsuID, ts)
 		rev := RevokeRecord{
 			ID:        revID,
@@ -2020,6 +2162,326 @@ func (s *SmartContract) GetAllRSUTrustScores(ctx contractapi.TransactionContextI
 			return nil, e
 		}
 		var r RSUTrustScore
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return nil, e
+		}
+		out = append(out, &r)
+	}
+	return out, nil
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Eq 3.60 — SC-Trust controller trust EMA (SLOW path)
+// ─────────────────────────────────────────────────────────────────────────────
+
+// SCControllerFinalizeEpoch updates every ACTIVE controller's trust score τ_ck(t)
+// for one epoch using the directional conflict indicator (paper Eq 3.60, the
+// SLOW trust-decay path — distinct from the FAST binary CP-DETECT flag_c of
+// Eq 3.69 handled in CPDetectCheck):
+//
+//	τ_ck(t) = α·τ_ck(t-1) + (1-α)·(1 - (1/|R^obs_ck|)·Σ_{r_j ∈ R^obs_ck} conflict_j(t))
+//
+// where conflict_j(t) = (1 - flag^ctrl)·flag^rsu_j (Eq 3.68) is the DIRECTIONAL
+// suppression signal: it fires only when the controller called a vehicle benign
+// (Φ ≤ ψ_th) while RSU r_j called it anomalous (ψ > ψ_th). A controller catching
+// what its RSUs missed is superior detection and is NOT penalised (p.74).
+//
+// R^obs_ck(t) = {r_j ∈ R_trusted(t) : c_assigned(r_j) = c_k} is read from the
+// on-chain AssignedController field (Table 3.2). Per RSU r_j we average conflict
+// over the vehicles the controller submitted CSUBM for this epoch (the windows
+// it actually observed); an RSU that flagged none of those vehicles contributes
+// 0. The per-vehicle conflict granularity (mean over co-observed vehicles) is an
+// implementation choice where the paper leaves the per-epoch roll-up of the
+// per-vehicle Eq 3.68 indicator unspecified; it preserves the [0,1] range the
+// EMA expects and reduces to the binary indicator when one vehicle is observed.
+//
+// If τ_ck stays below τ_min for T_rev consecutive epochs, the controller is
+// terminally revoked (Status → REVOKED, SCREVOKE_ + CTRLREASSIGN_ records,
+// "ControllerRevoked" event), leaving C_trusted on-chain so affected RSUs roll
+// over to a trusted controller (handled sim-side by the reassignment loop, p.75).
+//
+// Channel-wide and idempotent over the epoch. Controllers with no CSUBM this
+// epoch (no observation) or an empty R^obs_ck are skipped — no evidence, no
+// update — mirroring the vehicle/RSU finalizers. Synchronous.
+//
+// Args: epoch
+func (s *SmartContract) SCControllerFinalizeEpoch(ctx contractapi.TransactionContextInterface,
+	epoch string) ([]*ControllerTrustScore, error) {
+
+	cfg, err := s.GetNetworkConfig(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("NetworkConfig: %v", err)
+	}
+
+	// Pass 1: controller submissions for this epoch → ctrlVehAnom[ctrl][veh] =
+	// flag^ctrl (Φ_i > ψ_th). Keys are CSUBM_<veh>_<epoch>, so the epoch is not a
+	// contiguous range — scan and filter, fine at sim scale.
+	ctrlVehAnom := make(map[string]map[string]bool)
+	{
+		iter, e := ctx.GetStub().GetStateByRange("CSUBM_", "CSUBM_~")
+		if e != nil {
+			return nil, e
+		}
+		defer iter.Close()
+		for iter.HasNext() {
+			qr, e2 := iter.Next()
+			if e2 != nil {
+				return nil, e2
+			}
+			var cs ControllerSubmission
+			if e2 := json.Unmarshal(qr.Value, &cs); e2 != nil {
+				return nil, e2
+			}
+			if cs.Epoch != epoch {
+				continue
+			}
+			if ctrlVehAnom[cs.ControllerID] == nil {
+				ctrlVehAnom[cs.ControllerID] = make(map[string]bool)
+			}
+			ctrlVehAnom[cs.ControllerID][cs.VehicleID] = cs.Phi > cfg.PsiAnomalyTh
+		}
+	}
+
+	// Pass 2: RSU submissions for this epoch → rsuVehAnom[rsu][veh] = flag^rsu_j
+	// (ψ_j > ψ_th).
+	rsuVehAnom := make(map[string]map[string]bool)
+	{
+		iter, e := ctx.GetStub().GetStateByRange("SUBM_", "SUBM_~")
+		if e != nil {
+			return nil, e
+		}
+		defer iter.Close()
+		for iter.HasNext() {
+			qr, e2 := iter.Next()
+			if e2 != nil {
+				return nil, e2
+			}
+			var sub EpochSubmission
+			if e2 := json.Unmarshal(qr.Value, &sub); e2 != nil {
+				return nil, e2
+			}
+			if sub.Epoch != epoch {
+				continue
+			}
+			if rsuVehAnom[sub.RSUID] == nil {
+				rsuVehAnom[sub.RSUID] = make(map[string]bool)
+			}
+			rsuVehAnom[sub.RSUID][sub.VehicleID] = sub.Psi > cfg.PsiAnomalyTh
+		}
+	}
+
+	// Pass 3: build R^obs_ck from the on-chain c_assigned map — only ACTIVE,
+	// TRUSTED RSUs count toward the observation set (a demoted/CLIENT RSU carries
+	// zero quorum weight, §3.5.1).
+	rObs := make(map[string][]string) // controllerID → []rsuID
+	{
+		iter, e := ctx.GetStub().GetStateByRange("REG_", "REG_~")
+		if e != nil {
+			return nil, e
+		}
+		defer iter.Close()
+		for iter.HasNext() {
+			qr, e2 := iter.Next()
+			if e2 != nil {
+				return nil, e2
+			}
+			var reg RegistrationRecord
+			if e2 := json.Unmarshal(qr.Value, &reg); e2 != nil {
+				return nil, e2
+			}
+			if reg.Role != RoleRSU || reg.Status != StatusActive || reg.AssignedController == "" {
+				continue
+			}
+			if !s.isTrustedRSU(ctx, reg.ID) {
+				continue
+			}
+			rObs[reg.AssignedController] = append(rObs[reg.AssignedController], reg.ID)
+		}
+	}
+
+	var out []*ControllerTrustScore
+	for ctrlID, vehAnom := range ctrlVehAnom {
+		if len(vehAnom) == 0 {
+			continue // controller observed nothing this epoch
+		}
+		obs := rObs[ctrlID]
+		if len(obs) == 0 {
+			continue // no RSUs assigned → R^obs_ck empty, Eq 3.60 undefined
+		}
+
+		// mean directional conflict over R^obs_ck.
+		sumConflict := 0.0
+		for _, rsuID := range obs {
+			perRSU := rsuVehAnom[rsuID]
+			coObserved := 0
+			conflicts := 0
+			for veh, cAnom := range vehAnom {
+				rAnom, reported := perRSU[veh]
+				if !reported {
+					continue // r_j wrote no SUBM for veh → flag^rsu_j = 0
+				}
+				coObserved++
+				// Eq 3.68: (1 - flag^ctrl)·flag^rsu_j.
+				if !cAnom && rAnom {
+					conflicts++
+				}
+			}
+			if coObserved > 0 {
+				sumConflict += float64(conflicts) / float64(coObserved)
+			}
+			// coObserved == 0 → conflict_j = 0 (no co-observation, no disagreement).
+		}
+		meanConflict := sumConflict / float64(len(obs))
+
+		rec, err := s.updateControllerTrust(ctx, ctrlID, meanConflict, len(obs), epoch, cfg)
+		if err != nil {
+			return nil, err
+		}
+		if rec != nil {
+			out = append(out, rec)
+		}
+	}
+	return out, nil
+}
+
+// updateControllerTrust applies the Eq 3.60 EMA and the T_rev revocation gate for
+// one controller given its per-epoch mean directional conflict. Mirrors the
+// vehicle (SCTrustFinalizeEpoch) and RSU (updateRSUTrust) paths, minus the BFT
+// 3f+1 floor guard (the paper defines no minimum trusted-controller count — RSUs
+// fall back to rule-based LW-DETECT if every controller is excluded). Returns the
+// updated record, or nil if the controller is already excluded/revoked or has no
+// trust row.
+func (s *SmartContract) updateControllerTrust(ctx contractapi.TransactionContextInterface,
+	controllerID string, meanConflict float64, numRSUs int, epoch string, cfg *NetworkConfig) (*ControllerTrustScore, error) {
+
+	reg, err := s.getRegistration(ctx, controllerID)
+	if err != nil {
+		return nil, err
+	}
+	if reg == nil || reg.Role != RoleController || reg.Status != StatusActive {
+		return nil, nil // unregistered, or already EXCLUDED (fast path) / REVOKED — skip
+	}
+
+	id := "CTRUST_" + controllerID
+	data, err := ctx.GetStub().GetState(id)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, nil
+	}
+	var rec ControllerTrustScore
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, err
+	}
+
+	// Eq 3.60: τ_ck(t) = α·τ_ck(t-1) + (1-α)·(1 - meanConflict).
+	rec.TrustScore = cfg.Alpha*rec.TrustScore + (1-cfg.Alpha)*(1-meanConflict)
+	rec.MeanConflict = meanConflict
+	rec.NumRSUsLastEpoch = numRSUs
+	rec.LastEpochTimestamp = epoch
+	rec.UpdateCount++
+	rec.UpdatedAt = txTimeStr(ctx)
+
+	// T_rev consecutive-low-epoch gate, keyed on the stricter τ_min floor.
+	if rec.TrustScore < cfg.TauMin {
+		rec.ConsecutiveLowEpochs++
+	} else {
+		rec.ConsecutiveLowEpochs = 0
+	}
+	rec.Probationary = rec.TrustScore < cfg.TauWarn && rec.TrustScore >= cfg.TauMin
+
+	// Terminal slow-path revocation (paper §3.5.4 p.64 / Fig 3.11 step 11c): if
+	// τ_ck stays below τ_min for T_rev epochs, SC-Revoke issues ControllerRevoked
+	// and updates C_trusted(t) on-chain. We flip Status → REVOKED (so its evidence
+	// bounces at requireActive and it leaves the ACTIVE trusted set), commit an
+	// SCREVOKE_ + CTRLREASSIGN_ record, and emit "ControllerRevoked". Affected RSUs
+	// reassign c_assigned sim-side via the C_trusted query loop (p.75).
+	if rec.ConsecutiveLowEpochs >= cfg.TRev {
+		reg.Status = StatusRevoked
+		if rj, e := json.Marshal(reg); e == nil {
+			if e := ctx.GetStub().PutState("REG_"+controllerID, rj); e != nil {
+				return nil, e
+			}
+		}
+		ts := txTimeStrNano(ctx)
+		revID := fmt.Sprintf("SCREVOKE_%s_%s", controllerID, ts)
+		rev := RevokeRecord{
+			ID:        revID,
+			VehicleID: controllerID, // target identity (a controller here)
+			Reason:    "controller_trust_decay",
+			RSUID:     "",
+			Timestamp: ts,
+			RevokedAt: ts,
+		}
+		if rj, e := json.Marshal(rev); e == nil {
+			_ = ctx.GetStub().PutState(revID, rj)
+		}
+		successor, e := s.activeControllerExcluding(ctx, controllerID)
+		if e != nil {
+			return nil, e
+		}
+		ra := ControllerReassignment{
+			ID:                  fmt.Sprintf("CTRLREASSIGN_%s_%s", controllerID, epoch),
+			ExcludedController:  controllerID,
+			SuccessorController: successor,
+			Reason:              "controller_trust_decay",
+			Epoch:               epoch,
+			ConflictCount:       0,
+			ThresholdFP1:        0,
+			At:                  txTimeStr(ctx),
+		}
+		if rj, e := json.Marshal(ra); e == nil {
+			_ = ctx.GetStub().PutState(ra.ID, rj)
+		}
+		ctx.GetStub().SetEvent("ControllerRevoked", []byte(fmt.Sprintf(
+			`{"controllerID":"%s","successor":"%s","trust":%f,"consec":%d,"trev":%d,"epoch":"%s"}`,
+			controllerID, successor, rec.TrustScore, rec.ConsecutiveLowEpochs, cfg.TRev, epoch)))
+	}
+
+	j, err := json.Marshal(rec)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.GetStub().PutState(id, j); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// GetControllerTrustScore — read τ_ck for one controller.
+func (s *SmartContract) GetControllerTrustScore(ctx contractapi.TransactionContextInterface,
+	controllerID string) (*ControllerTrustScore, error) {
+
+	id := "CTRUST_" + controllerID
+	data, err := ctx.GetStub().GetState(id)
+	if err != nil {
+		return nil, err
+	}
+	if data == nil {
+		return nil, fmt.Errorf("no controller trust score for %s (controller unregistered?)", controllerID)
+	}
+	var rec ControllerTrustScore
+	if err := json.Unmarshal(data, &rec); err != nil {
+		return nil, err
+	}
+	return &rec, nil
+}
+
+// GetAllControllerTrustScores — list every controller's current trust score.
+func (s *SmartContract) GetAllControllerTrustScores(ctx contractapi.TransactionContextInterface) ([]*ControllerTrustScore, error) {
+	iter, err := ctx.GetStub().GetStateByRange("CTRUST_", "CTRUST_~")
+	if err != nil {
+		return nil, err
+	}
+	defer iter.Close()
+	var out []*ControllerTrustScore
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return nil, e
+		}
+		var r ControllerTrustScore
 		if e := json.Unmarshal(qr.Value, &r); e != nil {
 			return nil, e
 		}

@@ -57,7 +57,7 @@
 // The physical NS-3 controller_Node remains a single sim-only relay (CLAUDE.md
 // known deviation); the controller IDENTITY it submits under is the chain-
 // authoritative active controller (see node-side active-controller tracking).
-static constexpr uint32_t N_Controllers = 5;
+
 
 // ── initialize_blockchain() — start Hyperledger Fabric (§3.3.4) ──────────────
 void initialize_blockchain()
@@ -198,6 +198,21 @@ void assign_controllers()
 
         cout << "node " << i << " controller id " << node_controller_ID[i]
              << " consortium id " << assigned_consortium_ID[i] << endl;
+    }
+
+    // ── c_assigned(r_j): RSU→controller assignment (paper §3.1 / Table 3.2) ──
+    // The paper defines controller assignment over RSUs (geo-proximity / load
+    // balance), and R^obs_ck (Eq 3.60) over the RSUs assigned to c_k — NOT over
+    // vehicles. Sim default: an even contiguous partition of the N_RSUs RSU
+    // indices across the N_Controllers controllers. With sequentially-placed
+    // RSUs this is the geo-proximity init (adjacent RSUs share a controller);
+    // for the 4-RSU / 4-controller test net it is the identity map (RSU r→c r).
+    // SUMO 64-RSU / 4-controller runs give 16 RSUs per controller.
+    for (uint32_t r = 0; r < N_RSUs && r < uint32_t(total_size); ++r) {
+        rsu_controller_ID[r] = (N_Controllers > 0)
+                                 ? (r * N_Controllers) / N_RSUs
+                                 : 0;
+        cout << "RSU " << r << " c_assigned CTRL_" << rsu_controller_ID[r] << endl;
     }
 }
 
@@ -744,6 +759,39 @@ static void mptd_active_controller_refresh_loop(double period)
                   << " → CTRL_" << g_active_controller_idx
                   << " @t=" << Simulator::Now().GetSeconds() << "s\n";
     }
+
+    // ── c_assigned(r_j) reassignment-following (paper p.75) ──────────────────
+    // After a CP-DETECT (Eq 3.66–3.69) or EMA (Eq 3.60) controller revocation,
+    // its RegistrationRecord flips to EXCLUDED and it leaves C_trusted. Every RSU
+    // still assigned to it would then have its window evidence E_c(t) bounce at
+    // the chaincode requireActive gate — so the orphaned RSUs must roll over to
+    // "any available trusted controller" automatically, with no manual failover.
+    // We query the live C_trusted set and reassign ONLY the orphaned RSUs (whose
+    // c_assigned is no longer trusted), spreading them round-robin across the
+    // survivors to keep the load balanced; healthy assignments are left untouched
+    // to avoid needless churn. Fail-safe: an empty/failed query keeps the prior
+    // mapping rather than dropping every RSU.
+    std::vector<uint32_t> trusted = mptd_query_trusted_controllers();
+    if (!trusted.empty()) {
+        std::set<uint32_t> tset(trusted.begin(), trusted.end());
+        uint32_t rr = 0;
+        for (uint32_t r = 0; r < N_RSUs && r < uint32_t(total_size); ++r) {
+            if (tset.find(rsu_controller_ID[r]) == tset.end()) {
+                uint32_t nc = trusted[rr % trusted.size()];
+                ++rr;
+                std::cout << "[C-TRUSTED] RSU " << r
+                          << " c_assigned reassigned CTRL_" << rsu_controller_ID[r]
+                          << " → CTRL_" << nc
+                          << " @t=" << Simulator::Now().GetSeconds() << "s\n";
+                rsu_controller_ID[r] = nc;
+                // Persist the new c_assigned(r_j) on-chain so SC-Trust's
+                // R^obs_ck(t) reconstruction (Table 3.2) follows the rollover
+                // (paper p.75). Sync invoke — cheap at the ~1 Hz refresh cadence.
+                CallSCSetRSUController(r, nc);
+            }
+        }
+    }
+
     Simulator::Schedule(Seconds(period),
                         &mptd_active_controller_refresh_loop, period);
 }
@@ -867,6 +915,20 @@ void register_all_nodes()
     }
     std::cout << "[SC-REGISTER] controllers registered: " << ctrl_ok << "/"
               << N_Controllers << "\n";
+
+    // ── 4. Initial c_assigned(r_j) → on-chain (Eq 3.60 / Table 3.2) ──────────
+    // Now that both the RSUs and the controllers are SC-Registered, publish each
+    // RSU's boot-time controller assignment (from assign_controllers()' even
+    // partition in rsu_controller_ID[]) on-chain so SC-Trust can reconstruct
+    // R^obs_ck(t) = { r_j ∈ R_trusted : c_assigned(r_j)=c_k } (Table 3.2) for the
+    // controller-trust EMA. Sync invokes at boot only — off the per-beacon path.
+    uint32_t cassign_ok = 0;
+    for (uint32_t r = 0; r < n_rsus && r < uint32_t(total_size); ++r) {
+        uint32_t cidx = rsu_controller_ID[r];
+        if (CallSCSetRSUController(r, cidx).ok) cassign_ok++;
+    }
+    std::cout << "[SC-REGISTER] c_assigned published on-chain: " << cassign_ok
+              << "/" << n_rsus << " RSUs\n";
 
     std::cout << "[SC-REGISTER] boot-time registration complete: "
               << rsu_ok << " RSUs + " << veh_ok << " vehicles + "
