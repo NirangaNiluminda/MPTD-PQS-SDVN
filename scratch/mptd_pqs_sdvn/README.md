@@ -483,7 +483,7 @@ python3 docker-api-proxy.py &
 
 ## Key Implementation Notes
 
-- **Real PQ crypto** (paper §3.5.4, Eq 3.45–3.56): TRS = real CRYSTALS-Dilithium / ML-DSA-44 via liboqs (`DilithiumTrsBackend`, t-of-n bundle — see D1 note below); FHE = real threshold (t,n+1) BFV via OpenFHE (`ThresholdBfvBackend`). No simulated/placeholder crypto. Classical Shamir-Schnorr-P256 retained only as the A4 ablation / ECDSA-class PBPO baseline.
+- **Real PQ crypto** (paper §3.5.4, Eq 3.45–3.56): TRS = real CRYSTALS-Dilithium / ML-DSA-87 (Dilithium5, FIPS 204 Cat 5, NIST Level 5) via liboqs (`DilithiumTrsBackend`, t-of-n bundle — see D1 note below); FHE = real threshold (t,n+1) BFV at `HEStd_256_quantum` (256-bit, NIST Level 5) via OpenFHE (`ThresholdBfvBackend`). No simulated/placeholder crypto. Classical Shamir-Schnorr-P256 retained only as the A4 ablation / ECDSA-class PBPO baseline.
   - **D1 (Dilithium bundle):** liboqs has only single-signer ML-DSA, so σ_TRS is a bundle of t partial signatures verified as "≥t distinct valid." Real PQ + sound t-of-n gate, but NOT the compact/anonymous signature Eq 3.50's prose claims (needs paper-text correction).
 - **Blockchain non-blocking**: Simulation continues if Fabric is offline — all curl calls are fire-and-forget.
 - **Score fusion**: Φ_i(t) = 0.3·ψ + 0.4·S + 0.3·(ε/θ_ae) > 0.5 (Eq. 3.43; revised paper).
