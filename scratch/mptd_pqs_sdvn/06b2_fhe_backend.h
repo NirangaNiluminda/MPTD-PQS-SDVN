@@ -42,6 +42,7 @@
 #include <string>
 #include <unordered_map>
 
+#if __has_include("openfhe.h")
 // OpenFHE master header. Pulls in DCRTPoly, CryptoContext, KeyPair, etc.
 // All under namespace lbcrypto.
 #include "openfhe.h"
@@ -478,5 +479,248 @@ static bool init_threshold_fhe_backend(uint32_t n_rsus = 4, uint32_t threshold =
     g_thfhe_backend.reset(new ThresholdBfvBackend());
     return g_thfhe_backend->init(n_rsus, threshold, plaintext_modulus, mult_depth);
 }
+
+#else
+
+// Mock implementation of BfvBackend and ThresholdBfvBackend when openfhe.h is missing
+class BfvBackend {
+public:
+    struct DummyCiphertext {
+        std::vector<uint8_t> data;
+    };
+    using Ctx        = void*;
+    using Ciphertext = DummyCiphertext;
+    using KeyPair    = void*;
+    using Plaintext  = void*;
+
+    static constexpr int64_t SPEED_SCALE = 100;
+    static constexpr int64_t POS_SCALE   = 1000;
+
+    bool init(uint32_t plaintext_modulus = 65537, uint32_t mult_depth = 1) {
+        ready_ = true;
+        pt_mod_ = plaintext_modulus;
+        return true;
+    }
+
+    Ciphertext encrypt_scalar_int(int64_t value) const {
+        Ciphertext ct;
+        ct.data.resize(sizeof(value));
+        std::memcpy(ct.data.data(), &value, sizeof(value));
+        return ct;
+    }
+
+    Ciphertext encrypt_vector_int(const std::vector<int64_t> &values) const {
+        Ciphertext ct;
+        ct.data.resize(values.size() * sizeof(int64_t));
+        std::memcpy(ct.data.data(), values.data(), ct.data.size());
+        return ct;
+    }
+
+    Ciphertext add(const Ciphertext &a, const Ciphertext &b) const {
+        Ciphertext ct;
+        int64_t valA = 0, valB = 0;
+        if (a.data.size() >= sizeof(int64_t)) std::memcpy(&valA, a.data.data(), sizeof(int64_t));
+        if (b.data.size() >= sizeof(int64_t)) std::memcpy(&valB, b.data.data(), sizeof(int64_t));
+        int64_t sum = valA + valB;
+        ct.data.resize(sizeof(sum));
+        std::memcpy(ct.data.data(), &sum, sizeof(sum));
+        return ct;
+    }
+
+    Ciphertext add_many(const std::vector<Ciphertext> &cts) const {
+        if (cts.empty()) throw std::runtime_error("BfvBackend::add_many empty");
+        int64_t sum = 0;
+        for (const auto &ct : cts) {
+            int64_t val = 0;
+            if (ct.data.size() >= sizeof(int64_t)) std::memcpy(&val, ct.data.data(), sizeof(int64_t));
+            sum += val;
+        }
+        Ciphertext res;
+        res.data.resize(sizeof(sum));
+        std::memcpy(res.data.data(), &sum, sizeof(sum));
+        return res;
+    }
+
+    int64_t decrypt_to_int(const Ciphertext &ct) const {
+        int64_t val = 0;
+        if (ct.data.size() >= sizeof(int64_t)) std::memcpy(&val, ct.data.data(), sizeof(int64_t));
+        return val;
+    }
+
+    std::vector<int64_t> decrypt_to_vector(const Ciphertext &ct, size_t length) const {
+        std::vector<int64_t> res(length, 0);
+        size_t count = std::min(length, ct.data.size() / sizeof(int64_t));
+        if (count > 0) std::memcpy(res.data(), ct.data.data(), count * sizeof(int64_t));
+        return res;
+    }
+
+    Ciphertext encrypt_speed_mps(double speed_mps) const {
+        int64_t q = static_cast<int64_t>(speed_mps * (double)SPEED_SCALE);
+        return encrypt_scalar_int(q);
+    }
+    double decrypt_mean_speed_mps(const Ciphertext &ct_sum, size_t n) const {
+        if (n == 0) return 0.0;
+        int64_t s = decrypt_to_int(ct_sum);
+        return ((double)s) / ((double)SPEED_SCALE * (double)n);
+    }
+
+    Ciphertext encrypt_pos_m(double pos_m) const {
+        int64_t q = static_cast<int64_t>(pos_m * (double)POS_SCALE);
+        return encrypt_scalar_int(q);
+    }
+    double decrypt_mean_pos_m(const Ciphertext &ct_sum, size_t n) const {
+        if (n == 0) return 0.0;
+        int64_t s = decrypt_to_int(ct_sum);
+        return ((double)s) / ((double)POS_SCALE * (double)n);
+    }
+
+    bool        ready()        const { return ready_;       }
+    uint32_t    ring_dim()     const { return 1024;         }
+    uint32_t    plaintext_modulus() const { return pt_mod_; }
+    const char* scheme_name()  const { return "Mock FHE BFV-RNS"; }
+    const std::string& last_error() const { return last_error_; }
+
+private:
+    uint32_t    pt_mod_     = 0;
+    bool        ready_      = false;
+    std::string last_error_;
+};
+
+static std::unique_ptr<BfvBackend> g_fhe_backend;
+static inline bool init_fhe_backend(uint32_t pt_mod = 65537, uint32_t depth = 1) {
+    g_fhe_backend = std::unique_ptr<BfvBackend>(new BfvBackend());
+    return g_fhe_backend->init(pt_mod, depth);
+}
+
+class ThresholdBfvBackend {
+public:
+    using Ctx        = void*;
+    using Ciphertext = BfvBackend::Ciphertext;
+    using KeyPair    = void*;
+    using Plaintext  = void*;
+
+    struct DummyEvalKey {
+        std::vector<uint8_t> data;
+    };
+    using EvalKey = DummyEvalKey;
+
+    static constexpr int64_t SPEED_SCALE = 100;
+    static constexpr int64_t POS_SCALE   = 1000;
+
+    bool init(uint32_t n_rsus, uint32_t threshold,
+              uint32_t plaintext_modulus = 65537, uint32_t mult_depth = 1) {
+        n_parties_ = n_rsus + 1;
+        threshold_ = threshold;
+        ready_ = true;
+        pt_mod_ = plaintext_modulus;
+        return true;
+    }
+
+    Ciphertext encrypt_scalar_int(int64_t v) const {
+        Ciphertext ct;
+        ct.data.resize(sizeof(v));
+        std::memcpy(ct.data.data(), &v, sizeof(v));
+        return ct;
+    }
+    Ciphertext encrypt_speed_mps(double s) const {
+        return encrypt_scalar_int(static_cast<int64_t>(s * (double)SPEED_SCALE));
+    }
+    Ciphertext encrypt_pos_m(double p) const {
+        return encrypt_scalar_int(static_cast<int64_t>(p * (double)POS_SCALE));
+    }
+
+    Ciphertext encrypt_vector_int(const std::vector<int64_t> &values) const {
+        Ciphertext ct;
+        ct.data.resize(values.size() * sizeof(int64_t));
+        std::memcpy(ct.data.data(), values.data(), ct.data.size());
+        return ct;
+    }
+
+    std::vector<uint8_t> serialize_ciphertext(const Ciphertext& ct) const {
+        return ct.data;
+    }
+
+    Ciphertext add(const Ciphertext& a, const Ciphertext& b) const {
+        Ciphertext ct;
+        int64_t valA = 0, valB = 0;
+        if (a.data.size() >= sizeof(int64_t)) std::memcpy(&valA, a.data.data(), sizeof(int64_t));
+        if (b.data.size() >= sizeof(int64_t)) std::memcpy(&valB, b.data.data(), sizeof(int64_t));
+        int64_t sum = valA + valB;
+        ct.data.resize(sizeof(sum));
+        std::memcpy(ct.data.data(), &sum, sizeof(sum));
+        return ct;
+    }
+
+    Ciphertext add_many(const std::vector<Ciphertext>& cts) const {
+        if (cts.empty()) throw std::runtime_error("ThresholdBfvBackend::add_many empty");
+        int64_t sum = 0;
+        for (const auto &ct : cts) {
+            int64_t val = 0;
+            if (ct.data.size() >= sizeof(int64_t)) std::memcpy(&val, ct.data.data(), sizeof(int64_t));
+            sum += val;
+        }
+        Ciphertext res;
+        res.data.resize(sizeof(sum));
+        std::memcpy(res.data.data(), &sum, sizeof(sum));
+        return res;
+    }
+
+    bool threshold_decrypt_int(const Ciphertext &ct,
+                               const std::vector<uint32_t> &present_rsus,
+                               int64_t &out) const
+    {
+        std::vector<int64_t> v;
+        if (!threshold_decrypt_vec(ct, present_rsus, 1, v)) return false;
+        out = v.empty() ? 0 : v[0];
+        return true;
+    }
+
+    bool threshold_decrypt_vec(const Ciphertext& ct,
+                               const std::vector<uint32_t>& present_rsus,
+                               size_t len, std::vector<int64_t>& out) const {
+        (void)present_rsus;
+        out.assign(len, 0);
+        size_t count = std::min(len, ct.data.size() / sizeof(int64_t));
+        if (count > 0) std::memcpy(out.data(), ct.data.data(), count * sizeof(int64_t));
+        return true;
+    }
+
+    bool threshold_decrypt_mean_speed(const Ciphertext &ct_sum, size_t nveh,
+                                      const std::vector<uint32_t> &present,
+                                      double &out_mps) const {
+        int64_t s = 0;
+        if (!threshold_decrypt_int(ct_sum, present, s)) return false;
+        out_mps = (nveh == 0) ? 0.0 : (double)s / ((double)SPEED_SCALE * (double)nveh);
+        return true;
+    }
+
+    bool        ready()              const { return ready_; }
+    bool        shares_available()   const { return true; }
+    uint32_t    ring_dim()           const { return 1024; }
+    uint32_t    num_parties()        const { return n_parties_; }
+    uint32_t    threshold()          const { return threshold_; }
+    const char* scheme_name()        const { return "Mock Threshold FHE BFV-RNS"; }
+    const std::string& last_error()  const { return last_error_; }
+
+private:
+    uint32_t pt_mod_ = 0;
+    uint32_t n_parties_ = 0;
+    uint32_t threshold_ = 0;
+    bool ready_ = false;
+    std::string last_error_;
+};
+
+static std::unique_ptr<ThresholdBfvBackend> g_thfhe_backend;
+
+static bool init_threshold_fhe_backend(uint32_t n_rsus = 4, uint32_t threshold = 3,
+                                       uint32_t plaintext_modulus = 65537,
+                                       uint32_t mult_depth = 1)
+{
+    if (g_thfhe_backend && g_thfhe_backend->ready()) return true;
+    g_thfhe_backend.reset(new ThresholdBfvBackend());
+    return g_thfhe_backend->init(n_rsus, threshold, plaintext_modulus, mult_depth);
+}
+
+#endif
 
 #endif // MPTD_PQS_06B2_FHE_BACKEND_H

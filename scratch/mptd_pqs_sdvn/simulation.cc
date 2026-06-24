@@ -34,6 +34,12 @@
 // ============================================================
 
 #include "01_includes.h"
+
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wunused-function"
+#pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#pragma GCC diagnostic ignored "-Wsign-compare"
+
 #include "02_config_globals.h"
 #include "00_lkh_keys.h"   // LKH tree + HMAC-SHA256 (Eq.3.33–3.37) — must come before 03
 #include "03_packet_tags.h"
@@ -62,3 +68,5 @@
 #include "10_metrics_csv.h"
 #include "11_blockchain_setup.h"
 #include "12_main.h"
+
+#pragma GCC diagnostic pop

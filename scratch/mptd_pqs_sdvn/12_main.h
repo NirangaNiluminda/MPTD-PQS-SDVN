@@ -38,6 +38,7 @@ int main(int argc, char *argv[])
     CommandLine cmd;
     cmd.AddValue ("N_RSUs", "N_RSUs", N_RSUs);
     cmd.AddValue ("N_Vehicles", "N_Vehicles", N_Vehicles);
+    cmd.AddValue ("N_Controllers", "N_Controllers", N_Controllers);
     cmd.AddValue ("data_transmission_frequency", "data_transmission_frequency", data_transmission_frequency);
     cmd.AddValue ("link_lifetime_threshold", "link_lifetime_threshold", link_lifetime_threshold);
     cmd.AddValue ("simTime", "simTime", simTime);
@@ -192,7 +193,7 @@ int main(int argc, char *argv[])
     }
     clear_delta_at_controller(delta_at_controller_inst);
   
-  controller_Node.Create(1);
+  controller_Node.Create(N_Controllers);
   management_Node.Create(1);
   // R4.b: backup_controller_Node removed. Paper architecture has no backup
   // controller; CP-DETECT (Alg 7, §3.5.5) via RSU consensus replaces it in R6.
@@ -285,10 +286,10 @@ int main(int argc, char *argv[])
   	  address.SetBase ("10.1.1.0", "255.255.255.0");
   	  stack.Install (csma_nodes);
   	  csmaInterfaces = address.Assign (csmaDevices);
-  	  // ── Option B: management_node is the 2nd-last entry in csma_nodes ─────────
-  	  // Order: RSU0..RSU(N_RSUs-1), controller, management
-  	  //   → management index = N_RSUs + 1 (last entry after R4.b removed backup)
-  	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + 1);
+  	  // ── Option B: management_node is the last entry in csma_nodes ─────────
+  	  // Order: RSU0..RSU(N_RSUs-1), controller_0..N_Controllers-1, management
+  	  //   → management index = N_RSUs + N_Controllers
+  	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + N_Controllers);
   	  cout << "[OPT-B] management CSMA IP  = " << g_management_csma_ip << endl;
   	  // ── Store RSU CSMA IPs for management → RSU downlink (port 8888) ──────────────
   	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
@@ -766,9 +767,11 @@ int main(int argc, char *argv[])
 
    if (architecture != 1)
    {
-	   Ptr<ConstantVelocityMobilityModel> mdl_controller = DynamicCast <ConstantVelocityMobilityModel> (controller_Node.Get(0)->GetObject<MobilityModel>());
-	   mdl_controller->SetPosition(Vector(con_base_posx, con_base_posy, 0));
-	   mdl_controller->SetVelocity(Vector(0, 0, 0));//centralized controller placement
+	   for (uint32_t c = 0; c < N_Controllers; ++c) {
+	       Ptr<ConstantVelocityMobilityModel> mdl_controller = DynamicCast <ConstantVelocityMobilityModel> (controller_Node.Get(c)->GetObject<MobilityModel>());
+	       mdl_controller->SetPosition(Vector(con_base_posx + c * 50.0, con_base_posy, 0));
+	       mdl_controller->SetVelocity(Vector(0, 0, 0));
+	   }
 
 	   // R4.b: backup_controller_Node mobility removed (node no longer created).
 	   // Paper has no backup; CP-DETECT (Alg 7) provides controller-misbehavior
@@ -808,14 +811,18 @@ int main(int argc, char *argv[])
 		  Ipv4InterfaceContainer internetipfaces = ipv4h.Assign(internetdevices);
 		  //Ipv4Address remoteHostAddr = internetipfaces.GetAddress (1);
 		  
-		  //point to point connction for controller
+		  //point to point connection for controllers
 		  PointToPointHelper p2p_controllers;
 		  p2p_controllers.SetDeviceAttribute("DataRate", DataRateValue(DataRate("1000Mb/s")));
 		  p2p_controllers.SetChannelAttribute("Delay", TimeValue(MicroSeconds(10)));
-		  NetDeviceContainer p2pcontroller_devices = p2p_controllers.Install(pgw,controller_Node.Get(0));
-		  Ipv4AddressHelper ipv4helper;
-		  ipv4helper.SetBase("40.1.1.0","255.255.255.0");
-		  Ipv4InterfaceContainer controller_interfaces = ipv4helper.Assign(p2pcontroller_devices);
+		  std::vector<Ipv4InterfaceContainer> controller_interfaces(N_Controllers);
+		  for (uint32_t c = 0; c < N_Controllers; ++c) {
+		      NetDeviceContainer p2pcontroller_devices = p2p_controllers.Install(pgw, controller_Node.Get(c));
+		      Ipv4AddressHelper ipv4helper;
+		      std::string subnet = "40.1." + std::to_string(c + 1) + ".0";
+		      ipv4helper.SetBase(subnet.c_str(), "255.255.255.0");
+		      controller_interfaces[c] = ipv4helper.Assign(p2pcontroller_devices);
+		  }
 		  
 		  //point to point connection for management server
 		  PointToPointHelper p2p_management;
@@ -831,8 +838,10 @@ int main(int argc, char *argv[])
 		  Ptr<Ipv4StaticRouting> remotehoststaticrouting = ipv4routinghelper.GetStaticRouting(remotehost->GetObject<Ipv4>());
 		  remotehoststaticrouting->AddNetworkRouteTo (Ipv4Address("7.0.0.0"),Ipv4Mask("255.0.0.0"),1);
 
-		  Ptr<Ipv4StaticRouting> controller_staticrouting = ipv4routinghelper_con.GetStaticRouting(controller_Node.Get(0)->GetObject<Ipv4>());
-		  controller_staticrouting->AddNetworkRouteTo (Ipv4Address("7.0.0.0"),Ipv4Mask("255.0.0.0"),2);
+		  for (uint32_t c = 0; c < N_Controllers; ++c) {
+		      Ptr<Ipv4StaticRouting> controller_staticrouting = ipv4routinghelper_con.GetStaticRouting(controller_Node.Get(c)->GetObject<Ipv4>());
+		      controller_staticrouting->AddNetworkRouteTo (Ipv4Address("7.0.0.0"),Ipv4Mask("255.0.0.0"),2);
+		  }
 
 		  Ipv4StaticRoutingHelper ipv4routinghelper_man;
 		  Ptr<Ipv4StaticRouting> management_staticrouting = ipv4routinghelper_man.GetStaticRouting(management_Node.Get(0)->GetObject<Ipv4>());
@@ -1903,18 +1912,20 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
           routing_test ? "MANAGEMENT\nMPTD-PQS Detection\n(DSRC-RSU relay)"
                        : "MANAGEMENT\n(SDN control)");
 
-      // ── Primary controller: RED if malicious (attacks 5/7), PURPLE if honest ──
+      // ── Controllers: RED if malicious (attacks 5/7), PURPLE if honest ──
       bool ctrl_malicious = (attack_number == 5 || attack_number == 7);
-      if (ctrl_malicious) {
-          anim.UpdateNodeColor(controller_Node.Get(0), 255, 0, 0);  // RED = compromised
-          anim.UpdateNodeDescription(controller_Node.Get(0),
-              routing_test ? "SDN CTRL\n[COMPROMISED]\nTP-S3/MP-S4" : "CTRL [COMPROMISED]");
-      } else {
-          anim.UpdateNodeColor(controller_Node.Get(0), 150, 0, 220); // PURPLE = honest
-          anim.UpdateNodeDescription(controller_Node.Get(0),
-              routing_test ? "SDN CONTROLLER\n(MPTD-PQS)" : "CONTROLLER");
+      for (uint32_t c = 0; c < N_Controllers; ++c) {
+          if (ctrl_malicious) {
+              anim.UpdateNodeColor(controller_Node.Get(c), 255, 0, 0);  // RED = compromised
+              anim.UpdateNodeDescription(controller_Node.Get(c),
+                  routing_test ? ("SDN CTRL " + std::to_string(c) + "\n[COMPROMISED]\nTP-S3/MP-S4") : ("CTRL " + std::to_string(c) + " [COMPROMISED]"));
+          } else {
+              anim.UpdateNodeColor(controller_Node.Get(c), 150, 0, 220); // PURPLE = honest
+              anim.UpdateNodeDescription(controller_Node.Get(c),
+                  routing_test ? ("SDN CONTROLLER " + std::to_string(c) + "\n(MPTD-PQS)") : ("CONTROLLER " + std::to_string(c)));
+          }
+          anim.UpdateNodeSize(controller_Node.Get(c)->GetId(), 35.0, 35.0);
       }
-      anim.UpdateNodeSize(controller_Node.Get(0)->GetId(), 35.0, 35.0);
 
       // R4.b: backup_controller_Node coloring removed (node no longer created).
       // Paper has no backup; CP-DETECT (Alg 7) provides controller-misbehavior

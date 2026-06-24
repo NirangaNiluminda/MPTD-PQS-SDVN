@@ -52,6 +52,7 @@
 #ifndef MPTD_PQS_06D_AI_INFERENCE_H
 #define MPTD_PQS_06D_AI_INFERENCE_H
 
+#if __has_include(<onnxruntime_cxx_api.h>)
 #include <onnxruntime_cxx_api.h>
 
 #include <cmath>
@@ -441,5 +442,111 @@ inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
     const float phi = lp * psi + lg * used_gat + la * used_ae;
     return FusionScore{psi, used_gat, used_ae, phi, phi > p.phi_threshold};
 }
+
+#else
+
+// Mock implementation of AiInferenceEngine when onnxruntime_cxx_api.h is missing
+namespace mptd_ai {
+constexpr int    GAT_FEATURE_DIM = 6;
+constexpr int    LSTM_FEATURE_DIM = 5;
+constexpr int    LSTM_WINDOW_SIZE = 20;
+constexpr double R_MAX_GRAPH   = 300.0;
+constexpr double PHI_MAX_GRAPH = 1.5707963267948966;
+constexpr float  TAU_DEFAULT = 1.0f;
+
+struct AiScaler {
+    bool loaded = false;
+    std::vector<float> mean;
+    std::vector<float> scale;
+};
+} // namespace mptd_ai
+
+struct FusionParams {
+    bool  use_gat       = true;
+    bool  use_ae        = true;
+    float lambda_psi    = 0.4f;
+    float lambda_gat    = 0.3f;
+    float lambda_ae     = 0.3f;
+    float phi_threshold = 0.5f;
+};
+
+inline FusionParams g_fusion;
+
+class AiInferenceEngine {
+public:
+    AiInferenceEngine() {}
+
+    bool init(const std::string &gat_path,
+              const std::string &lstm_ae_path,
+              const std::string &scaler_path,
+              const std::string &theta_path) {
+        theta_ae_ = 0.05f;
+        ready_ = false;
+        std::cerr << "[WARNING] ONNX Runtime header <onnxruntime_cxx_api.h> not found. Mock AI Engine initialized." << std::endl;
+        return false;
+    }
+
+    bool ready()        const { return ready_; }
+    bool has_gat()      const { return false; }
+    bool has_lstm_ae()  const { return false; }
+    float theta_ae()    const { return theta_ae_; }
+    const mptd_ai::AiScaler &scaler() const { return scaler_; }
+
+    bool score_gat(const float *per_vehicle_raw, int N,
+                   const float *tau,
+                   std::vector<float> &scores) {
+        (void)per_vehicle_raw;
+        (void)tau;
+        scores.assign(N, 0.0f);
+        return false;
+    }
+
+    bool score_lstm_ae(const float *window_raw, float &recon_mse) {
+        (void)window_raw;
+        recon_mse = 0.0f;
+        return false;
+    }
+
+private:
+    bool ready_ = false;
+    float theta_ae_ = 0.05f;
+    mptd_ai::AiScaler scaler_;
+};
+
+inline AiInferenceEngine g_ai_engine;
+
+struct FusionScore {
+    float psi;
+    float gat;
+    float ae_norm;
+    float phi;
+    bool  anomalous;
+};
+
+inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
+                               float theta_ae,
+                               const FusionParams &p = g_fusion) {
+    const float denom = (theta_ae > 1e-9f ? theta_ae : 1e-9f);
+    float ae_norm = ae_err / denom;
+    if (ae_norm > 1.0f) ae_norm = 1.0f;
+    if (ae_norm < 0.0f) ae_norm = 0.0f;
+
+    float lp = p.lambda_psi;
+    float lg = p.use_gat ? p.lambda_gat : 0.0f;
+    float la = p.use_ae  ? p.lambda_ae  : 0.0f;
+    const float sum_w = lp + lg + la;
+    if (sum_w > 1e-9f) {
+        lp /= sum_w;
+        lg /= sum_w;
+        la /= sum_w;
+    }
+
+    const float used_gat = p.use_gat ? gat_score : 0.0f;
+    const float used_ae  = p.use_ae  ? ae_norm   : 0.0f;
+    const float phi = lp * psi + lg * used_gat + la * used_ae;
+    return FusionScore{psi, used_gat, used_ae, phi, phi > p.phi_threshold};
+}
+
+#endif
 
 #endif // MPTD_PQS_06D_AI_INFERENCE_H

@@ -783,6 +783,38 @@ func TestSCTrustFinalizeEpoch(t *testing.T) {
 			t.Errorf("consec=%d want 0 after recovery", rec.ConsecutiveLowEpochs)
 		}
 	})
+
+	// Slow-path revocation (paper §3.5.5 p.72): τ < τ_min for T_rev consecutive
+	// epochs must trigger a DIRECT revocation (SCREVOKE_ record + REG_ REVOKED),
+	// not a dead-end re-vote. Was previously an observed-only "TrustLow" no-op.
+	t.Run("T_rev gate commits direct slow-path revocation", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.0, 0.5, 0.3, 2, 0.5) // alpha=0 → τ=1-meanPsi; T_rev=2
+		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		seedTrust(fl, "VEH_1", 1.0)
+		seedReg(fl, "RSU_0", RoleRSU, pk) // trusted witness (§3.5.1)
+		sc := SmartContract{}
+
+		// Epoch 1: τ=0.2 < τ_min → consec=1, not yet revoked.
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8)
+		_, err := sc.SCTrustFinalizeEpoch(ctx, "VEH_1", "E1")
+		ok(t, err)
+		if isRev, _ := sc.IsRevoked(ctx, "VEH_1"); isRev != "false" {
+			t.Fatalf("revoked too early after 1 low epoch: %s", isRev)
+		}
+
+		// Epoch 2: consec=2 ≥ T_rev → DIRECT revocation must commit.
+		seedSubm(fl, "VEH_1", "E2", "RSU_0", 0.8)
+		_, err = sc.SCTrustFinalizeEpoch(ctx, "VEH_1", "E2")
+		ok(t, err)
+		if isRev, _ := sc.IsRevoked(ctx, "VEH_1"); isRev != "true" {
+			t.Fatalf("slow-path revocation did not commit at T_rev gate: %s", isRev)
+		}
+		// Registration must be flipped to REVOKED so further submissions bounce.
+		seedSubm(fl, "VEH_1", "E3", "RSU_0", 0.8)
+		_, err = sc.SCTrustFinalizeEpoch(ctx, "VEH_1", "E3")
+		errHas(t, err, "status=REVOKED")
+	})
 }
 
 func TestTrustReads(t *testing.T) {
@@ -812,7 +844,7 @@ func TestTrustReads(t *testing.T) {
 }
 
 // ═════════════════════════════════════════════════════════════════════════════
-// Algorithm 8 / Eq 3.59 — CP-DETECT
+// Algorithm 9 / Eq 3.66–3.69 — CP-DETECT (directional conflict)
 // ═════════════════════════════════════════════════════════════════════════════
 
 func TestCPDetectCheck(t *testing.T) {
@@ -827,16 +859,37 @@ func TestCPDetectCheck(t *testing.T) {
 		}
 	})
 
-	t.Run("controller-anom vs implicit-clean RSUs fires flag", func(t *testing.T) {
+	// Eq 3.68 is directional: controller-anomalous + RSUs-clean is the controller
+	// performing SUPERIOR detection and must NOT be penalised → conflict=0, no flag.
+	t.Run("controller-anom vs clean RSUs → NO flag (Eq 3.68 superior detection)", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)        // f=1 → f+1 = 2
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)   // f=1 → f+1 = 2
 		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.8) // Φ>ψ_th → cAnom=true
-		// no RSU SUBMs → 4 implicit clean votes → conflict=4 ≥ 2
+		// no RSU SUBMs → all RSUs clean (flag^rsu=0) → conflict=0 (directional)
+		sc := SmartContract{}
+		flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
+		ok(t, err)
+		if flag != nil {
+			t.Error("controller catching an anomaly RSUs missed must not be flagged (Eq 3.68)")
+		}
+	})
+
+	// Suppression case: controller says benign while ≥ f+1 trusted RSUs say
+	// anomalous → conflict ≥ f+1 → flag fires (Eq 3.68 + Eq 3.69).
+	t.Run("controller-clean suppresses f+1 anomalous RSUs → flag fires", func(t *testing.T) {
+		ctx, fl := newCtx()
+		_, pk := genIDStatic()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)   // f=1 → f+1 = 2
+		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // cAnom=false
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedReg(fl, "RSU_1", RoleRSU, pk)
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // anomalous
+		seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.8) // anomalous → conflict=2 ≥ 2
 		sc := SmartContract{}
 		flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
 		ok(t, err)
 		if flag == nil {
-			t.Fatal("expected flag to fire")
+			t.Fatal("expected flag to fire on controller suppression")
 		}
 		if flag.ConflictCount < flag.ThresholdFP1 {
 			t.Errorf("conflict %d < threshold %d", flag.ConflictCount, flag.ThresholdFP1)
@@ -848,9 +901,11 @@ func TestCPDetectCheck(t *testing.T) {
 
 	t.Run("controller-clean minor disagreement → no flag", func(t *testing.T) {
 		ctx, fl := newCtx()
-		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)        // f+1 = 2
+		_, pk := genIDStatic()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)   // f+1 = 2
 		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // cAnom=false
-		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8)  // 1 RSU disagrees
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // 1 RSU disagrees → conflict=1
 		sc := SmartContract{}
 		flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
 		ok(t, err)
@@ -862,8 +917,13 @@ func TestCPDetectCheck(t *testing.T) {
 
 func TestControllerFlagReads(t *testing.T) {
 	ctx, fl := newCtx()
+	_, pk := genIDStatic()
 	seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
-	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.9)
+	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // controller benign (suppression)
+	seedReg(fl, "RSU_0", RoleRSU, pk)
+	seedReg(fl, "RSU_1", RoleRSU, pk)
+	seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // anomalous
+	seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.8) // anomalous → conflict=2 ≥ f+1
 	sc := SmartContract{}
 	_, err := sc.CPDetectCheck(ctx, "VEH_1", "E1") // fires a flag
 	ok(t, err)
@@ -957,9 +1017,14 @@ func TestCPDetectExcludesAndReassigns(t *testing.T) {
 	seedControllers(fl, 5)              // CTRL_0..CTRL_4 ACTIVE
 	_, vpk := genIDStatic()
 	seedReg(fl, "VEH_1", RoleVehicle, vpk) // so evidence reaches the controller gate
-	// CTRL_0 (current head) flags an anomaly the RSUs implicitly clean-vote
-	// against → conflict ≥ f+1 → exclude CTRL_0, hand off to CTRL_1.
-	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.9)
+	// CTRL_0 (current head) SUPPRESSES an alert: it says benign while ≥ f+1
+	// trusted RSUs flag anomalous → directional conflict ≥ f+1 (Eq 3.68/3.69)
+	// → exclude CTRL_0, hand off to CTRL_1.
+	seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // cAnom=false (suppression)
+	seedReg(fl, "RSU_0", RoleRSU, vpk)
+	seedReg(fl, "RSU_1", RoleRSU, vpk)
+	seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // anomalous
+	seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.8) // anomalous → conflict=2 ≥ 2
 	sc := SmartContract{}
 
 	flag, err := sc.CPDetectCheck(ctx, "VEH_1", "E1")
@@ -1010,6 +1075,191 @@ func TestCPDetectExcludesAndReassigns(t *testing.T) {
 	if len(ras2) != 1 {
 		t.Errorf("reassignments after idempotent re-run=%d want 1", len(ras2))
 	}
+}
+
+// ═════════════════════════════════════════════════════════════════════════════
+// Eq 3.60 — c_assigned setter + controller trust EMA (SLOW path)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// seedRSUWithCtrl seeds an ACTIVE/TRUSTED RSU with its c_assigned controller set,
+// so SCControllerFinalizeEpoch picks it into R^obs_ck.
+func seedRSUWithCtrl(fl *fakeLedger, rsu, ctrl string) {
+	_, pk := genIDStatic()
+	rec := RegistrationRecord{ID: rsu, Role: RoleRSU, PkHex: pk, HKuHex: hku64,
+		TauInit: TauInit, Status: StatusActive, RSUState: RSUStateTrusted,
+		AssignedController: ctrl, RegisteredAt: "seed"}
+	b, _ := json.Marshal(rec)
+	fl.m["REG_"+rsu] = b
+}
+
+func seedCTrust(fl *fakeLedger, ctrl string, score float64) {
+	rec := ControllerTrustScore{ID: "CTRUST_" + ctrl, ControllerID: ctrl, TrustScore: score}
+	b, _ := json.Marshal(rec)
+	fl.m["CTRUST_"+ctrl] = b
+}
+
+func TestSCSetRSUController(t *testing.T) {
+	t.Run("sets c_assigned on a registered RSU", func(t *testing.T) {
+		ctx, fl := newCtx()
+		_, pk := genIDStatic()
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedControllers(fl, 2)
+		sc := SmartContract{}
+		ok(t, sc.SCSetRSUController(ctx, "RSU_0", "CTRL_1"))
+		var reg RegistrationRecord
+		json.Unmarshal(fl.m["REG_RSU_0"], &reg)
+		if reg.AssignedController != "CTRL_1" {
+			t.Errorf("AssignedController=%q want CTRL_1", reg.AssignedController)
+		}
+		// idempotent re-set
+		ok(t, sc.SCSetRSUController(ctx, "RSU_0", "CTRL_1"))
+	})
+
+	t.Run("rejects non-RSU target", func(t *testing.T) {
+		ctx, fl := newCtx()
+		_, pk := genIDStatic()
+		seedReg(fl, "VEH_1", RoleVehicle, pk)
+		seedControllers(fl, 1)
+		sc := SmartContract{}
+		errHas(t, sc.SCSetRSUController(ctx, "VEH_1", "CTRL_0"), "not a registered RSU")
+	})
+
+	t.Run("rejects non-controller target", func(t *testing.T) {
+		ctx, fl := newCtx()
+		_, pk := genIDStatic()
+		seedReg(fl, "RSU_0", RoleRSU, pk)
+		seedReg(fl, "VEH_9", RoleVehicle, pk)
+		sc := SmartContract{}
+		errHas(t, sc.SCSetRSUController(ctx, "RSU_0", "VEH_9"), "not a registered controller")
+	})
+}
+
+func TestSCControllerFinalizeEpoch(t *testing.T) {
+	// Eq 3.60 suppression: controller benign while its assigned RSUs flag anomaly
+	// → meanConflict=1 → τ_ck decays. α=0.3, τ_init=1 → τ = 0.3·1 + 0.7·0 = 0.3.
+	t.Run("suppression decays τ_ck (Eq 3.60)", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
+		seedControllers(fl, 1)
+		seedCTrust(fl, "CTRL_0", 1.0)
+		seedRSUWithCtrl(fl, "RSU_0", "CTRL_0")
+		seedRSUWithCtrl(fl, "RSU_1", "CTRL_0")
+		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // flag^ctrl=0 (benign)
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8)  // flag^rsu=1 → conflict
+		seedSubm(fl, "VEH_1", "E1", "RSU_1", 0.8)  // flag^rsu=1 → conflict
+		sc := SmartContract{}
+		out, err := sc.SCControllerFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		if len(out) != 1 {
+			t.Fatalf("updated %d controllers want 1", len(out))
+		}
+		rec, err := sc.GetControllerTrustScore(ctx, "CTRL_0")
+		ok(t, err)
+		if math.Abs(rec.MeanConflict-1.0) > 1e-9 {
+			t.Errorf("meanConflict=%v want 1.0", rec.MeanConflict)
+		}
+		if math.Abs(rec.TrustScore-0.3) > 1e-9 {
+			t.Errorf("τ_ck=%v want 0.3", rec.TrustScore)
+		}
+		if rec.NumRSUsLastEpoch != 2 {
+			t.Errorf("|R^obs|=%d want 2", rec.NumRSUsLastEpoch)
+		}
+	})
+
+	// Eq 3.68 directional: controller anomalous + RSU agrees → conflict=0 → no
+	// penalty. τ = 0.3·1 + 0.7·1 = 1.0 (stays at ceiling).
+	t.Run("superior/agreeing detection: no penalty", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
+		seedControllers(fl, 1)
+		seedCTrust(fl, "CTRL_0", 1.0)
+		seedRSUWithCtrl(fl, "RSU_0", "CTRL_0")
+		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.8) // flag^ctrl=1
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8)  // flag^rsu=1 → (1-1)·1 = 0
+		sc := SmartContract{}
+		_, err := sc.SCControllerFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		rec, err := sc.GetControllerTrustScore(ctx, "CTRL_0")
+		ok(t, err)
+		if math.Abs(rec.MeanConflict) > 1e-9 {
+			t.Errorf("meanConflict=%v want 0", rec.MeanConflict)
+		}
+		if math.Abs(rec.TrustScore-1.0) > 1e-9 {
+			t.Errorf("τ_ck=%v want 1.0", rec.TrustScore)
+		}
+	})
+
+	t.Run("controller with no CSUBM this epoch is skipped", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
+		seedControllers(fl, 1)
+		seedCTrust(fl, "CTRL_0", 1.0)
+		seedRSUWithCtrl(fl, "RSU_0", "CTRL_0")
+		seedSubm(fl, "VEH_1", "E1", "RSU_0", 0.8) // RSU evidence but no CSUBM
+		sc := SmartContract{}
+		out, err := sc.SCControllerFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		if len(out) != 0 {
+			t.Errorf("updated %d controllers want 0 (no observation)", len(out))
+		}
+		rec, _ := sc.GetControllerTrustScore(ctx, "CTRL_0")
+		if rec.UpdateCount != 0 || math.Abs(rec.TrustScore-1.0) > 1e-9 {
+			t.Errorf("τ_ck changed without observation: %+v", rec)
+		}
+	})
+
+	t.Run("controller with empty R^obs is skipped", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
+		seedControllers(fl, 1)
+		seedCTrust(fl, "CTRL_0", 1.0)
+		seedCSub(fl, "VEH_1", "CTRL_0", "E1", 0.2) // observed, but no RSU assigned
+		sc := SmartContract{}
+		out, err := sc.SCControllerFinalizeEpoch(ctx, "E1")
+		ok(t, err)
+		if len(out) != 0 {
+			t.Errorf("updated %d controllers want 0 (empty R^obs)", len(out))
+		}
+	})
+
+	// Sustained suppression for T_rev epochs → terminal ControllerRevoked.
+	// τ_min=0.35, T_rev=2: E1 τ=0.3<0.35 (consec=1); E2 τ=0.09<0.35 (consec=2≥2) → revoke.
+	t.Run("T_rev sustained low → ControllerRevoked + reassignment", func(t *testing.T) {
+		ctx, fl := newCtx()
+		seedNetCfg(fl, 4, 0.3, 0.5, 0.35, 2, 0.5)
+		seedControllers(fl, 2) // CTRL_0 target, CTRL_1 successor
+		seedCTrust(fl, "CTRL_0", 1.0)
+		seedRSUWithCtrl(fl, "RSU_0", "CTRL_0")
+		seedRSUWithCtrl(fl, "RSU_1", "CTRL_0")
+		sc := SmartContract{}
+		for _, ep := range []string{"E1", "E2"} {
+			seedCSub(fl, "VEH_1", "CTRL_0", ep, 0.2)
+			seedSubm(fl, "VEH_1", ep, "RSU_0", 0.8)
+			seedSubm(fl, "VEH_1", ep, "RSU_1", 0.8)
+			_, err := sc.SCControllerFinalizeEpoch(ctx, ep)
+			ok(t, err)
+		}
+		var reg RegistrationRecord
+		json.Unmarshal(fl.m["REG_CTRL_0"], &reg)
+		if reg.Status != StatusRevoked {
+			t.Errorf("CTRL_0 status=%s want REVOKED", reg.Status)
+		}
+		// A revocation record + reassignment naming the successor must exist.
+		if v, _ := sc.IsRevoked(ctx, "CTRL_0"); v != "true" {
+			t.Error("CTRL_0 should be revoked")
+		}
+		ras, err := sc.GetControllerReassignments(ctx)
+		ok(t, err)
+		if len(ras) != 1 || ras[0].ExcludedController != "CTRL_0" || ras[0].SuccessorController != "CTRL_1" {
+			t.Errorf("reassignment=%+v want CTRL_0→CTRL_1", ras)
+		}
+		// A REVOKED controller leaves the ACTIVE trusted head to its successor.
+		head, err := sc.GetActiveController(ctx)
+		ok(t, err)
+		if head != "CTRL_1" {
+			t.Errorf("head=%s want CTRL_1", head)
+		}
+	})
 }
 
 // ═════════════════════════════════════════════════════════════════════════════

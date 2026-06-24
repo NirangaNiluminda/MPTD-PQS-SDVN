@@ -21,7 +21,7 @@ and ledger, no fork-per-call subprocess overhead (Invariant 1 preserved).
 | 3.47 / 3.56 | σ_j = s_j · H(m_j) (RSU partial threshold sig) | `06b1_trs_backend.h:734 mptd_trs_partial_sign_hex` (over `ClassicalTrsBackend` Shamir-Schnorr P-256, n=4, t=3) | stored opaquely in `EpochSubmission.Signature` | `8b37eea` (TASK ①-J) |
 | 3.57 | Controller evidence E_c(t) = ⟨vid, epoch, Φ_i, h(b), σ_c⟩ | `08_detection_engine.h:1632 CallSCControllerSubmitEvidence` (unconditional per fused window) | `smartcontract.go:1165 SCControllerSubmitEvidence` → key `CSUBM_<vid>_<epoch>` | `be400ae` (TASK ①-L) |
 | 3.58 | SC-Revoke BFT 2f+1 vote: revoke iff Σ vote_j ≥ 2f+1 | `08_detection_engine.h:2511 CallSCRevokeVote` (sync, payload-parsed `"revoked":true`); LKH rekey gated on positive payload | `smartcontract.go:1436 SCRevokeVote` (writes `VOTE_<vid>_<rsu>`, emits `SCRevoke` event when threshold met) | `479c3eb` (TASK ①-N) |
-| 3.59 | CP-DETECT flag_c = 1 iff Σ ((Φ>ψ_th) XOR (ψ_j>ψ_th)) ≥ f+1 | `08_detection_engine.h:1690` schedules `CallCPDetectCheckAsync` at +0.5s after CSUBM commit (per-window dedup) | `smartcontract.go:1293 CPDetectCheck` → writes `CFLAG_<ctrl>_<vid>_<epoch>` + emits `CPDetectFlag` event | `95745b5` (TASK ①-M) + `f30cd1e` (implicit-clean-vote fix) |
+| 3.66–3.69 | CP-DETECT flag_c = 1 iff Σ (1−flag^ctrl)·flag^rsu_j ≥ f+1 (directional: counts only controller-benign + RSU-anomaly suppression) | `08_detection_engine.h:1690` schedules `CallCPDetectCheckAsync` at +0.5s after CSUBM commit (per-window dedup) | `smartcontract.go:1293 CPDetectCheck` → writes `CFLAG_<ctrl>_<vid>_<epoch>` + emits `CPDetectFlag` event | `95745b5` (TASK ①-M); directional-conflict fix (Eq 3.68 — removed anti-paper implicit-clean-vote) |
 
 ---
 

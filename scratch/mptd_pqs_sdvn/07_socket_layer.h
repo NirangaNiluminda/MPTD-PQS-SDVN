@@ -186,8 +186,8 @@ void SimpleUdpApplication::StartApplication()
 
         // ── LKH rekey receive socket — vehicles only (not management node) ────────
         // Listens on LKH_REKEY_PORT (5555) for RekeyTag packets from RSU.
-        // Management node (nid=1) does not need this — it has the full LKH state.
-        bool is_vehicle_node = (nid >= 2);
+        // Management node does not need this — it has the full LKH state.
+        bool is_vehicle_node = (g_first_vehicle_node_id > 0 && nid >= g_first_vehicle_node_id && nid < g_first_vehicle_node_id + N_Vehicles);
         if (is_vehicle_node) {
             m_recv_socket_rekey = Socket::CreateSocket(GetNode(), tid);
             SetupReceiveSocket(m_recv_socket_rekey, LKH_REKEY_PORT);
@@ -210,11 +210,10 @@ void SimpleUdpApplication::StartApplication()
         m_uplink_send_socket->SetAllowBroadcast(true);
         m_downlink_send_socket->SetAllowBroadcast(true);
 
-        // ── Management node (nid=1): store downlink socket globally ──────────────────
+        // ── Management node (nid=N_Controllers): store downlink socket globally ──────
         // HandleBeaconReceived() is a free function without `this`, so it uses
         // g_mgmt_downlink_socket to send centralized_dsrc_data_broadcast/unicast.
-        // nid==1 is always management_node (controller_Node is nid=0, created first).
-        if (GetNode()->GetId() == 1) {
+        if (GetNode()->GetId() == N_Controllers) {
             g_mgmt_downlink_socket = m_downlink_send_socket;
             cout << "[DL-INIT] management node " << nid
                  << " downlink socket registered (port 30000)" << endl;
@@ -240,8 +239,7 @@ void SimpleUdpApplication::HandleReadTwo(Ptr<Socket> socket)
 
         // Guard: skip management/controller/RSU nodes — only vehicles log downlink receipt
         // (RSU broadcasts on 3.255.255.255 which may also reach management on CSMA)
-        bool is_vehicle = (my_nid >= 2) &&
-                          !(g_option_b_active && my_nid >= g_first_rsu_node_id);
+        bool is_vehicle = (g_first_vehicle_node_id > 0 && my_nid >= g_first_vehicle_node_id && my_nid < g_first_vehicle_node_id + N_Vehicles);
         if (!is_vehicle) continue;
 
         DownlinkControlTag dl_tag;
@@ -250,8 +248,8 @@ void SimpleUdpApplication::HandleReadTwo(Ptr<Socket> socket)
             const char* alert_str = (dl_tag.GetAlertType() == 0) ? "CLEAN_ROUTING" :
                                     (dl_tag.GetAlertType() == 1) ? "ATTACK_DETECTED" :
                                                                    "WRONG_ROUTING";
-            // vid displayed as V(nid-2) so it matches vehicle index used in logs
-            uint32_t vid = my_nid - 2;
+            // vid displayed as V(nid - g_first_vehicle_node_id) so it matches vehicle index used in logs
+            uint32_t vid = my_nid - g_first_vehicle_node_id;
             cout << "[DL-VEH-RX] V" << vid
                  << " (nid=" << my_nid << ")"
                  << " from RSU" << dl_tag.GetRsuId()
@@ -269,7 +267,7 @@ void SimpleUdpApplication::HandleReadTwo(Ptr<Socket> socket)
                      << " t=" << Simulator::Now().GetSeconds() << endl;
             }
         } else {
-            NS_LOG_INFO(PURPLE_CODE << "HandleReadTwo: V" << (my_nid - 2)
+            NS_LOG_INFO(PURPLE_CODE << "HandleReadTwo: V" << (my_nid - g_first_vehicle_node_id)
                         << " received packet size=" << packet->GetSize()
                         << " t=" << Now().GetSeconds() << END_CODE);
         }
@@ -367,7 +365,7 @@ void SimpleUdpApplication::HandleRekeyReceived(Ptr<Socket> socket)
         // 3. Recompute K_i = KDF(new_K_leaf, new_η_i, ID_i) [Eq.3.22]
         lkh_compute_session_key(veh_idx);
 
-        cout << "[LKH-REKEY-RX] V" << (my_nid - 2)
+        cout << "[LKH-REKEY-RX] V" << (my_nid - g_first_vehicle_node_id)
              << " (nid=" << my_nid << ")"
              << " new K_i from RSU" << rk.GetRsuId()
              << " nonce=" << rk.GetNewNonce()

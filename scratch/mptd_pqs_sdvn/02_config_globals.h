@@ -58,6 +58,9 @@ using namespace std::chrono;
 const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
 uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban 8×8 grid=64)
 uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
+uint32_t N_Controllers = 4;
+uint32_t g_first_rsu_node_id = 0;
+uint32_t g_first_vehicle_node_id = 0;
 
 uint16_t N_eNodeBs = 1 + N_Vehicles / 40;
 int      var       = N_Vehicles + N_RSUs;
@@ -390,8 +393,20 @@ double send_prev_speed[MAX_NODES] = {};
 double send_prev_time [MAX_NODES] = {};
 
 // ── Node/consortium assignment ─────────────────────────────────────────────
+// node_controller_ID: VEHICLE→controller for the SDN data plane (flow routing,
+// 12_main.h routing_algorithm==4). This is the control-plane flow mapping and
+// is NOT the evidence/trust attribution.
 uint32_t node_controller_ID[total_size];
 uint32_t assigned_consortium_ID[total_size];
+
+// rsu_controller_ID: c_assigned(r_j) — paper §3.1 / Table 3.2. The controller
+// each RSU is assigned to (over RSUs, NOT vehicles). Indexed by RSU index
+// (0..N_RSUs-1). Defines the controller observation set
+// R^obs_ck(t) = {r_j ∈ R_trusted(t) : c_assigned(r_j)=c_k} (Eq 3.60) and the
+// identity under which an RSU's window evidence E_c(t) (Eq 3.64) is submitted.
+// Mutable: a CP-DETECT/EMA controller revocation reassigns the orphaned RSUs to
+// a trusted controller (paper p.75, "no manual failover").
+uint32_t rsu_controller_ID[total_size];
 
 // ── LTE state ─────────────────────────────────────────────────────────────
 double uplink_last[total_size];

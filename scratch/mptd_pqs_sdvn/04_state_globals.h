@@ -175,13 +175,6 @@ uint64_t unregistered_beacon_reject_count = 0;
 Ipv4Address g_management_csma_ip;            // management_node CSMA IP (10.1.1.6)
 Ipv4Address g_rsu_dsrc_ip[MAX_RSUS];                // RSU DSRC IPs from dsrc_interfaces (3.x.x.x)
 Ipv4Address g_rsu_csma_ip[MAX_RSUS];               // RSU CSMA IPs for management → RSU downlink (10.1.1.x)
-uint32_t    g_first_rsu_node_id = 0;         // NS-3 NodeID of RSU_Nodes.Get(0)
-uint32_t    g_first_vehicle_node_id = 0;     // NS-3 NodeID of Vehicle_Nodes.Get(0)
-                                             //   (R7e.4: needed to convert raw NodeID
-                                             //   carried in BsmBeaconTag back to the
-                                             //   local vehicle index 0..N_Vehicles-1
-                                             //   used by IMobilityProvider::get_gt_position
-                                             //   and the per-vehicle state arrays)
 uint32_t    g_num_active_rsus   = 0;         // = N_RSUs when routing_test=true
 bool        g_option_b_active   = false;     // set true by 12_main.h when relay is ready
 Ptr<Socket>  g_mgmt_downlink_socket;         // management node's downlink send socket (set in StartApplication)
