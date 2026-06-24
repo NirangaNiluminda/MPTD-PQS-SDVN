@@ -196,7 +196,7 @@ bool g_enable_lstm_ae     = true; // effective value after dispatch (R7f)
 bool use_pq_crypto = true;
 
 // ── TRS scheme selector (paper §3.5.4 Eq 3.49; RQ5 PBPO baseline) ───────────
-// false (default) = real PQ CRYSTALS-Dilithium / ML-DSA-44 (DilithiumTrsBackend),
+// false (default) = real PQ CRYSTALS-Dilithium / ML-DSA-87 (DilithiumTrsBackend, NIST Level 5),
 //                   the paper-correct full-mode threshold ring signature.
 // true            = classical Shamir-Schnorr-P256 (ClassicalTrsBackend), kept ONLY
 //                   as the ECDSA-class signing-latency baseline for RQ5 (TRS-vs-ECDSA

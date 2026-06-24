@@ -68,7 +68,7 @@ int main(int argc, char *argv[])
                   "R7f: force LSTM-AE temporal detector on(1)/off(0); -1=follow ablation_mode",
                   g_enable_lstm_ae_cli);
     cmd.AddValue ("trs_classical",
-                  "TRS scheme: 0=PQ Dilithium/ML-DSA-44 (default, paper Eq 3.49), "
+                  "TRS scheme: 0=PQ Dilithium/ML-DSA-87 (default, paper Eq 3.49, NIST L5), "
                   "1=classical Shamir-Schnorr-P256 ECDSA-class baseline for RQ5 PBPO",
                   g_trs_classical_baseline);
     cmd.AddValue ("skip_blockchain",
