@@ -54,6 +54,14 @@ static void crypto_selftest_run()
     if (!crypto_selftest_enabled()) return;
 
     std::cout << "\n[CRYPTO/SELFTEST] starting — set MPTD_CRYPTO_SELFTEST=0 to disable\n";
+    // ── NIST Level 5 evidence banner (supervisor requirement) ─────────────
+    if (g_trs_backend)
+        std::cout << "  [LEVEL5] TRS backend: " << g_trs_backend->scheme_name()
+                  << "  (sig=" << g_trs_backend->expected_sig_size()
+                  << "B pk=" << g_trs_backend->expected_pk_size() << "B)\n";
+    if (g_thfhe_backend)
+        std::cout << "  [LEVEL5] FHE backend: " << g_thfhe_backend->scheme_name()
+                  << "  (ring_dim=" << g_thfhe_backend->ring_dim() << ")\n";
     int passed = 0, failed = 0;
     auto step = [&](const char* name, bool ok) {
         std::cout << "  [" << (ok ? "PASS" : "FAIL") << "] " << name << "\n";
