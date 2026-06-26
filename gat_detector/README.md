@@ -183,3 +183,24 @@ Phase 1b — calibrate per-node statistics on clean data
 python calibrate.py --scenario urban --clean_csv data/urban_clean.csv
 python calibrate.py --scenario suburban --clean_csv data/suburban_clean.csv
 python calibrate.py --scenario highway --clean_csv data/highway_clean.csv
+
+
+Phase 1c / Phase 2
+
+Not in this folder — LSTM-AE (Phase 1c) and fusion λ-learning (Phase 2) are
+separate components. This GAT pipeline outputs the spatial score S_i that feeds
+the fusion later.
+
+python score.py --scenario urban --attack_csv data/urban_attack.csv
+python score.py --scenario suburban --attack_csv data/suburban_attack.csv
+python score.py --scenario highway  --attack_csv data/highway_attack.csv
+
+
+
+
+6. If want run from the begining, Clean restart
+Remove-Item checkpoints\* -Force -ErrorAction SilentlyContinue
+Remove-Item outputs\*     -Force -ErrorAction SilentlyContinue
+Remove-Item data\*.csv    -Force -ErrorAction SilentlyContinue
+
+Then repeat from 4.
