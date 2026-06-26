@@ -1,5 +1,5 @@
 # Ignore everything
-*
+
 
 # ── Core NS-3 simulation code (C++ codebase) ──────────────────────────────────
 !analytics/
