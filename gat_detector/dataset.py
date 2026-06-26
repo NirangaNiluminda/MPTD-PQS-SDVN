@@ -88,6 +88,11 @@ def build_graph(df_t, cfg):
     )
     data.vid = torch.tensor(df_t["vehicle_id"].astype("category").cat.codes.values,
                             dtype=torch.long)
+    # Stable RAW vehicle ids (as strings), aligned with the node order. Phase 1b
+    # (calibrate.py) keys the per-node statistics x̄'_i, σ'_i by these, and score.py
+    # looks them up by the same id. Kept as a plain list so it is not collated by
+    # the DataLoader batching used in train.py.
+    data.node_ids = [str(v) for v in df_t["vehicle_id"].tolist()]
     # RSU EXTENSION POINT:
     #   add vehicle-RSU edges here and a node-type mask so RSU nodes are
     #   excluded from the loss in train.py.
