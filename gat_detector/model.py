@@ -28,9 +28,7 @@ import torch.nn.functional as F
 from torch_geometric.nn import GATConv
 
 
-# ─────────────────────────────────────────────────────────────────────────────
 # Shared encoder machinery (architecture supplied per scenario)
-# ─────────────────────────────────────────────────────────────────────────────
 class GATEncoder(nn.Module):
     def __init__(self, in_dim, hidden_dim, emb_dim, heads, dropout):
         super().__init__()
@@ -47,10 +45,7 @@ class GATEncoder(nn.Module):
         x_prime = self.gat2(h, edge_index)      # x'_i, Eq. 3.29
         return x_prime
 
-
-# ─────────────────────────────────────────────────────────────────────────────
 # Base scenario model: encoder + linear sigmoid head
-# ─────────────────────────────────────────────────────────────────────────────
 class _SceneGAT(nn.Module):
     """Base class for a single-scenario model. Subclasses set `scenario`."""
     scenario: str = "base"
@@ -72,20 +67,15 @@ class _SceneGAT(nn.Module):
 
     def embed(self, x, edge_index):
         return self.encoder(x, edge_index)
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # THE THREE SEPARATE MODELS
-# ─────────────────────────────────────────────────────────────────────────────
+
 class UrbanGAT(_SceneGAT):
     """Model 1 — dense urban traffic (largest architecture)."""
     scenario = "urban"
 
-
 class SuburbanGAT(_SceneGAT):
     """Model 2 — intermediate suburban traffic (medium architecture)."""
     scenario = "suburban"
-
 
 class HighwayGAT(_SceneGAT):
     """Model 3 — sparse highway platoons (smallest architecture)."""
@@ -98,8 +88,6 @@ MODEL_REGISTRY = {
     "suburban": SuburbanGAT,
     "highway": HighwayGAT,
 }
-
-
 def build_model(cfg, in_dim):
     """Return the correct scenario model (encoder + head) for Phase 1a training."""
     if cfg.name not in MODEL_REGISTRY:
