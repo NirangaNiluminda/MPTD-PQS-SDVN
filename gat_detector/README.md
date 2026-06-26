@@ -2,7 +2,7 @@
 
 This is the **GAT component** of the MPTD-PQS framework (the spatial anomaly
 detector, report §3.5.3 / Eqs. 3.26–3.29, 3.38). It is built to the supervised
-training design in your supervisor's modeling update (Phase 1a → 1b), runs on a
+training design in  modeling update (Phase 1a → 1b), runs on a
 **laptop CPU**, and uses **three separate models** (urban / suburban / highway).
 
 The LSTM-AE and the Phase-2 fusion are **separate** and not in this folder; this
@@ -53,35 +53,7 @@ Per scenario you produce two files:
 - `data/<scenario>_attack.csv` — NS-3 run **with** attacks, `label` ∈ {0,1}.
 - `data/<scenario>_clean.csv`  — NS-3 run **without** attacks, all `label`=0.
 
-**Don't have NS-3/SUMO output yet?** Develop against the included generator,
-which writes the identical schema:
-```bash
-python synthetic_data.py --scenario urban    --out data/urban
-python synthetic_data.py --scenario suburban --out data/suburban
-python synthetic_data.py --scenario highway  --out data/highway
-```
-When real data arrives, just drop your CSVs in `data/` with the same columns —
-no code changes.
-
----
-
-## 4. Workflow (run per scenario)
-
-```bash
-# PHASE 1a — supervised GAT training (class-weighted BCE, Eq. gat_loss)
-python train.py     --scenario urban --attack_csv data/urban_attack.csv
-
-# PHASE 1b — lock clean stats x̄'_i, σ'_i and threshold theta_S (Eq. 3.38)
-python calibrate.py --scenario urban --clean_csv  data/urban_clean.csv
-
-# INFERENCE / EVAL — compute S_i and metrics (MCC/F1/FPR, Eqs. 4.1–4.2)
-python score.py     --scenario urban --attack_csv data/urban_attack.csv
-```
-
-All three scenarios at once:
-```bash
-bash run_all.sh
-```
+*
 
 Artifacts:
 - `checkpoints/<scenario>_encoder.pt` — locked encoder (W_h, a_h) + the head
@@ -163,3 +135,51 @@ calibrate.py       Phase 1b: lock mu, sd, theta_S from clean embeddings (Eq. 3.3
 score.py           inference: S_i (Eq. 3.38) + head prob; MCC/F1/FPR
 run_all.sh         all three scenarios end-to-end
 ```
+
+
+# HOW TO RUN
+
+1. Only needed once.
+
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install torch
+pip install torch_geometric scikit-learn pandas numpy matplotlib
+
+2. Verify
+python -c "import torch, torch_geometric, sklearn, pandas; print('deps OK')"
+
+3. Confirm the three separate models
+python models_summary.py
+
+Expected:
+scenario   class        heads hidden  emb dropout  r_max  phi   params
+urban      UrbanGAT         8     64   32    0.20    300   45   136257
+suburban   SuburbanGAT      4     32   16    0.10    500   30     9505
+highway    HighwayGAT       2     16    8    0.05    800   15      849
+
+4. Get the data
+
+Option A: synthetic data (for development / demo)
+
+python synthetic_data.py --scenario urban    --out data/urban
+python synthetic_data.py --scenario suburban --out data/suburban
+python synthetic_data.py --scenario highway  --out data/highway
+
+Option B: real NS-3/SUMO data
+Export to the exact schema in DATA_FORMAT.md (columns
+scenario, seed, t, vehicle_id, x, y, speed, heading, accel, label; heading in
+radians; x/y in metres). Drop the files in data/ with the same names. No code
+changes needed. Use several NS-3 seeds per scenario.
+
+
+5. Phase 1a — train the GAT (supervised, class-weighted BCE)
+python train.py --scenario urban --attack_csv data/urban_attack.csv
+python train.py --scenario suburban --attack_csv data/suburban_attack.csv
+python train.py --scenario highway --attack_csv data/highway_attack.csv
+
+Phase 1b — calibrate per-node statistics on clean data
+python calibrate.py --scenario urban --clean_csv data/urban_clean.csv
+python calibrate.py --scenario suburban --clean_csv data/suburban_clean.csv
+python calibrate.py --scenario highway --clean_csv data/highway_clean.csv
