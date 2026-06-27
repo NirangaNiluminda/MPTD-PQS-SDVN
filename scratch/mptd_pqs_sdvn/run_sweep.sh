@@ -111,6 +111,12 @@ for MODE in "${MODES[@]}"; do
         echo "[SWEEP] RUN  ${DONE}/${TOTAL} a=${ATK} p=${PCT} s=${SPD} m=${MODE}..."
 
         # Run simulation — output goes to /dev/null except errors
+        SYBIL_FLAG=""
+        if [ "${ATK}" -eq 3 ]; then
+          SYBIL_FLAG="--sybil_registration_pct=40"
+        fi
+
+        # Run simulation — output goes to /dev/null except errors
         if python3 waf --run \
               "mptd_pqs_sdvn \
               --routing_algorithm=4 \
@@ -119,8 +125,19 @@ for MODE in "${MODES[@]}"; do
               --attack_percentage=${PCT} \
               --maxspeed=${SPD} \
               --ablation_mode=${MODE} \
-              --simTime=${SIMTIME}" \
+              --simTime=${SIMTIME} \
+              ${SYBIL_FLAG}" \
               2>/dev/null ; then
+        # if python3 waf --run \
+        #       "mptd_pqs_sdvn \
+        #       --routing_algorithm=4 \
+        #       --routing_test=true \
+        #       --attack_number=${ATK} \
+        #       --attack_percentage=${PCT} \
+        #       --maxspeed=${SPD} \
+        #       --ablation_mode=${MODE} \
+        #       --simTime=${SIMTIME}" \
+        #       2>/dev/null ; then
           # Print the MCC from the generated CSV (last data line)
           if [ -f "$OUTFILE" ]; then
             MCC=$(tail -1 "$OUTFILE" | cut -d',' -f9)

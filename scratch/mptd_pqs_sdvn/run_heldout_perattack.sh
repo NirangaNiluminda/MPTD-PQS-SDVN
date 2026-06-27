@@ -28,11 +28,19 @@ mkdir -p "$LIVE"
 ts()  { date '+%H:%M:%S'; }
 log() { echo "[$(ts)] $*"; }
 
-run_sim() {  # atk pct mode rng
-  { echo "=========="; echo "[$(ts)] SIM a$1_p$2 mode=$3 RngRun=$4"; echo "=========="; } > "$SIMLOG"
+# run_sim() {  # atk pct mode rng
+#   { echo "=========="; echo "[$(ts)] SIM a$1_p$2 mode=$3 RngRun=$4"; echo "=========="; } > "$SIMLOG"
+#   ./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=200 \
+#     --skip_blockchain=true --ablation_mode=$3 --attack_number=$1 \
+#     --attack_percentage=$2 --maxspeed=$SPEED --simTime=$SIMTIME --RngRun=$4" \
+#     >> "$SIMLOG" 2>&1
+# }
+
+run_sim() {  # atk pct mode rng [extra_args]
+  { echo "=========="; echo "[$(ts)] SIM a$1_p$2 mode=$3 RngRun=$4 extra='${5:-}'"; echo "=========="; } > "$SIMLOG"
   ./waf --run "mptd_pqs_sdvn --mobility_source=1 --N_RSUs=64 --N_Vehicles=200 \
     --skip_blockchain=true --ablation_mode=$3 --attack_number=$1 \
-    --attack_percentage=$2 --maxspeed=$SPEED --simTime=$SIMTIME --RngRun=$4" \
+    --attack_percentage=$2 --maxspeed=$SPEED --simTime=$SIMTIME --RngRun=$4 ${5:-}" \
     >> "$SIMLOG" 2>&1
 }
 
@@ -44,7 +52,12 @@ for atk in 1 2 3 4 5 6 7; do
   for pct in 0 20 40 60 80 100; do
     s="a${atk}_p${pct}"
     log "===== ${s} : held-out sim (mode 1, RngRun=2) ====="
-    if run_sim "$atk" "$pct" 1 2; then
+    # if run_sim "$atk" "$pct" 1 2; then
+    EXTRA=""
+    if [ "$atk" -eq 3 ]; then
+      EXTRA="--sybil_registration_pct=40"
+    fi
+    if run_sim "$atk" "$pct" 1 2 "$EXTRA"; then
     REAL_DIR="$PROJ/real_data/a${atk}_p${pct}"
       mkdir -p "$REAL_DIR"
       cp "$RES/beacon_log.csv"       "$REAL_DIR/" 2>/dev/null || true

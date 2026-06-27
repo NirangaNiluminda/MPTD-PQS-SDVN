@@ -85,11 +85,24 @@ int main(int argc, char *argv[])
 
     // ── Apply ablation mode overrides ─────────────────────────────────────────
     // A4: disable TRS + FHE to measure cryptographic mitigation contribution (RQ5)
+    // if (ablation_mode == 4) {
+    //     use_pq_crypto = false;
+    //     std::cout << "[ABLATION] Mode A4: PQ crypto (TRS+FHE) DISABLED" << std::endl;
+    // }
+    // if (ablation_mode == 5) {
+    //     std::cout << "[ABLATION] Mode A5: Blockchain SC calls DISABLED" << std::endl;
+    // }
+
+    if (ablation_mode == 1) {
+        use_pq_crypto = false;
+        std::cout << "[ABLATION] Mode A1: PQ crypto (TRS+FHE) DISABLED (lightweight only)" << std::endl;
+    }
     if (ablation_mode == 4) {
         use_pq_crypto = false;
         std::cout << "[ABLATION] Mode A4: PQ crypto (TRS+FHE) DISABLED" << std::endl;
     }
     if (ablation_mode == 5) {
+        skip_blockchain = true;
         std::cout << "[ABLATION] Mode A5: Blockchain SC calls DISABLED" << std::endl;
     }
 

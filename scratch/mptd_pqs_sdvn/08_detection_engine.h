@@ -22,16 +22,16 @@
 
 #include <cmath>
 #include <sstream>
-#include <deque>          // CP-DETECT per-vehicle rolling RSU view window (Eq 3.59)
-#include <map>            // CP-DETECT per-vehicle window keyed by vehicle id
-#include <unordered_set>  // TASK ①-K: SCTrustFinalizeEpoch (vid,epoch) dedup
-#include <time.h>         // clock_gettime for PBPO timing
+#include <deque>         // CP-DETECT per-vehicle rolling RSU view window (Eq 3.59)
+#include <map>           // CP-DETECT per-vehicle window keyed by vehicle id
+#include <unordered_set> // TASK ①-K: SCTrustFinalizeEpoch (vid,epoch) dedup
+#include <time.h>        // clock_gettime for PBPO timing
 
 // ── Internal forward declarations ────────────────────────────────────────────
 static uint32_t nearest_rsu_for_position(double px, double py); // defined later in this file
-static uint32_t best_rsu_for_position(double px, double py,    // LL-based selection (§RSU-LL)
-                                       double vx, double vy,
-                                       uint32_t vid, bool is_mal);
+static uint32_t best_rsu_for_position(double px, double py,     // LL-based selection (§RSU-LL)
+                                      double vx, double vy,
+                                      uint32_t vid, bool is_mal);
 
 // ── Forward declarations (defined in 10_metrics_csv.h) ───────────────────────
 // 10_metrics_csv.h is included after this file in simulation.cc, so we
@@ -44,15 +44,15 @@ void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
                       double sim_t,
                       double real_px, double real_py,
                       double fake_px, double fake_py,
-                      double speed,   double heading, double accel,
+                      double speed, double heading, double accel,
                       double drift_x, double drift_y, double disp_err,
-                      bool   is_abrupt = false, double step_scaled = 0.0);
+                      bool is_abrupt = false, double step_scaled = 0.0);
 void log_rsu_relay(uint32_t vid, uint32_t rsu_id, double sim_t, bool is_poisoned,
                    double real_px, double real_py,
                    double recv_px, double recv_py,
-                   double speed,   double heading, double accel);
+                   double speed, double heading, double accel);
 void log_vehicle_tx(uint32_t vid, uint32_t nearest_rsu,
-                    double sim_t,   bool is_malicious,
+                    double sim_t, bool is_malicious,
                     double real_px, double real_py,
                     double sent_px, double sent_py,
                     double real_spd, double sent_spd,
@@ -72,7 +72,7 @@ void log_controller_poison(double sim_t,
                            uint32_t vehicle_id, uint32_t rsu_id,
                            double real_spd, double fake_spd,
                            double shift_factor,
-                           double real_hdg,  double fake_hdg,
+                           double real_hdg, double fake_hdg,
                            uint8_t alert_type, double spd_adv);
 // P6: SC-Register gate rejection logger (defined in 10_metrics_csv.h).
 // Called from handle_readone() when a vehicle's vid is not in
@@ -93,8 +93,8 @@ void log_unregistered_beacon_reject(uint32_t vid, uint32_t rsu_id, double sim_t,
 // per-(RSU,vehicle) refresh guard rate-limits vote SUBMISSION only (an anti-spam
 // network concern) — it does NOT gate detection or metrics. The same RSU re-votes
 // only after VOTE_REFRESH_SEC of continued flagging; distinct RSUs are unaffected.
-static const double VOTE_REFRESH_SEC = 15.0;   // ~T_w/2 (T_w default 30 s, chaincode side)
-static std::map<uint64_t, double> last_revoke_vote_ts;  // key = (rsu_idx<<32)|vid
+static const double VOTE_REFRESH_SEC = 15.0;           // ~T_w/2 (T_w default 30 s, chaincode side)
+static std::map<uint64_t, double> last_revoke_vote_ts; // key = (rsu_idx<<32)|vid
 
 // ============================================================
 // send_lkh_rekey_to_vehicles() — Real NS-3 rekey packet transmission
@@ -108,8 +108,8 @@ static std::map<uint64_t, double> last_revoke_vote_ts;  // key = (rsu_idx<<32)|v
 //   4. Receive side: HandleRekeyReceived() in 07_socket_layer.h
 // ============================================================
 static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
-                                        uint32_t rsu_id,
-                                        double   sim_time)
+                                       uint32_t rsu_id,
+                                       double sim_time)
 {
     // veh_idx of the revoked vehicle
     int rev_idx = lkh_veh_idx(revoked_vehicle_id);
@@ -121,7 +121,8 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
 
     // RSU rekey socket (set in 07_socket_layer.h StartApplication)
     Ptr<Socket> rekey_sock = (rsu_id < N_RSUs) ? g_rsu_rekey_socket[rsu_id] : nullptr;
-    if (!rekey_sock) {
+    if (!rekey_sock)
+    {
         cout << "[LKH-REKEY] WARNING: no rekey socket for RSU" << rsu_id << endl;
         return;
     }
@@ -130,8 +131,10 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
 
     // Send unicast RekeyTag only to the surviving members of the revoked
     // vehicle's ZONE (paper §3.5.2: rekey is zone-scoped, not network-wide).
-    for (int vi : g_lkh_affected_members) {
-        if (vi < 0 || vi >= LKH_MAX_VEH) continue;
+    for (int vi : g_lkh_affected_members)
+    {
+        if (vi < 0 || vi >= LKH_MAX_VEH)
+            continue;
         uint32_t veh_nid = (uint32_t)(vi + 2);
 
         // Increment nonce η_i → new K_i cannot be derived from the old one
@@ -153,26 +156,30 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
 
         // Unicast to vehicle's DSRC IP if known; otherwise broadcast on DSRC subnet
         int err = -1;
-        if (g_vehicle_ip_known[vi]) {
+        if (g_vehicle_ip_known[vi])
+        {
             // True unicast to this vehicle's DSRC address
             err = rekey_sock->SendTo(rk_pkt, 0,
-                      InetSocketAddress(g_vehicle_dsrc_ip[vi], LKH_REKEY_PORT));
+                                     InetSocketAddress(g_vehicle_dsrc_ip[vi], LKH_REKEY_PORT));
             cout << "[LKH-REKEY-TX] RSU" << rsu_id
                  << " → V" << vi
                  << " (" << g_vehicle_dsrc_ip[vi] << ":" << LKH_REKEY_PORT << ")"
                  << " nonce=" << g_vehicle_nonce[vi]
                  << " (unicast, Eq.3.33)" << endl;
-        } else {
+        }
+        else
+        {
             // Fallback: broadcast on DSRC subnet — vehicle filters by target_vehicle_id
             err = rekey_sock->SendTo(rk_pkt, 0,
-                      InetSocketAddress(Ipv4Address("3.255.255.255"), LKH_REKEY_PORT));
+                                     InetSocketAddress(Ipv4Address("3.255.255.255"), LKH_REKEY_PORT));
             cout << "[LKH-REKEY-TX] RSU" << rsu_id
                  << " → V" << vi
                  << " (broadcast fallback, IP not yet recorded)"
                  << " nonce=" << g_vehicle_nonce[vi] << endl;
         }
 
-        if (err >= 0) packets_sent++;
+        if (err >= 0)
+            packets_sent++;
     }
 
     cout << "[LKH-REKEY] Revoked V" << (revoked_vehicle_id - 2)
@@ -201,7 +208,8 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
 
 static std::unordered_set<uint64_t> g_lkh_rekey_seen;
 
-static inline uint64_t mptd_lkh_dedup_key(uint32_t vid, uint32_t rsu_id) {
+static inline uint64_t mptd_lkh_dedup_key(uint32_t vid, uint32_t rsu_id)
+{
     return (static_cast<uint64_t>(vid) << 32) | static_cast<uint64_t>(rsu_id);
 }
 
@@ -210,7 +218,8 @@ static inline uint64_t mptd_lkh_dedup_key(uint32_t vid, uint32_t rsu_id) {
 // event drainer should go through this so dedup is enforced in one place.
 static bool send_lkh_rekey_if_new(uint32_t vid, uint32_t rsu_id, double sim_time)
 {
-    if (!g_lkh_rekey_seen.insert(mptd_lkh_dedup_key(vid, rsu_id)).second) {
+    if (!g_lkh_rekey_seen.insert(mptd_lkh_dedup_key(vid, rsu_id)).second)
+    {
         return false;
     }
     send_lkh_rekey_to_vehicles(vid, rsu_id, sim_time);
@@ -226,10 +235,13 @@ static bool send_lkh_rekey_if_new(uint32_t vid, uint32_t rsu_id, double sim_time
 static void mptd_drain_and_dispatch_fabric_events()
 {
     std::vector<MptdFabricEvent> events;
-    if (mptd_fabric_drain_events(events)) {
+    if (mptd_fabric_drain_events(events))
+    {
         double now = Simulator::Now().GetSeconds();
-        for (const auto& ev : events) {
-            if (ev.name != "SCRevoke") {
+        for (const auto &ev : events)
+        {
+            if (ev.name != "SCRevoke")
+            {
                 // CPDetectFlag (and any other non-revoke event) is observed only
                 // — no rekey trigger. NOTE: the slow trust-decay path now also
                 // emits "SCRevoke" (paper §3.5.5 p.72 RevocationRequest), so it
@@ -243,14 +255,17 @@ static void mptd_drain_and_dispatch_fabric_events()
                           << " t=" << now << std::endl;
                 continue;
             }
-            if (ev.vehicle_id == 0) {
+            if (ev.vehicle_id == 0)
+            {
                 std::cout << "[FABRIC-EVT] SCRevoke with no parseable vehicleID,"
                           << " skipping: " << ev.payload << std::endl;
                 continue;
             }
             int dispatched = 0;
-            for (uint32_t rsu_id = 0; rsu_id < N_RSUs; ++rsu_id) {
-                if (send_lkh_rekey_if_new(ev.vehicle_id, rsu_id, now)) {
+            for (uint32_t rsu_id = 0; rsu_id < N_RSUs; ++rsu_id)
+            {
+                if (send_lkh_rekey_if_new(ev.vehicle_id, rsu_id, now))
+                {
                     ++dispatched;
                 }
             }
@@ -279,20 +294,21 @@ static void mptd_drain_and_dispatch_fabric_events()
 static void mptd_arm_event_drainer_once()
 {
     static std::once_flag armed;
-    std::call_once(armed, []() {
+    std::call_once(armed, []()
+                   {
         Simulator::Schedule(Seconds(0.5),
                             &mptd_drain_and_dispatch_fabric_events);
         std::cout << "[FABRIC-EVT] drainer armed @1Hz starting +0.5s "
-                  << "(paper §3.5.5 cross-RSU SCRevoke broadcast)" << std::endl;
-    });
+                  << "(paper §3.5.5 cross-RSU SCRevoke broadcast)" << std::endl; });
 }
 
 // Hook for the SC-Init bootstrap to force-arm the drainer when verifying the
 // cross-RSU path with a pre-seeded JSONL file. Wired from CallSCInitNetworkConfig.
 static inline void mptd_arm_event_drainer_if_env()
 {
-    const char* e = std::getenv("MPTD_FABRIC_EVT_FORCE_ARM");
-    if (e && *e && *e != '0') {
+    const char *e = std::getenv("MPTD_FABRIC_EVT_FORCE_ARM");
+    if (e && *e && *e != '0')
+    {
         mptd_arm_event_drainer_once();
     }
 }
@@ -313,24 +329,26 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     int curr = (vs.head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
 
     double dt = vs.timestamp[curr] - vs.timestamp[prev];
-    if (dt <= 0) dt = T_b; // fallback
+    if (dt <= 0)
+        dt = T_b; // fallback
 
     // TP-S1: kinematic position feasibility
     // ||p_i(t) - p_i(t-T_b)|| > s_max * T_b
     double dx = vs.pos_x[curr] - vs.pos_x[prev];
     double dy = vs.pos_y[curr] - vs.pos_y[prev];
-    double dist = std::sqrt(dx*dx + dy*dy);
+    double dist = std::sqrt(dx * dx + dy * dy);
     if (dist > s_max * dt)
         violated |= (1 << 0);
 
     // TP-S2: heading rate deviation
     // |θ_i(t) - θ_i(t-T_b)| > ω_max * T_b
     double dtheta = std::fabs(vs.heading[curr] - vs.heading[prev]);
-    if (dtheta > M_PI) dtheta = 2*M_PI - dtheta; // wrap
+    if (dtheta > M_PI)
+        dtheta = 2 * M_PI - dtheta; // wrap
     if (dtheta > omega_max * dt)
         violated |= (1 << 1);
 
-    // TP-S3: acceleration bound  (paper Eq 3.12)
+    // TP-S3: acceleration bound  (paper Eq 3.13)
     //   |a_i(t)| > a_max
     //
     // Two evaluation paths combined with OR — both are "the acceleration the
@@ -355,7 +373,7 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     // Both paths use the same a_max threshold (4 m/s² road-friction limit).
     {
         double a_reported = std::fabs(vs.accel[curr]);
-        double a_implied  = std::fabs(vs.speed[curr] - vs.speed[prev]) / dt;
+        double a_implied = std::fabs(vs.speed[curr] - vs.speed[prev]) / dt;
         if (a_reported > a_max || a_implied > a_max)
             violated |= (1 << 2);
     }
@@ -364,8 +382,8 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     // r_i(t) = ||p̂_i(t) - p_i(t)||, p̂ = p(t-1) + v(t-1)*dt
     double pred_x = vs.pos_x[prev] + vs.speed[prev] * std::cos(vs.heading[prev]) * dt;
     double pred_y = vs.pos_y[prev] + vs.speed[prev] * std::sin(vs.heading[prev]) * dt;
-    double residual = std::sqrt((vs.pos_x[curr]-pred_x)*(vs.pos_x[curr]-pred_x) +
-                                (vs.pos_y[curr]-pred_y)*(vs.pos_y[curr]-pred_y));
+    double residual = std::sqrt((vs.pos_x[curr] - pred_x) * (vs.pos_x[curr] - pred_x) +
+                                (vs.pos_y[curr] - pred_y) * (vs.pos_y[curr] - pred_y));
     if (residual > delta_th)
         violated |= (1 << 3);
 
@@ -373,19 +391,21 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     // Recompute rolling average over the last drift_window_k beacon pairs
     // using the circular position history already stored in vs.
     {
-        int avail = (vs.count >= 2) ? (vs.count - 1) : 0;  // pairs available
-        int k     = (avail < drift_window_k) ? avail : drift_window_k;
+        int avail = (vs.count >= 2) ? (vs.count - 1) : 0; // pairs available
+        int k = (avail < drift_window_k) ? avail : drift_window_k;
         double drift_sum = 0.0;
-        for (int step = 0; step < k; step++) {
+        for (int step = 0; step < k; step++)
+        {
             // pair: (head-2-step) → (head-1-step)  in circular buffer
-            int b_cur  = ((vs.head - 1 - step) + BEACON_HISTORY) % BEACON_HISTORY;
+            int b_cur = ((vs.head - 1 - step) + BEACON_HISTORY) % BEACON_HISTORY;
             int b_prev = ((vs.head - 2 - step) + BEACON_HISTORY) % BEACON_HISTORY;
             double dt_s = vs.timestamp[b_cur] - vs.timestamp[b_prev];
-            if (dt_s <= 0) dt_s = T_b;
+            if (dt_s <= 0)
+                dt_s = T_b;
             double px_hat = vs.pos_x[b_prev] + vs.speed[b_prev] * std::cos(vs.heading[b_prev]) * dt_s;
             double py_hat = vs.pos_y[b_prev] + vs.speed[b_prev] * std::sin(vs.heading[b_prev]) * dt_s;
-            double r = std::sqrt((vs.pos_x[b_cur]-px_hat)*(vs.pos_x[b_cur]-px_hat) +
-                                 (vs.pos_y[b_cur]-py_hat)*(vs.pos_y[b_cur]-py_hat));
+            double r = std::sqrt((vs.pos_x[b_cur] - px_hat) * (vs.pos_x[b_cur] - px_hat) +
+                                 (vs.pos_y[b_cur] - py_hat) * (vs.pos_y[b_cur] - py_hat));
             drift_sum += r;
         }
         vs.drift_score = (k > 0) ? (drift_sum / k) : 0.0;
@@ -407,7 +427,7 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 
     // MP-S1: identity density check (Eq. 3.7)
     // |{ID_i : p_i ∈ A_j}| > N_Vehicles (threshold = expected legitimate count)
-    register_vehicle_at_rsu(rsu_id, vid, now);  // count++ for this real vehicle
+    register_vehicle_at_rsu(rsu_id, vid, now); // count++ for this real vehicle
     // MP-S1: Ghost count is now built by REAL ghost UDP packets transmitted by the
     // compromised RSU in handle_readone() (Fig 3.4 Steps 4-6).
     // Each ghost packet calls register_vehicle_at_rsu() here via HandleBeaconReceived()
@@ -438,8 +458,8 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     // Any beacon count > 4 at a single RSU indicates ghost injection. This is the
     // per-topology instantiation of the paper's area-density formula.
     double density_limit = (double)(N_Vehicles / N_RSUs); // per-RSU expected count = 4
-    bool count_exceeded  = (rsu_id >= 0 && rsu_id < total_size &&
-                            rsu_id_set[rsu_id].count > (int)density_limit);
+    bool count_exceeded = (rsu_id >= 0 && rsu_id < total_size &&
+                           rsu_id_set[rsu_id].count > (int)density_limit);
     bool ghost_seen_flag = (rsu_id >= 0 && rsu_id < total_size &&
                             rsu_id_set[rsu_id].ghost_seen);
     if ((count_exceeded || ghost_seen_flag) && tag.GetIsPoisoned())
@@ -467,16 +487,18 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     //
     // Cell-scope guard remains — honest cross-cell vehicles never paired.
     {
-        const int    MP_S2_K_MIN = 3;            // need ≥3 paired beacons
-        const int    MP_S2_K_MAX = (BEACON_HISTORY < 8) ? BEACON_HISTORY : 8;
-        const double NEAR_T_MAX  = 0.050;        // ignore pairs > 50 ms apart
-                                                  // (clearly different identities,
-                                                  // pairing would be meaningless)
+        const int MP_S2_K_MIN = 3; // need ≥3 paired beacons
+        const int MP_S2_K_MAX = (BEACON_HISTORY < 8) ? BEACON_HISTORY : 8;
+        const double NEAR_T_MAX = 0.050; // ignore pairs > 50 ms apart
+                                         // (clearly different identities,
+                                         // pairing would be meaningless)
 
         // a = vid (current beacon's vehicle), b = other
         VehicleBeaconState &va = vehicle_state[vid];
-        if (va.count >= MP_S2_K_MIN) {
-            for (int other = 0; other < total_size; other++) {
+        if (va.count >= MP_S2_K_MIN)
+        {
+            for (int other = 0; other < total_size; other++)
+            {
                 if (other == vid || vehicle_state[other].count < MP_S2_K_MIN)
                     continue;
                 VehicleBeaconState &vb = vehicle_state[other];
@@ -486,35 +508,49 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
                 int hb = (vb.head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
                 double cdx = vb.pos_x[hb] - va.pos_x[ha];
                 double cdy = vb.pos_y[hb] - va.pos_y[ha];
-                if (std::sqrt(cdx*cdx + cdy*cdy) >= R_max_comm) continue;
+                if (std::sqrt(cdx * cdx + cdy * cdy) >= R_max_comm)
+                    continue;
 
                 int K = (va.count < vb.count) ? va.count : vb.count;
-                if (K > MP_S2_K_MAX) K = MP_S2_K_MAX;
+                if (K > MP_S2_K_MAX)
+                    K = MP_S2_K_MAX;
 
                 int sync_hits = 0;
                 int sync_total = 0;
-                for (int k = 0; k < K; k++) {
+                for (int k = 0; k < K; k++)
+                {
                     int ia = (va.head - 1 - k + BEACON_HISTORY) % BEACON_HISTORY;
                     double ta = va.timestamp[ia];
-                    if (ta <= 0.0) continue;
+                    if (ta <= 0.0)
+                        continue;
                     // Find b's beacon nearest in time to ta
                     double best_dt = NEAR_T_MAX;
-                    bool   found   = false;
-                    for (int kk = 0; kk < vb.count && kk < BEACON_HISTORY; kk++) {
+                    bool found = false;
+                    for (int kk = 0; kk < vb.count && kk < BEACON_HISTORY; kk++)
+                    {
                         int ib = (vb.head - 1 - kk + BEACON_HISTORY) % BEACON_HISTORY;
                         double tb = vb.timestamp[ib];
-                        if (tb <= 0.0) continue;
+                        if (tb <= 0.0)
+                            continue;
                         double d = std::fabs(ta - tb);
-                        if (d < best_dt) { best_dt = d; found = true; }
+                        if (d < best_dt)
+                        {
+                            best_dt = d;
+                            found = true;
+                        }
                     }
-                    if (!found) continue;
+                    if (!found)
+                        continue;
                     sync_total++;
-                    if (best_dt < tau_sync) sync_hits++;
+                    if (best_dt < tau_sync)
+                        sync_hits++;
                 }
 
-                if (sync_total >= MP_S2_K_MIN) {
+                if (sync_total >= MP_S2_K_MIN)
+                {
                     double frac = (double)sync_hits / (double)sync_total;
-                    if (frac > rho_sync) {
+                    if (frac > rho_sync)
+                    {
                         violated |= (1 << 1);
                         cout << "[MP-S2-SYNC] V" << vid << " ↔ V" << other
                              << " sync_frac=" << std::fixed << std::setprecision(2)
@@ -536,14 +572,16 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     // MP-S4: ghost transit impossibility
     // d(r_j, r_k) / |t_j - t_k| > s_max
     // (simplified: check if same ID appearing at impossible distance in short time)
-    if (vehicle_state[vid].count >= 2) {
+    if (vehicle_state[vid].count >= 2)
+    {
         int prev = (vehicle_state[vid].head - 2 + BEACON_HISTORY) % BEACON_HISTORY;
         int curr = (vehicle_state[vid].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
         double tdiff = vehicle_state[vid].timestamp[curr] - vehicle_state[vid].timestamp[prev];
-        if (tdiff > 0) {
+        if (tdiff > 0)
+        {
             double ddx = vehicle_state[vid].pos_x[curr] - vehicle_state[vid].pos_x[prev];
             double ddy = vehicle_state[vid].pos_y[curr] - vehicle_state[vid].pos_y[prev];
-            double d = std::sqrt(ddx*ddx + ddy*ddy);
+            double d = std::sqrt(ddx * ddx + ddy * ddy);
             if (d / tdiff > s_max)
                 violated |= (1 << 3);
         }
@@ -594,34 +632,45 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
 
     // ── Step 1: collect speeds of vehicles in scope ──────────────────────────
     double speeds[64];
-    int    n_speeds = 0;
-    for (int v = 0; v < total_size && n_speeds < 64; v++) {
-        if (vehicle_state[v].count == 0) continue;
+    int n_speeds = 0;
+    for (int v = 0; v < total_size && n_speeds < 64; v++)
+    {
+        if (vehicle_state[v].count == 0)
+            continue;
         int h = (vehicle_state[v].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
-        if (!use_global) {
+        if (!use_global)
+        {
             double dx = vehicle_state[v].pos_x[h] - tag.GetPosX();
             double dy = vehicle_state[v].pos_y[h] - tag.GetPosY();
-            if (std::sqrt(dx*dx + dy*dy) >= R_max_comm) continue;
+            if (std::sqrt(dx * dx + dy * dy) >= R_max_comm)
+                continue;
         }
         speeds[n_speeds++] = vehicle_state[v].speed[h];
     }
 
-    if (n_speeds >= 3) {  // need at least 3 samples for a meaningful distribution
+    if (n_speeds >= 3)
+    { // need at least 3 samples for a meaningful distribution
         // ── Step 2: build P_t — current speed histogram, normalised to sum=1 ──
         double P_t[KL_BINS] = {};
-        for (int i = 0; i < n_speeds; i++) {
+        for (int i = 0; i < n_speeds; i++)
+        {
             int b = (int)(speeds[i] / s_max * KL_BINS);
-            if (b < 0)       b = 0;
-            if (b >= KL_BINS) b = KL_BINS - 1;
+            if (b < 0)
+                b = 0;
+            if (b >= KL_BINS)
+                b = KL_BINS - 1;
             P_t[b] += 1.0;
         }
-        for (int b = 0; b < KL_BINS; b++) P_t[b] /= (double)n_speeds;
+        for (int b = 0; b < KL_BINS; b++)
+            P_t[b] /= (double)n_speeds;
 
         // ── Step 3: initialise or update P_hist ─────────────────────────────
         int ri = (rsu_id >= 0 && rsu_id < N_RSUs) ? rsu_id : 0;
-        if (!kl_hist_ready[ri]) {
+        if (!kl_hist_ready[ri])
+        {
             // Cold start: set P_hist = P_t (first observation = baseline)
-            for (int b = 0; b < KL_BINS; b++) kl_hist[ri][b] = P_t[b];
+            for (int b = 0; b < KL_BINS; b++)
+                kl_hist[ri][b] = P_t[b];
             kl_hist_ready[ri] = true;
             // Cannot compute KL yet — need at least one historical reference.
             // Return without flagging on very first beacon.
@@ -629,16 +678,16 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
         }
         // Slow exponential moving average update of historical baseline
         for (int b = 0; b < KL_BINS; b++)
-            kl_hist[ri][b] = (1.0 - KL_ALPHA) * kl_hist[ri][b]
-                           +        KL_ALPHA   * P_t[b];
+            kl_hist[ri][b] = (1.0 - KL_ALPHA) * kl_hist[ri][b] + KL_ALPHA * P_t[b];
 
         // ── Step 4: compute D_KL(P_t ‖ P_hist) — paper Eq. 3.18 ────────────
         // Additive smoothing ε prevents log(0) when a bin is empty in either dist.
         const double EPS = 1e-6;
         double kl_div = 0.0;
-        for (int b = 0; b < KL_BINS; b++) {
-            double p = P_t[b]      + EPS;  // current distribution
-            double q = kl_hist[ri][b] + EPS;  // historical baseline
+        for (int b = 0; b < KL_BINS; b++)
+        {
+            double p = P_t[b] + EPS;         // current distribution
+            double q = kl_hist[ri][b] + EPS; // historical baseline
             kl_div += p * std::log(p / q);
         }
 
@@ -655,26 +704,30 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
         // Flag beacon only if D_KL > kappa_th AND |v − μ| > 2σ  (2-sigma rule).
         // This fires reliably when ALL/MOST beacons are boosted (MitM, attack 6)
         // while suppressing FP when only a minority are malicious (attack 2, attack 3).
-        if (kl_div > kappa_th) {
+        if (kl_div > kappa_th)
+        {
             double mu = 0.0;
-            for (int b = 0; b < KL_BINS; b++) {
-                double bc = (b + 0.5) * s_max / KL_BINS;  // bin centre
+            for (int b = 0; b < KL_BINS; b++)
+            {
+                double bc = (b + 0.5) * s_max / KL_BINS; // bin centre
                 mu += kl_hist[ri][b] * bc;
             }
             double var = 0.0;
-            for (int b = 0; b < KL_BINS; b++) {
-                double bc   = (b + 0.5) * s_max / KL_BINS;
+            for (int b = 0; b < KL_BINS; b++)
+            {
+                double bc = (b + 0.5) * s_max / KL_BINS;
                 double diff = bc - mu;
                 var += kl_hist[ri][b] * diff * diff;
             }
             double sigma = std::sqrt(var + 1e-6);
             double cur_spd = tag.GetSpeed();
-            if (std::fabs(cur_spd - mu) > 2.0 * sigma) {
-                violated |= (1 << 2);  // bit 2 = MP-S3
+            if (std::fabs(cur_spd - mu) > 2.0 * sigma)
+            {
+                violated |= (1 << 2); // bit 2 = MP-S3
                 cout << "[MP-S3-KL] RSU" << ri
                      << " D_KL=" << std::fixed << std::setprecision(4) << kl_div
                      << " cur_spd=" << cur_spd
-                     << " mu=" << mu << " 2σ=" << 2.0*sigma
+                     << " mu=" << mu << " 2σ=" << 2.0 * sigma
                      << " → individual speed anomaly confirmed" << endl;
             }
         }
@@ -740,19 +793,20 @@ uint32_t run_cp_detect(BsmBeaconTag &tag)
 // WRONG_ROUTING against clean RSU views ⇒ every beacon is a disagreement and
 // the window fills in ≤ K = 3 beacons.
 // ============================================================
-struct CpDetectVehicleWindow {
+struct CpDetectVehicleWindow
+{
     // Rolling per-beacon disagreement events for one vehicle.
     // Each entry corresponds to ONE controller decision that was audited.
-    std::deque<bool>     disagreed;       // (rsu_anom != ctrl_anom) for the beacon
-    std::deque<bool>     rsu_anom_hist;   // RSU view at decision time (audit log)
-    std::deque<bool>     ctrl_anom_hist;  // controller view at decision time (audit log)
-    std::deque<double>   psi_hist;        // RSU's ψ_i(t) at decision time
-    std::deque<uint32_t> rsu_ids;         // which RSU produced the view
+    std::deque<bool> disagreed;      // (rsu_anom != ctrl_anom) for the beacon
+    std::deque<bool> rsu_anom_hist;  // RSU view at decision time (audit log)
+    std::deque<bool> ctrl_anom_hist; // controller view at decision time (audit log)
+    std::deque<double> psi_hist;     // RSU's ψ_i(t) at decision time
+    std::deque<uint32_t> rsu_ids;    // which RSU produced the view
 };
 static std::map<uint32_t, CpDetectVehicleWindow> g_cp_detect_windows;
-static constexpr size_t CP_DETECT_WINDOW_K   = 3;  // = f + 1 + 1 (one slack)
-static constexpr size_t CP_DETECT_F          = 1;  // BFT byzantine bound
-static constexpr size_t CP_DETECT_THRESHOLD  = CP_DETECT_F + 1;  // Eq 3.59: f+1 = 2
+static constexpr size_t CP_DETECT_WINDOW_K = 3;                // = f + 1 + 1 (one slack)
+static constexpr size_t CP_DETECT_F = 1;                       // BFT byzantine bound
+static constexpr size_t CP_DETECT_THRESHOLD = CP_DETECT_F + 1; // Eq 3.59: f+1 = 2
 
 // TRS-verify gate (Algorithm 7 lines 2–6).
 //
@@ -769,17 +823,19 @@ static constexpr size_t CP_DETECT_THRESHOLD  = CP_DETECT_F + 1;  // Eq 3.59: f+1
 // (vehicle_id, rsu_id, alert_type, epoch) — R8 will replace with the actual
 // submission payload bytes the controller signed.
 static inline bool cp_detect_verify_trs(const uint8_t *sigma_trs,
-                                        size_t         sigma_len,
-                                        uint32_t       vehicle_id = 0,
-                                        uint32_t       rsu_id     = 0,
-                                        uint8_t        alert_type = 0)
+                                        size_t sigma_len,
+                                        uint32_t vehicle_id = 0,
+                                        uint32_t rsu_id = 0,
+                                        uint8_t alert_type = 0)
 {
-    if (sigma_trs == nullptr || sigma_len == 0) {
+    if (sigma_trs == nullptr || sigma_len == 0)
+    {
         // R6.5 path: no σ_TRS produced yet — Algorithm 7 gate (a) is a no-op
         // and gate (b) handles all detections in current builds.
         return true;
     }
-    if (!g_trs_backend || g_trs_ring_pks.empty()) {
+    if (!g_trs_backend || g_trs_ring_pks.empty())
+    {
         // Defensive: TRS backend not initialized → fail closed. This is a
         // configuration bug; CP-DETECT should not be invoked before
         // init_trs_backend() runs in 11_blockchain_setup.h.
@@ -788,14 +844,14 @@ static inline bool cp_detect_verify_trs(const uint8_t *sigma_trs,
     }
     std::vector<uint8_t> msg;
     msg.reserve(16);
-    msg.push_back((uint8_t)(vehicle_id      & 0xFF));
-    msg.push_back((uint8_t)((vehicle_id>>8) & 0xFF));
-    msg.push_back((uint8_t)((vehicle_id>>16)& 0xFF));
-    msg.push_back((uint8_t)((vehicle_id>>24)& 0xFF));
-    msg.push_back((uint8_t)(rsu_id          & 0xFF));
-    msg.push_back((uint8_t)((rsu_id>>8)     & 0xFF));
-    msg.push_back((uint8_t)((rsu_id>>16)    & 0xFF));
-    msg.push_back((uint8_t)((rsu_id>>24)    & 0xFF));
+    msg.push_back((uint8_t)(vehicle_id & 0xFF));
+    msg.push_back((uint8_t)((vehicle_id >> 8) & 0xFF));
+    msg.push_back((uint8_t)((vehicle_id >> 16) & 0xFF));
+    msg.push_back((uint8_t)((vehicle_id >> 24) & 0xFF));
+    msg.push_back((uint8_t)(rsu_id & 0xFF));
+    msg.push_back((uint8_t)((rsu_id >> 8) & 0xFF));
+    msg.push_back((uint8_t)((rsu_id >> 16) & 0xFF));
+    msg.push_back((uint8_t)((rsu_id >> 24) & 0xFF));
     msg.push_back(alert_type);
     // (R8: append epoch + RSU peer view bytes per Algorithm 7 line 3.)
     std::vector<uint8_t> sigma(sigma_trs, sigma_trs + sigma_len);
@@ -815,14 +871,14 @@ static inline bool cp_detect_verify_trs(const uint8_t *sigma_trs,
 //   rsu_psi             — RSU's ψ_i(t) for the beacon (audit log only).
 //   sigma_trs/sigma_len — R6 callers pass nullptr/0; R8 will pass the real
 //                         controller-as-peer σ_TRS attached to the submission.
-static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
-                                    uint32_t       rsu_id,
-                                    uint8_t        alert_type,
-                                    bool           controller_anomalous,
-                                    bool           rsu_anomalous,
-                                    double         rsu_psi,
+static bool run_cp_detect_per_epoch(uint32_t vehicle_id,
+                                    uint32_t rsu_id,
+                                    uint8_t alert_type,
+                                    bool controller_anomalous,
+                                    bool rsu_anomalous,
+                                    double rsu_psi,
                                     const uint8_t *sigma_trs = nullptr,
-                                    size_t         sigma_len = 0)
+                                    size_t sigma_len = 0)
 {
     g_cp_detect_epochs_evaluated++;
 
@@ -831,7 +887,8 @@ static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
     // R8 will start passing a real σ_TRS produced by the controller-as-peer
     // submission path; the call shape doesn't change.
     if (!cp_detect_verify_trs(sigma_trs, sigma_len,
-                              vehicle_id, rsu_id, alert_type)) {
+                              vehicle_id, rsu_id, alert_type))
+    {
         g_cp_detect_trs_fails++;
         g_cp_detect_alerts_total++;
         g_flag_c_active = true;
@@ -852,7 +909,8 @@ static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
     w.ctrl_anom_hist.push_back(controller_anomalous);
     w.psi_hist.push_back(rsu_psi);
     w.rsu_ids.push_back(rsu_id);
-    while (w.disagreed.size() > CP_DETECT_WINDOW_K) {
+    while (w.disagreed.size() > CP_DETECT_WINDOW_K)
+    {
         w.disagreed.pop_front();
         w.rsu_anom_hist.pop_front();
         w.ctrl_anom_hist.pop_front();
@@ -861,17 +919,22 @@ static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
     }
 
     size_t disagreement_count = 0;
-    for (bool d : w.disagreed) if (d) disagreement_count++;
+    for (bool d : w.disagreed)
+        if (d)
+            disagreement_count++;
 
-    if (disagreement_count >= CP_DETECT_THRESHOLD) {
+    if (disagreement_count >= CP_DETECT_THRESHOLD)
+    {
         g_cp_detect_conflict_fires++;
         g_cp_detect_alerts_total++;
         g_flag_c_active = true;
 
         // Build a compact audit dump of the window.
         std::ostringstream peer_dump;
-        for (size_t k = 0; k < w.disagreed.size(); k++) {
-            if (k) peer_dump << ",";
+        for (size_t k = 0; k < w.disagreed.size(); k++)
+        {
+            if (k)
+                peer_dump << ",";
             peer_dump << "RSU" << w.rsu_ids[k]
                       << "(ψ=" << std::fixed << std::setprecision(2) << w.psi_hist[k]
                       << ",rsu=" << (w.rsu_anom_hist[k] ? "ANOM" : "CLEAN")
@@ -913,22 +976,23 @@ static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
 //                               total       1.00
 // ============================================================
 static const double SIG_WEIGHTS[9] = {
-    0.15,  // TP-S1
-    0.10,  // TP-S2
-    0.10,  // TP-S3
-    0.15,  // TP-S4
-    0.15,  // TP-S5
-    0.15,  // MP-S1
-    0.05,  // MP-S2
-    0.10,  // MP-S3
-    0.05,  // MP-S4
+    0.15, // TP-S1
+    0.10, // TP-S2
+    0.10, // TP-S3
+    0.15, // TP-S4
+    0.15, // TP-S5
+    0.15, // MP-S1
+    0.05, // MP-S2
+    0.10, // MP-S3
+    0.05, // MP-S4
 };
 
 bool run_lightweight_score(uint32_t tp_flags, uint32_t mp_flags)
 {
     uint32_t all_flags = tp_flags | (mp_flags << 5);
     double psi = 0.0;
-    for (int k = 0; k < 9; k++) {
+    for (int k = 0; k < 9; k++)
+    {
         if (all_flags & (1u << k))
             psi += SIG_WEIGHTS[k];
     }
@@ -960,14 +1024,15 @@ bool run_lightweight_score(uint32_t tp_flags, uint32_t mp_flags)
 // beacon — it pops the RSU-pushed vehicle_state entry first, then calls this
 // again so the modified kinematics are scored.
 // ============================================================
-struct LwDetectResult {
-    uint32_t tp_flags;      // bits 0..4 = TP-S1..S5
-    uint32_t mp_flags;      // bits 0..3 = MP-S1..S4 (after SYB ∪ MITM)
-    uint32_t cp_flags;      // CP-DETECT raw bits
-    uint32_t sig_violated;  // packed: tp | (mp<<5) | (cp<<9)
-    double   psi;           // ψ_i(t) composite (Eq. 3.20)
-    bool     anomalous;     // ψ_i > ψ_th
-    bool     detected;      // anomalous || (CP fired for attack 7) || B1 LTT
+struct LwDetectResult
+{
+    uint32_t tp_flags;     // bits 0..4 = TP-S1..S5
+    uint32_t mp_flags;     // bits 0..3 = MP-S1..S4 (after SYB ∪ MITM)
+    uint32_t cp_flags;     // CP-DETECT raw bits
+    uint32_t sig_violated; // packed: tp | (mp<<5) | (cp<<9)
+    double psi;            // ψ_i(t) composite (Eq. 3.20)
+    bool anomalous;        // ψ_i > ψ_th
+    bool detected;         // anomalous || (CP fired for attack 7) || B1 LTT
 };
 
 LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
@@ -978,7 +1043,7 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     r.tp_flags = r.mp_flags = r.cp_flags = r.sig_violated = 0;
     r.psi = 0.0;
     r.anomalous = false;
-    r.detected  = false;
+    r.detected = false;
 
     // 1. Push new beacon into circular state buffer
     push_beacon((int)vehicle_id,
@@ -989,25 +1054,27 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     // 2. Run detection algorithms
     // B1 ablation (mode=6): Ghaleb (2014) LTT — two rule checks only, no MPTD-PQS sigs
     // All other modes: full MPTD-PQS pipeline (Algorithms 1–4)
-    g_save_restore_context = false;  // unused — kept for compilation
-    if (ablation_mode != 6) {
-        r.tp_flags  = run_tp_detect((int)vehicle_id, tag);              // Alg 1: TP-S1..S5
-        r.mp_flags  = run_syb_detect((int)vehicle_id, (int)rsu_id, tag);// Alg 2: MP-S1,S2,S4
+    g_save_restore_context = false; // unused — kept for compilation
+    if (ablation_mode != 6)
+    {
+        r.tp_flags = run_tp_detect((int)vehicle_id, tag);                   // Alg 1: TP-S1..S5
+        r.mp_flags = run_syb_detect((int)vehicle_id, (int)rsu_id, tag);     // Alg 2: MP-S1,S2,S4
         uint32_t mitm = run_mitm_detect((int)vehicle_id, (int)rsu_id, tag); // Alg 3: MP-S3
         r.mp_flags |= mitm;
-        r.cp_flags  = run_cp_detect(tag);                               // Alg 4: CP
+        r.cp_flags = run_cp_detect(tag); // Alg 4: CP
     }
-    g_save_restore_context = false;  // reset after detection to prevent leakage
+    g_save_restore_context = false; // reset after detection to prevent leakage
 
     // 3. Composite sig bitmask + lightweight score gate (Eq. 3.20)
     r.sig_violated = r.tp_flags | (r.mp_flags << 5) | (r.cp_flags << 9);
-    r.anomalous    = run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4));
+    r.anomalous = run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4));
 
     // 4. ψ_i(t) — same weights as run_lightweight_score (used for SC-Trust)
     {
         uint32_t all_f = r.tp_flags | (r.mp_flags << 5);
         for (int k = 0; k < 9; k++)
-            if (all_f & (1u << k)) r.psi += SIG_WEIGHTS[k];
+            if (all_f & (1u << k))
+                r.psi += SIG_WEIGHTS[k];
     }
 
     // 5. Detection decision
@@ -1019,10 +1086,13 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     // here would mark every attack-{5,7} beacon as detected — generating FPs on the
     // ~(1-attack_pct)% of beacons that were NOT modified by the controller, which
     // collapses MCC to zero (same failure mode this follow-up was created to fix).
-    if (ablation_mode == 6) {
+    if (ablation_mode == 6)
+    {
         // B1: Ghaleb (2014) LTT baseline
         r.detected = run_ltt_detect(vehicle_id, rsu_id, tag);
-    } else {
+    }
+    else
+    {
         // MPTD-PQS: composite score gate (Eq. 3.20) — kinematic-signature only.
         r.detected = r.anomalous;
     }
@@ -1038,22 +1108,34 @@ void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
                       uint32_t sig_violated)
 {
     total_trajectories_received++;
-    if (is_poisoned) total_trajectories_poisoned++;
+    if (is_poisoned)
+        total_trajectories_poisoned++;
 
-    if (is_poisoned) {
+    if (is_poisoned)
+    {
         // Determine violated signature string
         std::ostringstream sig_str;
-        if (sig_violated & (1<<0)) sig_str << "TP-S1,";
-        if (sig_violated & (1<<1)) sig_str << "TP-S2,";
-        if (sig_violated & (1<<2)) sig_str << "TP-S3,";
-        if (sig_violated & (1<<3)) sig_str << "TP-S4,";
-        if (sig_violated & (1<<4)) sig_str << "TP-S5,";
-        if (sig_violated & (1<<5)) sig_str << "MP-S1,";
-        if (sig_violated & (1<<6)) sig_str << "MP-S2,";
-        if (sig_violated & (1<<7)) sig_str << "MP-S3,";
-        if (sig_violated & (1<<8)) sig_str << "MP-S4,";
+        if (sig_violated & (1 << 0))
+            sig_str << "TP-S1,";
+        if (sig_violated & (1 << 1))
+            sig_str << "TP-S2,";
+        if (sig_violated & (1 << 2))
+            sig_str << "TP-S3,";
+        if (sig_violated & (1 << 3))
+            sig_str << "TP-S4,";
+        if (sig_violated & (1 << 4))
+            sig_str << "TP-S5,";
+        if (sig_violated & (1 << 5))
+            sig_str << "MP-S1,";
+        if (sig_violated & (1 << 6))
+            sig_str << "MP-S2,";
+        if (sig_violated & (1 << 7))
+            sig_str << "MP-S3,";
+        if (sig_violated & (1 << 8))
+            sig_str << "MP-S4,";
         std::string s = sig_str.str();
-        if (!s.empty() && s.back() == ',') s.pop_back();
+        if (!s.empty() && s.back() == ',')
+            s.pop_back();
         std::cout << "[METRICS] TP attack=" << attack_num
                   << " vehicle=" << vehicle_id
                   << " rsu=" << rsu_id
@@ -1065,7 +1147,9 @@ void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
                   << " t=" << tag.GetTimestamp()
                   << " sig=" << s
                   << std::endl;
-    } else {
+    }
+    else
+    {
         std::cout << "[METRICS] TN attack=" << attack_num
                   << " vehicle=" << vehicle_id
                   << " rsu=" << rsu_id
@@ -1133,21 +1217,22 @@ void log_metrics_line(int attack_num, bool is_poisoned, uint32_t vehicle_id,
 // is fully real; only the c_j delivery is in-process. Ablation isolation
 // (TRS/FHE on-vs-off) does not depend on this transport.
 // ════════════════════════════════════════════════════════════════════════════
-struct FullModeCryptoResult {
-    bool   ran                  = false;
-    bool   trs_verified         = false;
-    bool   decrypt_ok           = false;
-    size_t contributing_rsus    = 0;
-    size_t sigma_bytes          = 0;
-    int64_t total_vehicles      = 0;
-    double recovered_mean_speed = 0.0;   // from threshold decrypt (Eq 3.56)
-    double plaintext_mean_speed = 0.0;   // local plaintext reference for sanity
-    double elapsed_ms           = 0.0;
+struct FullModeCryptoResult
+{
+    bool ran = false;
+    bool trs_verified = false;
+    bool decrypt_ok = false;
+    size_t contributing_rsus = 0;
+    size_t sigma_bytes = 0;
+    int64_t total_vehicles = 0;
+    double recovered_mean_speed = 0.0; // from threshold decrypt (Eq 3.56)
+    double plaintext_mean_speed = 0.0; // local plaintext reference for sanity
+    double elapsed_ms = 0.0;
 };
 
 // Full-mode crypto PBPO accounting (paper Eq 4.7, per-window W = L·T_b split).
-static uint64_t g_fullcrypto_runs       = 0;
-static double   g_fullcrypto_time_sum_ms = 0.0;
+static uint64_t g_fullcrypto_runs = 0;
+static double g_fullcrypto_time_sum_ms = 0.0;
 
 // Returns true iff the pipeline executed (verified or rejected). Caller gates on
 // full mode + use_pq_crypto; this function additionally requires both backends
@@ -1156,17 +1241,23 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
                                           FullModeCryptoResult &res)
 {
     // Only the ring coordinator drives one pipeline run per window (see note).
-    if (closing_rsu != 0) return false;
-    if (!use_pq_crypto)   return false;
-    if (!g_trs_ready || !g_trs_backend) return false;
-    if (!g_thfhe_backend || !g_thfhe_backend->ready()) return false;
+    if (closing_rsu != 0)
+        return false;
+    if (!use_pq_crypto)
+        return false;
+    if (!g_trs_ready || !g_trs_backend)
+        return false;
+    if (!g_thfhe_backend || !g_thfhe_backend->ready())
+        return false;
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
 
-    const uint32_t n = g_trs_ring_n;            // RSUs in the signing ring
-    auto append_u32 = [](std::vector<uint8_t> &v, uint32_t x) {
-        for (int b = 0; b < 4; b++) v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
+    const uint32_t n = g_trs_ring_n; // RSUs in the signing ring
+    auto append_u32 = [](std::vector<uint8_t> &v, uint32_t x)
+    {
+        for (int b = 0; b < 4; b++)
+            v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
     };
 
     // ── Algorithm 6 lines 2–3: each RSU computes A_j (Eq 3.45 mean) then FHE-
@@ -1175,59 +1266,68 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     // (mean = Σ / count, integer-exact in BFV — no FP inside ciphertext).
     std::vector<ThresholdBfvBackend::Ciphertext> c_j;
     std::vector<uint32_t> vehicle_union;
-    int64_t total_count   = 0;
-    int64_t pt_speed_sum  = 0;                  // plaintext reference only
-    for (uint32_t r = 0; r < n && r < MAX_RSUS; r++) {
-        if (!rsu_last_window_valid[r]) continue;
+    int64_t total_count = 0;
+    int64_t pt_speed_sum = 0; // plaintext reference only
+    for (uint32_t r = 0; r < n && r < MAX_RSUS; r++)
+    {
+        if (!rsu_last_window_valid[r])
+            continue;
         const RsuBeaconWindow &rw = rsu_last_window[r];
         const uint32_t N = rw.beacon_count;
-        if (N == 0) continue;
+        if (N == 0)
+            continue;
         int64_t s_speed = 0, s_px = 0, s_py = 0;
-        for (uint32_t i = 0; i < N; i++) {
+        for (uint32_t i = 0; i < N; i++)
+        {
             s_speed += (int64_t)std::llround(rw.speed[i] * (double)ThresholdBfvBackend::SPEED_SCALE);
-            s_px    += (int64_t)std::llround(rw.pos_x[i] * (double)ThresholdBfvBackend::POS_SCALE);
-            s_py    += (int64_t)std::llround(rw.pos_y[i] * (double)ThresholdBfvBackend::POS_SCALE);
+            s_px += (int64_t)std::llround(rw.pos_x[i] * (double)ThresholdBfvBackend::POS_SCALE);
+            s_py += (int64_t)std::llround(rw.pos_y[i] * (double)ThresholdBfvBackend::POS_SCALE);
             vehicle_union.push_back(rw.vid[i]);
         }
-        std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
-        c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
-        total_count  += (int64_t)N;
+        std::vector<int64_t> A_r{s_speed, s_px, s_py, (int64_t)N};
+        c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r)); // Eq 3.46
+        total_count += (int64_t)N;
         pt_speed_sum += s_speed;
     }
-    if (c_j.empty()) return false;
+    if (c_j.empty())
+        return false;
     res.contributing_rsus = c_j.size();
-    res.total_vehicles    = total_count;
+    res.total_vehicles = total_count;
 
     // ── Algorithm 6 line 6: ring homomorphic add (Eq 3.47), ciphertext-only ──
     ThresholdBfvBackend::Ciphertext enc_ring = g_thfhe_backend->add_many(c_j);
 
     // ── Algorithm 6 line 7: bind ciphertext into TRS message (Eq 3.48) ───────
     std::vector<uint8_t> msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
-    append_u32(msg, g_trs_ring_t);              // t
-    append_u32(msg, closing_rsu);               // ID_S (ring identity)
-    append_u32(msg, epoch);                      // timestamp surrogate
-    for (uint32_t v : vehicle_union) append_u32(msg, v);   // h(S) material
+    append_u32(msg, g_trs_ring_t); // t
+    append_u32(msg, closing_rsu);  // ID_S (ring identity)
+    append_u32(msg, epoch);        // timestamp surrogate
+    for (uint32_t v : vehicle_union)
+        append_u32(msg, v); // h(S) material
 
     // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
     std::vector<std::vector<uint8_t>> partials;
     std::vector<uint32_t> signers;
-    for (uint32_t j = 0; j < g_trs_ring_t && j < g_trs_ring_n; j++) {
+    for (uint32_t j = 0; j < g_trs_ring_t && j < g_trs_ring_n; j++)
+    {
         std::vector<uint8_t> p;
-        if (!g_trs_backend->partial_sign(msg, g_trs_ring_sks[j], p)) return false;
+        if (!g_trs_backend->partial_sign(msg, g_trs_ring_sks[j], p))
+            return false;
         partials.push_back(std::move(p));
-        signers.push_back(j + 1);               // 1-indexed signer ids
+        signers.push_back(j + 1); // 1-indexed signer ids
     }
     std::vector<uint8_t> sigma_trs;
-    if (!g_trs_backend->aggregate(partials, signers, sigma_trs)) return false;
+    if (!g_trs_backend->aggregate(partials, signers, sigma_trs))
+        return false;
     res.sigma_bytes = sigma_trs.size();
 
     // ── Cloud-side Eq 3.51: TRS-verify gate. Reject before any decryption ────
     res.trs_verified = g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
-    if (!res.trs_verified) {
-        g_trs_rejected_count++;                 // PARR numerator (Eq 4.3)
+    if (!res.trs_verified)
+    {
+        g_trs_rejected_count++; // PARR numerator (Eq 4.3)
         clock_gettime(CLOCK_MONOTONIC, &t1);
-        res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                       + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+        res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         g_fullcrypto_runs++;
         g_fullcrypto_time_sum_ms += res.elapsed_ms;
         res.ran = true;
@@ -1240,20 +1340,19 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     ThresholdBfvBackend::Ciphertext enc_global = enc_ring;
 
     // ── Algorithm 7 (THRESH-DEC): cloud(lead) + t−1 RSU partials (Eq 3.53–3.56)
-    std::vector<uint32_t> present;              // t−1 RSUs; cloud auto-added
-    for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++) present.push_back(j);
+    std::vector<uint32_t> present; // t−1 RSUs; cloud auto-added
+    for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++)
+        present.push_back(j);
     std::vector<int64_t> out_vec;
     res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
-    if (res.decrypt_ok && total_count > 0) {
-        res.recovered_mean_speed = (double)out_vec[0]
-                                 / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
-        res.plaintext_mean_speed = (double)pt_speed_sum
-                                 / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
+    if (res.decrypt_ok && total_count > 0)
+    {
+        res.recovered_mean_speed = (double)out_vec[0] / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
+        res.plaintext_mean_speed = (double)pt_speed_sum / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
-    res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
-                   + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0 + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     g_fullcrypto_runs++;
     g_fullcrypto_time_sum_ms += res.elapsed_ms;
     res.ran = true;
@@ -1280,7 +1379,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // Ghost packets skip: TP/SYB/MITM detection, confusion matrix, beacon_log.csv,
     //                     downlink response — they are purely density-injection packets.
     static const uint32_t GHOST_VID_BASE = 10000;
-    if (vehicle_id >= GHOST_VID_BASE) {
+    if (vehicle_id >= GHOST_VID_BASE)
+    {
         bool is_new_ghost = register_vehicle_at_rsu((int)rsu_id, vehicle_id, now);
         // Mark this RSU's window as ghost-infected — used for CSMA-order-robust detection.
         // Even if CSMA interleaving delivers this ghost after the real beacon, the NEXT
@@ -1294,7 +1394,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         // per RSU cell → est_count >> gt_count → TDEE rises proportional to ghost count.
         {
             uint32_t ghost_rsu = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
-            if (ghost_rsu < N_RSUs) tdee_est_count[ghost_rsu]++;
+            if (ghost_rsu < N_RSUs)
+                tdee_est_count[ghost_rsu]++;
         }
         cout << "[MP-S1-GHOST-RX] ghost_id=" << vehicle_id
              << " RSU" << rsu_id
@@ -1316,16 +1417,18 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // vid_idx = vehicle_id - 2  (NodeID offset: controller=0, management=1, vehicles=2..N+1)
     // sybil_mitm_nodes[vid_idx] = true only for pre-registered AND runtime-active Sybil.
     if (attack_number == 3 && sybil_registration_pct > 0 &&
-        vehicle_id >= 2 && (int)vehicle_id < 2 + total_size) {
+        vehicle_id >= 2 && (int)vehicle_id < 2 + total_size)
+    {
         int vid_idx = (int)vehicle_id - 2;
-        if (vid_idx >= 0 && vid_idx < total_size && sybil_mitm_nodes[vid_idx]) {
+        if (vid_idx >= 0 && vid_idx < total_size && sybil_mitm_nodes[vid_idx])
+        {
             tag.SetIsPoisoned(true);
             tag.SetAttackType(3);
             // Accumulate displacement error for TDEE/TPE (position drift is small by design)
             double drift_err = std::sqrt(
-                std::pow(tag.GetPosX() - tag.GetPosX(), 2) +  // placeholder: real pos not here
-                std::pow(tag.GetPosY() - tag.GetPosY(), 2));  // TDEE accumulated at send side
-            (void)drift_err;  // send_lte_dataunicast_alone() already accumulated TDEE/TPE
+                std::pow(tag.GetPosX() - tag.GetPosX(), 2) + // placeholder: real pos not here
+                std::pow(tag.GetPosY() - tag.GetPosY(), 2)); // TDEE accumulated at send side
+            (void)drift_err;                                 // send_lte_dataunicast_alone() already accumulated TDEE/TPE
         }
     }
 
@@ -1344,17 +1447,17 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         rsu_id < N_RSUs &&
         compromised_rsu[rsu_id])
     {
-        double real_px  = tag.GetPosX();
-        double real_py  = tag.GetPosY();
+        double real_px = tag.GetPosX();
+        double real_py = tag.GetPosY();
         double real_spd = tag.GetSpeed();
         double real_hdg = tag.GetHeading();
         double real_acc = tag.GetAcceleration();
-        double t        = Simulator::Now().GetSeconds();
+        double t = Simulator::Now().GetSeconds();
 
-        double drift_x  = poisoning_intensity_theta * max_position_deviation * sin(t * 0.7);
-        double drift_y  = poisoning_intensity_theta * max_position_deviation * cos(t * 0.5);
-        double fake_px  = real_px + drift_x;
-        double fake_py  = real_py + drift_y;
+        double drift_x = poisoning_intensity_theta * max_position_deviation * sin(t * 0.7);
+        double drift_y = poisoning_intensity_theta * max_position_deviation * cos(t * 0.5);
+        double fake_px = real_px + drift_x;
+        double fake_py = real_py + drift_y;
         fake_px = (fake_px < min_position_x) ? min_position_x : (fake_px > max_position_x ? max_position_x : fake_px);
         fake_py = (fake_py < min_position_y) ? min_position_y : (fake_py > max_position_y ? max_position_y : fake_py);
 
@@ -1362,10 +1465,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tag.SetIsPoisoned(true);
         tag.SetAttackType(1);
 
-        double dx       = fake_px - real_px;
-        double dy       = fake_py - real_py;
-        double disp_err = std::sqrt(dx*dx + dy*dy);
-        tpe_sq_sum += disp_err * disp_err;   // TPE: injection magnitude for malicious beacon
+        double dx = fake_px - real_px;
+        double dy = fake_py - real_py;
+        double disp_err = std::sqrt(dx * dx + dy * dy);
+        tpe_sq_sum += disp_err * disp_err; // TPE: injection magnitude for malicious beacon
         tpe_cnt++;
 
         bool det_likely = (disp_err > s_max * T_b);
@@ -1378,14 +1481,15 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
              << "  (drift " << std::showpos << drift_x << std::noshowpos << " m)" << endl;
         cout << "  pos_y " << real_py << " → " << fake_py
              << "  (drift " << std::showpos << drift_y << std::noshowpos << " m)" << endl;
-        cout << "  disp_err=" << disp_err << " m  s_max*T_b=" << s_max*T_b
+        cout << "  disp_err=" << disp_err << " m  s_max*T_b=" << s_max * T_b
              << "  detect=" << (det_likely ? "LIKELY" : "below-threshold") << endl;
-        cout << "[TP-S1-DEBUG] ══════════════════════════════════════════════\n" << endl;
+        cout << "[TP-S1-DEBUG] ══════════════════════════════════════════════\n"
+             << endl;
 
         log_tp_s1_poison(vehicle_id, rsu_id, t,
                          real_px, real_py, fake_px, fake_py,
                          real_spd, real_hdg, real_acc,
-                         drift_x,  drift_y,  disp_err);
+                         drift_x, drift_y, disp_err);
     }
 
     // ── MP-S1: Compromised RSU injects ghost vehicle IDs (attack_number==3) ──────
@@ -1401,7 +1505,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         tag.SetAttackType(3);
         double now_t = Simulator::Now().GetSeconds();
         double ghost_err = R_max_comm * poisoning_intensity_theta;
-        tpe_sq_sum += ghost_err * ghost_err;   // TPE: ghost displacement magnitude
+        tpe_sq_sum += ghost_err * ghost_err; // TPE: ghost displacement magnitude
         tpe_cnt++;
         cout << "[MP-S1-RSU] RSU " << rsu_id << " ghosting V" << vehicle_id
              << " at t=" << now_t << endl;
@@ -1411,7 +1515,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // Paper (Fig 3.6 Step 6): Controller receives forged beacons and merges them into
     // its global learning model. Over time, accumulated false speed/location data
     // corrupts the learned mobility patterns and the model sends back degraded control.
-    if (attack_number == 6 && tag.GetIsPoisoned()) {
+    if (attack_number == 6 && tag.GetIsPoisoned())
+    {
         cout << "[A6-STEP6] Controller aggregating MitM-poisoned V" << vehicle_id
              << " data: spd=" << std::fixed << std::setprecision(2) << tag.GetSpeed()
              << " pos(" << tag.GetPosX() << "," << tag.GetPosY() << ")"
@@ -1438,12 +1543,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     {
         double real_spd = tag.GetSpeed();
         double real_hdg = tag.GetHeading();
-        double t_mp4    = Simulator::Now().GetSeconds();
+        double t_mp4 = Simulator::Now().GetSeconds();
         // Systematic speed elevation: shifts regional distribution ~25-50% above normal.
         // kl_approx = |fake_spd - mean| / (mean + s_max*0.1); with mean≈15, fake≈22-30 m/s:
         // (22-15)/18.3 ≈ 0.38 per vehicle — collectively shifts distribution > κ_th=1.5.
-        double shift    = 1.0 + 0.5 * poisoning_intensity_theta
-                              + 0.2 * poisoning_intensity_theta * std::sin(t_mp4 * 0.3);
+        double shift = 1.0 + 0.5 * poisoning_intensity_theta + 0.2 * poisoning_intensity_theta * std::sin(t_mp4 * 0.3);
         double fake_spd = real_spd * shift;
         // Slight heading noise to corrupt mobility pattern vectors
         double fake_hdg = real_hdg + 0.15 * poisoning_intensity_theta * std::sin(t_mp4 * 0.7);
@@ -1452,11 +1556,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         fake_spd = (fake_spd > sp_ceil) ? sp_ceil : fake_spd;
         tag.SetSpeed(fake_spd);
         tag.SetHeading(fake_hdg);
-        tag.SetIsPoisoned(true);     // controller-poisoned beacon
+        tag.SetIsPoisoned(true); // controller-poisoned beacon
         tag.SetAttackType(7);
         // Accumulate TPE using speed-displacement proxy (speed error × T_b = distance proxy)
         double spd_disp = std::fabs(fake_spd - real_spd) * T_b;
-        tpe_sq_sum += spd_disp * spd_disp;   // TPE: speed-shift magnitude for malicious beacon
+        tpe_sq_sum += spd_disp * spd_disp; // TPE: speed-shift magnitude for malicious beacon
         tpe_cnt++;
         cout << "[MP-S4-CTRL] controller poisoned global model V" << vehicle_id
              << " spd " << real_spd << "->" << fake_spd << endl;
@@ -1484,29 +1588,27 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         controller_malicious_assumption &&
         GetBooleanWithProbability(attack_percentage, vehicle_id))
     {
-        double real_px  = tag.GetPosX();
-        double real_py  = tag.GetPosY();
+        double real_px = tag.GetPosX();
+        double real_py = tag.GetPosY();
         double real_spd = tag.GetSpeed();
-        double t_cp     = Simulator::Now().GetSeconds();
+        double t_cp = Simulator::Now().GetSeconds();
         // Controller applies sinusoidal position drift + speed perturbation
-        double fake_px  = real_px  + poisoning_intensity_theta * max_position_deviation
-                                   * std::sin(t_cp * 1.1);
-        double fake_py  = real_py  + poisoning_intensity_theta * max_position_deviation
-                                   * std::cos(t_cp * 0.9);
+        double fake_px = real_px + poisoning_intensity_theta * max_position_deviation * std::sin(t_cp * 1.1);
+        double fake_py = real_py + poisoning_intensity_theta * max_position_deviation * std::cos(t_cp * 0.9);
         double fake_spd = real_spd * (1.0 + poisoning_intensity_theta * std::sin(t_cp * 2.3));
         // Clamp to simulation area (kept as ternary for legibility; std::max
         // is now safe after R6.5 renamed the global `max` macro to MPTD_MAX_NEIGHBORS).
-        fake_px  = (fake_px  < min_position_x) ? min_position_x : (fake_px  > max_position_x ? max_position_x : fake_px);
-        fake_py  = (fake_py  < min_position_y) ? min_position_y : (fake_py  > max_position_y ? max_position_y : fake_py);
-        fake_spd = (fake_spd < 0.0)            ? 0.0            : (fake_spd > s_max * 1.5     ? s_max * 1.5    : fake_spd);
+        fake_px = (fake_px < min_position_x) ? min_position_x : (fake_px > max_position_x ? max_position_x : fake_px);
+        fake_py = (fake_py < min_position_y) ? min_position_y : (fake_py > max_position_y ? max_position_y : fake_py);
+        fake_spd = (fake_spd < 0.0) ? 0.0 : (fake_spd > s_max * 1.5 ? s_max * 1.5 : fake_spd);
         tag.SetPosition(fake_px, fake_py);
         tag.SetSpeed(fake_spd);
         tag.SetIsPoisoned(true);
         tag.SetAttackType(5);
         // Accumulate TPE (controller-introduced displacement error for malicious beacon)
         double dx = fake_px - real_px, dy = fake_py - real_py;
-        double disp_err = std::sqrt(dx*dx + dy*dy);
-        tpe_sq_sum += disp_err * disp_err;   // TPE: injection magnitude
+        double disp_err = std::sqrt(dx * dx + dy * dy);
+        tpe_sq_sum += disp_err * disp_err; // TPE: injection magnitude
         tpe_cnt++;
         cout << "[TP-S3-CTRL] controller corrupted V" << vehicle_id
              << " pos(" << real_px << "," << real_py
@@ -1545,10 +1647,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // attack 4 (MP-S2) / attack 6 (MP-S3): stolen/intercepted ID uses victim's vehicle_id.
     //   Attacker's fake position stored in victim's vehicle_state → FP on next honest beacon.
     bool save_state = ((attack_number == 1) || (attack_number == 4) ||
-                       (attack_number == 5) || (attack_number == 6))
-                   && (vehicle_id < (uint32_t)total_size)
-                   && tag.GetIsPoisoned()
-                   && !sybil_mitm_nodes[vehicle_id]; // intercepted/stolen ID = honest vehicle
+                       (attack_number == 5) || (attack_number == 6)) &&
+                      (vehicle_id < (uint32_t)total_size) && tag.GetIsPoisoned() && !sybil_mitm_nodes[vehicle_id]; // intercepted/stolen ID = honest vehicle
     VehicleBeaconState vs_backup;
     if (save_state)
         vs_backup = vehicle_state[vehicle_id];
@@ -1558,10 +1658,12 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // est_count[rsu_rep]++ : estimated   — where reported position maps (may differ if forged)
     // Placed AFTER all attack injection blocks so tag.GetPosX()/GetPosY() is the
     // final forged position the controller actually sees.
-    if (rsu_id < N_RSUs) {
+    if (rsu_id < N_RSUs)
+    {
         tdee_gt_count[rsu_id]++;
         uint32_t rsu_rep = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
-        if (rsu_rep < N_RSUs) tdee_est_count[rsu_rep]++;
+        if (rsu_rep < N_RSUs)
+            tdee_est_count[rsu_rep]++;
     }
 
     // ── R1: LW-DETECT result dispatch (paper §3.5.3 Algorithm 1, Fig 3.10) ───
@@ -1589,45 +1691,50 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 
     uint32_t sig_violated = 0;
     uint32_t tp_flags = 0, mp_flags = 0, cp_flags = 0;
-    (void)cp_flags;   // R7f.followup-1: cp_flags is unpacked for SC-Trust sigmask
-                      // bookkeeping only; per-beacon detection no longer uses it
-                      // (CDER tracks CP-DETECT effectiveness instead).
-    double   psi = 0.0;
-    bool     anomalous = false;
-    bool     detected  = false;
+    (void)cp_flags; // R7f.followup-1: cp_flags is unpacked for SC-Trust sigmask
+                    // bookkeeping only; per-beacon detection no longer uses it
+                    // (CDER tracks CP-DETECT effectiveness instead).
+    double psi = 0.0;
+    bool anomalous = false;
+    bool detected = false;
 
     bool controller_modified = (attack_number == 5 || attack_number == 7);
 
-    if (!tag.GetLwDetectionRan()) {
+    if (!tag.GetLwDetectionRan())
+    {
         // Path A: RSU did not run LW-DETECT (legacy !g_option_b_active path).
         // Run it here. Push happens inside the helper.
         LwDetectResult ctrl_lw = run_lw_detect_per_beacon(vehicle_id, tag, rsu_id);
-        tp_flags     = ctrl_lw.tp_flags;
-        mp_flags     = ctrl_lw.mp_flags;
-        cp_flags     = ctrl_lw.cp_flags;
+        tp_flags = ctrl_lw.tp_flags;
+        mp_flags = ctrl_lw.mp_flags;
+        cp_flags = ctrl_lw.cp_flags;
         sig_violated = ctrl_lw.sig_violated;
-        psi          = ctrl_lw.psi;
-        anomalous    = ctrl_lw.anomalous;
-        detected     = ctrl_lw.detected;
-    } else if (controller_modified) {
+        psi = ctrl_lw.psi;
+        anomalous = ctrl_lw.anomalous;
+        detected = ctrl_lw.detected;
+    }
+    else if (controller_modified)
+    {
         // Path C: controller modified the beacon (attacks 5/7) — re-run LW-DETECT
         // on the new kinematics. Pop the RSU-pushed unmodified entry first so
         // velocity / drift checks see the modified beacon as the "current" sample.
         pop_last_beacon((int)vehicle_id);
         LwDetectResult ctrl_lw = run_lw_detect_per_beacon(vehicle_id, tag, rsu_id);
-        tp_flags     = ctrl_lw.tp_flags;
-        mp_flags     = ctrl_lw.mp_flags;
-        cp_flags     = ctrl_lw.cp_flags;
+        tp_flags = ctrl_lw.tp_flags;
+        mp_flags = ctrl_lw.mp_flags;
+        cp_flags = ctrl_lw.cp_flags;
         sig_violated = ctrl_lw.sig_violated;
-        psi          = ctrl_lw.psi;
-        anomalous    = ctrl_lw.anomalous;
-        detected     = ctrl_lw.detected;
-    } else {
+        psi = ctrl_lw.psi;
+        anomalous = ctrl_lw.anomalous;
+        detected = ctrl_lw.detected;
+    }
+    else
+    {
         // Path B: use RSU-cached result (attacks 1-4, 6, and clean beacons).
         // No push, no detection — the RSU is authoritative per paper §3.5.3.
         sig_violated = tag.GetSigViolated();
-        psi          = tag.GetLwPsi();
-        anomalous    = tag.GetLwAnomalous();
+        psi = tag.GetLwPsi();
+        anomalous = tag.GetLwAnomalous();
         // Reconstruct unpacked component flags (used by SC-Trust sigmask + log)
         tp_flags = sig_violated & 0x1F;
         mp_flags = (sig_violated >> 5) & 0x0F;
@@ -1635,9 +1742,12 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         // Detection decision matches helper's logic (R7f.followup-1: cp_flags is a
         // system-level signal for CDER, not per-beacon evidence — see line ~803 helper
         // for the full rationale.  Kinematic signatures own per-beacon detection.)
-        if (ablation_mode == 6) {
+        if (ablation_mode == 6)
+        {
             detected = run_ltt_detect(vehicle_id, rsu_id, tag);
-        } else {
+        }
+        else
+        {
             detected = anomalous;
         }
     }
@@ -1652,8 +1762,9 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // (attacks 4/6 with MP-S4 fired): a different attacker beacon uses the victim's
     // vehicle_id, so the victim's vehicle_state[vid] is polluted by a third-party
     // position. Restore here keeps per-vehicle state per-identity.
-    if (save_state) {
-        bool should_restore = (mp_flags & (1u << 3));   // MP-S4 fired: stolen-ID case only
+    if (save_state)
+    {
+        bool should_restore = (mp_flags & (1u << 3)); // MP-S4 fired: stolen-ID case only
         if (should_restore)
             vehicle_state[vehicle_id] = vs_backup;
     }
@@ -1683,27 +1794,30 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // via g_first_vehicle_node_id (see 04_state_globals.h, 12_main.h). Without
     // this conversion (prior bug) prediction-for-V_A was compared against GT-of-V_B,
     // which produced ~300 m baseline displacement instead of ~0 m.
-    if (g_mobility_provider && vehicle_id >= g_first_vehicle_node_id) {
+    if (g_mobility_provider && vehicle_id >= g_first_vehicle_node_id)
+    {
         const uint32_t vid_local = vehicle_id - g_first_vehicle_node_id;
-        if (vid_local < (uint32_t)total_size) {
+        if (vid_local < (uint32_t)total_size)
+        {
             TpeObs &prev = tpe_last_obs[vid_local];
-            if (prev.has_obs && now > prev.t) {
-                const double dt    = now - prev.t;
-                const double vx    = prev.speed * std::cos(prev.heading);
-                const double vy    = prev.speed * std::sin(prev.heading);
+            if (prev.has_obs && now > prev.t)
+            {
+                const double dt = now - prev.t;
+                const double vx = prev.speed * std::cos(prev.heading);
+                const double vy = prev.speed * std::sin(prev.heading);
                 const double pred_x = prev.px + vx * dt;
                 const double pred_y = prev.py + vy * dt;
                 const Vector gt = g_mobility_provider->get_gt_position(vid_local);
                 const double dx = pred_x - gt.x;
                 const double dy = pred_y - gt.y;
-                tpe_disp_sum += std::sqrt(dx*dx + dy*dy);
+                tpe_disp_sum += std::sqrt(dx * dx + dy * dy);
                 tpe_disp_cnt++;
             }
-            prev.px      = tag.GetPosX();
-            prev.py      = tag.GetPosY();
-            prev.speed   = tag.GetSpeed();
+            prev.px = tag.GetPosX();
+            prev.py = tag.GetPosY();
+            prev.speed = tag.GetSpeed();
             prev.heading = tag.GetHeading();
-            prev.t       = now;
+            prev.t = now;
             prev.has_obs = true;
         }
     }
@@ -1715,17 +1829,22 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // stats-only push — the authoritative control decision is owned by the RSU
     // (R2). The rollover hook is currently a no-op log stub (R7+ will replace
     // the log with the actual GAT + LSTM-AE invocation).
-    if (rsu_id < N_RSUs) {
+    if (rsu_id < N_RSUs)
+    {
         ControllerWindow &cw = ctrl_window[rsu_id];
-        if (cw.beacon_count == 0) cw.window_start = now;
+        if (cw.beacon_count == 0)
+            cw.window_start = now;
         cw.beacon_count++;
-        if (anomalous)           cw.anomalous_count++;
-        if (is_poisoned)         cw.poisoned_count++;
+        if (anomalous)
+            cw.anomalous_count++;
+        if (is_poisoned)
+            cw.poisoned_count++;
         cw.psi_sum += psi;
         // Window rollover: every L beacons OR every W = L · T_b seconds elapsed.
         bool by_count = (cw.beacon_count >= (uint32_t)WINDOW_L_BEACONS);
-        bool by_time  = (now - cw.window_start >= WINDOW_L_BEACONS * T_b);
-        if (by_count || by_time) {
+        bool by_time = (now - cw.window_start >= WINDOW_L_BEACONS * T_b);
+        if (by_count || by_time)
+        {
             cout << "[CTRL-WIN-" << rsu_id << "] epoch=" << cw.window_epoch
                  << " beacons=" << cw.beacon_count
                  << " anomalous=" << cw.anomalous_count
@@ -1741,9 +1860,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             // and B1 (LTT baseline); TRS/FHE gated by use_pq_crypto (off for A4).
             // Independent of the AI block below — crypto runs even when GAT/AE are
             // disabled (A4/A5), preserving ablation isolation (paper §4.1.1).
-            if (use_pq_crypto && ablation_mode != 1 && ablation_mode != 6) {
+            if (use_pq_crypto && ablation_mode != 1 && ablation_mode != 6)
+            {
                 FullModeCryptoResult cr;
-                if (run_full_mode_crypto_pipeline(rsu_id, cw.window_epoch, cr) && cr.ran) {
+                if (run_full_mode_crypto_pipeline(rsu_id, cw.window_epoch, cr) && cr.ran)
+                {
                     cout << "[FULLCRYPTO] epoch=" << cw.window_epoch
                          << " rings=" << cr.contributing_rsus
                          << " veh=" << cr.total_vehicles
@@ -1755,6 +1876,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                          << " mean_speed_pt=" << cr.plaintext_mean_speed
                          << " " << std::setprecision(2) << cr.elapsed_ms << "ms"
                          << " (Alg6/7 Eq 3.45-3.56)" << endl;
+
+                    if (!cr.trs_verified)
+                    {
+                        parr_trs_rejected += cw.poisoned_count;
+                    }
                 }
             }
 
@@ -1770,30 +1896,38 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             // LSTM-AE temporal scoring needs a per-vehicle 20-beacon sliding
             // ring buffer that we do NOT yet maintain — R7e adds that ring and
             // wires score_lstm_ae() into the same window-close hook.
-            if (g_ai_engine.ready() && rsu_id < N_RSUs && rsu_last_window_valid[rsu_id]) {
+            if (g_ai_engine.ready() && rsu_id < N_RSUs && rsu_last_window_valid[rsu_id])
+            {
                 const RsuBeaconWindow &rw = rsu_last_window[rsu_id];
                 const int N = (int)rw.beacon_count;
-                if (N > 0) {
+                if (N > 0)
+                {
                     // ── 1. GAT spatial scores (one per row of the L-beacon window) ──
                     std::vector<float> feats5(N * 5);
-                    for (int i = 0; i < N; ++i) {
-                        feats5[i*5 + 0] = (float)rw.pos_x[i];
-                        feats5[i*5 + 1] = (float)rw.pos_y[i];
-                        feats5[i*5 + 2] = (float)rw.speed[i];
-                        feats5[i*5 + 3] = (float)rw.heading[i];
-                        feats5[i*5 + 4] = (float)rw.accel[i];
+                    for (int i = 0; i < N; ++i)
+                    {
+                        feats5[i * 5 + 0] = (float)rw.pos_x[i];
+                        feats5[i * 5 + 1] = (float)rw.pos_y[i];
+                        feats5[i * 5 + 2] = (float)rw.speed[i];
+                        feats5[i * 5 + 3] = (float)rw.heading[i];
+                        feats5[i * 5 + 4] = (float)rw.accel[i];
                     }
                     std::vector<float> gat_scores;
                     bool gat_ok = false;
-                    if (g_ai_engine.has_gat()) {
+                    if (g_ai_engine.has_gat())
+                    {
                         gat_ok = g_ai_engine.score_gat(
                             feats5.data(), N, nullptr, gat_scores);
                     }
-                    if (gat_ok) {
+                    if (gat_ok)
+                    {
                         double smin = gat_scores[0], smax = gat_scores[0], smean = 0.0;
-                        for (float s : gat_scores) {
-                            if (s < smin) smin = s;
-                            if (s > smax) smax = s;
+                        for (float s : gat_scores)
+                        {
+                            if (s < smin)
+                                smin = s;
+                            if (s > smax)
+                                smax = s;
                             smean += s;
                         }
                         smean /= (double)gat_scores.size();
@@ -1802,7 +1936,9 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                              << " min=" << std::fixed << std::setprecision(4) << smin
                              << " mean=" << smean << " max=" << smax
                              << " (paper §3.5.3 Eq 3.42)" << endl;
-                    } else if (g_ai_engine.has_gat()) {
+                    }
+                    else if (g_ai_engine.has_gat())
+                    {
                         // GAT enabled but inference failed — degrade to zeros so
                         // fusion still runs (ψ + ε will carry the decision).
                         gat_scores.assign(N, 0.0f);
@@ -1818,10 +1954,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                     // R7d's GAT-only log is preserved above; this adds per-vehicle
                     // fusion lines. ψ_total / Φ_total counters surface in metrics.
                     const float theta_ae = g_ai_engine.theta_ae();
-                    int        fused_count = 0;
-                    int        full_flag_count = 0;
-                    double     phi_sum = 0.0;
-                    double     phi_max = 0.0;
+                    int fused_count = 0;
+                    int full_flag_count = 0;
+                    double phi_sum = 0.0;
+                    double phi_max = 0.0;
 
                     // ── Per-window dedup for Eq 3.57 CSUBM (TASK ①-L) ─────────
                     // Multiple beacons from the same vehicle in one L-beacon
@@ -1832,24 +1968,30 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                     // to this window only; a fresh window starts a new set.
                     std::unordered_set<std::string> csubm_seen;
 
-                    for (int i = 0; i < N; ++i) {
+                    for (int i = 0; i < N; ++i)
+                    {
                         const uint32_t vid_i = rw.vid[i];
-                        if (vid_i >= (uint32_t)total_size) continue;
+                        if (vid_i >= (uint32_t)total_size)
+                            continue;
                         const float psi_i = (float)last_psi_per_vehicle[vid_i];
                         const float gat_i = gat_ok ? gat_scores[i] : 0.0f;
                         float ae_err = 0.0f;
-                        if (g_ai_engine.has_lstm_ae()) {
+                        if (g_ai_engine.has_lstm_ae())
+                        {
                             float ring_buf[LSTM_RING_SIZE * 5];
-                            if (lstm_ring_dump(vid_i, ring_buf)) {
+                            if (lstm_ring_dump(vid_i, ring_buf))
+                            {
                                 (void)g_ai_engine.score_lstm_ae(ring_buf, ae_err);
                             }
                         }
                         const FusionScore fs = fuse_scores(
                             psi_i, gat_i, ae_err, theta_ae);
                         fused_count++;
-                        if (fs.anomalous) full_flag_count++;
+                        if (fs.anomalous)
+                            full_flag_count++;
                         phi_sum += fs.phi;
-                        if (fs.phi > phi_max) phi_max = fs.phi;
+                        if (fs.phi > phi_max)
+                            phi_max = fs.phi;
 
                         // ── C1: score the full-mode Fusion verdict (Eq 3.45
                         // Φ_i > Φ_th) against this beacon's ground-truth poison
@@ -1860,17 +2002,18 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         // authoritative and this matrix is left empty. This is the
                         // window-close (W = L·T_b) controller-side scoring path —
                         // invariant #3 (LW skip-on-pass) is untouched.
-                        if (ablation_mode != 1 && ablation_mode != 6) {
+                        if (ablation_mode != 1 && ablation_mode != 6)
+                        {
                             update_confusion_matrix_full(
                                 rw.is_poisoned[i], fs.anomalous);
                         }
                         cout << "[FUSION-RSU" << rsu_id << "] epoch="
                              << cw.window_epoch
                              << " vid=" << vid_i
-                             << " psi="     << std::fixed << std::setprecision(3) << psi_i
-                             << " S="       << gat_i
+                             << " psi=" << std::fixed << std::setprecision(3) << psi_i
+                             << " S=" << gat_i
                              << " ae_norm=" << fs.ae_norm
-                             << " phi="     << fs.phi
+                             << " phi=" << fs.phi
                              << " full_anom=" << (fs.anomalous ? "YES" : "no")
                              << " (Eq 3.46)" << endl;
 
@@ -1918,10 +2061,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         //
                         // A5 ablation (no blockchain) and routing_test mode
                         // both skip — matches the RSU-side guards.
-                        if (!routing_test && ablation_mode != 5) {
-                            const double speed_i   = rw.speed[i];
+                        if (!routing_test && ablation_mode != 5)
+                        {
+                            const double speed_i = rw.speed[i];
                             const double heading_i = rw.heading[i];
-                            const double accel_i   = rw.accel[i];
+                            const double accel_i = rw.accel[i];
                             const double vx = speed_i * std::cos(heading_i);
                             const double vy = speed_i * std::sin(heading_i);
                             const double ax = accel_i * std::cos(heading_i);
@@ -1931,13 +2075,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 mptd_epoch_from_ts(rw.timestamp[i]);
                             std::string dedup_key =
                                 std::to_string(vid_i) + "|" + ctrl_epoch;
-                            if (csubm_seen.insert(dedup_key).second) {
+                            if (csubm_seen.insert(dedup_key).second)
+                            {
                                 std::string h_X = mptd_beacon_hash(
                                     std::to_string(vid_i),
-                                    "C",  // controller-view tag (RSU side uses rsu_idx;
-                                          // the canonical blob omits this field, so it
-                                          // is for documentary use only and does not
-                                          // affect the CID)
+                                    "C", // controller-view tag (RSU side uses rsu_idx;
+                                         // the canonical blob omits this field, so it
+                                         // is for documentary use only and does not
+                                         // affect the CID)
                                     rw.pos_x[i], rw.pos_y[i], 0.0,
                                     vx, vy, 0.0,
                                     ax, ay, 0.0,
@@ -2006,7 +2151,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 // the controller says anomaly" behaviour was an
                                 // Eq-3.68 violation and has been removed.
                                 static std::unordered_set<std::string> g_cpdetect_scheduled;
-                                static std::mutex                       g_cpdetect_mu;
+                                static std::mutex g_cpdetect_mu;
                                 std::string cp_key =
                                     std::to_string(vid_i) + "|" + ctrl_epoch;
                                 bool cp_first;
@@ -2014,22 +2159,24 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                     std::lock_guard<std::mutex> lk(g_cpdetect_mu);
                                     cp_first = g_cpdetect_scheduled.insert(cp_key).second;
                                 }
-                                if (cp_first) {
+                                if (cp_first)
+                                {
                                     Simulator::Schedule(Seconds(0.5),
-                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch,
-                                        controllerID);
+                                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch,
+                                                        controllerID);
                                 }
                             }
                         }
                     }
-                    if (fused_count > 0) {
+                    if (fused_count > 0)
+                    {
                         cout << "[FUSION-WIN-RSU" << rsu_id << "] epoch="
                              << cw.window_epoch
                              << " fused=" << fused_count
                              << " full_anom=" << full_flag_count
                              << " mean_phi=" << std::fixed << std::setprecision(4)
                              << (phi_sum / fused_count)
-                             << " max_phi="  << phi_max
+                             << " max_phi=" << phi_max
                              << " theta_ae=" << theta_ae
                              << " (paper §3.5.3 Eq 3.46, Φ_th=0.5)" << endl;
                     }
@@ -2037,11 +2184,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             }
             // ── End R7d/R7e ─────────────────────────────────────────────────────
 
-            cw.beacon_count    = 0;
+            cw.beacon_count = 0;
             cw.anomalous_count = 0;
-            cw.poisoned_count  = 0;
-            cw.psi_sum         = 0.0;
-            cw.window_start    = now;
+            cw.poisoned_count = 0;
+            cw.psi_sum = 0.0;
+            cw.window_start = now;
             cw.window_epoch++;
         }
     }
@@ -2065,7 +2212,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 
     // Update confusion matrix + beacon CSV log
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
-    if (tag.GetIsPoisoned()) parr_poisoned_total++;   // PARR denominator: total poisoned submissions
+    if (tag.GetIsPoisoned())
+        parr_poisoned_total++; // PARR denominator: total poisoned submissions
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
                       tp_flags | (mp_flags << 5), psi);
 
@@ -2075,8 +2223,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 
     // PBPO: stop timer and accumulate (§4.1.2 Eq 4.7)
     clock_gettime(CLOCK_MONOTONIC, &t_end);
-    double elapsed_ms = (t_end.tv_sec  - t_start.tv_sec)  * 1000.0
-                      + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
+    double elapsed_ms = (t_end.tv_sec - t_start.tv_sec) * 1000.0 + (t_end.tv_nsec - t_start.tv_nsec) / 1e6;
     pbpo_time_sum_ms += elapsed_ms;
     pbpo_cnt++;
 
@@ -2120,27 +2267,31 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // CDER (Eq.4.4) stays well-defined: exactly one control decision per beacon —
     // R2 fast-path for {2,3,4,6,clean}; controller-here for {1,5,7}.
     if (g_option_b_active && rsu_id < N_RSUs && g_mgmt_downlink_socket &&
-        (attack_number == 1 || attack_number == 5 || attack_number == 7)) {
+        (attack_number == 1 || attack_number == 5 || attack_number == 7))
+    {
         bool malicious_ctrl = (attack_number == 5 || attack_number == 7);
 
-        uint8_t  alert_type;
-        double   spd_advice;
+        uint8_t alert_type;
+        double spd_advice;
         uint32_t target_vid;
-        bool     bcast;
+        bool bcast;
 
-        if (malicious_ctrl) {
+        if (malicious_ctrl)
+        {
             // Malicious controller (attacks 5/7): hardcoded WRONG_ROUTING, broadcast.
-            alert_type = 2;                                  // WRONG_ROUTING
+            alert_type = 2; // WRONG_ROUTING
             spd_advice = detected ? (s_max * 0.5) : s_max;
-            target_vid = 0;                                  // 0 = all vehicles (broadcast)
-            bcast      = true;
-        } else {
+            target_vid = 0; // 0 = all vehicles (broadcast)
+            bcast = true;
+        }
+        else
+        {
             // attack_number == 1: honest controller, decision = f(cached LW result).
             // Paper Fig 3.1 Step 5-7: LW miss on RSU-poisoned data → deceived controller.
-            alert_type = detected ? 1 : 0;                   // ATTACK_DETECTED or CLEAN_ROUTING
+            alert_type = detected ? 1 : 0; // ATTACK_DETECTED or CLEAN_ROUTING
             spd_advice = detected ? (s_max * 0.5) : s_max;
-            target_vid = vehicle_id;                         // unicast: this vehicle's beacon
-            bcast      = false;
+            target_vid = vehicle_id; // unicast: this vehicle's beacon
+            bcast = false;
         }
 
         // ── A1-STEP5: Controller ingests RSU-poisoned beacon into its mobility view ──
@@ -2148,7 +2299,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         // learns an incorrect trajectory model and is deceived into believing that the
         // traffic situation is safe." (Stub: full GAT/LSTM-AE learning lands in R7+;
         // this marker records the controller's per-beacon exposure to corrupted state.)
-        if (attack_number == 1 && is_poisoned) {
+        if (attack_number == 1 && is_poisoned)
+        {
             cout << "[A1-STEP5] Controller learning from RSU" << rsu_id
                  << "-poisoned V" << vehicle_id
                  << " pos(" << std::fixed << std::setprecision(2)
@@ -2159,11 +2311,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         }
 
         DownlinkControlTag dl_tag;
-        dl_tag.SetVehicleId   (target_vid);
-        dl_tag.SetAlertType   (alert_type);
-        dl_tag.SetSpeedAdvice (spd_advice);
-        dl_tag.SetTimestamp   (Simulator::Now().GetSeconds());
-        dl_tag.SetRsuId       (rsu_id);
+        dl_tag.SetVehicleId(target_vid);
+        dl_tag.SetAlertType(alert_type);
+        dl_tag.SetSpeedAdvice(spd_advice);
+        dl_tag.SetTimestamp(Simulator::Now().GetSeconds());
+        dl_tag.SetRsuId(rsu_id);
 
         Ptr<Packet> dl_pkt = Create<Packet>(0);
         dl_pkt->AddPacketTag(dl_tag);
@@ -2171,28 +2323,32 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         // Management → RSU CSMA IP (10.1.1.x) port 8888
         // RSU handle_downlink_at_rsu() then forwards to vehicles on DSRC:9999
         int err = g_mgmt_downlink_socket->SendTo(
-                      dl_pkt, 0,
-                      InetSocketAddress(g_rsu_csma_ip[rsu_id], 8888));
+            dl_pkt, 0,
+            InetSocketAddress(g_rsu_csma_ip[rsu_id], 8888));
 
-        const char* alert_str = (alert_type == 0) ? "CLEAN_ROUTING" :
-                                (alert_type == 1) ? "ATTACK_DETECTED" :
-                                                    "WRONG_ROUTING";
-        const char* dl_fn     = bcast ? "centralized_dsrc_data_broadcast"
-                                      : "centralized_dsrc_data_unicast";
-        if (err >= 0) {
+        const char *alert_str = (alert_type == 0) ? "CLEAN_ROUTING" : (alert_type == 1) ? "ATTACK_DETECTED"
+                                                                                        : "WRONG_ROUTING";
+        const char *dl_fn = bcast ? "centralized_dsrc_data_broadcast"
+                                  : "centralized_dsrc_data_unicast";
+        if (err >= 0)
+        {
             // CDER (Eq.4.4): exactly one control decision per beacon.
             ctrl_decisions_total++;
             bool wrong;
-            if (malicious_ctrl) {
+            if (malicious_ctrl)
+            {
                 // Attacks 5/7: malicious controller's WRONG_ROUTING is always wrong.
                 wrong = true;
-            } else {
+            }
+            else
+            {
                 // Attack 1: honest controller — wrong iff (detected ⊻ is_poisoned)
                 //   FP: detected=true,  is_poisoned=false → ATTACK_DETECTED on clean
                 //   FN: detected=false, is_poisoned=true  → CLEAN_ROUTING on poisoned (DECEIVED)
                 wrong = (detected ? !is_poisoned : is_poisoned);
             }
-            if (wrong) ctrl_decisions_wrong++;
+            if (wrong)
+                ctrl_decisions_wrong++;
 
             // ── R6: CP-DETECT (paper Algorithm 7 / Eq 3.59) ─────────────────
             // Audit the controller's just-emitted decision against the RSU's
@@ -2211,15 +2367,16 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             //     window fills to threshold within K=3 beacons.
             // sigma_trs is nullptr/0 in R6; R8 will supply the real σ_TRS.
             bool controller_anomalous = (alert_type != 0);
-            bool   rsu_anomalous_cached = tag.GetLwAnomalous();
-            double rsu_psi_cached       = tag.GetLwPsi();
+            bool rsu_anomalous_cached = tag.GetLwAnomalous();
+            double rsu_psi_cached = tag.GetLwPsi();
             (void)run_cp_detect_per_epoch(vehicle_id, rsu_id, alert_type,
                                           controller_anomalous,
                                           rsu_anomalous_cached,
                                           rsu_psi_cached,
                                           nullptr, 0);
 
-            if (attack_number == 7) {
+            if (attack_number == 7)
+            {
                 // A7-STEP5-TX: Malicious controller sends WRONG_ROUTING to all vehicles.
                 // Paper Fig 3.7: Controller generates incorrect control packets from
                 // poisoned model and sends them back to RSU via control plane.
@@ -2227,13 +2384,17 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                      << " WRONG_ROUTING control packet (poisoned model output)"
                      << " vid=" << (bcast ? 0U : vehicle_id)
                      << "  [" << dl_fn << "]" << endl;
-            } else if (attack_number == 5) {
+            }
+            else if (attack_number == 5)
+            {
                 // attack_number == 5 (TP-S3, controller trajectory poisoning)
                 cout << "[A5-CTL-TX] Controller → RSU" << rsu_id
                      << " " << alert_str
                      << " (paper Fig 3.3 Step 5-7)"
                      << "  [" << dl_fn << "]" << endl;
-            } else {
+            }
+            else
+            {
                 // attack_number == 1: honest-but-deceived controller emission.
                 // ── A1-STEP6: Controller generates control decision from (poisoned) view ──
                 // Paper Fig 3.1 §3.4.1 page 25: "the controller generates incorrect
@@ -2283,19 +2444,19 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 void SimpleUdpApplication::handle_downlink_at_rsu(Ptr<Socket> socket)
 {
     Ptr<Packet> packet;
-    Address     from;
+    Address from;
     while ((packet = socket->RecvFrom(from)) != nullptr)
     {
         DownlinkControlTag dl_tag;
-        if (!packet->RemovePacketTag(dl_tag)) continue;
+        if (!packet->RemovePacketTag(dl_tag))
+            continue;
 
         uint32_t rsu_idx = GetNode()->GetId() - g_first_rsu_node_id;
-        uint32_t vid     = dl_tag.GetVehicleId();
-        double   t       = Simulator::Now().GetSeconds();
+        uint32_t vid = dl_tag.GetVehicleId();
+        double t = Simulator::Now().GetSeconds();
 
-        const char* alert_str = (dl_tag.GetAlertType() == 0) ? "CLEAN_ROUTING" :
-                                (dl_tag.GetAlertType() == 1) ? "ATTACK_DETECTED" :
-                                                               "WRONG_ROUTING";
+        const char *alert_str = (dl_tag.GetAlertType() == 0) ? "CLEAN_ROUTING" : (dl_tag.GetAlertType() == 1) ? "ATTACK_DETECTED"
+                                                                                                              : "WRONG_ROUTING";
         cout << "[DL-RSU" << rsu_idx << "-RX] from MGT"
              << " vid=" << vid
              << " alert=" << alert_str
@@ -2307,13 +2468,15 @@ void SimpleUdpApplication::handle_downlink_at_rsu(Ptr<Socket> socket)
         Ptr<Packet> fwd_pkt = Create<Packet>(0);
         fwd_pkt->AddPacketTag(dl_tag);
 
-        if (m_send_socket) {
+        if (m_send_socket)
+        {
             int err = m_send_socket->SendTo(
-                          fwd_pkt, 0,
-                          InetSocketAddress(Ipv4Address("3.255.255.255"), 9999));
-            const char* dl_fn = (vid == 0) ? "centralized_dsrc_data_broadcast"
+                fwd_pkt, 0,
+                InetSocketAddress(Ipv4Address("3.255.255.255"), 9999));
+            const char *dl_fn = (vid == 0) ? "centralized_dsrc_data_broadcast"
                                            : "centralized_dsrc_data_unicast";
-            if (err >= 0) {
+            if (err >= 0)
+            {
                 cout << "[DL-RSU" << rsu_idx << "-FWD] → V"
                      << (vid == 0 ? "ALL" : std::to_string(vid - 2))
                      << " :9999  [" << dl_fn << "]" << endl;
@@ -2324,13 +2487,16 @@ void SimpleUdpApplication::handle_downlink_at_rsu(Ptr<Socket> socket)
                 // origin of this packet (R5: A1-STEP6); the RSU is honest and just relays
                 // it onto DSRC. The vehicle plane now carries whatever the (deceived or
                 // accurate) controller decided — completing the Fig 3.1 5→6→7 chain.
-                if (attack_number == 1) {
+                if (attack_number == 1)
+                {
                     cout << "[A1-STEP7] RSU" << rsu_idx << " delivered controller's "
                          << alert_str << " to V"
                          << (vid == 0 ? "ALL" : std::to_string(vid - 2))
                          << " via DSRC  (paper Fig 3.1 Step 7)" << endl;
                 }
-            } else {
+            }
+            else
+            {
                 cout << "[DL-RSU" << rsu_idx << "-FWD-ERR] failed fwd vid=" << vid << endl;
             }
         }
@@ -2355,16 +2521,17 @@ void SimpleUdpApplication::handle_downlink_at_rsu(Ptr<Socket> socket)
 void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 {
     Ptr<Packet> packet;
-    Address     from;
+    Address from;
     while ((packet = socket->RecvFrom(from)) != nullptr)
     {
         BsmBeaconTag tag;
-        if (!packet->RemovePacketTag(tag)) continue; // not a BSM beacon
+        if (!packet->RemovePacketTag(tag))
+            continue; // not a BSM beacon
 
-        uint32_t nid     = GetNode()->GetId();
+        uint32_t nid = GetNode()->GetId();
         uint32_t rsu_idx = nid - g_first_rsu_node_id;
-        uint32_t vid     = tag.GetVehicleId();
-        double   t       = Simulator::Now().GetSeconds();
+        uint32_t vid = tag.GetVehicleId();
+        double t = Simulator::Now().GetSeconds();
 
         // Capture honest vehicle position BEFORE any RSU modification
         double real_px = tag.GetPosX();
@@ -2375,7 +2542,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         //  one should act — in NS-3 unicast this is automatic; this guard is a
         //  belt-and-suspenders check for the nearest-RSU logic in the vehicle TX.)
         uint32_t nearest = nearest_rsu_for_position(tag.GetPosX(), tag.GetPosY());
-        if (nearest != rsu_idx) {
+        if (nearest != rsu_idx)
+        {
             // Not our vehicle — silently drop
             continue;
         }
@@ -2385,7 +2553,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // Vehicle nid → veh_idx = nid - 2, stored in g_vehicle_dsrc_ip[veh_idx].
         {
             int v_idx = lkh_veh_idx(vid);
-            if (v_idx >= 0 && v_idx < LKH_MAX_VEH && !g_vehicle_ip_known[v_idx]) {
+            if (v_idx >= 0 && v_idx < LKH_MAX_VEH && !g_vehicle_ip_known[v_idx])
+            {
                 InetSocketAddress sender = InetSocketAddress::ConvertFrom(from);
                 g_vehicle_dsrc_ip[v_idx] = sender.GetIpv4();
                 g_vehicle_ip_known[v_idx] = true;
@@ -2409,9 +2578,11 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         struct timespec t_lw_start, t_lw_end;
         clock_gettime(CLOCK_MONOTONIC, &t_lw_start);
         bool hmac_gate_pass = true;
-        if (vid < 10000) {  // skip HMAC check for RSU-injected ghost packets
+        if (vid < 10000)
+        { // skip HMAC check for RSU-injected ghost packets
             int v_idx = lkh_veh_idx(vid);
-            if (v_idx >= 0 && v_idx < LKH_MAX_VEH && tag.GetHmacSet()) {
+            if (v_idx >= 0 && v_idx < LKH_MAX_VEH && tag.GetHmacSet())
+            {
                 uint8_t recv_mac[8];
                 tag.GetHmac(recv_mac);
                 bool mac_ok = lkh_verify_beacon_hmac(
@@ -2420,14 +2591,17 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     tag.GetSpeed(), tag.GetHeading(), tag.GetAcceleration(),
                     tag.GetTimestamp(), vid, recv_mac);
                 tag.SetHmacValid(mac_ok);
-                if (!mac_ok) {
+                if (!mac_ok)
+                {
                     hmac_gate_pass = false;
                     cout << "[LKH-HMAC-FAIL] RSU" << rsu_idx
                          << " V" << (vid - 2)
                          << " HMAC verification FAILED → beacon rejected"
                          << " t=" << t << endl;
                 }
-            } else if (v_idx >= 0 && !tag.GetHmacSet()) {
+            }
+            else if (v_idx >= 0 && !tag.GetHmacSet())
+            {
                 // No HMAC present — treat as HMAC failure (unauthenticated beacon)
                 hmac_gate_pass = false;
                 cout << "[LKH-HMAC-MISSING] RSU" << rsu_idx
@@ -2439,8 +2613,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // PBPO_LW: stop HMAC gate timer — captures RSU-side lightweight overhead per beacon.
         // Accumulated regardless of pass/fail so the mean reflects ALL beacon arrivals.
         clock_gettime(CLOCK_MONOTONIC, &t_lw_end);
-        pbpo_lw_time_sum_ms += (t_lw_end.tv_sec  - t_lw_start.tv_sec)  * 1000.0
-                             + (t_lw_end.tv_nsec - t_lw_start.tv_nsec) / 1e6;
+        pbpo_lw_time_sum_ms += (t_lw_end.tv_sec - t_lw_start.tv_sec) * 1000.0 + (t_lw_end.tv_nsec - t_lw_start.tv_nsec) / 1e6;
         pbpo_lw_cnt++;
 
         // ── LKH dynamic membership (paper §3.5.2, P1b-C) ─────────────────────────
@@ -2450,7 +2623,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // beacon — no cross-RSU key race. On a zone change this rotates K_i to the
         // new zone's leaf key for the NEXT beacon (per-RSU-contact keys, Eq 3.22).
         // Only on a genuine HMAC pass (don't register a vehicle off a forged beacon).
-        if (vid < 10000 && hmac_gate_pass) {
+        if (vid < 10000 && hmac_gate_pass)
+        {
             int mv_idx = lkh_veh_idx(vid);
             if (mv_idx >= 0 && mv_idx < LKH_MAX_VEH)
                 lkh_on_beacon_at_rsu((int)rsu_idx, mv_idx, t);
@@ -2459,19 +2633,23 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // If HMAC gate fails: do not forward to management node (drop the beacon)
         // The beacon is silently dropped — no detection pipeline, no downlink response.
         // In a real system a short alert could be sent; here we track it via PARR.
-        if (!hmac_gate_pass) {
+        if (!hmac_gate_pass)
+        {
             // Count as a detected poisoned beacon for confusion matrix
             // (attacker who can't forge HMAC is trivially detected)
-            if (tag.GetIsPoisoned()) {
-                update_confusion_matrix(true, true);   // TP
+            if (tag.GetIsPoisoned())
+            {
+                update_confusion_matrix(true, true); // TP
                 parr_poisoned_total++;
-            } else {
+            }
+            else
+            {
                 // An honest vehicle with wrong key (e.g., after rekey lag): FP
                 // This can happen in the brief window before the vehicle receives
                 // its RekeyTag. Counted as FP — drives system design to minimise rekey lag.
-                update_confusion_matrix(false, true);  // FP
+                update_confusion_matrix(false, true); // FP
             }
-            continue;  // drop: do not forward to management
+            continue; // drop: do not forward to management
         }
 
         // ── SC-Register authorisation gate (paper §3.5.5 Algorithm 7) ──────
@@ -2505,7 +2683,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         if (!skip_blockchain && ablation_mode != 5 &&
             routing_algorithm == 4 && vid < 10000)
         {
-            if (g_registered_vids.find(vid) == g_registered_vids.end()) {
+            if (g_registered_vids.find(vid) == g_registered_vids.end())
+            {
                 unregistered_beacon_reject_count++;
                 log_unregistered_beacon_reject(vid, rsu_idx, t, real_px, real_py);
                 cout << "[SC-REGISTER-REJECT] RSU" << rsu_idx
@@ -2523,7 +2702,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // ── A7-STEP3: RSU receives HONEST beacon from vehicle (data plane correct) ──
         // Paper Fig 3.7: RSU operates correctly — no modification at this stage.
         // Controller is malicious but RSU is honest; beacon arrives unchanged.
-        if (attack_number == 7) {
+        if (attack_number == 7)
+        {
             cout << "[A7-STEP3] RSU" << rsu_idx
                  << " received HONEST V" << vid
                  << " spd=" << tag.GetSpeed()
@@ -2538,8 +2718,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             rsu_idx < N_RSUs &&
             compromised_rsu[rsu_idx])
         {
-            double real_px  = tag.GetPosX();
-            double real_py  = tag.GetPosY();
+            double real_px = tag.GetPosX();
+            double real_py = tag.GetPosY();
             double real_spd = tag.GetSpeed();
             double real_hdg = tag.GetHeading();
             double real_acc = tag.GetAcceleration();
@@ -2549,12 +2729,12 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // (above s_max·T_b → trips TP-S1 → LW detects). Returns CUMULATIVE drift.
             // θ scales the bound: theta=1 → full ε_max, theta=0.5 → half, etc.
             double drift_x_raw, drift_y_raw, inc_mag_step;
-            bool   is_abrupt;
+            bool is_abrupt;
             SampleBoundedDrift((int)vid, drift_x_raw, drift_y_raw, is_abrupt, inc_mag_step);
-            double drift_x  = poisoning_intensity_theta * drift_x_raw;
-            double drift_y  = poisoning_intensity_theta * drift_y_raw;
-            double fake_px  = real_px + drift_x;
-            double fake_py  = real_py + drift_y;
+            double drift_x = poisoning_intensity_theta * drift_x_raw;
+            double drift_y = poisoning_intensity_theta * drift_y_raw;
+            double fake_px = real_px + drift_x;
+            double fake_py = real_py + drift_y;
             fake_px = (fake_px < min_position_x) ? min_position_x : (fake_px > max_position_x ? max_position_x : fake_px);
             fake_py = (fake_py < min_position_y) ? min_position_y : (fake_py > max_position_y ? max_position_y : fake_py);
 
@@ -2563,14 +2743,14 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             tag.SetAttackType(1);
 
             double dx = fake_px - real_px, dy = fake_py - real_py;
-            double disp_err = std::sqrt(dx*dx + dy*dy);
-            tpe_sq_sum += disp_err * disp_err;   // TPE: injection magnitude (Option B path)
+            double disp_err = std::sqrt(dx * dx + dy * dy);
+            tpe_sq_sum += disp_err * disp_err; // TPE: injection magnitude (Option B path)
             tpe_cnt++;
 
             // Per-beacon LW detectability: TP-S1 kinematic gate fires if step
             // increment exceeds s_max·T_b. Scaled by theta to match drift scaling.
-            double step_scaled  = poisoning_intensity_theta * inc_mag_step;
-            bool   det_step_lw  = (step_scaled > s_max * T_b);
+            double step_scaled = poisoning_intensity_theta * inc_mag_step;
+            bool det_step_lw = (step_scaled > s_max * T_b);
             cout << "\n[TP-S1-RSU" << rsu_idx << "] "
                  << (is_abrupt ? "[ABRUPT]" : "[STEALTH]")
                  << " ═════════════════════════════════════" << endl;
@@ -2582,10 +2762,11 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                  << "  (cum_drift " << std::showpos << drift_x << std::noshowpos << " m)" << endl;
             cout << "  pos_y " << real_py << " → " << fake_py
                  << "  (cum_drift " << std::showpos << drift_y << std::noshowpos << " m)" << endl;
-            cout << "  step=" << step_scaled << " m  (gate=" << s_max*T_b << " m)"
+            cout << "  step=" << step_scaled << " m  (gate=" << s_max * T_b << " m)"
                  << "  cum_disp=" << disp_err << " m"
                  << "  LW-fires-this-beacon=" << (det_step_lw ? "YES" : "no") << endl;
-            cout << "[TP-S1-RSU" << rsu_idx << "] ═════════════════════════════════════\n" << endl;
+            cout << "[TP-S1-RSU" << rsu_idx << "] ═════════════════════════════════════\n"
+                 << endl;
 
             log_tp_s1_poison(vid, rsu_idx, t, real_px, real_py, fake_px, fake_py,
                              real_spd, real_hdg, real_acc, drift_x, drift_y, disp_err,
@@ -2613,7 +2794,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             tag.SetIsPoisoned(true);
             tag.SetAttackType(3);
             double ghost_disp = R_max_comm * poisoning_intensity_theta; // 270*0.5 = 135 m
-            tpe_sq_sum += ghost_disp * ghost_disp;   // TPE: ghost displacement (Option B path)
+            tpe_sq_sum += ghost_disp * ghost_disp;                      // TPE: ghost displacement (Option B path)
             tpe_cnt++;
             cout << "[MP-S1-RSU" << rsu_idx << "] intercepting V" << vid
                  << " at t=" << t << " → generating ghost IDs" << endl;
@@ -2622,10 +2803,11 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // the real beacon. Ghost IDs are unique per (RSU, vehicle, ghost-index):
             //   ghost_vid = GHOST_VID_BASE + rsu_idx*100 + vid*10 + gi
             // Placed evenly at ghost_disp (150 m) radius around the real vehicle.
-            static const int    N_ghost        = 4;
+            static const int N_ghost = 4;
             static const uint32_t GHOST_VID_BASE = 10000;
-            for (int gi = 0; gi < N_ghost; gi++) {
-                double angle    = gi * (2.0 * M_PI / N_ghost); // 0°, 90°, 180°, 270°
+            for (int gi = 0; gi < N_ghost; gi++)
+            {
+                double angle = gi * (2.0 * M_PI / N_ghost); // 0°, 90°, 180°, 270°
                 double ghost_px = real_px + ghost_disp * std::cos(angle);
                 double ghost_py = real_py + ghost_disp * std::sin(angle);
                 uint32_t ghost_vid = GHOST_VID_BASE + rsu_idx * 100 + vid * 10 + gi;
@@ -2656,9 +2838,10 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                 ghost_pkt->AddPacketTag(ghost_tag);
 
                 // Send ghost packet to controller — queued BEFORE the real beacon
-                if (m_relay_socket) {
+                if (m_relay_socket)
+                {
                     m_relay_socket->SendTo(ghost_pkt, 0,
-                        InetSocketAddress(g_management_csma_ip, 7777));
+                                           InetSocketAddress(g_management_csma_ip, 7777));
                     cout << "[MP-S1-GHOST-TX] RSU" << rsu_idx
                          << " ghost_id=" << ghost_vid
                          << " pos(" << std::fixed << std::setprecision(2)
@@ -2677,7 +2860,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // Paper (Fig 3.6): RSU cannot distinguish forged MitM packets from legitimate ones.
         // It forwards BOTH the honest vehicle beacon (Step 1→3) AND the MitM forged
         // beacon (Step 4→5) to the controller, which then corrupts its global model.
-        if (attack_number == 6 && tag.GetIsPoisoned()) {
+        if (attack_number == 6 && tag.GetIsPoisoned())
+        {
             cout << "[A6-STEP3] RSU" << rsu_idx
                  << " received MitM forged beacon for V" << vid
                  << " spd=" << std::fixed << std::setprecision(2) << tag.GetSpeed()
@@ -2707,24 +2891,23 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // Restore happens only if MP-S4 (impossible velocity) fires — matching the
         // paper-justified case in §3.5.3.
         bool save_state_rsu = ((attack_number == 1) || (attack_number == 4) ||
-                               (attack_number == 5) || (attack_number == 6))
-                           && (vid < (uint32_t)total_size)
-                           && tag.GetIsPoisoned()
-                           && !sybil_mitm_nodes[vid];
+                               (attack_number == 5) || (attack_number == 6)) &&
+                              (vid < (uint32_t)total_size) && tag.GetIsPoisoned() && !sybil_mitm_nodes[vid];
         VehicleBeaconState vs_backup_rsu;
-        if (save_state_rsu) vs_backup_rsu = vehicle_state[vid];
+        if (save_state_rsu)
+            vs_backup_rsu = vehicle_state[vid];
 
         struct timespec t_det_start, t_det_end;
         clock_gettime(CLOCK_MONOTONIC, &t_det_start);
         LwDetectResult rsu_lw = run_lw_detect_per_beacon(vid, tag, rsu_idx);
         clock_gettime(CLOCK_MONOTONIC, &t_det_end);
-        pbpo_lw_time_sum_ms += (t_det_end.tv_sec  - t_det_start.tv_sec)  * 1000.0
-                             + (t_det_end.tv_nsec - t_det_start.tv_nsec) / 1e6;
+        pbpo_lw_time_sum_ms += (t_det_end.tv_sec - t_det_start.tv_sec) * 1000.0 + (t_det_end.tv_nsec - t_det_start.tv_nsec) / 1e6;
         // NOTE: pbpo_lw_cnt was already incremented by the HMAC gate timer above;
         // detection time accumulates into the SAME per-beacon sample so the mean
         // reflects HMAC + LW-DETECT together (paper Eq.4.7 lightweight mode total).
 
-        if (save_state_rsu && (rsu_lw.mp_flags & (1u << 3))) {
+        if (save_state_rsu && (rsu_lw.mp_flags & (1u << 3)))
+        {
             // MP-S4 fired on the RSU push — restore pre-push state to prevent
             // future detection on the same vid from comparing against the
             // poisoned/intercepted baseline.
@@ -2733,9 +2916,9 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 
         // Stamp cached LW-DETECT result onto the tag for the controller to consume
         tag.SetLwDetectionRan(true);
-        tag.SetLwAnomalous   (rsu_lw.anomalous);
-        tag.SetLwPsi         (rsu_lw.psi);
-        tag.SetSigViolated   (rsu_lw.sig_violated);
+        tag.SetLwAnomalous(rsu_lw.anomalous);
+        tag.SetLwPsi(rsu_lw.psi);
+        tag.SetSigViolated(rsu_lw.sig_violated);
 
         cout << "[LW-DETECT-RSU" << rsu_idx << "] V" << vid
              << " psi=" << std::fixed << std::setprecision(3) << rsu_lw.psi
@@ -2770,7 +2953,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // window from IPFS to run GAT + LSTM-AE in Full mode (pending R7+).
         // Uses the POST-LW-DETECT kinematic tag fields so the stored window
         // reflects exactly what the RSU's authoritative path saw.
-        if (rsu_idx < N_RSUs) {
+        if (rsu_idx < N_RSUs)
+        {
             ipfs_push_and_maybe_flush(rsu_idx, vid,
                                       tag.GetPosX(), tag.GetPosY(),
                                       tag.GetSpeed(), tag.GetHeading(),
@@ -2786,7 +2970,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // record both at the RSU because the kinematics on this path are
         // exactly what the LW-DETECT authority saw — no double-counting of
         // attacker-flipped values from a different code path.
-        if (vid < (uint32_t)total_size) {
+        if (vid < (uint32_t)total_size)
+        {
             last_psi_per_vehicle[vid] = rsu_lw.psi;
             lstm_ring_push(vid,
                            (float)tag.GetPosX(), (float)tag.GetPosY(),
@@ -2811,8 +2996,10 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // in HandleBeaconReceived (R2). PARR denominator (parr_poisoned_total) is
         // still aggregated at the controller; the numerator (parr_trs_rejected)
         // moves here with the revoke event.
-        if (vid < (uint32_t)(total_size + 2)) {
-            if (rsu_lw.detected) {
+        if (vid < (uint32_t)(total_size + 2))
+        {
+            if (rsu_lw.detected)
+            {
                 double ts = Simulator::Now().GetSeconds();
 
                 // ── PARR numerator (Eq 4.3) ──────────────────────────────────
@@ -2821,7 +3008,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                 // poisoned beacon, in lockstep with parr_poisoned_total — NOT
                 // throttled by the vote refresh guard below (that is a network
                 // anti-spam concern, not a detection metric).
-                if (tag.GetIsPoisoned()) parr_trs_rejected++; // PARR numerator (Eq.4.3)
+                // if (tag.GetIsPoisoned())
+                //     parr_trs_rejected++; // PARR numerator (Eq.4.3)
 
                 // ── Per-(RSU,vehicle) vote refresh guard (anti-spam only) ────
                 // The RSU is a revocation witness the instant it flags the
@@ -2832,9 +3020,9 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                 // witness — only redundant re-sends from the SAME RSU are coalesced.
                 uint64_t guard_key = ((uint64_t)rsu_idx << 32) | (uint64_t)vid;
                 auto vit = last_revoke_vote_ts.find(guard_key);
-                bool should_vote = (vit == last_revoke_vote_ts.end())
-                                   || (ts - vit->second >= VOTE_REFRESH_SEC);
-                if (should_vote) {
+                bool should_vote = (vit == last_revoke_vote_ts.end()) || (ts - vit->second >= VOTE_REFRESH_SEC);
+                if (should_vote)
+                {
                     last_revoke_vote_ts[guard_key] = ts;
 
                     // ── Eq 3.65 SC-Revoke BFT ────────────────────────────────
@@ -2866,17 +3054,19 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // (vehId‖rsuId‖reason‖ts) and verified on submit by the
                     // chaincode, so a forged identity cannot pad the 2f+1 tally.
                     bool revoked = false;
-                    if (!routing_test && ablation_mode != 5) {
+                    if (!routing_test && ablation_mode != 5)
+                    {
                         std::string vote_payload = CallSCRevokeVote(
                             vid, rsu_idx, "lw_anomaly_flag", ts);
                         // Payload shape: {"voted":true,"votes":N,"threshold":T,"revoked":bool}
-                        revoked = (vote_payload.find("\"revoked\":true")
-                                   != std::string::npos);
+                        revoked = (vote_payload.find("\"revoked\":true") != std::string::npos);
                         cout << "[SC-REVOKE-VOTE-RSU" << rsu_idx << "] V" << (vid - 2)
                              << " ts=" << std::fixed << std::setprecision(3) << ts
                              << " payload=" << vote_payload
                              << " (paper §3.5.5 Eq 3.65 BFT 2f+1, window T_w)" << endl;
-                    } else {
+                    }
+                    else
+                    {
                         // A5 / routing_test: no BC consensus — local revoke
                         revoked = true;
                         cout << "[SC-REVOKE-LOCAL-RSU" << rsu_idx << "] V" << (vid - 2)
@@ -2889,7 +3079,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // LKH rekey (Eq.3.34): N_rekey = log₂|V_j| unicasts to
                     // remaining vehicles. Fires only when BFT quorum was hit
                     // (Eq 3.65) OR the no-BC fallback authorized local revoke.
-                    if (revoked && rsu_idx < N_RSUs) {
+                    if (revoked && rsu_idx < N_RSUs)
+                    {
                         cout << "[LKH-REVOKE-RSU" << rsu_idx << "] V" << (vid - 2)
                              << " revoked (Eq.3.65 BFT) → group rekey (Eq.3.34)"
                              << endl;
@@ -2911,7 +3102,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // Algorithm 1 line 5-6 says "if ψ_i(t) > ψ_th" → gated on rsu_lw.anomalous
             // (NOT rsu_lw.detected which also folds in the CP-DETECT oracle).
             // A5 ablation skips SC-Trust for the blockchain-isolation comparison (RQ6).
-            if (!routing_test && ablation_mode != 5 && rsu_lw.anomalous) {
+            if (!routing_test && ablation_mode != 5 && rsu_lw.anomalous)
+            {
                 double ts = Simulator::Now().GetSeconds();
 
                 // ── Paper-aligned Eq 3.56 RSU evidence tuple (TASK ①-I) ──────
@@ -2936,9 +3128,9 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                 // per-RSU TRS partial-sig plumbing through ITrsBackend lands
                 // in TASK ①-J.
                 {
-                    const double speed   = tag.GetSpeed();
+                    const double speed = tag.GetSpeed();
                     const double heading = tag.GetHeading();
-                    const double accel   = tag.GetAcceleration();
+                    const double accel = tag.GetAcceleration();
                     const double vx = speed * std::cos(heading);
                     const double vy = speed * std::sin(heading);
                     const double ax = accel * std::cos(heading);
@@ -2984,16 +3176,17 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // Static set is process-local — fine since the sim runs in
                     // one process. Cleared on next sim run (re-static-init).
                     static std::unordered_set<std::string> g_finalize_scheduled;
-                    static std::mutex                       g_finalize_mu;
+                    static std::mutex g_finalize_mu;
                     std::string key = std::to_string(vid) + "|" + epoch;
                     bool first;
                     {
                         std::lock_guard<std::mutex> lk(g_finalize_mu);
                         first = g_finalize_scheduled.insert(key).second;
                     }
-                    if (first) {
+                    if (first)
+                    {
                         Simulator::Schedule(Seconds(1.0),
-                            &CallSCTrustFinalizeEpochAsync, vid, epoch);
+                                            &CallSCTrustFinalizeEpochAsync, vid, epoch);
                     }
 
                     // RSU SC-Trust finalize (Eq rsu_trust / rsu_misbehave) is
@@ -3005,15 +3198,16 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // landed before the contract reconstructs q_i. Idempotent
                     // on chain, so a converging re-fire is harmless.
                     static std::unordered_set<std::string> g_rsu_finalize_scheduled;
-                    static std::mutex                       g_rsu_finalize_mu;
+                    static std::mutex g_rsu_finalize_mu;
                     bool rsu_first;
                     {
                         std::lock_guard<std::mutex> lk(g_rsu_finalize_mu);
                         rsu_first = g_rsu_finalize_scheduled.insert(epoch).second;
                     }
-                    if (rsu_first) {
+                    if (rsu_first)
+                    {
                         Simulator::Schedule(Seconds(2.0),
-                            &CallSCRSUFinalizeEpochAsync, epoch);
+                                            &CallSCRSUFinalizeEpochAsync, epoch);
                     }
 
                     // Controller SC-Trust finalize (Eq 3.60 EMA / Eq 3.68
@@ -3027,15 +3221,16 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // chain (re-fire just re-evaluates the same submission set),
                     // so a converging re-fire is harmless.
                     static std::unordered_set<std::string> g_ctrl_finalize_scheduled;
-                    static std::mutex                       g_ctrl_finalize_mu;
+                    static std::mutex g_ctrl_finalize_mu;
                     bool ctrl_first;
                     {
                         std::lock_guard<std::mutex> lk(g_ctrl_finalize_mu);
                         ctrl_first = g_ctrl_finalize_scheduled.insert(epoch).second;
                     }
-                    if (ctrl_first) {
+                    if (ctrl_first)
+                    {
                         Simulator::Schedule(Seconds(3.0),
-                            &CallSCControllerFinalizeEpochAsync, epoch);
+                                            &CallSCControllerFinalizeEpochAsync, epoch);
                     }
                 }
             }
@@ -3060,35 +3255,40 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // (Step 11) emits the alert. CDER stays well-defined per Eq.4.4: exactly
         // one control decision per beacon (R2 fast-path OR controller-here, never both).
         if (g_option_b_active && m_send_socket &&
-            attack_number != 1 && attack_number != 5 && attack_number != 7) {
+            attack_number != 1 && attack_number != 5 && attack_number != 7)
+        {
             DownlinkControlTag dl_tag;
-            dl_tag.SetVehicleId   (vid);                                     // unicast target
-            dl_tag.SetAlertType   (rsu_lw.detected ? 1 : 0);                 // ATTACK_DETECTED or CLEAN_ROUTING
-            dl_tag.SetSpeedAdvice (rsu_lw.detected ? (s_max * 0.5) : s_max); // 50% advisory if attack
-            dl_tag.SetTimestamp   (t);
-            dl_tag.SetRsuId       (rsu_idx);
+            dl_tag.SetVehicleId(vid);                                       // unicast target
+            dl_tag.SetAlertType(rsu_lw.detected ? 1 : 0);                   // ATTACK_DETECTED or CLEAN_ROUTING
+            dl_tag.SetSpeedAdvice(rsu_lw.detected ? (s_max * 0.5) : s_max); // 50% advisory if attack
+            dl_tag.SetTimestamp(t);
+            dl_tag.SetRsuId(rsu_idx);
 
             Ptr<Packet> dl_pkt = Create<Packet>(0);
             dl_pkt->AddPacketTag(dl_tag);
 
             int dl_err = m_send_socket->SendTo(
-                             dl_pkt, 0,
-                             InetSocketAddress(Ipv4Address("3.255.255.255"), 9999));
+                dl_pkt, 0,
+                InetSocketAddress(Ipv4Address("3.255.255.255"), 9999));
 
-            const char* alert_str = rsu_lw.detected ? "ATTACK_DETECTED" : "CLEAN_ROUTING";
-            if (dl_err >= 0) {
+            const char *alert_str = rsu_lw.detected ? "ATTACK_DETECTED" : "CLEAN_ROUTING";
+            if (dl_err >= 0)
+            {
                 // CDER (Eq.4.4) — RSU-direct emission counts as one control decision.
                 // wrong iff (detected ⊻ is_poisoned): FP when CLEAN flagged, FN when ATTACK missed.
                 ctrl_decisions_total++;
                 bool is_poisoned_now = tag.GetIsPoisoned();
                 bool wrong = (rsu_lw.detected ? !is_poisoned_now : is_poisoned_now);
-                if (wrong) ctrl_decisions_wrong++;
+                if (wrong)
+                    ctrl_decisions_wrong++;
 
                 cout << "[DL-RSU" << rsu_idx << "-DIRECT] → V" << vid
                      << " :9999 alert=" << alert_str
                      << " spd_adv=" << (rsu_lw.detected ? s_max * 0.5 : s_max) << " m/s"
                      << " (paper Fig 3.1 Step 6/7)" << endl;
-            } else {
+            }
+            else
+            {
                 cout << "[DL-RSU" << rsu_idx << "-DIRECT-ERR] failed vid=" << vid << endl;
             }
         }
@@ -3099,27 +3299,35 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         //   If RSU needed to send collected data from multiple vehicles it would be
         //   send_rsu_dataunicast_agent — not used here because each vehicle beacon is
         //   forwarded immediately on arrival, not batched.
-        if (m_relay_socket) {
+        if (m_relay_socket)
+        {
             int err = m_relay_socket->SendTo(packet, 0,
-                          InetSocketAddress(g_management_csma_ip, 7777));
-            if (err < 0) {
+                                             InetSocketAddress(g_management_csma_ip, 7777));
+            if (err < 0)
+            {
                 cout << "[RSU-FWD-ERR] RSU" << rsu_idx
                      << " failed to relay V" << vid << " beacon" << endl;
-            } else {
+            }
+            else
+            {
                 // A6-STEP5: RSU forwards (both legitimate and forged) beacons to controller
-                if (attack_number == 6 && tag.GetIsPoisoned()) {
+                if (attack_number == 6 && tag.GetIsPoisoned())
+                {
                     cout << "[A6-STEP5] RSU" << rsu_idx
                          << " forwarding MitM-forged V" << vid
                          << " beacon to controller (controller receives poisoned data)"
                          << "  [send_rsu_dataunicast_alone]" << endl;
-                } else {
+                }
+                else
+                {
                     cout << "[RSU-FWD] RSU" << rsu_idx << " → MGT " << g_management_csma_ip
                          << ":7777  V=" << vid
                          << "  [send_rsu_dataunicast_alone]" << endl;
                     // ── A7-STEP4: RSU forwards HONEST data to controller via control plane ──
                     // Paper Fig 3.7: RSU correctly relays unmodified beacon to controller.
                     // At this point both vehicle and RSU have behaved honestly.
-                    if (attack_number == 7) {
+                    if (attack_number == 7)
+                    {
                         cout << "[A7-STEP4] RSU" << rsu_idx
                              << " → Controller: forwarding HONEST V" << vid
                              << " via control plane — controller receives correct data"
@@ -3147,7 +3355,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 // In SUMO-trace mode 12_main.h overwrites entries 0..N_RSUs-1 from the RSU CSV
 // (rsu_positions_<scenario>.csv) so cell mapping matches the placed RSU nodes.
 static double g_rsu_actual_pos_x[MAX_RSUS] = {250.0, 750.0, 1250.0, 1750.0}; // routing_test default
-static double g_rsu_actual_pos_y[MAX_RSUS] = {480.0, 480.0,  480.0,  480.0};
+static double g_rsu_actual_pos_y[MAX_RSUS] = {480.0, 480.0, 480.0, 480.0};
 
 // Populate the cell-mapping table from the ACTUAL placed RSU node positions
 // (called once at startup from 12_main.h after RSU_mobility.Install). In test
@@ -3155,7 +3363,11 @@ static double g_rsu_actual_pos_y[MAX_RSUS] = {480.0, 480.0,  480.0,  480.0};
 // SUMO-trace mode they are the CSV positions, so beacons map to the right cell.
 inline void set_rsu_actual_pos(uint32_t idx, double x, double y)
 {
-    if (idx < MAX_RSUS) { g_rsu_actual_pos_x[idx] = x; g_rsu_actual_pos_y[idx] = y; }
+    if (idx < MAX_RSUS)
+    {
+        g_rsu_actual_pos_x[idx] = x;
+        g_rsu_actual_pos_y[idx] = y;
+    }
 }
 
 static uint32_t nearest_rsu_for_position(double px, double py)
@@ -3165,11 +3377,16 @@ static uint32_t nearest_rsu_for_position(double px, double py)
     static const double (&rsu_y)[MAX_RSUS] = g_rsu_actual_pos_y;
     int active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? (int)N_RSUs : MAX_RSUS;
     uint32_t nearest = 0;
-    double   min_d2  = 1e18;
-    for (int r = 0; r < active; r++) {
+    double min_d2 = 1e18;
+    for (int r = 0; r < active; r++)
+    {
         double dx = px - rsu_x[r], dy = py - rsu_y[r];
-        double d2 = dx*dx + dy*dy;
-        if (d2 < min_d2) { min_d2 = d2; nearest = (uint32_t)r; }
+        double d2 = dx * dx + dy * dy;
+        if (d2 < min_d2)
+        {
+            min_d2 = d2;
+            nearest = (uint32_t)r;
+        }
     }
     return nearest;
 }
@@ -3197,14 +3414,14 @@ static uint32_t nearest_rsu_for_position(double px, double py)
 //   T_REF = 16.2 s — 2×270/33.33 = traversal reference
 //   δ     = 0.15   — hysteresis: 15% improvement required to trigger handoff
 // ─────────────────────────────────────────────────────────────────────────────
-static const double LL_T_MAX = 30.0;   // cap for LL when vehicle is stopped (s)
-static const double LL_T_REF = 16.2;   // 2*R_max_comm/s_max = 2*270/33.33 — traversal reference (s)
-static const double LL_DELTA = 0.15;   // hysteresis threshold (15 %)
+static const double LL_T_MAX = 30.0; // cap for LL when vehicle is stopped (s)
+static const double LL_T_REF = 16.2; // 2*R_max_comm/s_max = 2*270/33.33 — traversal reference (s)
+static const double LL_DELTA = 0.15; // hysteresis threshold (15 %)
 
 // Per-vehicle hysteresis state: last selected RSU index and score.
-static uint32_t g_vehicle_rsu_choice[MAX_NODES] = {};    // last selected RSU
-static double   g_vehicle_rsu_score [MAX_NODES] = {};    // last selected RSU score
-static bool     g_vehicle_rsu_init  [MAX_NODES] = {};    // false until first selection
+static uint32_t g_vehicle_rsu_choice[MAX_NODES] = {}; // last selected RSU
+static double g_vehicle_rsu_score[MAX_NODES] = {};    // last selected RSU score
+static bool g_vehicle_rsu_init[MAX_NODES] = {};       // false until first selection
 
 // Compute how long (s) a vehicle at (px,py) moving with velocity (vx,vy) will
 // remain within R_max_comm of the RSU at (rx,ry).
@@ -3218,19 +3435,23 @@ static double compute_link_lifetime(double px, double py,
                                     double vx, double vy,
                                     double rx, double ry)
 {
-    double dx   = px - rx,  dy  = py - ry;
-    double a    = vx*vx + vy*vy;
-    double b    = 2.0*(dx*vx + dy*vy);
-    double c    = dx*dx + dy*dy - R_max_comm*R_max_comm;
+    double dx = px - rx, dy = py - ry;
+    double a = vx * vx + vy * vy;
+    double b = 2.0 * (dx * vx + dy * vy);
+    double c = dx * dx + dy * dy - R_max_comm * R_max_comm;
 
-    if (c > 0.0)  return 0.0;           // outside range — not a candidate
-    if (a < 1e-9) return LL_T_MAX;      // vehicle stopped → stays indefinitely
+    if (c > 0.0)
+        return 0.0; // outside range — not a candidate
+    if (a < 1e-9)
+        return LL_T_MAX; // vehicle stopped → stays indefinitely
 
-    double disc = b*b - 4.0*a*c;
-    if (disc < 0.0) return LL_T_MAX;    // moves in circle inside range
+    double disc = b * b - 4.0 * a * c;
+    if (disc < 0.0)
+        return LL_T_MAX; // moves in circle inside range
 
-    double t_exit = (-b + std::sqrt(disc)) / (2.0*a);
-    if (t_exit < 0.0) t_exit = 0.0;
+    double t_exit = (-b + std::sqrt(disc)) / (2.0 * a);
+    if (t_exit < 0.0)
+        t_exit = 0.0;
     return std::min(t_exit, LL_T_MAX);
 }
 
@@ -3238,52 +3459,62 @@ static double compute_link_lifetime(double px, double py,
 // vx,vy = vehicle's REAL velocity (from MobilityModel — not the poisoned beacon).
 // is_mal is passed for diagnostic logging only; selection always uses real motion.
 static uint32_t best_rsu_for_position(double px, double py,
-                                       double vx, double vy,
-                                       uint32_t vid, bool is_mal)
+                                      double vx, double vy,
+                                      uint32_t vid, bool is_mal)
 {
     (void)is_mal; // reserved for future per-attack diagnostic hooks
     static const double (&rsu_x)[MAX_RSUS] = g_rsu_actual_pos_x;
     static const double (&rsu_y)[MAX_RSUS] = g_rsu_actual_pos_y;
     int active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? (int)N_RSUs : MAX_RSUS;
 
-    uint32_t best_idx   = 0;
-    double   best_score = -1.0;
-    bool     any_in_range = false;
+    uint32_t best_idx = 0;
+    double best_score = -1.0;
+    bool any_in_range = false;
 
-    for (int r = 0; r < active; r++) {
-        double dx  = px - rsu_x[r],  dy = py - rsu_y[r];
-        double d   = std::sqrt(dx*dx + dy*dy);
+    for (int r = 0; r < active; r++)
+    {
+        double dx = px - rsu_x[r], dy = py - rsu_y[r];
+        double d = std::sqrt(dx * dx + dy * dy);
 
-        if (d > R_max_comm) continue;   // out of range — skip
+        if (d > R_max_comm)
+            continue; // out of range — skip
         any_in_range = true;
 
         // d_norm ∈ (0,1]: avoid div/0 when vehicle sits on RSU antenna.
         // (Pre-R6.5 note: std::max avoided due to #define max 40 — that macro
         // is now MPTD_MAX_NEIGHBORS so std::max is safe; left as ternary.)
-        double d_raw   = d / R_max_comm;
-        double d_norm  = (d_raw > 1e-6) ? d_raw : 1e-6;
+        double d_raw = d / R_max_comm;
+        double d_norm = (d_raw > 1e-6) ? d_raw : 1e-6;
 
-        double ll      = compute_link_lifetime(px, py, vx, vy, rsu_x[r], rsu_y[r]);
-        double ll_norm = ll / LL_T_REF;  // may exceed 1.0 for slow vehicles — intentional
+        double ll = compute_link_lifetime(px, py, vx, vy, rsu_x[r], rsu_y[r]);
+        double ll_norm = ll / LL_T_REF; // may exceed 1.0 for slow vehicles — intentional
 
-        double score   = ll_norm / d_norm;
+        double score = ll_norm / d_norm;
 
-        if (score > best_score) { best_score = score; best_idx = (uint32_t)r; }
+        if (score > best_score)
+        {
+            best_score = score;
+            best_idx = (uint32_t)r;
+        }
     }
 
     // No RSU in communication range → fall back to nearest RSU (LTE path)
-    if (!any_in_range) return nearest_rsu_for_position(px, py);
+    if (!any_in_range)
+        return nearest_rsu_for_position(px, py);
 
     // ── Hysteresis: only switch RSU if improvement exceeds δ=15 % ────────────
     uint32_t safe_vid = (vid < MAX_NODES) ? vid : 0u;
-    if (g_vehicle_rsu_init[safe_vid]) {
-        uint32_t old_rsu   = g_vehicle_rsu_choice[safe_vid];
-        double   old_score = g_vehicle_rsu_score [safe_vid];
-        if (best_idx != old_rsu && best_score <= old_score * (1.0 + LL_DELTA)) {
+    if (g_vehicle_rsu_init[safe_vid])
+    {
+        uint32_t old_rsu = g_vehicle_rsu_choice[safe_vid];
+        double old_score = g_vehicle_rsu_score[safe_vid];
+        if (best_idx != old_rsu && best_score <= old_score * (1.0 + LL_DELTA))
+        {
             // Improvement is marginal — keep current RSU if still reachable
             double odx = px - rsu_x[old_rsu], ody = py - rsu_y[old_rsu];
-            if (std::sqrt(odx*odx + ody*ody) <= R_max_comm) {
-                best_idx   = old_rsu;
+            if (std::sqrt(odx * odx + ody * ody) <= R_max_comm)
+            {
+                best_idx = old_rsu;
                 best_score = old_score;
             }
         }
@@ -3291,8 +3522,8 @@ static uint32_t best_rsu_for_position(double px, double py,
 
     // Persist hysteresis state
     g_vehicle_rsu_choice[safe_vid] = best_idx;
-    g_vehicle_rsu_score [safe_vid] = best_score;
-    g_vehicle_rsu_init  [safe_vid] = true;
+    g_vehicle_rsu_score[safe_vid] = best_score;
+    g_vehicle_rsu_init[safe_vid] = true;
 
     return best_idx;
 }
@@ -3300,14 +3531,16 @@ static uint32_t best_rsu_for_position(double px, double py,
 void SimpleUdpApplication::HandleReadOne(Ptr<Socket> socket)
 {
     Ptr<Packet> packet;
-    Address     from;
+    Address from;
     while ((packet = socket->RecvFrom(from)) != nullptr)
     {
         BsmBeaconTag beaconTag;
-        if (packet->PeekPacketTag(beaconTag)) {
+        if (packet->PeekPacketTag(beaconTag))
+        {
             uint32_t vid = beaconTag.GetVehicleId();
             uint32_t rsuId;
-            if (g_option_b_active) {
+            if (g_option_b_active)
+            {
                 // Option B: RSU already stamped its index in the tag before forwarding
                 rsuId = beaconTag.GetRsuId();
                 cout << "[MGT-RX] V" << vid
@@ -3315,7 +3548,9 @@ void SimpleUdpApplication::HandleReadOne(Ptr<Socket> socket)
                      << " pos(" << beaconTag.GetPosX() << "," << beaconTag.GetPosY() << ")"
                      << " poisoned=" << (beaconTag.GetIsPoisoned() ? "YES" : "no")
                      << endl;
-            } else {
+            }
+            else
+            {
                 // Legacy fallback: assign RSU geographically (no actual DSRC path)
                 rsuId = nearest_rsu_for_position(beaconTag.GetPosX(), beaconTag.GetPosY());
                 cout << "[RSU-ASSIGN] V" << vid
