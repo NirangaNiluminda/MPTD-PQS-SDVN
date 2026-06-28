@@ -5,8 +5,8 @@ from .config import FEATURE_DIM, HIDDEN_DIM, NUM_LAYERS
 class LSTMAEDetector(nn.Module):
     """
     Sequence-to-sequence LSTM Autoencoder.
-    Input shape:  (batch, k, 5)
-    Output shape: (batch, k, 5) - reconstructed sequence
+    Input shape:  (batch, k, 6)   # [pos_x, pos_y, speed, heading, accel, tau_i]
+    Output shape: (batch, k, 6) - reconstructed sequence
     """
     def __init__(self, feat_dim: int = FEATURE_DIM,
                  hidden: int = HIDDEN_DIM, num_layers: int = NUM_LAYERS):
