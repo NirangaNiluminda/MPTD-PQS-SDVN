@@ -897,7 +897,8 @@ inline SCResult CallSCBootstrapRSU(
 
 // ── CallSCRegister — Algorithm 7 SC-Register (paper §3.5.5 page 64) ──────────
 // Submits identity (id, role, pk, h(K_u)) with 2f+1 distinct RSU endorsements
-// signed over sha256(id || pkHex || hKuHex) using EC-ECDSA P-256 ASN.1-DER.
+// signed over sha256(id || pkHex || hKuHex) using the active ledger scheme
+// (ML-DSA-87 by default, or EC-ECDSA P-256 ASN.1-DER per MPTD_LEDGER_SIG).
 // endorsementsJSON is a JSON array of {"rsuID":"...","sigHex":"..."}.
 // Synchronous: caller must know whether registration committed before any
 // downstream SCTrustSubmitEvidence / SCRevokeVote will be accepted by the
@@ -926,9 +927,10 @@ inline SCResult CallSCRegister(
 // Forward-declared here so the Call* wrappers can sign σ over the SAME string
 // args they transmit. The signer hashes (id‖…) identically to the chaincode
 // digest helpers (smartcontract.go evidenceDigest / controllerEvidenceDigest /
-// revokeVoteDigest) and signs with the node's registered P-256 key. Defining
-// them in 11 (which owns g_node_ec_keys, populated at SC-Register time) keeps
-// this header free of the EC keystore while still letting the wrapper produce a
+// revokeVoteDigest) and signs with the node's registered ledger key (ML-DSA-87
+// or ECDSA per MPTD_LEDGER_SIG). Defining them in 11 (which owns g_node_keys,
+// populated at SC-Register time) keeps this header free of the keystore while
+// still letting the wrapper produce a
 // chaincode-verifiable signature in one place — eliminating any risk that the
 // signed bytes drift from the transmitted bytes.
 std::string mptd_sign_evidence_hex(const std::string& vehId,
@@ -951,9 +953,10 @@ std::string mptd_sign_revoke_vote_hex(const std::string& vehId,
 // One call per RSU witness per beacon; SCTrustFinalizeEpoch later aggregates
 // them per Eq 3.55. Async because this is on the beacon-alert hot path.
 //
-// σ_j^sub is now produced HERE with the submitting RSU's registered P-256 key
-// over the exact transmitted strings (Eq 3.61) — the chaincode verifies it on
-// submit (smartcontract.go SCTrustSubmitEvidence). No caller-supplied sig.
+// σ_j^sub is now produced HERE with the submitting RSU's registered ledger key
+// (ML-DSA-87 / ECDSA per MPTD_LEDGER_SIG) over the exact transmitted strings
+// (Eq 3.61) — the chaincode verifies it on submit (smartcontract.go
+// SCTrustSubmitEvidence). No caller-supplied sig.
 inline void CallSCTrustSubmitEvidence(
     uint32_t vehicleID, uint32_t rsuID, const std::string& epoch,
     double psi, const std::string& beaconHash)
@@ -975,8 +978,9 @@ inline void CallSCTrustSubmitEvidence(
 // Written by the SDN controller (peer #2 in the Fabric organization mapping)
 // as an UNTRUSTED submission — CPDetectCheck (Eq 3.59) decides whether to
 // honour it. Async for the same reason as the RSU side.
-// σ_c^sub is now produced HERE with the controller's registered P-256 key over
-// the exact transmitted strings (Eq 3.62) — verified on submit by the chaincode
+// σ_c^sub is now produced HERE with the controller's registered ledger key
+// (ML-DSA-87 / ECDSA per MPTD_LEDGER_SIG) over the exact transmitted strings
+// (Eq 3.62) — verified on submit by the chaincode
 // (smartcontract.go SCControllerSubmitEvidence). The controller still writes as
 // a non-authoritative client (invariant 2); the signature only proves the
 // submission genuinely came from a registered controller identity.
@@ -1229,7 +1233,8 @@ inline std::vector<RsuTrustView> CallSCGetAllRSUTrustScores()
 // the returned `revoked` flag (e.g. trigger LKH rekey on the local RSU when
 // its own vote was the deciding one).
 // The vote signature is now produced HERE with the voting RSU's registered
-// P-256 key over (vehId‖rsuId‖reason‖tsStr) (Eq 3.63) — verified on submit by
+// ledger key (ML-DSA-87 / ECDSA per MPTD_LEDGER_SIG) over
+// (vehId‖rsuId‖reason‖tsStr) (Eq 3.63) — verified on submit by
 // the chaincode (smartcontract.go SCRevokeVote) so a forged identity cannot
 // pad the 2f+1 tally.
 inline std::string CallSCRevokeVote(
