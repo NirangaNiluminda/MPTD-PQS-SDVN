@@ -122,3 +122,8 @@ live_results/
 lstm_detector/
 analytics/ml/plots/
 analytics/ml/data/beacon_clean_*.csv
+
+# ── gat_detector generated artifacts (dir is not otherwise ignored) ───────────
+gat_detector/outputs/
+gat_detector/__pycache__/
+gat_detector/**/*.pyc
