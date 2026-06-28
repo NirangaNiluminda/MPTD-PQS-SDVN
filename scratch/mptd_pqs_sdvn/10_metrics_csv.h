@@ -123,6 +123,22 @@ void update_confusion_matrix_full(bool is_poisoned, bool full_flag)
 //   gt_speed       — ns-3 MobilityModel speed magnitude (sqrt(vx²+vy²+vz²))
 // Eval scripts compute displacement error = sqrt((pos_x-gt_pos_x)² + (pos_y-gt_pos_y)²)
 // → TPE training labels + LSTM-AE reconstruction targets.
+// ── Per-scenario results directory (option A) ────────────────────────────────
+// Every live-sim CSV is written under analytics/results/<scenario>/ so the three
+// SUMO scenarios never overwrite each other across runs. The scenario name is
+// read from the global mobility_scenario (0=urban, 1=rural, 2=highway), set from
+// the --mobility_scenario CLI arg in 12_main.h.
+static inline const char* mptd_scenario_name() {
+    switch (mobility_scenario) {
+        case 1:  return "rural";
+        case 2:  return "highway";
+        default: return "urban";
+    }
+}
+static inline std::string mptd_results_dir() {
+    return std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_name() + "/";
+}
+
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi)
 {
@@ -132,17 +148,18 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     // OVERWRITE each run: truncate on first call so the canonical CSV always
     // reflects the current run only. Use a static flag (reset each process run).
     static bool beacon_first_call = true;
-    const std::string path = NS3_ROOT "/analytics/results/beacon_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    const std::string path = mptd_results_dir() + "beacon_log.csv";
 
     // P0 (data persistence) — beacon_log.csv is truncated every run, so a manual
     // single `waf --run` would clobber the previous run's data. Mirror every row
     // into a permanent per-run archive keyed on this run's attack params so no
     // run is ever lost regardless of how the sim is launched. (The sweep also
     // archives via run_evaluation.sh; this protects ad-hoc invocations too.)
-    ensure_analytics_dir(NS3_ROOT "/analytics/results/runs");
+    ensure_analytics_dir((mptd_results_dir() + "runs").c_str());
     static const std::string run_path = [] {
         std::ostringstream o;
-        o << NS3_ROOT "/analytics/results/runs/beacon_a" << attack_number
+        o << mptd_results_dir() << "runs/beacon_a" << attack_number
           << "_p" << attack_percentage << "_s" << maxspeed << ".csv";
         return o.str();
     }();
@@ -223,7 +240,8 @@ void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    std::string path = NS3_ROOT "/analytics/results/tp_s1_poison_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    std::string path = mptd_results_dir() + "tp_s1_poison_log.csv";
     static bool poison_first_call = true;
     std::ofstream fout;
     if (poison_first_call) {
@@ -284,7 +302,8 @@ void log_ghost_identity(double sim_t, int rsu_id, int real_vid,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    std::string path = NS3_ROOT "/analytics/results/ghost_identity_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    std::string path = mptd_results_dir() + "ghost_identity_log.csv";
     static bool ghost_first_call = true;
     std::ofstream fout;
     if (ghost_first_call) {
@@ -343,7 +362,8 @@ void log_mitm_intercept(double sim_t,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    std::string path = NS3_ROOT "/analytics/results/mitm_intercept_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    std::string path = mptd_results_dir() + "mitm_intercept_log.csv";
     static bool mitm_first_call = true;
     std::ofstream fout;
     if (mitm_first_call) {
@@ -394,7 +414,8 @@ void log_rsu_relay(uint32_t vid, uint32_t rsu_id, double sim_t, bool is_poisoned
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    std::string path = NS3_ROOT "/analytics/results/rsu_relay_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    std::string path = mptd_results_dir() + "rsu_relay_log.csv";
     static bool relay_first_call = true;
     std::ofstream fout;
     if (relay_first_call) {
@@ -447,7 +468,8 @@ void log_vehicle_tx(uint32_t vid, uint32_t nearest_rsu,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    std::string path = NS3_ROOT "/analytics/results/vehicle_tx_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    std::string path = mptd_results_dir() + "vehicle_tx_log.csv";
     static bool tx_first_call = true;
     std::ofstream fout;
     if (tx_first_call) {
@@ -511,7 +533,8 @@ void log_unregistered_beacon_reject(uint32_t vid, uint32_t rsu_id, double sim_t,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    std::string path = NS3_ROOT "/analytics/results/unregistered_beacon_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    std::string path = mptd_results_dir() + "unregistered_beacon_log.csv";
     static bool ureg_first_call = true;
     std::ofstream fout;
     if (ureg_first_call) {
@@ -549,7 +572,8 @@ void log_controller_poison(double sim_t,
     ensure_analytics_dir(NS3_ROOT "/analytics");
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
 
-    std::string path = NS3_ROOT "/analytics/results/controller_poison_log.csv";
+    ensure_analytics_dir(mptd_results_dir().c_str());   // per-scenario folder (option A)
+    std::string path = mptd_results_dir() + "controller_poison_log.csv";
     static bool cp_first_call = true;
     std::ofstream fout;
     if (cp_first_call) {
@@ -859,10 +883,12 @@ static void export_run_dataset(const std::string &metrics_src)
         default: detail = "";                         break;
     }
 
-    const std::string results = NS3_ROOT "/analytics/results";
+    // per-scenario folder (option A); no trailing slash so the existing
+    // `results + "/..."` joins below stay correct.
+    const std::string results = std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_name();
 
     std::ostringstream dir;
-    dir << DATASET_ROOT "/analytics/datasets/a"
+    dir << DATASET_ROOT "/analytics/datasets/" << mptd_scenario_name() << "/a"
         << attack_number << "_p" << attack_percentage;
     const std::string dest = dir.str();
 
@@ -981,7 +1007,7 @@ void write_mptd_results_csv()
     // Also print to stdout and note the file written
     print_mptd_metrics();
     std::cout << "  Results CSV : " << fname.str() << std::endl;
-    std::cout << "  Beacon log  : " NS3_ROOT "/analytics/results/beacon_log.csv" << std::endl;
+    std::cout << "  Beacon log  : " << (mptd_results_dir() + "beacon_log.csv") << std::endl;
 
     // Additive, committable per-attack dataset snapshot (keeps every attack×pct run).
     export_run_dataset(fname.str());
