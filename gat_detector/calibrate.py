@@ -14,7 +14,7 @@ again during evaluation. At inference (score.py) the spatial anomaly score
 divides the node's current embedding deviation by its OWN sigma'_i and measures
 distance from its OWN x̄'_i:
 
-  S_i(t) = || (x'_i(t) - x̄'_i) / sigma'_i ||^2       (Eq. 3.38)
+  S_i(t) = || (x'_i(t) - x̄'_i) / sigma'_i ||_2        (Eq. gat_score)
 
 We also store a global fallback (pooled mean/std) for any vehicle id that appears
 at inference but was not seen during clean calibration (e.g. pseudonym rotation,
@@ -106,7 +106,7 @@ def main():
     for vid, vecs in per_node.items():
         r = id_to_row[vid]
         z = (np.stack(vecs) - mu_per_node[r]) / (sd_per_node[r] + EPS)
-        S_clean.append((z ** 2).sum(axis=1))
+        S_clean.append(np.sqrt((z ** 2).sum(axis=1)))  # Eq. gat_score: S_i = ||z||_2
     S_clean = np.concatenate(S_clean)
     theta_S = float(np.percentile(S_clean, cfg.score_percentile))
 

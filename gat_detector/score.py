@@ -4,7 +4,7 @@ score.py  —  INFERENCE  (per-node Eq. 3.38)
 Loads the locked encoder (Phase 1a) + locked PER-NODE stats (Phase 1b) and scores
 a beacon CSV. The spatial anomaly score uses each node's OWN locked statistics:
 
-  S_i(t) = || (x'_i(t) - x̄'_i) / sigma'_i ||^2        (Eq. 3.38)
+  S_i(t) = || (x'_i(t) - x̄'_i) / sigma'_i ||_2         (Eq. gat_score)
 
 where x̄'_i and sigma'_i are this vehicle's mean/std from the clean calibration.
 If a vehicle id was not seen during calibration, the locked GLOBAL fallback
@@ -86,7 +86,10 @@ def forward_all(enc, head, graphs, locked):
                 mu_rows[k], sd_rows[k] = mu_node[r], sd_node[r]
                 n_seen += 1
         z = (x_prime - mu_rows) / (sd_rows + EPS)
-        S_list.append((z ** 2).sum(axis=1))                   # Eq. 3.38, per node
+        # Eq. gat_score: S_i = ||(x'_i - x̄'_i)/σ'_i||_2 (L2 norm, per node).
+        # Threshold theta_S is calibrated on this same statistic in calibrate.py,
+        # so the detection decision is unchanged; the sqrt only matches the paper.
+        S_list.append(np.sqrt((z ** 2).sum(axis=1)))
         logit = head(torch.tensor(x_prime, dtype=torch.float32)).squeeze(-1)
         p_list.append(torch.sigmoid(logit).numpy())
         y_list.append(g.y.numpy())
