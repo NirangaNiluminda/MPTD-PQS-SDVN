@@ -44,6 +44,52 @@
 #include <cstdlib>
 #include <fstream>
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Ledger application-payload signature scheme (PQ migration / RQ5 overhead).
+//
+// The on-chain application signatures the chaincode VERIFIES — SC-Register
+// endorsements, σ_j^sub (RSU evidence, Eq 3.61), σ_c^sub (controller evidence,
+// Eq 3.62) and revoke votes (Eq 3.63) — default to ML-DSA-87 (CRYSTALS-
+// Dilithium5, FIPS 204, NIST Level 5), reusing the liboqs backend already
+// linked for the TRS (06b1_trs_backend.h). A classical EC-ECDSA P-256 path is
+// retained for the RQ5 ablation / overhead comparison and as a fallback when
+// liboqs is unavailable.
+//
+//   Build flag — MUST be mirrored on the Go chaincode verifier. A mismatch
+//   makes EVERY application signature fail verification, because the chaincode
+//   verifies each σ against the public key stored on chain at SC-Register:
+//     -DMPTD_LEDGER_SIG_ECDSA   → classical ECDSA P-256 (legacy / ablation)
+//     -DMPTD_LEDGER_SIG_MLDSA   → ML-DSA-87 (default when liboqs is present)
+//
+//   IMPORTANT (Fabric scope, state honestly in the report): this upgrades only
+//   the application payload we control. Hyperledger Fabric's own crypto (MSP
+//   transaction signing, peer/client TLS, Raft ordering) stays classical ECDSA
+//   — it cannot be made post-quantum without forking Fabric's BCCSP. So the
+//   accurate claim is "post-quantum (Level 5) on the application payload;
+//   classical at the Fabric platform layer", NOT "the whole blockchain is L5".
+//
+// The canonical digest rule is unchanged: every payload is SHA-256(ordered
+// string concat) and THAT 32-byte digest is the message handed to sign/verify,
+// so the signed bytes still equal the transmitted bytes on both sides. liboqs
+// OQS_SIG_sign for ML-DSA uses the FIPS 204 pure variant with an EMPTY context
+// string; the Go verifier (circl) MUST call Verify with a nil/empty context to
+// match.
+// ─────────────────────────────────────────────────────────────────────────────
+#if !defined(MPTD_LEDGER_SIG_ECDSA) && !defined(MPTD_LEDGER_SIG_MLDSA)
+#  if __has_include(<oqs/oqs.h>)
+#    define MPTD_LEDGER_SIG_MLDSA 1
+#  else
+#    define MPTD_LEDGER_SIG_ECDSA 1
+#  endif
+#endif
+#if defined(MPTD_LEDGER_SIG_MLDSA)
+#  if __has_include(<oqs/oqs.h>)
+#    include <oqs/oqs.h>
+#  else
+#    error "MPTD_LEDGER_SIG_MLDSA requested but <oqs/oqs.h> not found; install liboqs or build -DMPTD_LEDGER_SIG_ECDSA"
+#  endif
+#endif
+
 // Paper C_trusted set (Eq 3.1 / 3.60): the trusted-controller set. Fig 3.9
 // draws a single SDN controller for clarity, but the framework defines a SET of
 // trusted controllers so that a controller compromised per CP-DETECT (f+1 RSU
@@ -230,9 +276,10 @@ void assign_controllers()
 // (memory project_sc_register_decisions.md):
 //   - Fabric-CA enrollment (decision #1) is LIVE as of P4 — but operates at
 //     TWO distinct layers, kept deliberately separate:
-//       (a) Application keypair: the EC-ECDSA P-256 (id, pk, h(K_u)) tuple
-//           registered ON CHAIN is still generated here (g_node_ec_keys).
-//           This is the LKH/endorsement key the chaincode stores in PkHex.
+//       (a) Application keypair: the (id, pk, h(K_u)) tuple registered ON CHAIN
+//           is generated here (g_node_keys), ML-DSA-87 by default or ECDSA
+//           P-256 per MPTD_LEDGER_SIG. This is the LKH/endorsement key the
+//           chaincode stores in PkHex.
 //       (b) Fabric submitting identity: WHICH Fabric MSP x509 cert SIGNS the
 //           transaction. Pre-P4 every node submitted as the shared User1;
 //           P4 makes each node submit under its OWN CA-enrolled identity
@@ -252,12 +299,26 @@ void assign_controllers()
 
 namespace mptd_scregister {
 
+// LedgerKey — a per-node application-payload keypair, scheme-agnostic so the
+// MPTD_LEDGER_SIG build flag selects ML-DSA-87 (default) or EC-ECDSA P-256
+// (ablation) without touching call sites. Holds the SECRET key off-chain; the
+// public key is registered on chain (PkHex) at SC-Register time.
+struct LedgerKey {
+#if defined(MPTD_LEDGER_SIG_MLDSA)
+    std::vector<uint8_t> pk;   // ML-DSA-87 public key  (2592 B)
+    std::vector<uint8_t> sk;   // ML-DSA-87 secret key  (4896 B)
+#else
+    EC_KEY* ec = nullptr;      // EC P-256 keypair
+#endif
+};
+
 // Per-node keypair store. Keyed by full SC-Register ID ("VEH_<nid>",
 // "RSU_<idx>", "CTRL_<idx>"). RSU keys are needed AFTER bootstrap to sign
 // endorsements for the vehicle/controller registration phase, so the
-// vector outlives register_all_nodes(); leaked at process exit (acceptable
-// for an NS-3 sim, matches existing OpenFHE/TRS lifetime).
-static std::map<std::string, EC_KEY*> g_node_ec_keys;
+// store outlives register_all_nodes(); leaked at process exit (acceptable
+// for an NS-3 sim, matches existing OpenFHE/TRS lifetime — in ECDSA mode the
+// EC_KEY* inside LedgerKey is intentionally not freed).
+static std::map<std::string, LedgerKey> g_node_keys;
 static std::map<std::string, std::string> g_node_pk_hex;
 
 // ── P4 — leased Fabric-CA identity pool (see P4_FABRIC_CA_ENROLLMENT.md) ──────
@@ -357,7 +418,8 @@ static inline std::string sha256_hex(const uint8_t* data, size_t len)
 // ec_p256_keygen — generate a fresh EC P-256 keypair using OpenSSL low-level
 // API. The deprecation warning is silenced project-wide via wscript's
 // -Wno-deprecated-declarations.
-static EC_KEY* ec_p256_keygen()
+// [[maybe_unused]]: dead when built with MPTD_LEDGER_SIG_MLDSA (ML-DSA path).
+[[maybe_unused]] static EC_KEY* ec_p256_keygen()
 {
     EC_KEY* k = EC_KEY_new_by_curve_name(NID_X9_62_prime256v1);
     if (!k) return nullptr;
@@ -371,7 +433,8 @@ static EC_KEY* ec_p256_keygen()
 // ec_pubkey_uncompressed_hex — serialize the public key as a 65-byte
 // uncompressed point (0x04 || X32 || Y32) → 130 lowercase hex chars.
 // MUST match chaincode parseP256PubKey expectations.
-static std::string ec_pubkey_uncompressed_hex(EC_KEY* k)
+// [[maybe_unused]]: dead when built with MPTD_LEDGER_SIG_MLDSA.
+[[maybe_unused]] static std::string ec_pubkey_uncompressed_hex(EC_KEY* k)
 {
     const EC_GROUP* grp = EC_KEY_get0_group(k);
     const EC_POINT* pub = EC_KEY_get0_public_key(k);
@@ -390,7 +453,8 @@ static std::string ec_pubkey_uncompressed_hex(EC_KEY* k)
 // endorsementDigest) with EC-ECDSA P-256 and return the ASN.1-DER
 // signature as lowercase hex. Matches chaincode `verifyECDSAP256` which
 // expects `ecdsa.VerifyASN1` input format.
-static std::string ecdsa_sign_hex(EC_KEY* k,
+// [[maybe_unused]]: dead when built with MPTD_LEDGER_SIG_MLDSA.
+[[maybe_unused]] static std::string ecdsa_sign_hex(EC_KEY* k,
                                    const uint8_t* digest, size_t digest_len)
 {
     ECDSA_SIG* sig = ECDSA_do_sign(digest, (int)digest_len, k);
@@ -406,6 +470,67 @@ static std::string ecdsa_sign_hex(EC_KEY* k,
     i2d_ECDSA_SIG(sig, &p);
     ECDSA_SIG_free(sig);
     return hex_encode(der.data(), der.size());
+}
+
+#if defined(MPTD_LEDGER_SIG_MLDSA)
+// ledger_oqs_sig — process-wide ML-DSA-87 OQS_SIG handle for the ledger
+// application-payload signatures. Created once; never freed (process-lifetime
+// singleton, same convention as the TRS/OpenFHE backends). Returns nullptr if
+// liboqs cannot instantiate ML-DSA-87 (then keygen/sign fail closed → "").
+static OQS_SIG* ledger_oqs_sig()
+{
+    static OQS_SIG* s = OQS_SIG_new(OQS_SIG_alg_ml_dsa_87);
+    return s;
+}
+#endif
+
+// ledger_keygen — generate a fresh application-payload keypair for the active
+// scheme (ML-DSA-87 or EC P-256), store it in `out`, and return the PUBLIC key
+// as lowercase hex (the value registered on chain as PkHex). Returns "" on
+// failure so the caller can fail closed. Replaces the direct ec_p256_keygen +
+// ec_pubkey_uncompressed_hex pair at the registration call sites.
+static std::string ledger_keygen(LedgerKey& out)
+{
+#if defined(MPTD_LEDGER_SIG_MLDSA)
+    OQS_SIG* s = ledger_oqs_sig();
+    if (!s) return "";
+    out.pk.assign(s->length_public_key, 0);
+    out.sk.assign(s->length_secret_key, 0);
+    if (OQS_SIG_keypair(s, out.pk.data(), out.sk.data()) != OQS_SUCCESS) {
+        out.pk.clear();
+        out.sk.clear();
+        return "";
+    }
+    return hex_encode(out.pk.data(), out.pk.size());
+#else
+    out.ec = ec_p256_keygen();
+    if (!out.ec) return "";
+    return ec_pubkey_uncompressed_hex(out.ec);
+#endif
+}
+
+// ledger_sign_hex — sign the canonical 32-byte digest with `key` under the
+// active scheme and return the signature as lowercase hex. ML-DSA-87 signs the
+// digest as its message (FIPS 204 pure, EMPTY context — the Go circl verifier
+// must mirror that); ECDSA produces ASN.1-DER over the same digest. Returns ""
+// on any failure (key wrong size, OQS error) so the chaincode rejects rather
+// than accepting an unsigned submission.
+static std::string ledger_sign_hex(const LedgerKey& key,
+                                   const uint8_t* digest, size_t digest_len)
+{
+#if defined(MPTD_LEDGER_SIG_MLDSA)
+    OQS_SIG* s = ledger_oqs_sig();
+    if (!s || key.sk.size() != s->length_secret_key) return "";
+    std::vector<uint8_t> sig(s->length_signature);
+    size_t siglen = 0;
+    if (OQS_SIG_sign(s, sig.data(), &siglen,
+                     digest, digest_len, key.sk.data()) != OQS_SUCCESS)
+        return "";
+    return hex_encode(sig.data(), siglen);
+#else
+    if (!key.ec) return "";
+    return ecdsa_sign_hex(key.ec, digest, digest_len);
+#endif
 }
 
 // concat_digest — SHA-256 over the ordered raw-UTF-8 concatenation of `parts`
@@ -430,16 +555,16 @@ static std::vector<uint8_t> endorsement_digest(const std::string& id,
     return concat_digest({id, pkHex, hKuHex});
 }
 
-// node_sign_hex — sign `digest` with node `id`'s registered P-256 key from
-// g_node_ec_keys. Returns "" if the key is absent (node not registered) so the
-// chaincode's strict verify rejects the submission rather than silently
-// accepting forged evidence.
+// node_sign_hex — sign `digest` with node `id`'s registered ledger key from
+// g_node_keys (ML-DSA-87 or ECDSA per build flag). Returns "" if the key is
+// absent (node not registered) so the chaincode's strict verify rejects the
+// submission rather than silently accepting forged evidence.
 static std::string node_sign_hex(const std::string& id,
                                  const std::vector<uint8_t>& digest)
 {
-    auto it = g_node_ec_keys.find(id);
-    if (it == g_node_ec_keys.end() || !it->second) return "";
-    return ecdsa_sign_hex(it->second, digest.data(), digest.size());
+    auto it = g_node_keys.find(id);
+    if (it == g_node_keys.end()) return "";
+    return ledger_sign_hex(it->second, digest.data(), digest.size());
 }
 
 // derive_controller_k_u — paper §3.5.5 / Algorithm 7 hKuHex source for the
@@ -570,8 +695,9 @@ static void refresh_endorsement_committee()
 }
 
 // build_endorsements_json — for the registering node, ask `need` RSUs to
-// each ECDSA-sign the endorsement digest. Returns the JSON array string
-// expected by SCRegister.endorsersJSON (smartcontract.go Endorser type).
+// each sign the endorsement digest with their registered ledger key (ML-DSA-87
+// or ECDSA per MPTD_LEDGER_SIG). Returns the JSON array string expected by
+// SCRegister.endorsersJSON (smartcontract.go Endorser type).
 static std::string build_endorsements_json(const std::string& target_id,
                                             const std::string& target_pk_hex,
                                             const std::string& target_h_ku_hex,
@@ -592,9 +718,9 @@ static std::string build_endorsements_json(const std::string& target_id,
     bool first = true;
     for (uint32_t rsu_idx : sample) {
         std::string rsu_id = MakeRsuId(rsu_idx);
-        auto it = g_node_ec_keys.find(rsu_id);
-        if (it == g_node_ec_keys.end() || !it->second) continue;
-        std::string sig_hex = ecdsa_sign_hex(it->second,
+        auto it = g_node_keys.find(rsu_id);
+        if (it == g_node_keys.end()) continue;
+        std::string sig_hex = ledger_sign_hex(it->second,
                                               digest.data(), digest.size());
         if (sig_hex.empty()) continue;
         if (!first) js << ",";
@@ -617,15 +743,15 @@ static bool register_one(const std::string& id, const std::string& role,
                           uint32_t max_retries,
                           const std::string& submit_identity)
 {
-    // Generate per-node keypair (kept alive in g_node_ec_keys so RSUs can
-    // later sign endorsements).
-    EC_KEY* k = ec_p256_keygen();
-    if (!k) {
-        std::cerr << "[SC-REGISTER] " << id << ": EC keygen FAILED\n";
+    // Generate per-node keypair (kept alive in g_node_keys so RSUs can later
+    // sign endorsements). Scheme (ML-DSA-87 / ECDSA) follows MPTD_LEDGER_SIG.
+    LedgerKey k;
+    std::string pk_hex = ledger_keygen(k);
+    if (pk_hex.empty()) {
+        std::cerr << "[SC-REGISTER] " << id << ": ledger keygen FAILED\n";
         return false;
     }
-    g_node_ec_keys[id] = k;
-    std::string pk_hex = ec_pubkey_uncompressed_hex(k);
+    g_node_keys[id] = std::move(k);
     g_node_pk_hex[id] = pk_hex;
 
     // RSU genesis path: SCBootstrapRSU (no endorsers).
@@ -707,10 +833,11 @@ static bool register_one(const std::string& id, const std::string& role,
 // Produce σ over the EXACT strings the Call* wrappers transmit, hashed
 // identically to the chaincode digest helpers (smartcontract.go evidenceDigest
 // / controllerEvidenceDigest / revokeVoteDigest), signed with the node's
-// registered P-256 key. Forward-declared in 06c_blockchain_api.h so the
-// wrappers can sign without header-order coupling; defined here because they
-// need g_node_ec_keys (populated at SC-Register time). They delegate to the
-// namespaced concat_digest / node_sign_hex helpers.
+// registered ledger key (ML-DSA-87 / ECDSA per MPTD_LEDGER_SIG). Forward-
+// declared in 06c_blockchain_api.h so the wrappers can sign without header-
+// order coupling; defined here because they need g_node_keys (populated at
+// SC-Register time). They delegate to the namespaced concat_digest /
+// node_sign_hex helpers.
 
 // σ_j^sub (Eq 3.61): RSU `rsuId` signs SHA-256(vehId‖rsuId‖epoch‖psiStr‖beaconHash).
 std::string mptd_sign_evidence_hex(const std::string& vehId,

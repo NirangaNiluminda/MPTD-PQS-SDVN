@@ -9,15 +9,19 @@ logic, how NS-3 drives the chain, and how on-chain evidence is exported.
 - **Chaincode source** → `chaincode/chaincode/smartcontract.go` (canonical;
   the deploy copy at `$FAB_ROOT/trajectory-chaincode/chaincode/smartcontract.go`
   must be kept byte-identical — `deploy_cc.sh` builds the CCAAS image from it)
-- **Unit tests** → `chaincode/chaincode/smartcontract_test.go` (26 tests, 86.5%
-  stmt coverage, in-memory fake ledger; `go test ./chaincode/ -cover`)
+- **Unit tests** → `chaincode/chaincode/smartcontract_test.go` (30 tests, 79.6%
+  stmt coverage, in-memory fake ledger; `go test ./chaincode/ -cover`). Signature
+  helpers are scheme-aware (`sigtest_mldsa_test.go` / `sigtest_ecdsa_test.go`);
+  run the ablation with `go test -tags ledger_ecdsa ./chaincode/`
 
 ---
 
 ## 1. Roles, identities and the ID scheme
 
-Every participant is registered on-chain with a P-256 (`secp256r1`) public key
-and a role. IDs follow the locked prefix scheme (`06c_blockchain_api.h`
+Every participant is registered on-chain with a post-quantum **ML-DSA-87**
+(CRYSTALS-Dilithium5, FIPS 204, NIST Level 5) public key and a role — or a
+classical P-256 (`secp256r1`) key under the `-tags ledger_ecdsa` ablation. IDs
+follow the locked prefix scheme (`06c_blockchain_api.h`
 `MakeVehId/MakeRsuId/MakeCtrlId`):
 
 | Role | ID form | Registered by | Authoritative? |
@@ -31,11 +35,23 @@ RegisteredAt`. `Status ∈ {ACTIVE, REVOKED, EXCLUDED}`.
 
 ---
 
-## 2. Signature scheme — ECDSA P-256 over the registered key
+## 2. Signature scheme — ML-DSA-87 over the registered key
 
 **Decision (locked).** The evidence/vote signatures `σ_j^sub` (RSU), `σ_c^sub`
-(controller) and revoke-vote sigs are **ECDSA P-256 over each node's registered
-Fabric-MSP key** — *not* TRS partials.
+(controller) and revoke-vote sigs are **ML-DSA-87 (CRYSTALS-Dilithium5, FIPS 204,
+NIST Level 5) over each node's registered application key** — *not* TRS partials.
+A build flag (`MPTD_LEDGER_SIG`) keeps a classical **ECDSA P-256** ablation for
+the RQ5 overhead comparison: C++ signer macros `MPTD_LEDGER_SIG_MLDSA` /
+`MPTD_LEDGER_SIG_ECDSA` (auto-defaults to ML-DSA when `<oqs/oqs.h>` is present),
+Go verifier build tags (default ML-DSA, `-tags ledger_ecdsa` for the baseline).
+Signer and verifier **must** be paired — a scheme mismatch fails every signature.
+
+> **NIST-scope honesty.** Level 5 here applies to the **application payload we
+> control** — the evidence/vote/endorsement signatures verified by our chaincode.
+> Hyperledger Fabric's own crypto (MSP transaction signing, peer/client TLS, Raft
+> ordering) remains **classical ECDSA** and is out of scope for this upgrade. The
+> correct claim is "post-quantum Level 5 on the application payload", **not** "the
+> whole blockchain is Level 5".
 
 *Rationale.* SC-Trust evidence is keyed by submitter ID on-chain
 (`SUBM_<veh>_<epoch>_<rsuID>`), so there is **no signer anonymity to protect** —
@@ -43,7 +59,9 @@ the correct `σ` is the submitting node's identity signature. This is consistent
 with the SC-Register endorsement gate (`project_sc_register_decisions.md`). The
 privacy-preserving threshold-ring `σ_TRS` (Eq 3.48) is a **separate** construct
 over the FHE cloud aggregate (`06b1_trs_backend.h` / the 06b1 pipeline) and is
-untouched by this.
+untouched by this. Both share the same liboqs ML-DSA-87 backend; the C++ signer
+reuses the TRS's liboqs, the Go verifier uses Cloudflare circl
+(`circl/sign/mldsa/mldsa87`) — interop is empty-context FIPS 204 pure mode.
 
 ### Canonical digest rule (must be byte-identical C++ ↔ Go)
 
@@ -60,14 +78,18 @@ untouched by this.
 
 On the C++ side the digest is built by `mptd_scregister::concat_digest({...})`
 and signed by `mptd_scregister::node_sign_hex(id, digest)`, which looks up the
-node's key in `g_node_ec_keys[id]` (returns `""` if absent → chaincode rejects).
+node's key in `g_node_keys[id]` (returns `""` if absent → chaincode rejects).
 `beaconHash` carries `h(b_i(t))` (Eq 3.56), or in the full-mode TRS path the FHE
 ciphertext digest `h(Enc(A_ring))` so the signature binds the ciphertext.
 
-Every gated write verifies the signature with `verifyECDSAP256(pkHex, sig,
-digest)` against the submitter's **registered** key and **strict-rejects** on
-failure (mirrors the SC-Register endorsement gate). Crypto-agility: key/sig
-sizes are runtime values, never hardcoded.
+Every gated write verifies the signature with `verifyLedgerSig(pkHex, sig,
+digest)` (ML-DSA-87 by default, ECDSA P-256 under `-tags ledger_ecdsa`) against
+the submitter's **registered** key and **strict-rejects** on failure (mirrors the
+SC-Register endorsement gate). The scheme-specific verifier lives in build-tagged
+files `ledger_sig_mldsa.go` / `ledger_sig_ecdsa.go`. Crypto-agility: key/sig
+sizes are runtime values, never hardcoded (ML-DSA-87 pubkey 2592 B / 5184 hex,
+sig 4627 B / 9254 hex; P-256 pubkey 65 B, sig ~70 B — the ~40×/~65× blow-up is
+the RQ5 story).
 
 ---
 
@@ -263,7 +285,7 @@ consensus** (the conflict count), never by the controller itself (invariant 6).
 
 | Phase | Code | What happens |
 |-------|------|--------------|
-| Boot | `register_all_nodes()` (`11_blockchain_setup.h`) | RSUs (`SCBootstrapRSU`) → vehicles → controllers (`SCRegister`, 2f+1 endorsements). EC keys stored in `g_node_ec_keys[id]`. |
+| Boot | `register_all_nodes()` (`11_blockchain_setup.h`) | RSUs (`SCBootstrapRSU`) → vehicles → controllers (`SCRegister`, 2f+1 endorsements). Ledger keys stored in `g_node_keys[id]` (ML-DSA-87 / EC per `MPTD_LEDGER_SIG`). |
 | Lightweight alert path | `08_detection_engine.h` ~2930 | `CallSCTrustSubmitEvidence(vid, rsu_idx, epoch, psi, h_b)` (signs internally) |
 | Controller evidence | `08_detection_engine.h` ~1936 | `CallSCControllerSubmitEvidence(vid, g_active_controller_idx, epoch, phi, h_X)` |
 | Cross-RSU revoke | `08_detection_engine.h` ~2840 | `CallSCRevokeVote(vid, rsu_idx, reason, ts)` |
@@ -310,19 +332,23 @@ No-op under `skip_blockchain` / A5.
 | 1 — RSU→blockchain direct | RSU `Call*` wrappers submit directly; CRL = on-chain `SCREVOKE_` records read direct, never controller-relayed |
 | 2 — controller non-authoritative | controller registered as `CONTROLLER`, only a Raft orderer in the topology; CP-DETECT `f+1` excludes it; its evidence never overrides RSU consensus |
 | 3 — LW skip-on-pass | unchanged; blockchain only on the alert path |
-| 5 — FHE before TRS | separate 06b1 pipeline; this doc's σ are identity ECDSA, not σ_TRS |
+| 5 — FHE before TRS | separate 06b1 pipeline; this doc's σ are identity ML-DSA-87 (PQ Level 5), not σ_TRS |
 | 6 — distributed trust | N-way ledger replication; 2f+1 RSU consensus is authoritative; no single controller secret gates anything |
 
 ---
 
 ## 8. Testing & verification status
 
-- **Chaincode unit tests**: `go test ./chaincode/ -cover` → 26 tests pass, 86.5%
-  statement coverage. Covers happy paths, every rejection path (bad role/key,
+- **Chaincode unit tests**: `go test ./chaincode/ -cover` → 30 tests pass, 79.6%
+  statement coverage (ML-DSA-87 default); `go test -tags ledger_ecdsa` → 79.7%
+  (ECDSA ablation). Covers happy paths, every rejection path (bad role/key,
   insufficient/forged endorsements, invalid evidence/vote signatures, EXCLUDED
   bounce), CP-DETECT exclusion + reassignment + idempotence, and infra-failure
-  paths (ledger I/O errors, corrupt state, range/iterator failures).
-- **NS-3 build**: compiles clean with the signing wrappers + evidence export.
+  paths (ledger I/O errors, corrupt state, range/iterator failures). The
+  ML-DSA-87 round-trip is circl↔circl; liboqs↔circl interop is validated by the
+  live end-to-end run below.
+- **NS-3 build**: compiles clean with the ML-DSA-87 signing wrappers (liboqs) +
+  evidence export (`./waf build`, exit 0).
 - **Live end-to-end run** (real beacons driving SC-Trust/SC-Revoke/CP-Detect with
   `--skip_blockchain=false`): performed on the **HPC node** (Docker + Explorer +
   IPFS). See `HPC_RUN_GUIDE.md` §1b and `fabric_net/README.md`.

@@ -27,8 +27,12 @@
 //      exists for registered vehicles.
 //
 // Crypto choices (decided in TASK ② design-gap resolution):
-//   • Endorsement signature = EC-ECDSA on the NIST P-256 curve, ASN.1-DER
-//     encoded. Reuses each RSU's existing Fabric MSP identity key.
+//   • Endorsement signature = ML-DSA-87 (CRYSTALS-Dilithium5, FIPS 204, NIST
+//     Level 5) over each node's registered ledger key — the post-quantum
+//     default (ledger_sig_mldsa.go). The classical EC-ECDSA P-256 (ASN.1-DER)
+//     scheme is retained as the -tags ledger_ecdsa ablation. NOTE: this is the
+//     application-payload signature we control; Fabric's own MSP/TLS/Raft
+//     crypto stays classical and is out of scope (see BLOCKCHAIN_IMPLEMENTATION.md).
 //   • τ_init = 1.0 (benign vehicles start fully trusted; SC-Trust's EMA
 //     only drags scores down on detected anomalies).
 //   • Endorsement digest = SHA-256(vehicleID ‖ pkHex ‖ hKuHex). String
@@ -44,13 +48,10 @@
 package chaincode
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"math/big"
 	"strconv"
 	"time"
 
@@ -109,7 +110,7 @@ const (
 type RegistrationRecord struct {
 	ID           string  `json:"ID"`
 	Role         string  `json:"Role"`               // VEHICLE | RSU | CONTROLLER
-	PkHex        string  `json:"PkHex"`              // uncompressed P-256, 0x04‖X‖Y, 130 hex chars
+	PkHex        string  `json:"PkHex"`              // ML-DSA-87 pub, 5184 hex chars (or uncompressed P-256 130 hex in ablation)
 	HKuHex       string  `json:"HKuHex"`             // h(K_u_i), 64 hex chars (SHA-256)
 	TauInit      float64 `json:"TauInit"`            // τ_init at registration
 	Status       string  `json:"Status"`             // ACTIVE | REVOKED | EXCLUDED
@@ -276,7 +277,7 @@ type ControllerReassignment struct {
 // Endorser — one element of the endorsersJSON array passed to SCRegister.
 type Endorser struct {
 	RSUID  string `json:"rsuID"`
-	SigHex string `json:"sigHex"` // ASN.1-DER ECDSA-P256 signature, hex-encoded
+	SigHex string `json:"sigHex"` // application-payload signature (ML-DSA-87 raw, or ASN.1-DER ECDSA-P256 in ablation), hex-encoded
 }
 
 func txTimeStr(ctx contractapi.TransactionContextInterface) string {
@@ -358,39 +359,14 @@ func (s *SmartContract) requireActive(ctx contractapi.TransactionContextInterfac
 	return nil
 }
 
-// parseP256PubKey decodes an uncompressed P-256 public key from hex.
-// Expected format: 130 hex chars (1 byte 0x04 prefix + 32 bytes X + 32 bytes Y).
-func parseP256PubKey(pkHex string) (*ecdsa.PublicKey, error) {
-	raw, err := hex.DecodeString(pkHex)
-	if err != nil {
-		return nil, fmt.Errorf("pk hex decode: %v", err)
-	}
-	if len(raw) != 65 || raw[0] != 0x04 {
-		return nil, fmt.Errorf("pk must be 65-byte uncompressed P-256 (got %d bytes)", len(raw))
-	}
-	curve := elliptic.P256()
-	x := new(big.Int).SetBytes(raw[1:33])
-	y := new(big.Int).SetBytes(raw[33:65])
-	if !curve.IsOnCurve(x, y) {
-		return nil, fmt.Errorf("pk point not on P-256")
-	}
-	return &ecdsa.PublicKey{Curve: curve, X: x, Y: y}, nil
-}
-
-// verifyECDSAP256 verifies an ASN.1-DER ECDSA signature over `digest` using
-// the public key in `pkHex`. Returns true on success, false on any failure
-// (decode, parse, signature mismatch). Mirrors crypto/ecdsa.VerifyASN1.
-func verifyECDSAP256(pkHex, sigHex string, digest []byte) bool {
-	pub, err := parseP256PubKey(pkHex)
-	if err != nil {
-		return false
-	}
-	sig, err := hex.DecodeString(sigHex)
-	if err != nil {
-		return false
-	}
-	return ecdsa.VerifyASN1(pub, digest, sig)
-}
+// Application-payload signature verification (validateLedgerPubKey /
+// verifyLedgerSig) is defined in build-tagged files so the on-chain scheme can
+// be swapped without touching the call sites:
+//   ledger_sig_mldsa.go  (//go:build !ledger_ecdsa) → ML-DSA-87 (FIPS 204, L5)
+//   ledger_sig_ecdsa.go  (//go:build ledger_ecdsa)  → EC-ECDSA P-256 (ablation)
+// The selected scheme MUST match the NS-3 signer's MPTD_LEDGER_SIG build flag;
+// a mismatch makes every signature fail (the contract verifies σ against the
+// public key stored on chain at SC-Register).
 
 // concatDigest returns SHA-256 over the ordered string concatenation of
 // `parts`. This is the one canonical hashing rule shared by every signed
@@ -442,7 +418,8 @@ func revokeVoteDigest(vehicleID, rsuID, reason, timestamp string) []byte {
 // Args:
 //   vehicleID   — paper ID_i; chaincode key suffix.
 //   role        — "VEHICLE" | "RSU" | "CONTROLLER".
-//   pkHex       — uncompressed P-256 pubkey (130 hex chars, "04…").
+//   pkHex       — application pubkey hex (ML-DSA-87, 5184 hex chars; or
+//                 uncompressed P-256 130 hex chars under -tags ledger_ecdsa).
 //   hKuHex      — SHA-256(K_u_i) hex (64 chars).
 //   tReg        — caller-supplied registration timestamp.
 //   endorsersJSON — JSON array [{"rsuID":"…","sigHex":"…"}, …].
@@ -459,7 +436,7 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 	default:
 		return fmt.Errorf("rejected: invalid role %q", role)
 	}
-	if _, err := parseP256PubKey(pkHex); err != nil {
+	if err := validateLedgerPubKey(pkHex); err != nil {
 		return fmt.Errorf("rejected: invalid pk: %v", err)
 	}
 	if len(hKuHex) != 64 {
@@ -515,7 +492,7 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 		if regE.RSUState != "" && regE.RSUState != RSUStateTrusted {
 			continue
 		}
-		if !verifyECDSAP256(regE.PkHex, e.SigHex, digest) {
+		if !verifyLedgerSig(regE.PkHex, e.SigHex, digest) {
 			continue
 		}
 		seen[e.RSUID] = true
@@ -596,7 +573,7 @@ func (s *SmartContract) SCRegister(ctx contractapi.TransactionContextInterface,
 func (s *SmartContract) SCBootstrapRSU(ctx contractapi.TransactionContextInterface,
 	rsuID, pkHex, hKuHex, tReg string) error {
 
-	if _, err := parseP256PubKey(pkHex); err != nil {
+	if err := validateLedgerPubKey(pkHex); err != nil {
 		return fmt.Errorf("rejected: invalid pk: %v", err)
 	}
 	if len(hKuHex) != 64 {
@@ -990,8 +967,9 @@ func (s *SmartContract) SCTrustSubmitEvidence(ctx contractapi.TransactionContext
 		return err
 	}
 
-	// Eq 3.61 — verify σ_j^sub against the submitting RSU's on-chain P-256
-	// key over the canonical evidence digest. Strict reject mirrors the
+	// Eq 3.61 — verify σ_j^sub against the submitting RSU's on-chain ledger
+	// key (ML-DSA-87, or P-256 in the ablation) over the canonical evidence
+	// digest. Strict reject mirrors the
 	// SCRegister endorsement gate: an unverifiable signature is dropped, so
 	// only genuinely-keyed RSU evidence ever reaches SC-Trust aggregation.
 	regRSU, err := s.getRegistration(ctx, rsuID)
@@ -1001,7 +979,7 @@ func (s *SmartContract) SCTrustSubmitEvidence(ctx contractapi.TransactionContext
 	if regRSU == nil {
 		return fmt.Errorf("rejected: rsu %s not registered", rsuID)
 	}
-	if !verifyECDSAP256(regRSU.PkHex, signature,
+	if !verifyLedgerSig(regRSU.PkHex, signature,
 		evidenceDigest(vehicleID, rsuID, epoch, psiStr, beaconHash)) {
 		return fmt.Errorf("rejected: invalid evidence signature for rsu %s", rsuID)
 	}
@@ -1043,7 +1021,8 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 		return err
 	}
 
-	// Eq 3.62 — verify σ_c^sub against the controller's on-chain P-256 key.
+	// Eq 3.62 — verify σ_c^sub against the controller's on-chain ledger key
+	// (ML-DSA-87, or P-256 in the ablation).
 	// The controller writes evidence as a non-authoritative client (invariant
 	// 2): its submission is recorded and fed to CP-DETECT, but an unsigned or
 	// forged controller submission is rejected here before it can skew the
@@ -1055,7 +1034,7 @@ func (s *SmartContract) SCControllerSubmitEvidence(ctx contractapi.TransactionCo
 	if regCtrl == nil {
 		return fmt.Errorf("rejected: controller %s not registered", controllerID)
 	}
-	if !verifyECDSAP256(regCtrl.PkHex, signature,
+	if !verifyLedgerSig(regCtrl.PkHex, signature,
 		controllerEvidenceDigest(vehicleID, controllerID, epoch, phiStr, beaconHash)) {
 		return fmt.Errorf("rejected: invalid controller signature for %s", controllerID)
 	}
@@ -1639,7 +1618,8 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 	}
 
 	// Eq 3.63 — verify the revocation vote signature against the voting RSU's
-	// on-chain P-256 key. Without this gate a single forged identity could
+	// on-chain ledger key (ML-DSA-87, or P-256 in the ablation). Without this
+	// gate a single forged identity could
 	// stuff the 2f+1 tally; binding (vehicleID‖rsuID‖reason‖timestamp) also
 	// stops a valid vote being replayed against a different vehicle.
 	regRSU, err := s.getRegistration(ctx, rsuID)
@@ -1649,7 +1629,7 @@ func (s *SmartContract) SCRevokeVote(ctx contractapi.TransactionContextInterface
 	if regRSU == nil {
 		return "", fmt.Errorf("rejected: rsu %s not registered", rsuID)
 	}
-	if !verifyECDSAP256(regRSU.PkHex, signature,
+	if !verifyLedgerSig(regRSU.PkHex, signature,
 		revokeVoteDigest(vehicleID, rsuID, reason, timestamp)) {
 		return "", fmt.Errorf("rejected: invalid revoke vote signature for rsu %s", rsuID)
 	}
