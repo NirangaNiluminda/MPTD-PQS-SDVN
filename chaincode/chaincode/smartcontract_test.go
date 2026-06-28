@@ -15,10 +15,6 @@
 package chaincode
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -106,21 +102,10 @@ const dummyHKu = "ababababababababababababababababababababababababababababababab
 // dummyHKu must be exactly 64 hex chars:
 var hku64 = strings.Repeat("ab", 32)
 
-// genID returns a fresh P-256 keypair and its uncompressed 0x04‖X‖Y hex.
-func genID(t *testing.T) (*ecdsa.PrivateKey, string) {
-	t.Helper()
-	priv, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	ok(t, err)
-	raw := elliptic.Marshal(elliptic.P256(), priv.PublicKey.X, priv.PublicKey.Y)
-	return priv, hex.EncodeToString(raw)
-}
-
-func signHex(t *testing.T, priv *ecdsa.PrivateKey, digest []byte) string {
-	t.Helper()
-	sig, err := ecdsa.SignASN1(rand.Reader, priv, digest)
-	ok(t, err)
-	return hex.EncodeToString(sig)
-}
+// genID / signHex / genIDStatic are the scheme-aware test signing helpers,
+// defined in build-tagged files (sigtest_mldsa_test.go / sigtest_ecdsa_test.go)
+// so the test keypair + signature scheme tracks the chaincode verifier under
+// test. ledgerTestKey is the matching opaque key type.
 
 func seedReg(fl *fakeLedger, id, role, pkHex string) {
 	rec := RegistrationRecord{ID: id, Role: role, PkHex: pkHex, HKuHex: hku64,
@@ -134,7 +119,7 @@ func seedReg(fl *fakeLedger, id, role, pkHex string) {
 // verifies (Eq 3.61–3.63 evidence/vote gates). seedReg alone reuses a shared pk
 // whose private key is discarded — fine for read-path tests, useless for the
 // signature-gated write paths.
-func seedRegKeyed(t *testing.T, fl *fakeLedger, id, role string) *ecdsa.PrivateKey {
+func seedRegKeyed(t *testing.T, fl *fakeLedger, id, role string) ledgerTestKey {
 	t.Helper()
 	priv, pk := genID(t)
 	seedReg(fl, id, role, pk)
@@ -145,7 +130,7 @@ func seedRegKeyed(t *testing.T, fl *fakeLedger, id, role string) *ecdsa.PrivateK
 // submits the vote, mirroring how the NS-3 CallSCRevokeVote wrapper folds
 // signing into the call so signed-bytes == transmitted-bytes.
 func castVote(t *testing.T, sc SmartContract, ctx *mocks.TransactionContext,
-	priv *ecdsa.PrivateKey, veh, rsu, reason, ts string) (string, error) {
+	priv ledgerTestKey, veh, rsu, reason, ts string) (string, error) {
 	t.Helper()
 	sig := signHex(t, priv, revokeVoteDigest(veh, rsu, reason, ts))
 	return sc.SCRevokeVote(ctx, veh, rsu, reason, sig, ts)
@@ -198,43 +183,43 @@ func TestFByzantine(t *testing.T) {
 	}
 }
 
-func TestParseP256PubKey(t *testing.T) {
+// TestValidateLedgerPubKey / TestVerifyLedgerSig exercise the active ledger
+// signature scheme (ML-DSA-87 by default, EC-ECDSA P-256 under -tags
+// ledger_ecdsa). genID/signHex are build-tagged to produce keys+signatures in
+// that same scheme, so this is a real sign↔verify round-trip plus the forged-
+// signature rejection paths.
+func TestValidateLedgerPubKey(t *testing.T) {
 	_, pk := genID(t)
-	if _, err := parseP256PubKey(pk); err != nil {
+	if err := validateLedgerPubKey(pk); err != nil {
 		t.Fatalf("valid key rejected: %v", err)
 	}
-	if _, err := parseP256PubKey("zzzz"); err == nil {
+	if err := validateLedgerPubKey("zzzz"); err == nil {
 		t.Error("bad hex accepted")
 	}
-	if _, err := parseP256PubKey("04abcd"); err == nil {
+	if err := validateLedgerPubKey("04abcd"); err == nil {
 		t.Error("wrong-length key accepted")
-	}
-	// valid length, valid 0x04 prefix, but point not on curve.
-	bad := "04" + strings.Repeat("11", 64)
-	if _, err := parseP256PubKey(bad); err == nil {
-		t.Error("off-curve point accepted")
 	}
 }
 
-func TestVerifyECDSAP256(t *testing.T) {
+func TestVerifyLedgerSig(t *testing.T) {
 	priv, pk := genID(t)
 	digest := endorsementDigest("VEH_1", pk, hku64)
 	sig := signHex(t, priv, digest)
 
-	if !verifyECDSAP256(pk, sig, digest) {
+	if !verifyLedgerSig(pk, sig, digest) {
 		t.Error("valid signature rejected")
 	}
 	// tampered digest
-	if verifyECDSAP256(pk, sig, endorsementDigest("VEH_2", pk, hku64)) {
+	if verifyLedgerSig(pk, sig, endorsementDigest("VEH_2", pk, hku64)) {
 		t.Error("signature verified against wrong digest")
 	}
 	// bad sig hex
-	if verifyECDSAP256(pk, "zz", digest) {
+	if verifyLedgerSig(pk, "zz", digest) {
 		t.Error("bad sig hex verified")
 	}
 	// wrong key
 	_, otherPk := genID(t)
-	if verifyECDSAP256(otherPk, sig, digest) {
+	if verifyLedgerSig(otherPk, sig, digest) {
 		t.Error("signature verified under wrong public key")
 	}
 }
@@ -956,13 +941,6 @@ func seedControllers(fl *fakeLedger, n int) {
 	}
 }
 
-// genIDStatic mirrors genID but without *testing.T, for non-asserting seeds.
-func genIDStatic() (*ecdsa.PrivateKey, string) {
-	priv, _ := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	raw := elliptic.Marshal(elliptic.P256(), priv.PublicKey.X, priv.PublicKey.Y)
-	return priv, hex.EncodeToString(raw)
-}
-
 func TestActiveControllerSelection(t *testing.T) {
 	t.Run("head is lowest-numbered ACTIVE controller", func(t *testing.T) {
 		ctx, fl := newCtx()
@@ -1269,11 +1247,11 @@ func TestSCControllerFinalizeEpoch(t *testing.T) {
 func TestSCRevokeVote(t *testing.T) {
 	_, pk := genID(t)
 
-	setup := func() (*mocks.TransactionContext, *fakeLedger, SmartContract, map[string]*ecdsa.PrivateKey) {
+	setup := func() (*mocks.TransactionContext, *fakeLedger, SmartContract, map[string]ledgerTestKey) {
 		ctx, fl := newCtx()
 		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5) // f=1 → 2f+1 = 3
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		privs := map[string]*ecdsa.PrivateKey{}
+		privs := map[string]ledgerTestKey{}
 		for i := 0; i < 4; i++ {
 			id := fmt.Sprintf("RSU_%d", i)
 			privs[id] = seedRegKeyed(t, fl, id, RoleRSU)
@@ -1351,11 +1329,11 @@ func TestSCRevokeVote(t *testing.T) {
 func TestSCRevokeWindow(t *testing.T) {
 	_, pk := genID(t)
 
-	setup := func() (*mocks.TransactionContext, SmartContract, map[string]*ecdsa.PrivateKey) {
+	setup := func() (*mocks.TransactionContext, SmartContract, map[string]ledgerTestKey) {
 		ctx, fl := newCtx()
 		seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5) // f=1 → 2f+1 = 3; T_w backfills to 30
 		seedReg(fl, "VEH_1", RoleVehicle, pk)
-		privs := map[string]*ecdsa.PrivateKey{}
+		privs := map[string]ledgerTestKey{}
 		for i := 0; i < 4; i++ {
 			id := fmt.Sprintf("RSU_%d", i)
 			privs[id] = seedRegKeyed(t, fl, id, RoleRSU)
@@ -1405,7 +1383,7 @@ func TestRevokeReads(t *testing.T) {
 	ctx, fl := newCtx()
 	seedNetCfg(fl, 4, 0.3, 0.5, 0.3, 3, 0.5)
 	seedReg(fl, "VEH_1", RoleVehicle, pk)
-	privs := map[string]*ecdsa.PrivateKey{}
+	privs := map[string]ledgerTestKey{}
 	for i := 0; i < 4; i++ {
 		id := fmt.Sprintf("RSU_%d", i)
 		privs[id] = seedRegKeyed(t, fl, id, RoleRSU)
