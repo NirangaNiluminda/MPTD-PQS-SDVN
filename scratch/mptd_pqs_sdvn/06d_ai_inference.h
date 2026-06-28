@@ -52,9 +52,6 @@
 #ifndef MPTD_PQS_06D_AI_INFERENCE_H
 #define MPTD_PQS_06D_AI_INFERENCE_H
 
-#if __has_include(<onnxruntime_cxx_api.h>)
-#include <onnxruntime_cxx_api.h>
-
 #include <cmath>
 #include <cstdint>
 #include <fstream>
@@ -63,6 +60,59 @@
 #include <sstream>
 #include <string>
 #include <vector>
+
+struct FusionParams {
+    float lambda_psi   = 0.3f;   // λ₁  (always active — LW-DETECT is the base)
+    float lambda_gat   = 0.4f;   // λ₂
+    float lambda_ae    = 0.3f;   // λ₃
+    float phi_threshold = 0.5f;  // Φ_th
+    bool  use_gat      = true;
+    bool  use_ae       = true;
+};
+
+inline FusionParams g_fusion = FusionParams{};
+
+// Minimal JSON parser for {"lambda_psi": 0.05, "lambda_gat": 0.7168, "lambda_ae": 0.2332, "phi_threshold": 0.5}
+static inline bool load_fusion_weights_json(const std::string &path, FusionParams &out) {
+    std::ifstream f(path);
+    if (!f) return false;
+    std::stringstream ss; ss << f.rdbuf();
+    const std::string blob = ss.str();
+
+    auto extract_float = [&](const std::string &key, float &dst) -> bool {
+        const std::string needle = "\"" + key + "\"";
+        size_t k = blob.find(needle);
+        if (k == std::string::npos) return false;
+        size_t colon = blob.find(':', k);
+        if (colon == std::string::npos) return false;
+        size_t start = blob.find_first_not_of(" \t\r\n", colon + 1);
+        if (start == std::string::npos) return false;
+        size_t end = blob.find_first_of(",}\r\n", start);
+        if (end == std::string::npos) end = blob.size();
+        std::string val_str = blob.substr(start, end - start);
+        try {
+            dst = std::stof(val_str);
+            return true;
+        } catch (...) {
+            return false;
+        }
+    };
+
+    float lp = 0.0f, lg = 0.0f, la = 0.0f, pt = 0.0f;
+    if (!extract_float("lambda_psi", lp)) return false;
+    if (!extract_float("lambda_gat", lg)) return false;
+    if (!extract_float("lambda_ae", la)) return false;
+    if (!extract_float("phi_threshold", pt)) return false;
+
+    out.lambda_psi = lp;
+    out.lambda_gat = lg;
+    out.lambda_ae = la;
+    out.phi_threshold = pt;
+    return true;
+}
+
+#if __has_include(<onnxruntime_cxx_api.h>)
+#include <onnxruntime_cxx_api.h>
 
 // ────────────────────────────────────────────────────────────────────────────
 // Constants — must match analytics/ml/gat_detector.py + lstm_ae.py
@@ -133,6 +183,7 @@ static inline bool load_scaler_json(const std::string &path, AiScaler &out) {
     return true;
 }
 
+
 // ────────────────────────────────────────────────────────────────────────────
 // AiInferenceEngine — owns Ort::Env + Ort::Sessions for GAT and LSTM-AE.
 // Lifetime: constructed once via global g_ai_engine.init(...) in 12_main.h,
@@ -147,7 +198,8 @@ public:
     bool init(const std::string &gat_path,
               const std::string &lstm_ae_path,
               const std::string &scaler_path,
-              const std::string &theta_path) {
+              const std::string &theta_path,
+              const std::string &weights_path = "") {
         Ort::SessionOptions opts;
         opts.SetIntraOpNumThreads(1);              // determinism for PBPO timing
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
@@ -191,6 +243,19 @@ public:
         } else {
             std::cerr << "[AI-INIT] θ_ae file missing, using fallback "
                       << theta_ae_ << std::endl;
+        }
+
+        // Fusion weights
+        if (!weights_path.empty()) {
+            if (!load_fusion_weights_json(weights_path, g_fusion)) {
+                std::cerr << "[AI-INIT] fusion weights load failed: " << weights_path << std::endl;
+            } else {
+                std::cout << "[AI-INIT] fusion weights loaded: " << weights_path
+                          << " (lambda_psi=" << g_fusion.lambda_psi
+                          << " lambda_gat=" << g_fusion.lambda_gat
+                          << " lambda_ae=" << g_fusion.lambda_ae
+                          << " threshold=" << g_fusion.phi_threshold << ")" << std::endl;
+            }
         }
 
         ready_ = (gat_session_ != nullptr) || (lstm_session_ != nullptr);
@@ -396,19 +461,7 @@ inline AiInferenceEngine g_ai_engine;
 // The clamp on ae_norm prevents a single outlier reconstruction from dominating
 // Φ when θ_ae is small — matches score_fusion.py:55 `min(..., 1.0)`.
 // ────────────────────────────────────────────────────────────────────────────
-struct FusionParams {
-    float lambda_psi   = 0.3f;   // λ₁  (always active — LW-DETECT is the base)
-    float lambda_gat   = 0.4f;   // λ₂
-    float lambda_ae    = 0.3f;   // λ₃
-    float phi_threshold = 0.5f;  // Φ_th
-    // R7f: ablation flags. When false, the corresponding term is dropped and
-    // the surviving λs are RENORMALISED so they still sum to 1 — preserving
-    // the paper's Φ_th = 0.5 semantics across A2/A3/Full configurations.
-    bool  use_gat      = true;
-    bool  use_ae       = true;
-};
-
-inline FusionParams g_fusion = FusionParams{};
+// FusionParams and g_fusion are defined globally at the top of the file
 
 struct FusionScore {
     float psi;
@@ -461,16 +514,7 @@ struct AiScaler {
 };
 } // namespace mptd_ai
 
-struct FusionParams {
-    bool  use_gat       = true;
-    bool  use_ae        = true;
-    float lambda_psi    = 0.4f;
-    float lambda_gat    = 0.3f;
-    float lambda_ae     = 0.3f;
-    float phi_threshold = 0.5f;
-};
-
-inline FusionParams g_fusion;
+// FusionParams and g_fusion are defined globally at the top of the file
 
 class AiInferenceEngine {
 public:
@@ -479,9 +523,21 @@ public:
     bool init(const std::string &gat_path,
               const std::string &lstm_ae_path,
               const std::string &scaler_path,
-              const std::string &theta_path) {
+              const std::string &theta_path,
+              const std::string &weights_path = "") {
         theta_ae_ = 0.05f;
         ready_ = false;
+        if (!weights_path.empty()) {
+            if (!load_fusion_weights_json(weights_path, g_fusion)) {
+                std::cerr << "[AI-INIT] (Mock) fusion weights load failed: " << weights_path << std::endl;
+            } else {
+                std::cout << "[AI-INIT] (Mock) fusion weights loaded: " << weights_path
+                          << " (lambda_psi=" << g_fusion.lambda_psi
+                          << " lambda_gat=" << g_fusion.lambda_gat
+                          << " lambda_ae=" << g_fusion.lambda_ae
+                          << " threshold=" << g_fusion.phi_threshold << ")" << std::endl;
+            }
+        }
         std::cerr << "[WARNING] ONNX Runtime header <onnxruntime_cxx_api.h> not found. Mock AI Engine initialized." << std::endl;
         return false;
     }

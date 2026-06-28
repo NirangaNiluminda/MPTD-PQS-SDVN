@@ -1,3 +1,4 @@
+<?xml version='1.0' encoding='UTF-8'?>
 <routes>
     <vType id="carf_passenger" vClass="passenger" maxSpeed="41.67" length="4.5" color="1,0,0" guiShape="passenger" />
     <vType id="busf_bus" vClass="bus" maxSpeed="27.78" length="12.0" color="0,0,1" guiShape="bus" />

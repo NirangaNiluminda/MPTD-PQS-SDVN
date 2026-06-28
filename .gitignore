@@ -1,5 +1,5 @@
 # Ignore everything
-*
+
 
 # ── Core NS-3 simulation code (C++ codebase) ──────────────────────────────────
 !analytics/
@@ -109,3 +109,16 @@ analytics/datasets.zip
 # ── Per-run logs inside the sim scratch dir (the top-level `scratch/*.log` rule
 #    above does not reach the mptd_pqs_sdvn/ subdir). ───────────────────────────
 scratch/mptd_pqs_sdvn/*.log
+# Virtual environments
+.venv/
+venv/
+ENV/
+.env
+
+# Generated evaluation and plot folders
+real_data/
+results/
+live_results/
+lstm_detector/
+analytics/ml/plots/
+analytics/ml/data/beacon_clean_*.csv

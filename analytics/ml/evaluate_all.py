@@ -49,6 +49,7 @@ import os
 import sys
 import time
 import pickle
+import json
 
 import numpy as np
 import pandas as pd
@@ -107,30 +108,67 @@ def compute_mcc(tp, fp, tn, fn):
 # Load ML models
 # ---------------------------------------------------------------------------
 
-def load_models():
-    gat      = GATDetector().to(DEVICE)
-    ae       = LSTMAEDetector().to(DEVICE)
+def load_models(scenario="urban"):
+    gat      = GATDetector(in_dim=6).to(DEVICE)
+    ae       = LSTMAEDetector(feat_dim=6).to(DEVICE)
     theta_ae = 0.05
-    scaler   = None
+    scaler_mean = None
+    scaler_scale = None
+    weights = {
+        "lambda_psi": 0.3,
+        "lambda_gat": 0.4,
+        "lambda_ae": 0.3,
+        "phi_threshold": 0.5
+    }
 
-    for fname, obj, loader in [
-        ("gat_model.pt",      gat, lambda p: gat.load_state_dict(torch.load(p, map_location=DEVICE))),
-        ("lstm_ae_model.pt",  ae,  lambda p: ae.load_state_dict(torch.load(p, map_location=DEVICE))),
-    ]:
-        path = os.path.join(MODEL_DIR, fname)
-        if os.path.exists(path):
-            loader(path)
+    # Load GAT
+    gat_path = os.path.join(MODEL_DIR, "shared", "gat_model.pt")
+    if not os.path.exists(gat_path):
+        gat_path = os.path.join(MODEL_DIR, "gat_model.pt")
+    if os.path.exists(gat_path):
+        gat.load_state_dict(torch.load(gat_path, map_location=DEVICE))
 
-    th_path = os.path.join(MODEL_DIR, "theta_ae.txt")
-    sc_path = os.path.join(MODEL_DIR, "scaler.pkl")
+    # Load LSTM-AE (scenario-specific, fallback to general)
+    ae_path = os.path.join(MODEL_DIR, scenario, "lstm_ae_model.pt")
+    if not os.path.exists(ae_path):
+        ae_path = os.path.join(MODEL_DIR, "lstm_ae_model.pt")
+    if os.path.exists(ae_path):
+        ae.load_state_dict(torch.load(ae_path, map_location=DEVICE))
+
+    # Load scaler (scenario-specific JSON, fallback to scaler.json / scaler.pkl)
+    scaler_path = os.path.join(MODEL_DIR, scenario, "scaler.json")
+    if not os.path.exists(scaler_path):
+        scaler_path = os.path.join(MODEL_DIR, "scaler.json")
+    if os.path.exists(scaler_path):
+        with open(scaler_path, "r") as f:
+            scaler_data = json.load(f)
+        scaler_mean = np.array(scaler_data["mean"], dtype=np.float32)
+        scaler_scale = np.array(scaler_data["scale"], dtype=np.float32)
+    else:
+        pkl_path = os.path.join(MODEL_DIR, "scaler.pkl")
+        if os.path.exists(pkl_path):
+            with open(pkl_path, "rb") as f:
+                sc = pickle.load(f)
+            scaler_mean = sc.mean_
+            scaler_scale = sc.scale_
+
+    # Load theta (scenario-specific, fallback to theta_ae.txt)
+    th_path = os.path.join(MODEL_DIR, scenario, "theta_ae.txt")
+    if not os.path.exists(th_path):
+        th_path = os.path.join(MODEL_DIR, "theta_ae.txt")
     if os.path.exists(th_path):
-        theta_ae = float(open(th_path).read())
-    if os.path.exists(sc_path):
-        with open(sc_path, "rb") as f:
-            scaler = pickle.load(f)
+        theta_ae = float(open(th_path).read().strip())
+
+    # Load weights (scenario-specific, fallback to fusion_weights.json)
+    w_path = os.path.join(MODEL_DIR, scenario, "fusion_weights.json")
+    if not os.path.exists(w_path):
+        w_path = os.path.join(MODEL_DIR, "fusion_weights.json")
+    if os.path.exists(w_path):
+        with open(w_path, "r") as f:
+            weights = json.load(f)
 
     gat.eval(); ae.eval()
-    return gat, ae, theta_ae, scaler
+    return gat, ae, theta_ae, scaler_mean, scaler_scale, weights
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +191,7 @@ def load_beacon_csv(beacon_csv):
 # Per-beacon scoring (all 6 variants) with timing
 # ---------------------------------------------------------------------------
 
-def score_beacons(df, gat, ae, theta_ae, scaler):
+def score_beacons(df, gat, ae, theta_ae, scaler_mean, scaler_scale, weights):
     """
     Returns per-beacon DataFrame with columns:
       vehicle_id, sim_time, is_poisoned,
@@ -173,8 +211,11 @@ def score_beacons(df, gat, ae, theta_ae, scaler):
     feat_cols = ["pos_x", "pos_y", "speed", "heading", "accel"]
 
     df = df.copy()
-    if scaler is not None:
-        df[feat_cols] = scaler.transform(df[feat_cols])
+    if scaler_mean is not None and scaler_scale is not None:
+        for idx, col in enumerate(feat_cols):
+            mean_val = scaler_mean[idx]
+            scale_val = scaler_scale[idx] if scaler_scale[idx] != 0.0 else 1.0
+            df[col] = (df[col] - mean_val) / scale_val
 
     # psi_score column (from NS-3 beacon handler)
     if "psi_score" not in df.columns:
@@ -208,6 +249,9 @@ def score_beacons(df, gat, ae, theta_ae, scaler):
     for t, grp in df.groupby("_tick"):
         vids     = grp["vehicle_id"].values
         feats    = grp[feat_cols].values.astype(np.float32)
+        if ae.feat_dim == 6 and feats.shape[1] == 5:
+            tau_col = np.ones((len(feats), 1), dtype=np.float32)
+            feats = np.hstack([feats, tau_col])
         poisoned = grp["is_poisoned"].values
         psi_arr  = grp["psi_score"].values
         det_arr  = grp["detected"].values if has_lw_detected else None
@@ -242,7 +286,11 @@ def score_beacons(df, gat, ae, theta_ae, scaler):
             # ── Detection decisions per variant ──────────────────────────────
             # MPTD-PQS: full fusion Φ = λ1ψ + λ2S + λ3(ε/θ)
             t_fuse0 = time.perf_counter()
-            res_full = fuse(psi, g, ae_error, theta_ae)
+            res_full = fuse(psi, g, ae_error, theta_ae,
+                            lam1=weights["lambda_psi"],
+                            lam2=weights["lambda_gat"],
+                            lam3=weights["lambda_ae"],
+                            phi_thresh=weights["phi_threshold"])
             t_fuse_ms = (time.perf_counter() - t_fuse0) * 1000.0
 
             # A1: lightweight only — paper §3.5.3 Algorithm 1. Take the RSU's
@@ -482,11 +530,18 @@ def _fmt(v, prec=4):
 
 def evaluate_single_run(attack_number, attack_pct, speed_kmh, speed_label,
                          beacon_csv, output_csv, metrics_dir=None):
+    label_to_scenario = {
+        "low": "urban",
+        "medium": "rural",
+        "high": "highway"
+    }
+    scenario = label_to_scenario.get(speed_label, "urban")
+
     df           = load_beacon_csv(beacon_csv)
-    gat, ae, theta_ae, scaler = load_models()
+    gat, ae, theta_ae, scaler_mean, scaler_scale, weights = load_models(scenario)
 
     # Score all beacons and time per-component ML costs (paper Eq.4.7)
-    det_df, pbpo_dict = score_beacons(df, gat, ae, theta_ae, scaler)
+    det_df, pbpo_dict = score_beacons(df, gat, ae, theta_ae, scaler_mean, scaler_scale, weights)
 
     # Directory holding the C++ per-mode metrics CSVs (default: alongside output)
     if metrics_dir is None:

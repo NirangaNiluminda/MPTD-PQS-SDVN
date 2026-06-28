@@ -128,16 +128,21 @@ int main(int argc, char *argv[])
     // bypass that component. Fusion (06d_ai_inference.h) renormalises the
     // surviving λ weights so Φ_th = 0.5 keeps its meaning across A2/A3/Full.
     {
+        std::string scenario_sub = "urban";
+        if (mobility_scenario == 1) scenario_sub = "rural";
+        else if (mobility_scenario == 2) scenario_sub = "highway";
+
         const std::string gat_path     = g_enable_gat
-                                         ? NS3_ROOT "/analytics/ml/models/gat_model.onnx"
+                                         ? NS3_ROOT "/analytics/ml/models/shared/gat_model.onnx"
                                          : std::string();
         const std::string lstm_ae_path = g_enable_lstm_ae
-                                         ? NS3_ROOT "/analytics/ml/models/lstm_ae_model.onnx"
+                                         ? NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/lstm_ae_model.onnx"
                                          : std::string();
-        const std::string scaler_path  = NS3_ROOT "/analytics/ml/models/scaler.json";
-        const std::string theta_path   = NS3_ROOT "/analytics/ml/models/theta_ae.txt";
+        const std::string scaler_path  = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/scaler.json";
+        const std::string theta_path   = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/theta_ae.txt";
+        const std::string weights_path = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/fusion_weights.json";
         const bool ai_ok = g_ai_engine.init(gat_path, lstm_ae_path,
-                                            scaler_path, theta_path);
+                                            scaler_path, theta_path, weights_path);
         std::cout << "[AI-INIT] engine ready=" << (ai_ok ? "YES" : "NO")
                   << " gat=" << (g_ai_engine.has_gat() ? "YES" : "NO")
                   << " lstm_ae=" << (g_ai_engine.has_lstm_ae() ? "YES" : "NO")
