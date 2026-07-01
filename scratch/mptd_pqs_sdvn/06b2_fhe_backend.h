@@ -306,7 +306,11 @@ public:
             ctx_->Enable(lbcrypto::LEVELEDSHE);
             ctx_->Enable(lbcrypto::MULTIPARTY);
 
-            // Chained joined-key generation across the n+1 parties (Eq 3.54).
+            // Chained joined-key generation across the n+1 parties: this IS the
+            // paper's FHE-DKG (Eq 3.26 dkg_fhe / 3.54) — each party contributes to
+            // the joint key via MultipartyKeyGen, so NO dealer and NO controller
+            // holds the full secret. In-process (one sim process plays all parties);
+            // see DKG_RING_KEYS.md for the over-the-network follow-up.
             secret_.resize(n_parties_);
             auto kp0 = ctx_->KeyGen();
             secret_[0] = kp0.secretKey;
