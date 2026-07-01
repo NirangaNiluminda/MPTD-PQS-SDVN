@@ -127,3 +127,6 @@ analytics/ml/data/beacon_clean_*.csv
 gat_detector/outputs/
 gat_detector/__pycache__/
 gat_detector/**/*.pyc
+gat_detector/.venv/
+
+

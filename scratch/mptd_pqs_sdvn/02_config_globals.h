@@ -22,12 +22,12 @@
 // CHANGE THESE TWO LINES when moving to a different machine.
 // Usage in code: NS3_ROOT "/analytics/data/file.csv"
 //                FAB_ROOT "/test-network/..."
-#define NS3_ROOT "/home/vboxuser/ns-allinone-3.35/ns-3.35"
-#define FAB_ROOT "/home/vboxuser/fabric-samples"
+#define NS3_ROOT "/home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35"
+#define FAB_ROOT "/home/sdvn_mobility_flooding/fabric-samples"
 // DATASET_ROOT = the git repo working tree (committable). The additive
 // per-attack/per-percentage dataset export (export_run_dataset() in
 // 10_metrics_csv.h) writes here, separate from NS3_ROOT analytics output.
-#define DATASET_ROOT "/home/vboxuser/Desktop/MPTD-PQS-SDVN"
+#define DATASET_ROOT "/home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN"
 // ───────────────────────────────────────────────────────────────────────────
 
 using namespace std::chrono;
