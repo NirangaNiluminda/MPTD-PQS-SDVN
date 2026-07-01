@@ -42,6 +42,13 @@
 #include <string>
 #include <unordered_map>
 
+// NIST Level 5 enforcement (opt-in via -DMPTD_REQUIRE_LEVEL5): OpenFHE is
+// required; without "openfhe.h" this header compiles the Mock backend below,
+// which performs NO real encryption.
+#if defined(MPTD_REQUIRE_LEVEL5) && !__has_include("openfhe.h")
+#  error "MPTD_REQUIRE_LEVEL5: OpenFHE (openfhe.h) required for threshold BFV at HEStd_256_quantum; the Mock FHE backend is not real crypto."
+#endif
+
 #if __has_include("openfhe.h")
 // OpenFHE master header. Pulls in DCRTPoly, CryptoContext, KeyPair, etc.
 // All under namespace lbcrypto.

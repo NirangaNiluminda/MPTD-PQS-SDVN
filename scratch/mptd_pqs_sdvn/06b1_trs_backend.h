@@ -116,6 +116,13 @@
 #include <oqs/oqs.h>
 #endif
 
+// NIST Level 5 enforcement (opt-in via -DMPTD_REQUIRE_LEVEL5): the ML-DSA-87
+// PQ-TRS needs liboqs; without it init_trs_backend() silently falls back to the
+// classical Shamir-Schnorr P-256 backend, which is NOT post-quantum.
+#if defined(MPTD_REQUIRE_LEVEL5) && !__has_include(<oqs/oqs.h>)
+#  error "MPTD_REQUIRE_LEVEL5: liboqs (<oqs/oqs.h>) required for the ML-DSA-87 PQ-TRS; the classical Shamir-Schnorr fallback is not NIST Level 5."
+#endif
+
 // ────────────────────────────────────────────────────────────────────────────
 // ITrsBackend — abstract crypto-agile threshold ring signature interface.
 // Paper §3.5.4 Eq 3.47–3.54. All buffer sizes are runtime (no hardcoded 64).
