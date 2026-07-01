@@ -139,21 +139,38 @@ L2 = SHA-256 collision.
    post-quantum (Level-5) shared-secret DKG** in the system (no lattice
    threshold-DKG primitive exists in the linked libraries). Do NOT claim "the DKG
    is Level 5."
-2. **SHA-256 caps collision-dependent operations at Category 2.** Every field-set
-   that is SHA-256-hashed then ML-DSA-signed (ledger evidence/vote/registration
-   digests) inherits ~128-bit collision resistance (Cat 2), even though ML-DSA-87
-   is Cat 5. Strict Level 5 would pre-hash with SHA-512/SHA-384. (HMAC/KDF *as a
-   MAC/PRF* are fine — that relies on PRF security, not collision resistance.)
+2. **Signed ledger digests — FIXED (this branch).** `concat_digest` (C++) and
+   `concatDigest` (Go) are now **SHA-512**, so the ML-DSA-87-signed
+   evidence/vote/registration digests are Category 5, no longer capped at
+   SHA-256's Category 2. Residual sub-hashes *inside* the signed concat stay
+   SHA-256 and are not upgraded: `hKuHex` (a commitment over a secret 256-bit
+   leaf key — no practical collision-forgery vector; the chaincode also pins it
+   to 64 chars) and `beaconHash` (the IPFS CID — its content-integrity strength
+   is an IPFS-layer property, and its FNV-1a fallback is already flagged in §3).
 3. **Beacon HMAC tag is 64-bit.** Truncated for airtime; 64-bit forgery resistance
    per beacon — far below Level 5. Acceptable engineering tradeoff, but state it.
 4. **Classical TRS baseline + Fabric platform** are classical by design/necessity
    (RQ5 comparison point; Fabric BCCSP can't be made PQ without forking it).
-5. **Silent build fallbacks (§4)** drop the whole stack below Level 5 if the PQ
-   libraries aren't linked — confirm via the self-test `[LEVEL5]` banner.
+5. **Silent build fallbacks — FIXED (this branch, opt-in).** Building with
+   `-DMPTD_REQUIRE_LEVEL5` turns the three silent downgrades into hard `#error`s:
+   missing liboqs (→ classical TRS / ECDSA ledger) and missing OpenFHE (→ Mock
+   FHE) now fail the build instead of quietly shipping sub-Level-5 crypto. Still
+   confirm the self-test `[LEVEL5]` banner at runtime.
 
-### If strict "Level 5 everywhere" is required
-- Pre-hash ledger digests with **SHA-512** instead of SHA-256 (coordinated C++/Go
-  change — both sides must agree on the signed bytes).
-- Widen the beacon tag (costs airtime), or accept 64-bit and document it.
-- State plainly that the DKG (classical, baseline-only) and the Fabric platform
-  sit outside the Level-5 boundary.
+### Still outside the Level-5 boundary (documented, not fixed)
+After the hardening above, these remain sub-Level-5 by design or necessity:
+- **The DKG** — classical P-256, baseline-only (no PQ threshold-DKG primitive exists).
+- **Fabric platform** — MSP / TLS / ordering ECDSA (can't change without forking BCCSP).
+- **Beacon HMAC tag** — 64-bit (kept per the chosen scope; widening costs airtime).
+- **`beaconHash` / `hKuHex` sub-hashes** — SHA-256 (see flag 2); `beaconHash`
+  reaches Cat 5 only by configuring IPFS to emit `sha2-512` CIDs.
+- **Classical TRS baseline** — the RQ5 comparison point, intentionally classical.
+
+### HPC verification for this change
+- Build **with `-DMPTD_REQUIRE_LEVEL5`** — it must compile, which *proves* liboqs +
+  OpenFHE are actually linked (the fail-closed guard doing its job).
+- `go test ./chaincode/chaincode/` — the digest round-trip must stay green with
+  SHA-512 (the tests are self-consistent: they hash via `concatDigest`).
+- Live round-trip: C++ and Go **must both be SHA-512** — a mismatch makes every
+  signature fail verification, so this is the first thing to check if the ledger
+  path breaks after this change.
