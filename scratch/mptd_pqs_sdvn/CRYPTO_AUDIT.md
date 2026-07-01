@@ -107,3 +107,70 @@ banner to confirm the *real* backends compiled.
   DKG output is an identical `(t,n)` Shamir sharing, so all TRS self-tests keep
   their meaning. `generate_keys` runs **once** at init (guarded by `g_trs_ready`)
   and no code re-derives TRS shares, so fresh per-run randomness is safe.
+
+---
+
+## 7. NIST Level 5 coverage — where it holds and where it does NOT
+
+Is every cryptographic operation at NIST PQ Category 5? **No.** Level 5 holds on
+the core post-quantum path (ML-DSA-87 + FHE-256), but several primitives sit
+below it. Categories: L5 = AES-256 key search; L4 = SHA-384 collision;
+L2 = SHA-256 collision.
+
+| Primitive | Effective PQ strength | Level 5? |
+|---|---|---|
+| ML-DSA-87 TRS (default full mode) | Cat 5 | ✅ |
+| ML-DSA-87 ledger signatures (default) | Cat 5 | ✅ |
+| OpenFHE BFV @ `HEStd_256_quantum` (enc / multiparty keygen / thresh. dec) | Cat 5 (256-bit) | ✅ |
+| 256-bit LKH symmetric keys (HMAC/KDF key material) | AES-256-equiv | ✅ |
+| **SHA-256** (HMAC, KDF, ledger digest, beacon hash, `h(K_u)`, TRS challenge) | collision ≈ **Cat 2** | ⚠️ no |
+| **Beacon HMAC tag — truncated to 64 bits** | 64-bit forgery resistance | ⚠️ no |
+| **Joint-Feldman DKG on P-256** (classical TRS ring keys only) | ECDLP — **classical** | ❌ no |
+| Classical Shamir-Schnorr TRS (RQ5 baseline) | ECDLP — classical | ❌ by design |
+| Fabric MSP / TLS / ordering (ECDSA) | ECDLP — classical | ❌ documented ceiling |
+| Silent fallback: no liboqs → ECDSA; no OpenFHE → Mock | classical / none | ❌ build risk (§4) |
+
+### Flags (below Level 5)
+1. **The DKG is NOT post-quantum.** The Joint-Feldman DKG runs on the P-256 curve
+   — its security is ECDLP (broken by Shor), so it is **classical, not Level 5**.
+   It keys **only the classical TRS baseline**. The Level-5 ring (ML-DSA-87) does
+   **not** use it — each RSU independently generates its own ML-DSA-87 keypair. So
+   "no dealer" on the PQ path comes from *independent keygen*, and **there is no
+   post-quantum (Level-5) shared-secret DKG** in the system (no lattice
+   threshold-DKG primitive exists in the linked libraries). Do NOT claim "the DKG
+   is Level 5."
+2. **Signed ledger digests — FIXED (this branch).** `concat_digest` (C++) and
+   `concatDigest` (Go) are now **SHA-512**, so the ML-DSA-87-signed
+   evidence/vote/registration digests are Category 5, no longer capped at
+   SHA-256's Category 2. Residual sub-hashes *inside* the signed concat stay
+   SHA-256 and are not upgraded: `hKuHex` (a commitment over a secret 256-bit
+   leaf key — no practical collision-forgery vector; the chaincode also pins it
+   to 64 chars) and `beaconHash` (the IPFS CID — its content-integrity strength
+   is an IPFS-layer property, and its FNV-1a fallback is already flagged in §3).
+3. **Beacon HMAC tag is 64-bit.** Truncated for airtime; 64-bit forgery resistance
+   per beacon — far below Level 5. Acceptable engineering tradeoff, but state it.
+4. **Classical TRS baseline + Fabric platform** are classical by design/necessity
+   (RQ5 comparison point; Fabric BCCSP can't be made PQ without forking it).
+5. **Silent build fallbacks — FIXED (this branch, opt-in).** Building with
+   `-DMPTD_REQUIRE_LEVEL5` turns the three silent downgrades into hard `#error`s:
+   missing liboqs (→ classical TRS / ECDSA ledger) and missing OpenFHE (→ Mock
+   FHE) now fail the build instead of quietly shipping sub-Level-5 crypto. Still
+   confirm the self-test `[LEVEL5]` banner at runtime.
+
+### Still outside the Level-5 boundary (documented, not fixed)
+After the hardening above, these remain sub-Level-5 by design or necessity:
+- **The DKG** — classical P-256, baseline-only (no PQ threshold-DKG primitive exists).
+- **Fabric platform** — MSP / TLS / ordering ECDSA (can't change without forking BCCSP).
+- **Beacon HMAC tag** — 64-bit (kept per the chosen scope; widening costs airtime).
+- **`beaconHash` / `hKuHex` sub-hashes** — SHA-256 (see flag 2); `beaconHash`
+  reaches Cat 5 only by configuring IPFS to emit `sha2-512` CIDs.
+- **Classical TRS baseline** — the RQ5 comparison point, intentionally classical.
+
+### HPC verification for this change
+- Build **with `-DMPTD_REQUIRE_LEVEL5`** — it must compile, which *proves* liboqs +
+  OpenFHE are actually linked (the fail-closed guard doing its job).
+- `go test ./chaincode/chaincode/` — the digest round-trip must stay green with
+  SHA-512 (the tests are self-consistent: they hash via `concatDigest`).
+- Live round-trip: C++ and Go **must both be SHA-512** — a mismatch makes every
+  signature fail verification, so this is the first thing to check if the ledger
+  path breaks after this change.

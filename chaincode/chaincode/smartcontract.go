@@ -35,7 +35,7 @@
 //     crypto stays classical and is out of scope (see BLOCKCHAIN_IMPLEMENTATION.md).
 //   • τ_init = 1.0 (benign vehicles start fully trusted; SC-Trust's EMA
 //     only drags scores down on detected anomalies).
-//   • Endorsement digest = SHA-256(vehicleID ‖ pkHex ‖ hKuHex). String
+//   • Endorsement digest = SHA-512(vehicleID ‖ pkHex ‖ hKuHex). String
 //     concatenation matches the NS-3 endorsement-collection path.
 //
 // Bootstrap: paper §3.5.5 does not specify how the first 2f+1 RSUs come
@@ -48,7 +48,7 @@
 package chaincode
 
 import (
-	"crypto/sha256"
+	"crypto/sha512"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -368,19 +368,21 @@ func (s *SmartContract) requireActive(ctx contractapi.TransactionContextInterfac
 // a mismatch makes every signature fail (the contract verifies σ against the
 // public key stored on chain at SC-Register).
 
-// concatDigest returns SHA-256 over the ordered string concatenation of
+// concatDigest returns SHA-512 over the ordered string concatenation of
 // `parts`. This is the one canonical hashing rule shared by every signed
 // payload in the contract — the NS-3 signer MUST hash the exact same string
 // arguments, in the same order, with no separators, or verification fails.
+// SHA-512 (NIST Level 5) so the signed digest is not capped at SHA-256's
+// Category-2 collision resistance; both sides MUST use SHA-512 in lock-step.
 func concatDigest(parts ...string) []byte {
-	h := sha256.New()
+	h := sha512.New()
 	for _, p := range parts {
 		h.Write([]byte(p))
 	}
 	return h.Sum(nil)
 }
 
-// endorsementDigest returns SHA-256(vehicleID ‖ pkHex ‖ hKuHex). The string
+// endorsementDigest returns SHA-512(vehicleID ‖ pkHex ‖ hKuHex). The string
 // concatenation is the canonical form NS-3 endorsement collectors hash, and
 // must stay byte-identical on both sides.
 func endorsementDigest(vehicleID, pkHex, hKuHex string) []byte {
