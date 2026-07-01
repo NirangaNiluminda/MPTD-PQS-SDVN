@@ -291,7 +291,7 @@ def fig5_confusion_heatmap(df):
     atk_name = ATTACK_LABELS.get(int(best["attack_number"]), "").replace("\n"," ")
     pct_val  = int(best["attack_pct"])
     ax.set_title(f"Fig 5 — Confusion Matrix\n{atk_name}  ({pct_val}% attackers)\n"
-                 f"MCC = {best['MCC']:.4f}   FPR = {best['FPR']:.4f}",
+                 f"MCC = {best['MCC']:.4f}",
                  fontsize=10, fontweight="bold")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
     plt.tight_layout()
