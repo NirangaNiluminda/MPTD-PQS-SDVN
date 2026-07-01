@@ -107,3 +107,53 @@ banner to confirm the *real* backends compiled.
   DKG output is an identical `(t,n)` Shamir sharing, so all TRS self-tests keep
   their meaning. `generate_keys` runs **once** at init (guarded by `g_trs_ready`)
   and no code re-derives TRS shares, so fresh per-run randomness is safe.
+
+---
+
+## 7. NIST Level 5 coverage — where it holds and where it does NOT
+
+Is every cryptographic operation at NIST PQ Category 5? **No.** Level 5 holds on
+the core post-quantum path (ML-DSA-87 + FHE-256), but several primitives sit
+below it. Categories: L5 = AES-256 key search; L4 = SHA-384 collision;
+L2 = SHA-256 collision.
+
+| Primitive | Effective PQ strength | Level 5? |
+|---|---|---|
+| ML-DSA-87 TRS (default full mode) | Cat 5 | ✅ |
+| ML-DSA-87 ledger signatures (default) | Cat 5 | ✅ |
+| OpenFHE BFV @ `HEStd_256_quantum` (enc / multiparty keygen / thresh. dec) | Cat 5 (256-bit) | ✅ |
+| 256-bit LKH symmetric keys (HMAC/KDF key material) | AES-256-equiv | ✅ |
+| **SHA-256** (HMAC, KDF, ledger digest, beacon hash, `h(K_u)`, TRS challenge) | collision ≈ **Cat 2** | ⚠️ no |
+| **Beacon HMAC tag — truncated to 64 bits** | 64-bit forgery resistance | ⚠️ no |
+| **Joint-Feldman DKG on P-256** (classical TRS ring keys only) | ECDLP — **classical** | ❌ no |
+| Classical Shamir-Schnorr TRS (RQ5 baseline) | ECDLP — classical | ❌ by design |
+| Fabric MSP / TLS / ordering (ECDSA) | ECDLP — classical | ❌ documented ceiling |
+| Silent fallback: no liboqs → ECDSA; no OpenFHE → Mock | classical / none | ❌ build risk (§4) |
+
+### Flags (below Level 5)
+1. **The DKG is NOT post-quantum.** The Joint-Feldman DKG runs on the P-256 curve
+   — its security is ECDLP (broken by Shor), so it is **classical, not Level 5**.
+   It keys **only the classical TRS baseline**. The Level-5 ring (ML-DSA-87) does
+   **not** use it — each RSU independently generates its own ML-DSA-87 keypair. So
+   "no dealer" on the PQ path comes from *independent keygen*, and **there is no
+   post-quantum (Level-5) shared-secret DKG** in the system (no lattice
+   threshold-DKG primitive exists in the linked libraries). Do NOT claim "the DKG
+   is Level 5."
+2. **SHA-256 caps collision-dependent operations at Category 2.** Every field-set
+   that is SHA-256-hashed then ML-DSA-signed (ledger evidence/vote/registration
+   digests) inherits ~128-bit collision resistance (Cat 2), even though ML-DSA-87
+   is Cat 5. Strict Level 5 would pre-hash with SHA-512/SHA-384. (HMAC/KDF *as a
+   MAC/PRF* are fine — that relies on PRF security, not collision resistance.)
+3. **Beacon HMAC tag is 64-bit.** Truncated for airtime; 64-bit forgery resistance
+   per beacon — far below Level 5. Acceptable engineering tradeoff, but state it.
+4. **Classical TRS baseline + Fabric platform** are classical by design/necessity
+   (RQ5 comparison point; Fabric BCCSP can't be made PQ without forking it).
+5. **Silent build fallbacks (§4)** drop the whole stack below Level 5 if the PQ
+   libraries aren't linked — confirm via the self-test `[LEVEL5]` banner.
+
+### If strict "Level 5 everywhere" is required
+- Pre-hash ledger digests with **SHA-512** instead of SHA-256 (coordinated C++/Go
+  change — both sides must agree on the signed bytes).
+- Widen the beacon tag (costs airtime), or accept 64-bit and document it.
+- State plainly that the DKG (classical, baseline-only) and the Fabric platform
+  sit outside the Level-5 boundary.
