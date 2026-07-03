@@ -1,11 +1,18 @@
 # Paper ↔ Code Alignment — HPC Punch List
 
-**Date:** 2026-07-03. **Branch:** `feature/metrics-11`.
+**Date:** 2026-07-03 (reconciled against the latest paper draft). **Branch:** `ml-review-fixes`.
 **Trigger:** paper Chapter 4 was rewritten into **5 formal Experiments** (`sec:exp1`–`sec:exp5`)
 with a fixed default config, **11 ablation variants AB1–AB11** (`sec:ablation`), and **11
 metrics**, all evaluating the **full mode** against baselines **B1/B2/B3**. The code is still on
 the older A1–A5 + B1 scheme and the lightweight path. This file maps every experiment / AB
 variant / metric to the exact code knob so the HPC edits target the right things.
+
+**What the latest draft changed vs this punch list:** (a) `tab:set-scenarios` now fixes
+s_max=**60/90/150** and Log-distance (n=3.0) for BOTH rural and highway — matching the shipped
+code and the urban/rural/highway@200 datasets; three other tables/prose remain stale (see §0).
+(b) Full-mode component selection is now DONE offline — real GAT/LSTM-AE selection tables exist
+(GAT MCC urban 0.4056 / rural 0.1400 / highway 0.7942); only the integrated `ablation_mode=0`
+ns-3 run is still outstanding. (c) Results now report real AB5 (lightweight) MCC/PARR/CDER.
 
 Legend: ✅ aligned · ⚠️ partial (reachable but not labelled / needs a split) · ❌ gap (new code)
 
@@ -13,18 +20,27 @@ Legend: ✅ aligned · ⚠️ partial (reachable but not labelled / needs a spli
 
 ## 0. Resolve in the paper FIRST (else the code targets the wrong number)
 
-- [ ] **`s_max` per scenario is specified three incompatible ways** — `tab:set-lw`
-  `TBD{100,120,130,140}`; `tab:smax-sensitivity` grid (urban 80/100/120, rural 100/120/140,
-  highway 120/130/140); `tab:set-scenarios` concrete **60/90/150**. The code reads ONE
-  `s_max` per scenario. Pick one set before configuring.
-- [ ] **Highway propagation model contradicts itself** — §4.3 prose says **two-ray ground**,
-  `tab:set-scenarios` says **Log-distance (n=3.0)**. Configure the NS-3 channel to whichever
-  you keep.
+Status note (2026-07-03): the current paper draft **partially resolves** these, but the
+resolutions are inconsistent *across tables/prose within the same draft* — the code is
+already built to the `tab:set-scenarios` values (60/90/150, Log-distance both rural+highway),
+so the remaining action is to fix the paper's OTHER tables/prose to match, not to re-config code.
+
+- [ ] **`s_max` — `tab:set-scenarios` now concrete 60/90/150** (matches code + shipped
+  datasets), BUT still contradicted by three other places: `tab:set-lw` `TBD{100,120,130,140}`,
+  `tab:smax-sensitivity` grid (urban 80/100/120, rural 100/120/140, highway 120/130/140),
+  and `sec:param-rationale` prose. **Code is correct at 60/90/150** — fix the three stale
+  tables/prose in the paper to match, do NOT re-config.
+- [ ] **Highway propagation — `tab:set-scenarios` now says Log-distance (n=3.0)** for BOTH
+  rural AND highway, matching the shipped code (12_main.h scenario 2 = LogDistance, committed
+  5b6cd92). BUT `sec:mobility-scenarios` **prose still says highway uses "two-ray
+  ground-reflection model"** — stale, contradicts the table. Fix the prose → Log-distance.
 - [ ] **`\ref{eq:fpr}` still dangling** in the full-mode model-selection prose
   ("FPR, Eq.~\ref{eq:fpr}") — restore a one-line FPR def or drop the ref.
 - [ ] **Results/PARR prose** still says "gap between **A1** and B1" → **AB5/AB6**.
 - [ ] **Map area** — tables say ≈4 km²; the density sentence in `sec:param-rationale` says
-  "2 km²". Pick one (affects the 100 veh/km² claim).
+  "2 km²". Pick one (affects the 100 veh/km² claim). Note: rural map caps at ~138–151
+  full-window vehicles (sparse ~2 km² Hohenwart net), so the 200-veh/scenario fairness claim
+  cannot hold for rural without enlarging the map — document the rural cap or match by density.
 
 ---
 
@@ -34,10 +50,16 @@ Default config (`tab:default-config`): ρ_a=0.40, γ=0.70, v=60 km/h, N_v=200, T
 **full mode**. Every experiment's "proposed method" is **full mode vs B1/B2/B3**, so the two
 cross-cutting blockers below hit ALL five experiments:
 
-- ❌ **Full mode not exercised** — default run is `routing_test=true` + `ablation_mode=1`
-  (=AB5, lightweight). Full mode (GAT+LSTM ONNX, TRS/FHE, Fabric) is compiled-in but unrun.
+- ⚠️ **Full mode partially exercised (offline component selection done, end-to-end sim not)** —
+  the paper now carries REAL full-mode model-selection tables: `tab:gat-selection` (GAT chosen,
+  per-scenario MCC **urban 0.4056 / rural 0.1400 / highway 0.7942** at FPR 0), `tab:lstmae-selection`,
+  and `tab:fullmode-selected` (GAT finalised; LSTM-AE β still TBD). So the AI components ARE
+  trained/selected offline. What is STILL unrun is the **integrated ns-3 full-mode run**
+  (`ablation_mode=0`): default sweep is still `routing_test=true` + `ablation_mode=1` (=AB5,
+  lightweight). Bring up `ablation_mode=0` (GAT+LSTM ONNX inference, TRS/FHE, Fabric) end-to-end.
 - ❌ **B2, B3 missing** — only B1 (Ghaleb) is coded. B2 (Fed-LSTM-AE) / B3 (hTDC-AE) are
-  **ML baselines → coordinate with the ML member**, do not silently own.
+  **ML baselines → coordinate with the ML member**, do not silently own. (Reminder: B2/B3 must
+  each be ONE global model with held-out vehicles, not per-(attack×pct) models.)
 
 | Exp | Independent var | Code knob | Y-metrics | Status / extra blocker |
 |---|---|---|---|---|
@@ -96,9 +118,12 @@ CSV header: 10_metrics_csv.h:959. TTD helper: analytics/compute_ttd.py.
 
 ## 4. Recommended HPC edit order
 
-1. **Paper-first fixes (§0)** — 10 min, unblocks correct config.
+1. **Paper-first fixes (§0)** — now mostly editorial: the CODE is already correct at
+   60/90/150 + Log-distance; the remaining work is fixing the paper's three stale s_max tables
+   and the `sec:mobility-scenarios` two-ray prose to match `tab:set-scenarios`. ~10 min in LaTeX.
 2. **Full mode up + B1**, on SUMO → produces Exp1/Exp2/Exp5 for the proposed method
-   (the 6 all-baseline metrics already exist).
+   (the 6 all-baseline metrics already exist). AI components already selected offline
+   (GAT/LSTM-AE tables) — this step is the integrated `ablation_mode=0` ns-3 run.
 3. **Ablation selector 7→11** (§2) — biggest single edit; unlocks AB1–AB11.
 4. **Exp4 `threat_level` knob** (σ×n_coord), then **Exp3 scale-up** + **COO/BWO** (Stage 2).
 5. **B2/B3** with the ML member; **FRR/TCL** with Fabric (Stage 3).
