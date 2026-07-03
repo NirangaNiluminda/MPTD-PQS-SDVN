@@ -989,20 +989,25 @@ int main(int argc, char *argv[])
   	channel_182.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
   	channel_184.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
   }
-  if (mobility_scenario == 2)//open-highway mobility → Two-Ray Ground
+  if (mobility_scenario == 2)//open-highway mobility → LogDistance (supervisor 2026-07-02)
   {
-  	// Open highway has a strong ground-reflection (two-ray) channel. Frequency set
-  	// to the 5.9 GHz DSRC/WAVE band; HeightAboveZ = 1.5 m gives a realistic antenna
-  	// height (trace/RSU node z = 0, so the model's default height-0 must be lifted
-  	// or it degenerates). TxPower stays 41 dBm and R_max_comm stays 270 m (logical
-  	// range, see scenario-1 note) so coverage stays comparable across scenarios.
-  	channel.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_172.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_174.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_176.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_180.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_182.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_184.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	// CHANGED 2026-07-02 (Nilmantha Sir): TwoRayGround was too ideal for the open
+  	// highway. At 41 dBm its low path loss gave a ~2 km *physical* radio range, so
+  	// with 200 vehicles over ~6.3 km each PHY node sensed ~145 concurrent
+  	// transmitters (vs ~17 in urban/Cost231). That overloaded the ns-3.35 WiFi PHY
+  	// into a non-advancing zero-time event loop (simulation froze at t≈13 s).
+  	// LogDistance (path-loss exponent 3.0 — the same model rural/scenario-1 uses)
+  	// has much higher path loss, shrinking the physical range and the concurrent-
+  	// reception load. TxPower stays 41 dBm and R_max_comm stays 270 m (logical
+  	// range) so coverage/detection gating stays comparable across scenarios.
+  	// Original (kept for provenance): TwoRayGround @ 5.9 GHz, HeightAboveZ = 1.5 m.
+  	channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_172.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_174.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_176.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_180.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_182.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_184.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
   }
   
   //Physical layer helper for wave
