@@ -1894,9 +1894,15 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 
   ensure_analytics_dir(NS3_ROOT "/analytics");
   ensure_analytics_dir(NS3_ROOT "/analytics/results");
-  std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_a")
-                         + std::to_string(attack_number)
-                         + "_p" + std::to_string(attack_percentage) + ".xml";
+  // Filename keyed by scenario + attack + pct + ablation_mode. The old name used
+  // only attack+pct, so runs that differed solely in scenario (urban/rural/highway)
+  // or ablation mode (AB5 lightweight vs full) all wrote to the SAME xml and clobbered
+  // each other. Tag all four so an AB1–AB11 × 3-scenario sweep keeps distinct animations.
+  std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_")
+                         + mptd_scenario_name()
+                         + "_a" + std::to_string(attack_number)
+                         + "_p" + std::to_string(attack_percentage)
+                         + "_m" + std::to_string(ablation_mode) + ".xml";
   AnimationInterface anim(anim_path);
   // NOTE: EnablePacketMetadata(true) is intentionally omitted — NS-3 3.35 requires
   // it to be called before ANY packet is created (before scheduling), otherwise it

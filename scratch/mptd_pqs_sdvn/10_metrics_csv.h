@@ -887,9 +887,14 @@ static void export_run_dataset(const std::string &metrics_src)
     // `results + "/..."` joins below stay correct.
     const std::string results = std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_name();
 
+    // NOTE: the folder key includes _m{ablation_mode}. Without it, two ablation
+    // variants at the same scenario/attack/pct (e.g. AB5 lightweight vs full mode)
+    // would archive into the SAME aN_pP folder and silently overwrite each other's
+    // beacon_log.csv / metrics.csv. Keeping the mode in the path lets an AB1–AB11
+    // sweep coexist on disk.
     std::ostringstream dir;
     dir << DATASET_ROOT "/analytics/datasets/" << mptd_scenario_name() << "/a"
-        << attack_number << "_p" << attack_percentage;
+        << attack_number << "_p" << attack_percentage << "_m" << ablation_mode;
     const std::string dest = dir.str();
 
     std::error_code ec;
