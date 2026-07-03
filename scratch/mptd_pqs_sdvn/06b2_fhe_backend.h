@@ -42,6 +42,13 @@
 #include <string>
 #include <unordered_map>
 
+// NIST Level 5 enforcement (opt-in via -DMPTD_REQUIRE_LEVEL5): OpenFHE is
+// required; without "openfhe.h" this header compiles the Mock backend below,
+// which performs NO real encryption.
+#if defined(MPTD_REQUIRE_LEVEL5) && !__has_include("openfhe.h")
+#  error "MPTD_REQUIRE_LEVEL5: OpenFHE (openfhe.h) required for threshold BFV at HEStd_256_quantum; the Mock FHE backend is not real crypto."
+#endif
+
 #if __has_include("openfhe.h")
 // OpenFHE master header. Pulls in DCRTPoly, CryptoContext, KeyPair, etc.
 // All under namespace lbcrypto.
@@ -306,7 +313,11 @@ public:
             ctx_->Enable(lbcrypto::LEVELEDSHE);
             ctx_->Enable(lbcrypto::MULTIPARTY);
 
-            // Chained joined-key generation across the n+1 parties (Eq 3.54).
+            // Chained joined-key generation across the n+1 parties: this IS the
+            // paper's FHE-DKG (Eq 3.26 dkg_fhe / 3.54) — each party contributes to
+            // the joint key via MultipartyKeyGen, so NO dealer and NO controller
+            // holds the full secret. In-process (one sim process plays all parties);
+            // see DKG_RING_KEYS.md for the over-the-network follow-up.
             secret_.resize(n_parties_);
             auto kp0 = ctx_->KeyGen();
             secret_[0] = kp0.secretKey;

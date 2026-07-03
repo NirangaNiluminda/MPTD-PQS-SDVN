@@ -23,14 +23,13 @@
 //   primitive level, both produce a single 32-byte scalar σ_TRS that
 //   verifies against a 33-byte compressed master public key.
 //
-//   Scheme (sim-side trusted dealer; production would use DKG):
+//   Scheme (Joint-Feldman DKG: no single dealer, no controller, no K_ring):
 //     Setup (one-time per ring, in generate_keys):
-//       - Sample a₀..a_{t-1} ∈ Z_q deterministically from LKH-derived seed
-//         (KDF(K_ring, "trs-poly", n‖t)). Ties Eq 3.36 LKH state to TRS keys.
-//       - master_pk = a₀ · G                          (Eq 3.49 verifier input)
-//       - For j ∈ [1..n]: s_j = Σ_{k=0..t-1} a_k · j^k mod q  (Shamir share)
-//       - For j ∈ [1..n]: pk_j = s_j · G              (per-signer point, for
-//                                                      future provenance use)
+//       - Each member i samples its OWN degree-(t-1) poly f_i with fresh CSPRNG
+//         coefficients a_{i,k} and broadcasts Feldman commitments C_{i,k}=a_{i,k}*G.
+//       - master_pk = Sum_i C_{i,0} = x*G   (group secret x never assembled).
+//       - s_j  = Sum_i f_i(j) mod q          (Shamir share of x; VSS-verified).
+//       - pk_j = s_j * G                     (per-signer point; Eq 3.25 dkg_trs).
 //     PartialSign(s_j, m):                            (Eq 3.47, RSU j)
 //       - h = SHA256(m) reduced mod q                 (challenge scalar)
 //       - σ_j = (s_j · h) mod q                       (32-byte scalar)
@@ -117,6 +116,13 @@
 #include <oqs/oqs.h>
 #endif
 
+// NIST Level 5 enforcement (opt-in via -DMPTD_REQUIRE_LEVEL5): the ML-DSA-87
+// PQ-TRS needs liboqs; without it init_trs_backend() silently falls back to the
+// classical Shamir-Schnorr P-256 backend, which is NOT post-quantum.
+#if defined(MPTD_REQUIRE_LEVEL5) && !__has_include(<oqs/oqs.h>)
+#  error "MPTD_REQUIRE_LEVEL5: liboqs (<oqs/oqs.h>) required for the ML-DSA-87 PQ-TRS; the classical Shamir-Schnorr fallback is not NIST Level 5."
+#endif
+
 // ────────────────────────────────────────────────────────────────────────────
 // ITrsBackend — abstract crypto-agile threshold ring signature interface.
 // Paper §3.5.4 Eq 3.47–3.54. All buffer sizes are runtime (no hardcoded 64).
@@ -186,8 +192,9 @@ static bool                               g_trs_ready  = false;
 // ClassicalTrsBackend — Shamir t-of-n threshold Schnorr on EC P-256.
 //
 // Scheme summary (full security note in file header):
-//   master_pk = a₀ · G            with a₀ ← KDF(K_ring, "trs-poly", n‖t)
-//   s_j       = poly(j) = Σ a_k · j^k mod q     (j = 1..n, t-1 degree poly)
+//   master_pk = Sum_i C_{i,0} = x*G   (Joint-Feldman DKG; x = Sum_i a_{i,0} never
+//                                      assembled — no dealer, no controller, no K_ring)
+//   s_j       = Sum_i f_i(j) mod q     (Shamir share of x; VSS-verified, j=1..n)
 //   pk_j      = s_j · G                          (33B compressed)
 //   σ_j       = s_j · H(m) mod q                 (32B partial)
 //   σ_TRS     = Σ_{j∈S} λ_j(0) · σ_j mod q       (32B aggregated; |S|=t)
@@ -201,11 +208,32 @@ public:
     static constexpr size_t SK_LEN  = 32;  // raw scalar s_j
 
     // ──────────────────────────────────────────────────────────────────────
-    // generate_keys: Shamir poly seeded from the current LKH K_ring.
-    // K_ring is CSPRNG-fresh per run (P1b-1), so the ring differs run-to-run as a
-    // real deployment would. Within a run K_ring is fixed, so repeated
-    // init_trs_backend() / RSU-restart re-derives the same shares without
-    // out-of-band coordination (the property the selftest relies on).
+    // generate_keys: Joint-Feldman DKG (paper Eq 3.25 dkg_trs) — NO dealer,
+    // NO controller, NO K_ring seed.
+    //
+    // Each of the n RSU ring members independently samples its OWN degree-(t-1)
+    // polynomial f_i with FRESH CSPRNG coefficients a_{i,k} ∈ Z_q, publishes
+    // Feldman commitments C_{i,k} = a_{i,k}·G, and every member's contribution is
+    // summed: the final per-signer share is s_j = Σ_i f_i(j). The group secret
+    // x = Σ_i a_{i,0} is NEVER assembled at any single entity, and
+    // master_pk = Σ_i C_{i,0} = x·G. The resulting (master_pk, {s_j}) is a (t,n)
+    // Shamir sharing of x — identical in shape to the previous trusted-dealer
+    // output — so partial_sign / aggregate / verify_threshold are UNCHANGED.
+    //
+    // Faithfulness / realism (honest, like the FHE multiparty side in 06b2):
+    //   • REAL: per-member fresh randomness (BN_rand_range), Feldman commitments,
+    //     and the verifiable share check f_i(j)·G == Σ_k j^k·C_{i,k} are all
+    //     genuine VSS — no member's secret depends on a shared seed, no dealer
+    //     holds the master secret, K_ring is no longer consulted here.
+    //   • ABSTRACTED (HPC/Fabric follow-up): the protocol runs in-process (one
+    //     NS-3 process plays all n members) and commitment publication to the
+    //     blockchain "public bulletin board" + over-the-network share exchange
+    //     are not yet wired (needs the live Fabric layer). This matches the
+    //     in-process status of the OpenFHE MultipartyKeyGen DKG in 06b2.
+    //   • Keys are CSPRNG-fresh per run (generate_keys runs once under the
+    //     g_trs_ready guard); detection metrics depend only on within-run key
+    //     consistency, not on key values (unchanged from the prior design).
+    // NOTE: NOT yet compiled — verify on the HPC build (see DKG_RING_KEYS.md).
     // ──────────────────────────────────────────────────────────────────────
     bool generate_keys(uint32_t n, uint32_t t,
                        std::vector<std::vector<uint8_t>> &out_pks,
@@ -225,47 +253,75 @@ public:
             return false;
         }
 
-        // Poly seed = current LKH K_ring ‖ n ‖ t  → HMAC chain.
-        // (g_lkh_k_ring_current is CSPRNG-filled by lkh_init_master_keys(), called
-        //  at the top of initialize_crypto_backends() before this runs.)
-        std::vector<BIGNUM*> coef(t, nullptr);
-        bool sample_ok = true;
-        for (uint32_t k = 0; k < t && sample_ok; k++) {
-            uint8_t info[16] = {
-                't','r','s','-','c','o','e','f','_',
-                (uint8_t)k,
-                (uint8_t)n,
-                (uint8_t)t,
-                0,0,0,0
-            };
-            uint8_t out32[LKH_KEY_BYTES];
-            if (!lkh_hmac_sha256(g_lkh_k_ring_current, LKH_KEY_BYTES,
-                                 info, sizeof(info), out32)) {
-                sample_ok = false; break;
+        bool ok = true;
+
+        // Per-member secret polynomials coef[i][k] = a_{i,k} and their Feldman
+        // commitments commit[i][k] = a_{i,k}·G. nullptr-initialised so the single
+        // cleanup at the end is safe even on partial-allocation failure.
+        std::vector<std::vector<BIGNUM*>>   coef(n, std::vector<BIGNUM*>(t, nullptr));
+        std::vector<std::vector<EC_POINT*>> commit(n, std::vector<EC_POINT*>(t, nullptr));
+
+        // ── DKG step 1: each member i samples its own polynomial + broadcasts
+        //    Feldman commitments (fresh CSPRNG per coefficient; no shared seed). ──
+        for (uint32_t i = 0; i < n && ok; i++) {
+            for (uint32_t k = 0; k < t && ok; k++) {
+                BIGNUM *a = BN_new();
+                if (!a) { ok = false; break; }
+                if (BN_rand_range(a, q) != 1) { BN_free(a); ok = false; break; }
+                // a_{i,0} ≠ 0 so member i's constant-term commitment is non-identity.
+                if (k == 0 && BN_is_zero(a)) BN_set_word(a, 1);
+                coef[i][k] = a;
+                EC_POINT *C = EC_POINT_new(grp);
+                if (!C || EC_POINT_mul(grp, C, a, nullptr, nullptr, ctx) != 1) {
+                    if (C) EC_POINT_free(C);
+                    ok = false; break;
+                }
+                commit[i][k] = C;
             }
-            BIGNUM *c = BN_bin2bn(out32, (int)LKH_KEY_BYTES, nullptr);
-            if (!c) { sample_ok = false; break; }
-            BN_mod(c, c, q, ctx);
-            // Ensure a_0 ≠ 0 (master_pk = a_0·G must be non-identity).
-            // Probability of zero is ~1/2^256 — handle anyway.
-            if (k == 0 && BN_is_zero(c)) {
-                BN_set_word(c, 1);
-            }
-            coef[k] = c;
-        }
-        if (!sample_ok) {
-            for (auto *c : coef) if (c) BN_free(c);
-            BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
-            return false;
         }
 
-        // master_pk = a_0 · G
-        EC_POINT *mpk = EC_POINT_new(grp);
-        if (!mpk || EC_POINT_mul(grp, mpk, coef[0], nullptr, nullptr, ctx) != 1) {
-            if (mpk) EC_POINT_free(mpk);
-            for (auto *c : coef) BN_free(c);
-            BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
-            return false;
+        // ── DKG step 2: verify each contributor's shares against its commitments
+        //    f_i(j)·G == Σ_k j^k·C_{i,k}  (Feldman VSS check). Honest contributors
+        //    always pass in-process; a corrupted member's bad share fails here,
+        //    modelling the protocol's complaint/disqualification condition. ──
+        for (uint32_t i = 0; i < n && ok; i++) {
+            for (uint32_t j = 1; j <= n && ok; j++) {
+                BIGNUM   *fij  = BN_new();   // f_i(j) = Σ_k a_{i,k}·j^k
+                BIGNUM   *jpow = BN_new();   // j^k (for the scalar sum)
+                BIGNUM   *jp2  = BN_new();   // j^k (for the EC commitment combo)
+                BIGNUM   *bj   = BN_new();
+                BIGNUM   *term = BN_new();
+                EC_POINT *lhs  = EC_POINT_new(grp);   // f_i(j)·G
+                EC_POINT *rhs  = EC_POINT_new(grp);   // Σ_k j^k·C_{i,k}
+                EC_POINT *tmpP = EC_POINT_new(grp);
+                if (!fij || !jpow || !jp2 || !bj || !term || !lhs || !rhs || !tmpP) {
+                    ok = false;
+                } else {
+                    BN_zero(fij); BN_one(jpow); BN_one(jp2);
+                    BN_set_word(bj, (BN_ULONG)j);
+                    EC_POINT_set_to_infinity(grp, rhs);
+                    for (uint32_t k = 0; k < t && ok; k++) {
+                        if (BN_mod_mul(term, coef[i][k], jpow, q, ctx) != 1 ||
+                            BN_mod_add(fij, fij, term, q, ctx) != 1) { ok = false; break; }
+                        if (EC_POINT_mul(grp, tmpP, nullptr, commit[i][k], jp2, ctx) != 1 ||
+                            EC_POINT_add(grp, rhs, rhs, tmpP, ctx) != 1) { ok = false; break; }
+                        if (k + 1 < t) {
+                            if (BN_mod_mul(jpow, jpow, bj, q, ctx) != 1 ||
+                                BN_mod_mul(jp2,  jp2,  bj, q, ctx) != 1) { ok = false; break; }
+                        }
+                    }
+                    if (ok && EC_POINT_mul(grp, lhs, fij, nullptr, nullptr, ctx) != 1) ok = false;
+                    if (ok && EC_POINT_cmp(grp, lhs, rhs, ctx) != 0) ok = false; // VSS mismatch
+                }
+                if (fij)  BN_free(fij);
+                if (jpow) BN_free(jpow);
+                if (jp2)  BN_free(jp2);
+                if (bj)   BN_free(bj);
+                if (term) BN_free(term);
+                if (lhs)  EC_POINT_free(lhs);
+                if (rhs)  EC_POINT_free(rhs);
+                if (tmpP) EC_POINT_free(tmpP);
+            }
         }
 
         out_pks.clear();
@@ -273,82 +329,73 @@ public:
         out_sks.clear();
         out_sks.resize(n);
 
-        out_pks[0].assign(PK_LEN, 0);
-        if (EC_POINT_point2oct(grp, mpk, POINT_CONVERSION_COMPRESSED,
-                               out_pks[0].data(), PK_LEN, ctx) != PK_LEN) {
-            EC_POINT_free(mpk);
-            for (auto *c : coef) BN_free(c);
-            BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
-            return false;
+        // ── master_pk = Σ_i C_{i,0} = (Σ_i a_{i,0})·G = x·G (x never materialised) ──
+        if (ok) {
+            EC_POINT *mpk = EC_POINT_new(grp);
+            if (!mpk) { ok = false; }
+            else {
+                EC_POINT_set_to_infinity(grp, mpk);
+                for (uint32_t i = 0; i < n && ok; i++)
+                    if (EC_POINT_add(grp, mpk, mpk, commit[i][0], ctx) != 1) ok = false;
+                if (ok && EC_POINT_is_at_infinity(grp, mpk)) ok = false; // x ≡ 0 (negligible)
+                if (ok) {
+                    out_pks[0].assign(PK_LEN, 0);
+                    if (EC_POINT_point2oct(grp, mpk, POINT_CONVERSION_COMPRESSED,
+                                           out_pks[0].data(), PK_LEN, ctx) != PK_LEN) ok = false;
+                }
+                EC_POINT_free(mpk);
+            }
         }
-        EC_POINT_free(mpk);
 
-        // For j ∈ [1..n]: s_j = poly(j); pk_j = s_j · G.
-        bool ok = true;
+        // ── DKG step 3: final per-signer share s_j = Σ_i f_i(j); pk_j = s_j·G. ──
         for (uint32_t j = 1; j <= n && ok; j++) {
-            BIGNUM *s_j   = BN_new();      // accumulator
-            BIGNUM *j_pow = BN_new();      // j^k
-            BIGNUM *bj    = BN_new();      // j as BIGNUM
-            if (!s_j || !j_pow || !bj) { ok = false; goto j_cleanup; }
-
-            BN_zero(s_j);
-            BN_one(j_pow);
-            BN_set_word(bj, (BN_ULONG)j);
-
-            for (uint32_t k = 0; k < t && ok; k++) {
-                BIGNUM *term = BN_new();
-                if (!term ||
-                    BN_mod_mul(term, coef[k], j_pow, q, ctx) != 1 ||
-                    BN_mod_add(s_j, s_j, term, q, ctx) != 1) {
-                    if (term) BN_free(term);
-                    ok = false; break;
-                }
-                BN_free(term);
-                // Advance j_pow ← j_pow · j  mod q
-                if (k + 1 < t) {
-                    if (BN_mod_mul(j_pow, j_pow, bj, q, ctx) != 1) {
-                        ok = false; break;
+            BIGNUM *s_j  = BN_new();    // Σ_i f_i(j)
+            BIGNUM *jpow = BN_new();    // j^k (reset per contributor)
+            BIGNUM *bj   = BN_new();
+            BIGNUM *term = BN_new();
+            if (!s_j || !jpow || !bj || !term) {
+                ok = false;
+            } else {
+                BN_zero(s_j);
+                BN_set_word(bj, (BN_ULONG)j);
+                for (uint32_t i = 0; i < n && ok; i++) {
+                    BN_one(jpow);                    // j^0 for this contributor
+                    for (uint32_t k = 0; k < t && ok; k++) {
+                        if (BN_mod_mul(term, coef[i][k], jpow, q, ctx) != 1 ||
+                            BN_mod_add(s_j, s_j, term, q, ctx) != 1) { ok = false; break; }
+                        if (k + 1 < t && BN_mod_mul(jpow, jpow, bj, q, ctx) != 1) { ok = false; break; }
                     }
                 }
-            }
-
-            if (ok) {
-                // Store s_j (32 bytes, left-padded).
-                out_sks[j-1].assign(SK_LEN, 0);
-                int slen = BN_num_bytes(s_j);
-                if (slen > (int)SK_LEN) {
-                    ok = false;
-                } else {
-                    BN_bn2bin(s_j, out_sks[j-1].data() + (SK_LEN - (size_t)slen));
+                if (ok) {
+                    out_sks[j-1].assign(SK_LEN, 0);
+                    int slen = BN_num_bytes(s_j);
+                    if (slen > (int)SK_LEN) ok = false;
+                    else BN_bn2bin(s_j, out_sks[j-1].data() + (SK_LEN - (size_t)slen));
                 }
-            }
-
-            if (ok) {
-                // pk_j = s_j · G  → 33B compressed
-                EC_POINT *pk_j = EC_POINT_new(grp);
-                if (!pk_j ||
-                    EC_POINT_mul(grp, pk_j, s_j, nullptr, nullptr, ctx) != 1) {
-                    if (pk_j) EC_POINT_free(pk_j);
-                    ok = false;
-                } else {
-                    out_pks[j].assign(PK_LEN, 0);
-                    if (EC_POINT_point2oct(grp, pk_j,
-                                           POINT_CONVERSION_COMPRESSED,
-                                           out_pks[j].data(), PK_LEN,
-                                           ctx) != PK_LEN) {
+                if (ok) {
+                    EC_POINT *pk_j = EC_POINT_new(grp);
+                    if (!pk_j || EC_POINT_mul(grp, pk_j, s_j, nullptr, nullptr, ctx) != 1) {
                         ok = false;
+                    } else {
+                        out_pks[j].assign(PK_LEN, 0);
+                        if (EC_POINT_point2oct(grp, pk_j, POINT_CONVERSION_COMPRESSED,
+                                               out_pks[j].data(), PK_LEN, ctx) != PK_LEN) ok = false;
                     }
-                    EC_POINT_free(pk_j);
+                    if (pk_j) EC_POINT_free(pk_j);
                 }
             }
-
-        j_cleanup:
-            if (s_j)   BN_free(s_j);
-            if (j_pow) BN_free(j_pow);
-            if (bj)    BN_free(bj);
+            if (s_j)  BN_free(s_j);
+            if (jpow) BN_free(jpow);
+            if (bj)   BN_free(bj);
+            if (term) BN_free(term);
         }
 
-        for (auto *c : coef) BN_free(c);
+        // Single cleanup of all per-member polynomials + commitments.
+        for (uint32_t i = 0; i < n; i++)
+            for (uint32_t k = 0; k < t; k++) {
+                if (coef[i][k])   BN_free(coef[i][k]);
+                if (commit[i][k]) EC_POINT_free(commit[i][k]);
+            }
         BN_CTX_free(ctx); BN_free(q); EC_GROUP_free(grp);
         return ok;
     }
@@ -627,6 +674,12 @@ public:
         out_sks.assign(n,     std::vector<uint8_t>{});
         // pks[0]: ring descriptor (provenance only; no master secret exists for PQ).
         out_pks[0] = { 'M','L','D','S','A', (uint8_t)n, (uint8_t)t };
+        // DKG (Eq 3.25 dkg_trs) for the bundle scheme: each ring member generates
+        // its OWN ML-DSA keypair independently (OQS_SIG_keypair) — there is no
+        // shared secret, no dealer polynomial and no K_ring seed, so no entity ever
+        // holds another member's secret key. In-process here (one sim process plays
+        // all members); true per-RSU local keygen + on-chain pk_j publication to the
+        // blockchain bulletin board is the HPC/Fabric follow-up (see DKG_RING_KEYS.md).
         for (uint32_t j = 1; j <= n; j++) {
             std::vector<uint8_t> pk(sig_->length_public_key);
             std::vector<uint8_t> sk(sig_->length_secret_key);

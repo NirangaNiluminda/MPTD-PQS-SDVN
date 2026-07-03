@@ -242,35 +242,16 @@ def main():
 
     # ── Metric specifications ─────────────────────────────────────────────────
     # (column, y-axis label, plot title, output filename, (y_min, y_max))
+    # Paper §4.2 (2026-07 rewrite): FPR, DR, Precision, F1 are dropped as *primary*
+    # metrics — MCC subsumes them. FPR is still computed in the sim (it remains the
+    # threshold-calibration criterion), just not reported here. New primary metrics
+    # (TTD via compute_ttd.py; FRR, COO, BWO, TCL) land in later stages — see
+    # scratch/mptd_pqs_sdvn/METRICS_UPGRADE_PLAN.md.
     metric_specs = [
         ("MCC",
          "Matthews Correlation Coefficient",
          "MCC vs Attack %",
          "fig_mcc",
-         (0.0, 1.05)),
-
-        ("FPR",
-         "False Positive Rate",
-         "FPR vs Attack %",
-         "fig_fpr",
-         (0.0, 1.05)),
-
-        ("DR",
-         "Detection Rate",
-         "Detection Rate vs Attack %",
-         "fig_dr",
-         (0.0, 1.05)),
-
-        ("Precision",
-         "Precision",
-         "Precision vs Attack %",
-         "fig_precision",
-         (0.0, 1.05)),
-
-        ("F1",
-         "F1-Score",
-         "F1-Score vs Attack %",
-         "fig_f1",
          (0.0, 1.05)),
 
         ("CDER",

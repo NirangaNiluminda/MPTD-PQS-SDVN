@@ -82,6 +82,11 @@
 #    define MPTD_LEDGER_SIG_ECDSA 1
 #  endif
 #endif
+// NIST Level 5 enforcement (opt-in via -DMPTD_REQUIRE_LEVEL5): refuse to fall
+// back to classical ECDSA ledger signatures — ECDSA (P-256) is not post-quantum.
+#if defined(MPTD_REQUIRE_LEVEL5) && defined(MPTD_LEDGER_SIG_ECDSA)
+#  error "MPTD_REQUIRE_LEVEL5: ledger signatures resolved to classical ECDSA (liboqs missing or ECDSA forced) — not NIST Level 5. Install liboqs / drop -DMPTD_LEDGER_SIG_ECDSA."
+#endif
 #if defined(MPTD_LEDGER_SIG_MLDSA)
 #  if __has_include(<oqs/oqs.h>)
 #    include <oqs/oqs.h>
@@ -509,7 +514,7 @@ static std::string ledger_keygen(LedgerKey& out)
 #endif
 }
 
-// ledger_sign_hex — sign the canonical 32-byte digest with `key` under the
+// ledger_sign_hex — sign the canonical digest (64-byte SHA-512) with `key` under the
 // active scheme and return the signature as lowercase hex. ML-DSA-87 signs the
 // digest as its message (FIPS 204 pure, EMPTY context — the Go circl verifier
 // must mirror that); ECDSA produces ASN.1-DER over the same digest. Returns ""
@@ -533,17 +538,20 @@ static std::string ledger_sign_hex(const LedgerKey& key,
 #endif
 }
 
-// concat_digest — SHA-256 over the ordered raw-UTF-8 concatenation of `parts`
+// concat_digest — SHA-512 over the ordered raw-UTF-8 concatenation of `parts`
 // (no separators). The one canonical hashing rule shared with chaincode
 // concatDigest(); every signed payload below uses it so both sides agree.
+// SHA-512 (NIST Level 5): the signed message inherits Category-5 collision
+// resistance, so the ML-DSA-87 signature is no longer capped at SHA-256's
+// Category-2. Both sides MUST use SHA-512 in lock-step or verification fails.
 static std::vector<uint8_t> concat_digest(std::initializer_list<std::string> parts)
 {
-    SHA256_CTX c;
-    SHA256_Init(&c);
-    for (const std::string& p : parts) SHA256_Update(&c, p.data(), p.size());
-    uint8_t out[SHA256_DIGEST_LENGTH];
-    SHA256_Final(out, &c);
-    return std::vector<uint8_t>(out, out + SHA256_DIGEST_LENGTH);
+    SHA512_CTX c;
+    SHA512_Init(&c);
+    for (const std::string& p : parts) SHA512_Update(&c, p.data(), p.size());
+    uint8_t out[SHA512_DIGEST_LENGTH];
+    SHA512_Final(out, &c);
+    return std::vector<uint8_t>(out, out + SHA512_DIGEST_LENGTH);
 }
 
 // endorsement_digest — must stay byte-identical to chaincode endorsementDigest

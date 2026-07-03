@@ -16,7 +16,7 @@
 //   TRS-2f: sub-threshold (only 1 partial when t=3) → aggregate produces σ
 //           but verify_threshold REJECTS (no a_0 recovery from < t shares)
 //   TRS-3: tampered message → verify_threshold = REJECT
-//   TRS-4: wrong-ring pks (different n → different K_ring-seeded poly) → REJECT
+//   TRS-4: wrong-ring pks (independently generated DKG ring → different master_pk) → REJECT
 //   FHE-1: encrypt single int → decrypt = same int (single-key BFV)
 //   FHE-2: Σ EvalAdd(Enc(x_i)) → Decrypt = Σ x_i
 //   FHE-3: encrypt_speed_mps round-trip with ×100 quantization
@@ -149,10 +149,10 @@ static void crypto_selftest_run()
                                              g_trs_ring_pks);
         step("TRS-3: tampered message rejected", tamper_rejected);
 
-        // TRS-4: wrong ring. Using a different ring size (n+1 instead of n)
-        // changes the seed (since seed includes n and t), so the resulting
-        // master_pk is different from the global ring's. σ from global ring
-        // must not verify against wrong ring's pks.
+        // TRS-4: wrong ring. The Joint-Feldman DKG draws fresh per-party
+        // randomness each run, so an independently generated ring (here sized
+        // n+1) has a different master_pk = Σ_i C_{i,0} from the global ring's.
+        // σ from the global ring must not verify against the wrong ring's pks.
         ClassicalTrsBackend tmp;
         std::vector<std::vector<uint8_t>> wrong_pks, wrong_sks;
         bool wrong_ring_ok = tmp.generate_keys(g_trs_ring_n + 1,
