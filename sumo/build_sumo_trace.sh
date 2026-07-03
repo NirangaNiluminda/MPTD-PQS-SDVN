@@ -95,6 +95,16 @@ if [ ! -s "$REGIME.osm" ]; then
 fi
 grep -q "<way" "$REGIME.osm" || { echo "OSM download failed"; exit 1; }
 
+# REUSE_NET env-overridable: when set AND a prior $REGIME.net.xml already exists,
+# SKIP the OSM→netconvert rebuild (steps 1-2) and re-use the existing cropped net.
+# This (a) avoids re-cropping the map — so the scenario topology is byte-identical
+# to the net that produced the committed trace, which is what we want when only the
+# DEMAND (vehicle count / OVERGEN) is being changed — and (b) sidesteps a SUMO
+# 1.18 netconvert geometry assertion (NBNodesEdgesSorter getConvAngle) that aborts
+# the rebuild on this OSM extract. Leave REUSE_NET unset to force a full rebuild.
+if [ -n "${REUSE_NET:-}" ] && [ -s "$REGIME.net.xml" ]; then
+  echo "[2/6] REUSE_NET set and $REGIME.net.xml exists → skipping netconvert (re-using existing cropped net)"
+else
 echo "[2/6] netconvert → $REGIME.net.xml (cropped to an exact 2 km × 2 km box)"
 # Two passes are needed. Overpass returns whole ways crossing the bbox, and a
 # geo-boundary keeps any straddling way's full geometry — so a one-pass clip
@@ -155,6 +165,7 @@ print(f"      box=({bx0:.0f},{by0:.0f})-({bx1:.0f},{by1:.0f})m, kept {len(keep)}
 PY
 netconvert -s "${REGIME}_full.net.xml" -o "$REGIME.net.xml" \
   --keep-edges.input-file keep_edges.txt --remove-edges.isolated
+fi
 
 # MW_BIAS env (highway regime): weight every motorway edge as a randomTrips
 # src/dst so generated traffic is highway-dominant instead of looping on surface
