@@ -304,6 +304,48 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 	return nil
 }
 
+// ResetLedger wipes all per-run world state so each simulation starts from a
+// clean ledger. Fabric blocks are append-only, so this clears the CURRENT-state
+// keys the detection logic reads (registrations, trust scores, revocations,
+// evidence submissions, revoke votes, controller flags/reassignments, active
+// controller, and network config) — not the immutable block history. The sim
+// re-seeds config + RSU/vehicle/controller registrations at the start of every
+// run (CallSCInitNetworkConfig + register_all_nodes), so wiping every namespace
+// is safe. Returns the number of keys deleted.
+func (s *SmartContract) ResetLedger(ctx contractapi.TransactionContextInterface) (int, error) {
+	prefixes := []string{
+		"REG_", "SCTRUST_", "RSUTRUST_", "CTRUST_",
+		"SCREVOKE_", "SUBM_", "CSUBM_", "CFLAG_",
+		"CTRLREASSIGN_", "CTRL_", "VOTE_", "NETCFG",
+	}
+	deleted := 0
+	for _, p := range prefixes {
+		iter, err := ctx.GetStub().GetStateByRange(p, p+"~")
+		if err != nil {
+			return deleted, fmt.Errorf("ResetLedger: range %s: %w", p, err)
+		}
+		// Collect keys first; deleting while the range iterator is open is not
+		// guaranteed safe across state DBs.
+		var keys []string
+		for iter.HasNext() {
+			kv, err := iter.Next()
+			if err != nil {
+				iter.Close()
+				return deleted, fmt.Errorf("ResetLedger: iter %s: %w", p, err)
+			}
+			keys = append(keys, kv.Key)
+		}
+		iter.Close()
+		for _, k := range keys {
+			if err := ctx.GetStub().DelState(k); err != nil {
+				return deleted, fmt.Errorf("ResetLedger: del %s: %w", k, err)
+			}
+			deleted++
+		}
+	}
+	return deleted, nil
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────

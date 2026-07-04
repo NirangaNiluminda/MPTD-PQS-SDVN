@@ -2095,6 +2095,11 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // SCControllerSubmitEvidence / SCRevokeVote fires. No-op when
   // skip_blockchain=true or routing_algorithm != 4.
   if (routing_algorithm == 4) {
+    // Wipe any world state left over from a previous run so each simulation
+    // (every attack × percentage) starts from a clean ledger. No-op under
+    // skip_blockchain. Must precede register_all_nodes() so the fresh
+    // registrations are not rejected as duplicates of the prior run.
+    CallSCResetLedger();
     register_all_nodes();
   }
 

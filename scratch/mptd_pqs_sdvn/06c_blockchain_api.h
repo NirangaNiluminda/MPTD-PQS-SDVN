@@ -860,6 +860,20 @@ inline void CallSCInitNetworkConfig(
               << " → " << out;
 }
 
+// ── CallSCResetLedger — wipe per-run world state before re-seeding ────────────
+// Deletes all dynamic world-state keys (registrations, trust scores, revocations,
+// evidence/votes, controller flags/reassignments, active controller, config) so
+// each simulation starts from a clean ledger. Fabric blocks are append-only, so
+// only current state is cleared, not block history. Synchronous: the wipe must
+// commit before register_all_nodes() re-registers nodes for this run. No-op when
+// skip_blockchain is set (training-sweep mode).
+inline void CallSCResetLedger()
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    std::string out = mptd_fabric_invoke_sync("invoke", "ResetLedger", {});
+    std::cout << "[SC-RESET] per-run ledger wipe → " << out;
+}
+
 // SCResult — registration-call outcome (ok flag + error/payload string).
 // `ok=true`  → chaincode committed; `msg` is the chaincode-returned payload
 //             (empty when chaincode returns nil, e.g. SCRegister on success).
