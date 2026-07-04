@@ -64,7 +64,12 @@ VEH_COUNT=(100     25    25    25       25)
 # insert without congestion-discard; we OVER-GENERATE by OVERGEN to absorb
 # route-validation losses + insertion failures, then select the exact target
 # counts that survive the whole export window (see step [5]).
-INSERT_WINDOW=20.0
+# INSERT_WINDOW env-overridable: with KEEP_IN (vehicles never despawn) a sparse
+# net fills faster than it can insert a 20 s burst — the entry edges block and
+# most trips are discarded. Spreading departures over a LONGER window (e.g. 100 s)
+# with a matching long WARMUP lets vehicles enter gradually and ACCUMULATE (none
+# leave), so the map reaches the full target count before the export window opens.
+INSERT_WINDOW="${INSERT_WINDOW:-20.0}"
 # OVERGEN env-overridable: highway/rural regimes need more over-generation
 # because fast transit + sparse routes lose more vehicles before window end.
 OVERGEN="${OVERGEN:-1.8}"
@@ -274,7 +279,7 @@ else
     python3 "$SUMO_HOME/tools/randomTrips.py" -n "$REGIME.net.xml" \
       -o "trips_${name}.xml" -r "routes_${name}.rou.xml" \
       --begin 0 --end "$INSERT_WINDOW" --period "$period" \
-      --fringe-factor "$FRINGE" --intermediate 5 --min-distance "$MINDIST" \
+      --fringe-factor "$FRINGE" --intermediate "${INTERMEDIATE:-5}" --min-distance "$MINDIST" \
       "${WEIGHT_ARGS[@]}" \
       --vehicle-class "$vclass" --prefix "$name" --seed "$((SEED + i))" --validate
     ROUTE_FILES+=("routes_${name}.rou.xml")
@@ -299,8 +304,53 @@ for f in glob.glob("routes_*.rou.xml"):
 PY
 
 ROUTES_CSV=$(IFS=,; echo "${ROUTE_FILES[*]}")
+
+# ── KEEP_IN env: keep vehicles circulating INSIDE the map for the whole run ──
+# Sparse rural nets have short routes, so most vehicles reach their destination
+# and DESPAWN within the export window — that is why the full-window filter can
+# only retain ~138 of 200 on rural (they arrive and leave, not "drive off").
+# When KEEP_IN is set we emit a SUMO <rerouter> (destProbReroute) covering the
+# net: each time a vehicle passes a rerouter edge it is handed a fresh in-map
+# destination, so it never arrives/despawns and stays present the entire window.
+# This lets a sparse map hold the full target count at its real density without
+# enlarging the map. Rerouter edges are a spread SUBSET (every Kth edge) so a
+# vehicle drives a natural sub-trip between redirects instead of thrashing.
+# Leave KEEP_IN unset for urban/highway (dense/corridor nets already hold 200).
+REROUTE_ARGS=()
+if [ -n "${KEEP_IN:-}" ]; then
+  echo "[3c/6] KEEP_IN: building keep-in-network rerouter (vehicles never despawn)"
+  python3 - "$REGIME.net.xml" "${KEEP_IN_STRIDE:-4}" keepin.add.xml <<'PY'
+import sys, xml.etree.ElementTree as ET
+net, stride, out = sys.argv[1], int(sys.argv[2]), sys.argv[3]
+root = ET.parse(net).getroot()
+# normal, car-drivable edges only (skip internal + explicitly disallowed)
+edges=[]
+for e in root.findall('edge'):
+    if e.get('function')=='internal': continue
+    lanes=e.findall('lane')
+    if not lanes: continue
+    dis=lanes[0].get('disallow','') or ''
+    if 'passenger' in dis.split(): continue
+    edges.append(e.get('id'))
+edges=sorted(set(edges))
+if not edges: sys.exit("KEEP_IN: no drivable edges found")
+# destination pool = all drivable edges (uniform); rerouter fires on a spread
+# subset so redirects are periodic, not every-edge (keeps trajectories natural).
+trig = edges[::max(1,stride)] or edges
+lines=['<additional>',
+       f'  <rerouter id="keepin" edges="{" ".join(trig)}">',
+       '    <interval begin="0" end="100000">']
+for d in edges:
+    lines.append(f'      <destProbReroute id="{d}"/>')
+lines += ['    </interval>','  </rerouter>','</additional>']
+open(out,'w').write("\n".join(lines)+"\n")
+print(f"      rerouter over {len(trig)} trigger edges (stride {stride}) -> {len(edges)} dest edges")
+PY
+  REROUTE_ARGS=(-a keepin.add.xml)
+fi
+
 echo "[4/6] sumo --fcd-output over warmup+window (route files: $ROUTES_CSV)"
-sumo -n "$REGIME.net.xml" -r "$ROUTES_CSV" --fcd-output fcd.xml \
+sumo -n "$REGIME.net.xml" -r "$ROUTES_CSV" "${REROUTE_ARGS[@]}" --fcd-output fcd.xml \
   --begin 0 --end "$(echo "$WARMUP + $WINDOW + 5" | bc)" \
   --step-length 1.0 --no-step-log --no-warnings
 
