@@ -129,5 +129,20 @@ gat_detector/__pycache__/
 gat_detector/**/*.pyc
 gat_detector/.venv/
 
+# ── Local backups, experimental scans & archives (never committed; regeneratable) ─
+# Canonical maps/traces live at sumo/<scenario>/ and mobility/mobility_<scenario>_<spd>.tcl;
+# everything below is scratch produced while building them.
+**/*.bak*
+**/*.grid*
+lstm_detector.zip
+analytics/_archive_*/
+sumo/manching/
+sumo/manching3k/
+sumo/rural3k/
+sumo/ruralbig/
+sumo/**/keepin.add.xml
+mobility/mobility_manching*.tcl
+mobility/mobility_rural3k_*.tcl
+
 
 
