@@ -53,7 +53,7 @@ using namespace std::chrono;
 // 64-RSU uniform grid (rsu_positions_urban.csv; supervisor-mandated 2026-06-12,
 // 250 m spacing). All per-RSU arrays are sized [MAX_RSUS]; every loop / gate
 // over actual RSUs bounds on N_RSUs (NOT the literal 4 or MAX_RSUS).
-#define MAX_RSUS 64
+#define MAX_RSUS 256
 
 const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
 uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban 8×8 grid=64)

@@ -433,11 +433,12 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     // Honest RSU beacons always have IsPoisoned=false → condition short-circuits → FP=0.
     // density_limit justification (paper Eq. 3.7 uses K_sybil + ρ_v × A_j):
     // Plugging declared globals gives 5 + 0.01×π×270² ≈ 2295 — clearly calibrated for
-    // a much denser network than our 16-vehicle topology. For this simulation, the
-    // equivalent threshold is N_Vehicles/N_RSUs = 4 legitimate vehicles per RSU cell.
-    // Any beacon count > 4 at a single RSU indicates ghost injection. This is the
-    // per-topology instantiation of the paper's area-density formula.
-    double density_limit = (double)(N_Vehicles / N_RSUs); // per-RSU expected count = 4
+    // a much denser network than our topology. For this simulation, the equivalent
+    // threshold is N_Vehicles/N_RSUs legitimate vehicles per RSU cell (float division;
+    // ~3 for urban 200veh/64RSU, ~1 for rural 200veh/169RSU). A beacon count above that
+    // at a single RSU indicates ghost injection. This is the per-topology instantiation
+    // of the paper's area-density formula.
+    double density_limit = (double)N_Vehicles / (double)N_RSUs; // per-RSU expected legit count
     bool count_exceeded  = (rsu_id >= 0 && rsu_id < total_size &&
                             rsu_id_set[rsu_id].count > (int)density_limit);
     bool ghost_seen_flag = (rsu_id >= 0 && rsu_id < total_size &&

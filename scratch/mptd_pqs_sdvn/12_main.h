@@ -288,7 +288,7 @@ int main(int argc, char *argv[])
 	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
 	  //   → management index = N_RSUs + 1 (unchanged from prior layout)
 	  csmaDevices = csma.Install (csma_nodes);
-  	  address.SetBase ("10.1.1.0", "255.255.255.0");
+  	  address.SetBase ("10.1.0.0", "255.255.0.0");   // /16: CSMA backbone must hold up to 256 RSUs + controllers + mgmt (a /24's 254 hosts overflow at N_RSUs=256)
   	  stack.Install (csma_nodes);
   	  csmaInterfaces = address.Assign (csmaDevices);
   	  // ── Option B: management_node is the last entry in csma_nodes ─────────
