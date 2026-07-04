@@ -3,7 +3,7 @@
 # run_all_scenarios.sh — full evaluation sweep across the THREE SUMO scenarios
 #
 #   urban   (scenario 0)  — low-speed regime    60 km/h, 200 veh, 64 RSU
-#   rural   (scenario 1)  — mid-speed regime    90 km/h, 138 veh, 44 RSU
+#   rural   (scenario 1)  — mid-speed regime    90 km/h, 200 veh, 169 RSU
 #   highway (scenario 2)  — high-speed regime  150 km/h, 200 veh, 23 RSU
 #                           (trace tag = "autobahn")
 #
@@ -68,8 +68,8 @@ RUN_TIMEOUT="${RUN_TIMEOUT:-2700}"
 SCN_NAMES=(urban   rural   highway)
 SCN_IDS=(   0       1       2)
 SCN_SPEED=( 60      90      150)
-SCN_NVEH=(  200     138     200)
-SCN_NRSU=(  64      44      23)
+SCN_NVEH=(  200     200     200)
+SCN_NRSU=(  64      169     23)
 
 # Which scenarios to run (default all three). Match against SCN_NAMES.
 WANT="${SCN:-urban rural highway}"
