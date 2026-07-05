@@ -120,7 +120,7 @@ type RegistrationRecord struct {
 	// R^obs_ck(t) = {r_j ∈ R_trusted(t) : c_assigned(r_j)=c_k} that SCControllerFinalizeEpoch
 	// averages the directional conflict over (Eq 3.60). Set by SCSetRSUController at
 	// setup and rewritten on every CP-DETECT/EMA controller reassignment (p.75).
-	AssignedController string `json:"AssignedController,omitempty"`
+	AssignedController string `json:"AssignedController,omitempty" metadata:"AssignedController,optional"`
 	TReg         string  `json:"TReg"`               // caller-supplied registration timestamp
 	RegisteredAt string  `json:"RegisteredAt"`       // server-side commit time (RFC3339)
 }
@@ -153,7 +153,7 @@ type SCTrustScore struct {
 	MeanPsi              float64 `json:"MeanPsi"`              // (1/|R|)·Σ ψ_j^{(i)}(t) from last finalised epoch
 	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R| of last finalised epoch
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for T_rev gate (τ < τ_min)
-	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_i < τ_warn — reduced routing priority (paper §3.5.1)
+	Probationary         bool    `json:"Probationary,omitempty" metadata:"Probationary,optional"` // τ_min ≤ τ_i < τ_warn — reduced routing priority (paper §3.5.1)
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
 	UpdatedAt            string  `json:"UpdatedAt"`
@@ -173,8 +173,8 @@ type RSUTrustScore struct {
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate (τ < τ_min)
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
-	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_{r_j} < τ_warn — still TRUSTED/endorsing but under watch (paper §3.5.1)
-	FloorHeld            bool    `json:"FloorHeld,omitempty"`    // τ < τ_min but held TRUSTED by the BFT 3f+1 floor guard
+	Probationary         bool    `json:"Probationary,omitempty" metadata:"Probationary,optional"` // τ_min ≤ τ_{r_j} < τ_warn — still TRUSTED/endorsing but under watch (paper §3.5.1)
+	FloorHeld            bool    `json:"FloorHeld,omitempty" metadata:"FloorHeld,optional"`    // τ < τ_min but held TRUSTED by the BFT 3f+1 floor guard
 	UpdatedAt            string  `json:"UpdatedAt"`
 }
 
@@ -191,7 +191,7 @@ type ControllerTrustScore struct {
 	MeanConflict         float64 `json:"MeanConflict"`         // (1/|R^obs_ck|)·Σ conflict_j(t) from last finalised epoch (Eq 3.60)
 	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R^obs_ck(t)| of last finalised epoch
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate (τ < τ_min)
-	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_ck < τ_warn — under watch, still in C_trusted
+	Probationary         bool    `json:"Probationary,omitempty" metadata:"Probationary,optional"` // τ_min ≤ τ_ck < τ_warn — under watch, still in C_trusted
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
 	UpdatedAt            string  `json:"UpdatedAt"`
