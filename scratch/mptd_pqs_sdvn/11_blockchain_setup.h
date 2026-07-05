@@ -192,7 +192,7 @@ void initialize_crypto_backends()
     // (Eq 3.54 ThGen, multiparty key gen + Shamir ShareKeys "with aborts").
     // n_rsus=4, threshold=3; Cloud is the mandatory (n+1)-th lead party.
     if (init_threshold_fhe_backend(/*n_rsus=*/4, /*threshold=*/3,
-                                   /*ptmod=*/65537, /*depth=*/1)) {
+                                   /*ptmod=*/FHE_PLAINTEXT_MODULUS, /*depth=*/1)) {
         std::cout << "[CRYPTO/THFHE] " << g_thfhe_backend->scheme_name()
                   << " ready (ring_dim=" << g_thfhe_backend->ring_dim()
                   << " parties=" << g_thfhe_backend->num_parties()
@@ -207,7 +207,7 @@ void initialize_crypto_backends()
 
     // Single-key BFV retained ONLY for the 06b3 selftest's legacy sum/mean
     // checks; the live Full-mode aggregate path uses g_thfhe_backend above.
-    if (init_fhe_backend(/*ptmod=*/65537, /*depth=*/1)) {
+    if (init_fhe_backend(/*ptmod=*/FHE_PLAINTEXT_MODULUS, /*depth=*/1)) {
         std::cout << "[CRYPTO/FHE] " << g_fhe_backend->scheme_name()
                   << " ready (ring_dim=" << g_fhe_backend->ring_dim()
                   << " ptmod=" << g_fhe_backend->plaintext_modulus() << ")\n";
