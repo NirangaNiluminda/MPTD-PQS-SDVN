@@ -22,7 +22,7 @@ def score_window(model: torch.nn.Module, window_seq: np.ndarray) -> float:
     x = torch.tensor(window_seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         recon = model(x)
-    return float(((recon - x) ** 2).mean().cpu())
+    return float(((recon - x) ** 2).sum(dim=-1).mean().cpu())
 
 def main():
     parser = argparse.ArgumentParser()

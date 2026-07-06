@@ -182,6 +182,16 @@ def main():
         raise FileNotFoundError(f"{enc_path} not found. Run train.py first.")
 
     ckpt = torch.load(enc_path, map_location=device)
+    # Build the encoder from the architecture stored IN THE CHECKPOINT, not from
+    # config.py -- the deployed winner may be a different candidate (e.g. G4)
+    # than config's default, so shapes must come from the checkpoint.
+    if "arch" in ckpt:
+        import dataclasses
+        a = ckpt["arch"]
+        cfg = dataclasses.replace(cfg, heads=a["heads"], hidden_dim=a["hidden_dim"],
+                                  emb_dim=a["emb_dim"], dropout=a["dropout"])
+        print(f"[calibrate] using deployed arch: heads={cfg.heads} hidden={cfg.hidden_dim} "
+              f"emb={cfg.emb_dim} dropout={cfg.dropout}")
     enc = build_encoder(cfg, D.in_dim(cfg)).to(device)
     enc.load_state_dict(ckpt["encoder"])
     enc.eval()

@@ -1,0 +1,11 @@
+{
+  "scenario": "rural",
+  "selected_candidate": "G6",
+  "heads": 8,
+  "hidden_dim": 32,
+  "emb_dim": 16,
+  "dropout": 0.2,
+  "val_mcc_mean": 0.6836729705067245,
+  "val_fpr_mean": 0.21978166297299517,
+  "best_seed": 1
+}

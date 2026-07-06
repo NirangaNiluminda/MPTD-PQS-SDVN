@@ -203,6 +203,9 @@ def main():
     ap.add_argument("--data_root", default="data")
     ap.add_argument("--ckpt_dir", default="checkpoints")
     ap.add_argument("--out_dir", default="outputs")
+    ap.add_argument("--split", default="test", choices=["test", "all"],
+                    help="test = held-out later segment only (no leakage, default); "
+                         "all = score the entire attack file")
     args = ap.parse_args()
 
     cfg = get_config(args.scenario)
@@ -213,8 +216,16 @@ def main():
         if not os.path.exists(p):
             raise FileNotFoundError(f"{p} not found. Run train.py then calibrate.py first.")
 
+    _ckpt = torch.load(enc_path, map_location=device)
+    if "arch" in _ckpt:
+        import dataclasses
+        a = _ckpt["arch"]
+        cfg = dataclasses.replace(cfg, heads=a["heads"], hidden_dim=a["hidden_dim"],
+                                  emb_dim=a["emb_dim"], dropout=a["dropout"])
+        print(f"[score] using deployed arch: heads={cfg.heads} hidden={cfg.hidden_dim} "
+              f"emb={cfg.emb_dim} dropout={cfg.dropout}")
     enc = build_encoder(cfg, D.in_dim(cfg)).to(device)
-    enc.load_state_dict(torch.load(enc_path, map_location=device)["encoder"])
+    enc.load_state_dict(_ckpt["encoder"])
     enc.eval()
 
     st = np.load(stat_path)
@@ -225,6 +236,16 @@ def main():
 
     print(f"[score] scenario={cfg.name}: loading ATTACK graphs ...")
     graphs = D.load_attack_graphs(args.data_root, cfg)
+
+    if args.split == "test":
+        # SAME split train.py used -> evaluate only the held-out test tail,
+        # which the encoder never trained on (no train/test leakage).
+        _tr, _va, graphs = D.temporal_split3(graphs, train_frac=0.6, val_frac=0.2)
+        print(f"[score] evaluating on HELD-OUT TEST segment: {len(graphs)} graphs "
+              f"(last 20%, disjoint from train/val)")
+    else:
+        print(f"[score] evaluating on FULL attack file: {len(graphs)} graphs "
+              f"(includes training data - for inspection only)")
 
     rows = []
     for g in graphs:

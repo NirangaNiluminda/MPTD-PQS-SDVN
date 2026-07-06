@@ -707,3 +707,27 @@ def temporal_split(graphs, val_frac=0.3):
     cut = int(round(n * (1.0 - val_frac)))
     cut = max(1, min(cut, n - 1)) if n > 1 else 1
     return graphs[:cut], graphs[cut:]
+
+
+def temporal_split3(graphs, train_frac=0.6, val_frac=0.2):
+    """3-way TEMPORAL split -> (train, val, test), strictly time-ordered and
+    DISJOINT (mirrors the LSTM-AE's 60/20/20 temporal_split).
+
+      train : earliest train_frac           -> fit GAT weights (Phase 1a)
+      val   : next val_frac                  -> best-checkpoint / model selection
+      test  : latest (1-train-val) segment   -> FINAL scoring only (never trained on)
+
+    Because load_attack_graphs() returns graphs deterministically ordered by
+    (seed, tbin), train.py and score.py applying this same function with the
+    same fractions get the SAME disjoint slices -> no train/test leakage.
+    """
+    n = len(graphs)
+    if n < 3:
+        # too few graphs to hold out a test slice; degrade gracefully
+        tr, va = temporal_split(graphs, val_frac=val_frac)
+        return tr, va, va
+    c1 = int(round(n * train_frac))
+    c2 = int(round(n * (train_frac + val_frac)))
+    c1 = max(1, min(c1, n - 2))
+    c2 = max(c1 + 1, min(c2, n - 1))
+    return graphs[:c1], graphs[c1:c2], graphs[c2:]

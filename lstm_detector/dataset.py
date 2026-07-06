@@ -19,10 +19,16 @@ def load_beacon_csv(path: str) -> pd.DataFrame:
         df = df.rename(columns=rename_map)
 
     if "run_id" not in df.columns:
-        BOUNDARY_DROP = 2.0
-        prev = df["sim_time"].shift(1)
-        new_run = (prev.notna() & ((prev - df["sim_time"]) > BOUNDARY_DROP))
-        df["run_id"] = new_run.cumsum().astype(int)
+        if "source_run" in df.columns:
+            # Prefer the explicit run label written by combine_data.py over
+            # guessing from time gaps -- exact and can't be fooled by unusual
+            # sim_time patterns within a real run.
+            df["run_id"] = df["source_run"].astype("category").cat.codes
+        else:
+            BOUNDARY_DROP = 2.0
+            prev = df["sim_time"].shift(1)
+            new_run = (prev.notna() & ((prev - df["sim_time"]) > BOUNDARY_DROP))
+            df["run_id"] = new_run.cumsum().astype(int)
     return df
 
 def filter_clean_only(df: pd.DataFrame) -> pd.DataFrame:

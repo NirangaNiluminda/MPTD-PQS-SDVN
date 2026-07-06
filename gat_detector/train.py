@@ -204,7 +204,9 @@ def evaluate(model, loader, device):
 def train_one(cfg, graphs, device, seed=0, verbose=True):
     """Train the given cfg architecture once; return (best_model_state, best_mcc, best_fpr)."""
     torch.manual_seed(seed); np.random.seed(seed)
-    tr, va = D.temporal_split(graphs, val_frac=0.3)
+    tr, va, _te = D.temporal_split3(graphs, train_frac=0.6, val_frac=0.2)
+    # _te (last 20%) is the held-out TEST tail: never used for training or
+    # model selection; score.py evaluates on it via the same split.
     in_dim = D.in_dim(cfg)
     w_pos, w_neg = class_weights(tr)
 

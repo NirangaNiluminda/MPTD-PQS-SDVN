@@ -2,6 +2,11 @@
 train_fusion.py — Phase 2 Score Fusion Weight Learning
 Optimises scenario-specific fusion weights (lambda_1, lambda_2, lambda_3)
 using SLSQP constrained optimization over training data.
+
+The LSTM-AE score is computed with the SAME 6-dim model deployed to ns-3
+(lstm_detector, [5 kinematic + tau_i], window=10). tau is z-scaled by the
+6-dim scaler (trusted tau=1.0 -> 0.0); GAT keeps tau raw at 1.0. This makes the
+learned lambda match the runtime epsilon/theta_ae distribution the C++ produces.
 """
 
 import os
@@ -10,19 +15,38 @@ import json
 import numpy as np
 import pandas as pd
 import torch
-import torch.nn as nn
 
 # Ensure local imports work
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+REPO_ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..")
+sys.path.insert(0, REPO_ROOT)
 
 from gat_detector import GATDetector, score_snapshot
-from lstm_ae import LSTMAEDetector, score_window, WINDOW_SIZE
 from score_fusion import learn_weights
+from lstm_detector.model import LSTMAEDetector  # 6-dim bottleneck AE (deployed)
 
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 MODEL_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "models")
 DATA_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data")
+LSTM_CKPT_DIR = os.path.join(REPO_ROOT, "lstm_detector", "checkpoints")
+
+
+def _infer_ae_dims(sd):
+    """Recover (feat_dim, hidden, latent, num_layers) from a checkpoint state_dict."""
+    feat_dim = sd["encoder.weight_ih_l0"].shape[1]
+    hidden   = sd["encoder.weight_ih_l0"].shape[0] // 4
+    latent   = sd["to_latent.weight"].shape[0]
+    num_layers = sum(1 for k in sd if k.startswith("encoder.weight_ih_l"))
+    return feat_dim, hidden, latent, num_layers
+
+
+def score_ae_window(ae, window_6):
+    """Reconstruction MSE for one (window, 6) z-scaled window — mirrors the C++
+    score_lstm_ae MSE over all window*6 cells."""
+    x = torch.tensor(window_6, dtype=torch.float32, device=DEVICE).unsqueeze(0)
+    with torch.no_grad():
+        recon = ae(x)
+    return float(((recon - x) ** 2).mean().cpu())
 
 def get_scenario_for_run(run_df: pd.DataFrame) -> str:
     """
@@ -41,7 +65,8 @@ def get_scenario_for_run(run_df: pd.DataFrame) -> str:
 
 def load_scenario_assets(scenario: str):
     """
-    Load GAT, LSTM-AE models, scaler, and threshold for a scenario.
+    Load GAT (shared, 6-dim) + the deployed scenario-specific 6-dim LSTM-AE,
+    its 6-dim scaler, per-scenario theta_ae, and window length.
     """
     # GAT model (shared)
     gat = GATDetector(in_dim=6).to(DEVICE)
@@ -52,38 +77,41 @@ def load_scenario_assets(scenario: str):
         gat.load_state_dict(torch.load(gat_path, map_location=DEVICE))
     gat.eval()
 
-    # LSTM-AE model (scenario-specific, 6 features)
-    ae = LSTMAEDetector(feat_dim=6).to(DEVICE)
-    ae_path = os.path.join(MODEL_DIR, scenario, "lstm_ae_model.pt")
-    if not os.path.exists(ae_path):
-        ae_path = os.path.join(MODEL_DIR, f"lstm_ae_{scenario}.pt")
-    if not os.path.exists(ae_path):
-        ae_path = os.path.join(MODEL_DIR, "lstm_ae_model.pt")
-    if os.path.exists(ae_path):
-        ae.load_state_dict(torch.load(ae_path, map_location=DEVICE))
+    # LSTM-AE model — the exact 6-dim checkpoint promoted to ns-3 (paper d=6).
+    # Architecture dims are read from the checkpoint so the module matches the
+    # trained weights (arch search produced hidden=32/latent=16, not defaults).
+    ae_path = os.path.join(LSTM_CKPT_DIR, f"lstm_ae_{scenario}.pt")
+    sd = torch.load(ae_path, map_location=DEVICE)
+    feat_dim, hidden, latent, num_layers = _infer_ae_dims(sd)
+    ae = LSTMAEDetector(feat_dim=feat_dim, hidden=hidden,
+                        latent=latent, num_layers=num_layers).to(DEVICE)
+    ae.load_state_dict(sd)
     ae.eval()
 
-    # Scaler
-    scaler_path = os.path.join(MODEL_DIR, scenario, "scaler.json")
+    # Window length from the selected architecture (all scenarios = 10).
+    window = 10
+    arch_path = os.path.join(LSTM_CKPT_DIR, f"arch_{scenario}.json")
+    if os.path.exists(arch_path):
+        with open(arch_path) as f:
+            window = int(json.load(f).get("window", 10))
+
+    # 6-dim scaler (5 kinematic + tau_i) — same file deployed to ns-3.
+    scaler_path = os.path.join(LSTM_CKPT_DIR, f"scaler_{scenario}.json")
     if not os.path.exists(scaler_path):
-        scaler_path = os.path.join(MODEL_DIR, f"scaler_{scenario}.json")
-    if not os.path.exists(scaler_path):
-        scaler_path = os.path.join(MODEL_DIR, "scaler.json")
+        scaler_path = os.path.join(MODEL_DIR, scenario, "scaler.json")
     with open(scaler_path, "r") as f:
         scaler_data = json.load(f)
     mean = np.array(scaler_data["mean"], dtype=np.float32)
     scale = np.array(scaler_data["scale"], dtype=np.float32)
 
-    # Theta_ae
-    theta_path = os.path.join(MODEL_DIR, scenario, "theta_ae.txt")
+    # theta_ae — per-scenario calibrated threshold (median + kappa*MAD).
+    theta_path = os.path.join(LSTM_CKPT_DIR, f"theta_ae_{scenario}.txt")
     if not os.path.exists(theta_path):
-        theta_path = os.path.join(MODEL_DIR, f"theta_ae_{scenario}.txt")
-    if not os.path.exists(theta_path):
-        theta_path = os.path.join(MODEL_DIR, "theta_ae.txt")
+        theta_path = os.path.join(MODEL_DIR, scenario, "theta_ae.txt")
     with open(theta_path, "r") as f:
         theta_ae = float(f.read().strip())
 
-    return gat, ae, mean, scale, theta_ae
+    return gat, ae, mean, scale, theta_ae, window
 
 def process_scenario(scenario: str, runs: list):
     """
@@ -99,8 +127,8 @@ def process_scenario(scenario: str, runs: list):
 
     # Load assets
     try:
-        gat, ae, mean, scale, theta_ae = load_scenario_assets(scenario)
-        print(f"Loaded assets for {scenario}: theta_ae={theta_ae:.6f}")
+        gat, ae, mean, scale, theta_ae, window = load_scenario_assets(scenario)
+        print(f"Loaded assets for {scenario}: theta_ae={theta_ae:.6f} window={window}")
     except Exception as e:
         print(f"Failed to load assets for {scenario}: {e}. Skipping.")
         return
@@ -115,19 +143,19 @@ def process_scenario(scenario: str, runs: list):
     for run_idx, run_df in enumerate(runs):
         run_df = run_df.sort_values("sim_time").copy()
         
-        # 1. Scale kinematics using loaded scaler mean/scale
-        raw_feats = np.zeros((len(run_df), 6), dtype=np.float32)
-        raw_feats[:, :5] = run_df[feat_cols].values
-        raw_feats[:, 5] = 1.0  # tau_i defaults to 1.0
+        # 1. Scale the 5 kinematic features with the 6-dim scaler's first 5 rows.
+        kin = run_df[feat_cols].values.astype(np.float32)
+        scaled_kin = (kin - mean[:5]) / np.where(scale[:5] == 0.0, 1.0, scale[:5])
 
-        scaled_feats = raw_feats.copy()
-        scaled_feats[:, :5] = (raw_feats[:, :5] - mean[:5]) / np.where(scale[:5] == 0.0, 1.0, scale[:5])
-        scaled_feats[:, 5] = 1.0  # Keep tau_i unscaled as 1.0
+        # tau_i defaults to 1.0 (trusted). The GAT path appends it RAW (=1.0);
+        # the AE path z-scales it with the 6th scaler row (mean=1,scale=1 -> 0.0),
+        # matching the C++ GAT (raw tau) vs LSTM (scaled tau) split.
+        tau_ae = np.float32((1.0 - mean[5]) / (1.0 if scale[5] == 0.0 else scale[5]))
 
-        # Add scaled columns to run_df for windowing and tick grouping
         for col_idx, col_name in enumerate(feat_cols):
-            run_df[f"scaled_{col_name}"] = scaled_feats[:, col_idx]
-        run_df["scaled_tau_i"] = scaled_feats[:, 5]
+            run_df[f"scaled_{col_name}"] = scaled_kin[:, col_idx]
+        run_df["tau_gat"] = np.float32(1.0)   # raw tau for GAT
+        run_df["tau_ae"]  = tau_ae            # scaled tau for AE
 
         # 2. Group by _tick to generate GAT scores
         T_B = 0.1
@@ -135,7 +163,7 @@ def process_scenario(scenario: str, runs: list):
         
         gat_scores_map = {}
         for t, grp in run_df.groupby("_tick"):
-            grp_feats = grp[[f"scaled_{c}" for c in feat_cols] + ["scaled_tau_i"]].values.astype(np.float32)
+            grp_feats = grp[[f"scaled_{c}" for c in feat_cols] + ["tau_gat"]].values.astype(np.float32)
             # Run GAT
             gat_out = score_snapshot(gat, grp_feats, device=DEVICE)
             for idx, row_id in enumerate(grp.index):
@@ -143,23 +171,26 @@ def process_scenario(scenario: str, runs: list):
 
         run_df["gat_score"] = run_df.index.map(gat_scores_map)
 
-        # 3. Sliding windows per vehicle to generate LSTM-AE scores
-        ae_win = {}  # vehicle_id -> list of feature rows
+        # 3. Sliding windows per vehicle to generate LSTM-AE scores. The AE
+        # consumes 6 features [5 scaled kinematic + scaled tau_i], window=L,
+        # exactly as the deployed ns-3 ring buffer feeds score_lstm_ae.
+        ae_cols = [f"scaled_{c}" for c in feat_cols] + ["tau_ae"]
+        ae_win = {}  # vehicle_id -> list of 6-feature rows
         ae_errors = []
 
         for row_idx, row in run_df.iterrows():
             vid = row["vehicle_id"]
-            feat_row = row[[f"scaled_{c}" for c in feat_cols] + ["scaled_tau_i"]].values.astype(np.float32)
-            
+            feat_row = row[ae_cols].values.astype(np.float32)
+
             if vid not in ae_win:
                 ae_win[vid] = []
             ae_win[vid].append(feat_row)
-            if len(ae_win[vid]) > WINDOW_SIZE:
+            if len(ae_win[vid]) > window:
                 ae_win[vid].pop(0)
 
-            if len(ae_win[vid]) == WINDOW_SIZE:
+            if len(ae_win[vid]) == window:
                 w_arr = np.array(ae_win[vid], dtype=np.float32)
-                ae_err = score_window(ae, w_arr, device=DEVICE)
+                ae_err = score_ae_window(ae, w_arr)
                 ae_errors.append((row_idx, ae_err))
             else:
                 ae_errors.append((row_idx, -1.0))  # Sentinel for incomplete window
@@ -202,6 +233,7 @@ def process_scenario(scenario: str, runs: list):
     
     out_path = os.path.join(MODEL_DIR, scenario, "fusion_weights.json")
     legacy_out_path = os.path.join(MODEL_DIR, f"fusion_weights_{scenario}.json")
+    os.makedirs(os.path.dirname(out_path), exist_ok=True)
     with open(out_path, "w") as f:
         json.dump(weights, f, indent=2)
     with open(legacy_out_path, "w") as f:

@@ -23,7 +23,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def kinematic_loss(recon_raw: torch.Tensor, dt: float = DT) -> torch.Tensor:
     """
-    Computes the physics-informed kinematic constraint loss (Paper Eq. 3.45).
+    Computes the physics-informed kinematic constraint loss (Paper Eq. 3.39).
     Verifies that the predicted next state coordinates (pred_x, pred_y) match the 
     actual physical kinematics (dead reckoning check).
     
@@ -137,7 +137,7 @@ def calibrate_threshold(model: nn.Module, clean_windows: torch.Tensor, kappa: fl
             batch = clean_windows[i:i+64].to(DEVICE)
             recon = model(batch)
             # Compute Mean Squared Error (MSE) reconstruction error per window
-            mse   = ((recon - batch) ** 2).mean(dim=(1, 2))
+            mse   = ((recon - batch) ** 2).sum(dim=2).mean(dim=1)
             errors.extend(mse.cpu().numpy().tolist())
 
     errors = np.array(errors)
