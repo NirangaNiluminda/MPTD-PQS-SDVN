@@ -75,23 +75,28 @@ cross-cutting blockers below hit ALL five experiments:
 
 Code today (02_config_globals.h:167): `0=Full, 1=A1(LW-only), 2=A2, 3=A3, 4=A4(no PQ crypto),
 5=A5(no-BC), 6=B1(Ghaleb LTT)`. AI sub-toggles: `--enable_gat`, `--enable_lstm_ae`
-(02_config_globals.h:188). The paper's 11-way split does NOT map 1:1 — extend the selector:
+(02_config_globals.h:188).
 
-| AB | Removed | Code today | Edit |
-|---|---|---|---|
-| **AB1** | rule signatures (ψ) | ❌ | new mode: disable TP-S1..MP-S4 scoring |
-| **AB2** | HMAC + nonce | ❌ | new mode: disable HMAC gate |
-| **AB3** | GAT | ⚠️ `--enable_gat=0` | wire as AB3 label |
-| **AB4** | LSTM-AE | ⚠️ `--enable_lstm_ae=0` | wire as AB4 label |
-| **AB5** | full AI (LW only) | ✅ mode 1 (A1) | rename A1→AB5 |
-| **AB6** | TRS gate | ⚠️ half of mode 4 | split `use_pq_crypto`: TRS-off only |
-| **AB7** | FHE pre-coord | ⚠️ half of mode 4 | split `use_pq_crypto`: FHE-off only |
-| **AB8** | RSU 3-state lifecycle | ❌ | new mode: RSUs permanently trusted |
-| **AB9** | multi-controller | ❌ | new mode: single fixed controller |
-| **AB10** | blockchain (SC-Trust/Revoke) | ✅ mode 5 (A5) (04_state_globals.h:157) | rename A5→AB10 |
-| **AB11** | LKH→unicast rekey | ❌ | new mode: unicast rekey path |
+**RESOLVED (C10, 2026-07-06):** new `--ablation_ab=0..11` selector (02_config_globals.h,
+dispatch in 12_main.h) maps every AB onto fine-grained toggles; legacy `ablation_mode`
+enum untouched. Outputs get an `_ab{N}` suffix + `ablation_ab` CSV column.
 
-Net: **AB5, AB10 aligned; AB3, AB4, AB6, AB7 partial; AB1, AB2, AB8, AB9, AB11 are new.**
+| AB | Removed | Wiring |
+|---|---|---|
+| **AB1** | rule signatures (ψ) | ✅ `enable_rule_signatures=false` — TP/MP flags zeroed, detectors still warm state, CP-DETECT stays |
+| **AB2** | HMAC + nonce | ✅ `enable_hmac_gate=false` — Δ_HMAC gate bypassed |
+| **AB3** | GAT | ✅ `g_enable_gat_cli=0` |
+| **AB4** | LSTM-AE | ✅ `g_enable_lstm_ae_cli=0` |
+| **AB5** | full AI (LW only) | ✅ ≡ `ablation_mode=1` |
+| **AB6** | TRS gate | ✅ `enable_trs=false` — unsigned aggregate, PARR counters untouched (0/0) |
+| **AB7** | FHE pre-coord | ✅ `enable_fhe=false` — plaintext ring sums, TRS still binds payload, H7 envelope intact |
+| **AB8** | RSU 3-state lifecycle | ✅ `enable_rsu_lifecycle=false` — uniform-random endorsers over ALL RSUs |
+| **AB9** | multi-controller | ✅ `enable_ctrl_rotation=false` — controller 0 pinned |
+| **AB10** | blockchain (SC-Trust/Revoke) | ✅ ≡ `ablation_mode=5` + `skip_blockchain=true` |
+| **AB11** | LKH→unicast rekey | ✅ `use_lkh_tree=false` — flat group keying, N_rekey=\|V_j\| |
+
+Net: **all 11 variants wired.** Smoke-tested AB2/AB6/AB7/AB11 + legacy-full regression
+(simTime=30, a1/p30) — see DESIGN_FLAWS_AUDIT.md §6.2 C10 resolution note.
 
 ---
 

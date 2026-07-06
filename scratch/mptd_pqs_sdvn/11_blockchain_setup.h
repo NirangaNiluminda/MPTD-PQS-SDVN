@@ -641,7 +641,9 @@ static std::vector<uint32_t> select_endorsers_trust_ranked(uint32_t n_rsus,
                                                            uint32_t need,
                                                            uint64_t seed)
 {
-    if (!g_trust_peer_selection || g_rsu_trusted_set.empty())
+    // AB8 (C10): lifecycle removed — every RSU is permanently trusted, so the
+    // endorser pick degrades to a uniform random sample over ALL RSUs.
+    if (!g_trust_peer_selection || !enable_rsu_lifecycle || g_rsu_trusted_set.empty())
         return random_endorser_sample(n_rsus, need, seed);
 
     // Candidate pool: trusted RSUs within the addressable index range.
@@ -673,7 +675,9 @@ static std::vector<uint32_t> select_endorsers_trust_ranked(uint32_t n_rsus,
 // under skip_blockchain or when trust selection is disabled. Reschedules itself.
 static void refresh_endorsement_committee()
 {
-    if (skip_blockchain || !g_trust_peer_selection) return;
+    // AB8 (C10): no lifecycle → no trust snapshot to track; committee refresh
+    // is a no-op and selection stays uniform random over all RSUs.
+    if (skip_blockchain || !g_trust_peer_selection || !enable_rsu_lifecycle) return;
 
     auto views = CallSCGetAllRSUTrustScores();
     if (!views.empty()) {
@@ -886,7 +890,8 @@ std::string mptd_sign_revoke_vote_hex(const std::string& vehId,
 // touches the per-beacon hot path.
 static void mptd_active_controller_refresh_loop(double period)
 {
-    if (skip_blockchain) return;
+    // AB9 (C10): no rotation — c_assigned and the active controller are fixed.
+    if (skip_blockchain || !enable_ctrl_rotation) return;
     uint32_t prev = g_active_controller_idx;
     mptd_refresh_active_controller();
     if (g_active_controller_idx != prev) {

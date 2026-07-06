@@ -196,9 +196,11 @@ The paper's metrics section was rewritten to an **11-metric / 4-dimension** spec
 | C7 | COO | no per-epoch Δt_TRS + Δt_FHE split; no Δt_DKG | crypto-pipeline instrumentation |
 | C8 | BWO | no byte accounting + LKH-rekey scaling sweep | message-size instrumentation |
 | C9 | TCL | no Fabric confirm/reassign latency | on-chain tx timestamp capture (needs Fabric-on runs) |
-| C10 | Ablation map | AB6/AB7/AB10/AB11 not wired to `ablation_mode` | new toggles / enum extension |
+| C10 | Ablation map | ~~AB6/AB7/AB10/AB11 not wired to `ablation_mode`~~ **RESOLVED 2026-07-06** — new `--ablation_ab=0..11` selector + fine-grained toggles (see below) | — |
 
 > These are **documentation of gaps only** — no metric code was added in this pass. TTD/FRR/COO/BWO/TCL are entirely absent; TDEE/TPE exist but are C3-flawed; MCC/CDER/PBPO are sound. Recommended sequencing after C4b: C3 (TDEE/TPE correctness) → C10 (ablation map, unblocks all ablation-only metrics) → C5–C9.
+
+**C10 resolution (2026-07-06).** New `--ablation_ab=0..11` CLI selector maps every paper variant AB1–AB11 onto fine-grained boolean toggles (`enable_rule_signatures`, `enable_hmac_gate`, `enable_trs`, `enable_fhe`, `enable_rsu_lifecycle`, `enable_ctrl_rotation`, `use_lkh_tree`, plus existing GAT/AE CLI flags) [02_config_globals.h, dispatch in 12_main.h]. The legacy `ablation_mode` 0–6 enum is untouched (batch scripts/analyzer keep working); each AB except AB5 (≡mode 1) and AB10 (≡mode 5 + skip_blockchain) forces `ablation_mode=0` = full-minus-one-mechanism. Semantics: AB1 zeroes TP/MP rule flags (detectors still warm shared state, CP-DETECT stays); AB2 bypasses the Δ_HMAC gate; AB6 skips σ_TRS sign/verify (PARR counters untouched → 0/0); AB7 sends plaintext ring sums with TRS still binding the payload and the H7 envelope intact; AB8 → uniform-random endorsers over ALL RSUs; AB9 pins controller 0 (no rotation loop); AB11 → flat group keying, per-survivor leaf rotation, N_rekey=|V_j|. Outputs carry an `_ab{N}` suffix (dataset folder + sweep CSV) and a new `ablation_ab` CSV column after `ablation_mode`. Smoke (simTime=30, a1/p30, RngRun=1, skip_blockchain): AB2 → zero per-beacon HMAC-gate logs, full crypto path intact; AB6 → sigma=0B, TRS-verify 0/0, PARR 0/0; AB7 → plaintext path ~0.45 ms/epoch (vs ~170 ms FHE), dec mean == pt mean 8.000, sigma=13909B still present; AB11 → `FLAT/unicast (AB11: N_rekey=|V_j|)` on all 5 revocations; legacy `--ablation_mode=0` run unchanged (no `[ABLATION]` banner, no `_ab` suffix).
 
 ---
 
@@ -272,8 +274,8 @@ Implemented in the **live** TRS path `run_full_mode_crypto_pipeline` ([08_detect
 
 Priority order, superseding §5 where they overlap:
 1. **C4b** (PARR reachability — needs supervisor sign-off; now coupled with **H7** envelope checks)
-2. **C10** ablation map AB1–AB11 ↔ `ablation_mode` (unblocks all ablation-only metrics)
-3. **C5–C9** (TTD, FRR, COO, BWO, TCL)
+2. ~~**C10** ablation map AB1–AB11 ↔ `ablation_mode`~~ — resolved 2026-07-06 via `--ablation_ab` selector, see §6.2 resolution note
+3. **C5–C9** (TTD, FRR, COO, BWO, TCL) — now unblocked by C10
 4. **H3** controller-side relocation; **H1** σ_TRS wiring (only the CP-DETECT-side ν_S/Δ_TRS freshness re-check still rides with H1 — the coordinator/cloud side of **H6** landed 2026-07-05)
 5. **H2** coverage reachability (overlapping RSU coverage or evidence broadcast — same root cause as the SCREVOKE quorum-unreachable note)
 6. **M6–M8** (θ_S decision, GAT locked stats decision, window constant + paper table) — M6/M7 are **methodology decisions**, hold for supervisor

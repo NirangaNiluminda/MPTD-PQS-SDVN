@@ -777,7 +777,9 @@ static uint32_t g_active_controller_idx = 0;
 // per-beacon hot path.
 inline void mptd_refresh_active_controller()
 {
-    if (skip_blockchain) return;
+    // AB9 (C10): multi-controller removed — the initial controller stays
+    // pinned for the whole run, no CP-DETECT/EMA rollover.
+    if (skip_blockchain || !enable_ctrl_rotation) return;
     std::string out = mptd_fabric_invoke_sync("query", "GetActiveController", {});
     // Payload is the raw chaincode string (possibly JSON-quoted). Pull the
     // integer suffix after the LAST "CTRL_".

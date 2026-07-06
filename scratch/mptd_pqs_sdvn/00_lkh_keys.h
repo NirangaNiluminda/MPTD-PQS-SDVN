@@ -740,16 +740,37 @@ static int lkh_rekey_on_revoke(int veh_idx, double sim_time)
     }
     g_vehicle_zone[veh_idx] = -1; g_vehicle_slot[veh_idx] = -1;
 
-    lkh_zone_rekey_path(z, slot, sim_time);             // forward secrecy
+    int n_rekey;
+    const int vj = z.n_members;                         // survivors |V_j|
+    if (use_lkh_tree) {
+        lkh_zone_rekey_path(z, slot, sim_time);         // forward secrecy
 
-    for (int s = 0; s < z.cap; s++)
-        if (z.slot_owner[s] >= 0) g_lkh_affected_members.push_back(z.slot_owner[s]);
+        for (int s = 0; s < z.cap; s++)
+            if (z.slot_owner[s] >= 0) g_lkh_affected_members.push_back(z.slot_owner[s]);
 
-    int vj = z.n_members;                               // survivors |V_j|
-    int n_rekey = 0; for (int c = (vj > 0 ? vj : 1); c > 1; c >>= 1) n_rekey++;
-    printf("[LKH] Revoke veh_idx=%d from zone %d: %zu surviving zone members to "
-           "rekey (Eq.3.23 N_rekey=log2|V_j|=log2(%d)≈%d)\n",
-           veh_idx, rsu, g_lkh_affected_members.size(), vj, n_rekey);
+        n_rekey = 0; for (int c = (vj > 0 ? vj : 1); c > 1; c >>= 1) n_rekey++;
+        printf("[LKH] Revoke veh_idx=%d from zone %d: %zu surviving zone members to "
+               "rekey (Eq.3.23 N_rekey=log2|V_j|=log2(%d)≈%d)\n",
+               veh_idx, rsu, g_lkh_affected_members.size(), vj, n_rekey);
+    } else {
+        // AB11 (C10): key TREE removed — flat group keying. Every survivor's
+        // key is rotated INDIVIDUALLY (no shared path nodes amortise the
+        // rotation), so the rekey cost is linear, N_rekey = |V_j|, the classic
+        // pre-LKH unicast baseline the paper ablates against (vs log₂|V_j|).
+        lkh_zone_regen_node(z, z.first_leaf + slot, sim_time + 0.001);  // dead leaf
+        for (int s = 0; s < z.cap; s++) {
+            int v = z.slot_owner[s];
+            if (v < 0) continue;
+            lkh_zone_regen_node(z, z.first_leaf + s, sim_time);
+            std::memcpy(g_vehicle_leaf_key[v],
+                        z.nodes[z.first_leaf + s].key, LKH_KEY_BYTES);
+            g_lkh_affected_members.push_back(v);
+        }
+        n_rekey = vj;
+        printf("[LKH] Revoke veh_idx=%d from zone %d: %zu survivors rekeyed "
+               "FLAT/unicast (AB11: N_rekey=|V_j|=%d)\n",
+               veh_idx, rsu, g_lkh_affected_members.size(), n_rekey);
+    }
     return n_rekey;
 }
 

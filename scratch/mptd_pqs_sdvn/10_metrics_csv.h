@@ -951,6 +951,9 @@ static void export_run_dataset(const std::string &metrics_src)
     std::ostringstream dir;
     dir << DATASET_ROOT "/analytics/datasets/" << mptd_scenario_name() << "/a"
         << attack_number << "_p" << attack_percentage << "_m" << ablation_mode;
+    // C10: AB variants run with ablation_mode=0 internally, so without the _ab
+    // suffix an AB sweep would overwrite the true full-mode folder.
+    if (ablation_ab != 0) dir << "_ab" << ablation_ab;
     const std::string dest = dir.str();
 
     std::error_code ec;
@@ -1004,7 +1007,9 @@ void write_mptd_results_csv()
     fname << NS3_ROOT "/analytics/results/sweep/metrics_a"
           << attack_number << "_p" << attack_percentage
           << "_s" << maxspeed
-          << "_m" << ablation_mode << ".csv";
+          << "_m" << ablation_mode;
+    if (ablation_ab != 0) fname << "_ab" << ablation_ab;   // C10: keep AB sweeps distinct
+    fname << ".csv";
 
     std::ofstream fout(fname.str(), std::ios::out | std::ios::trunc);
 
@@ -1017,7 +1022,7 @@ void write_mptd_results_csv()
     const int run_attacker_class = attacker_class_for((int)attack_number);
 
     // Header — note: TDEE=-1, TPE=-1 (SUMO required); CDER from ctrl-plane decisions
-    fout << "attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,"
+    fout << "attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,ablation_ab,"
          << "cm_TP,cm_FP,cm_TN,cm_FN,"
          << "MCC,FPR,"
          << "cm_full_TP,cm_full_FP,cm_full_TN,cm_full_FN,"
@@ -1036,6 +1041,7 @@ void write_mptd_results_csv()
          << attack_percentage          << ","
          << maxspeed                   << ","
          << ablation_mode              << ","
+         << ablation_ab                << ","
          << cm_TP                      << ","
          << cm_FP                      << ","
          << cm_TN                      << ","

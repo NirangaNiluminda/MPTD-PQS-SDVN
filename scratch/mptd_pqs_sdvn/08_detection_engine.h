@@ -1000,6 +1000,15 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     }
     g_save_restore_context = false;  // reset after detection to prevent leakage
 
+    // AB1 (C10): rule signatures removed — detectors still run so shared state
+    // (windows, density trackers) stays warm for the AI components, but their
+    // TP/MP flags are zeroed so ψ, fusion and every decision ignore them.
+    // CP-DETECT (Alg 4) is a separate mechanism and stays active.
+    if (!enable_rule_signatures) {
+        r.tp_flags = 0;
+        r.mp_flags = 0;
+    }
+
     // 3. Composite sig bitmask + lightweight score gate (Eq. 3.20)
     r.sig_violated = r.tp_flags | (r.mp_flags << 5) | (r.cp_flags << 9);
     r.anomalous    = run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4));
@@ -1176,8 +1185,10 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     // Only the ring coordinator drives one pipeline run per window (see note).
     if (closing_rsu != 0) return false;
     if (!use_pq_crypto)   return false;
-    if (!g_trs_ready || !g_trs_backend) return false;
-    if (!g_thfhe_backend || !g_thfhe_backend->ready()) return false;
+    // AB6/AB7 (C10): TRS and FHE are independently removable; each backend is
+    // only required when its mechanism is enabled.
+    if (enable_trs && (!g_trs_ready || !g_trs_backend)) return false;
+    if (enable_fhe && (!g_thfhe_backend || !g_thfhe_backend->ready())) return false;
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
@@ -1193,8 +1204,11 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     // (mean = Σ / count, integer-exact in BFV — no FP inside ciphertext).
     std::vector<ThresholdBfvBackend::Ciphertext> c_j;
     std::vector<uint32_t> vehicle_union;
+    uint32_t contrib      = 0;
     int64_t total_count   = 0;
     int64_t pt_speed_sum  = 0;                  // plaintext reference only
+    int64_t pt_px_sum     = 0;                  // AB7 plaintext-aggregate path
+    int64_t pt_py_sum     = 0;
     for (uint32_t r = 0; r < n && r < MAX_RSUS; r++) {
         if (!rsu_last_window_valid[r]) continue;
         const RsuBeaconWindow &rw = rsu_last_window[r];
@@ -1223,17 +1237,25 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
         // (vid union filled only for ACCEPTED contributions so h(S) matches
         // the ciphertexts actually summed into Enc(A_ring))
         for (uint32_t i = 0; i < N; i++) vehicle_union.push_back(rw.vid[i]);
-        std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
-        c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
+        if (enable_fhe) {
+            std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
+            c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
+        }
+        contrib++;
         total_count  += (int64_t)N;
         pt_speed_sum += s_speed;
+        pt_px_sum    += s_px;
+        pt_py_sum    += s_py;
     }
-    if (c_j.empty()) return false;
-    res.contributing_rsus = c_j.size();
+    if (contrib == 0) return false;
+    res.contributing_rsus = contrib;
     res.total_vehicles    = total_count;
 
     // ── Algorithm 6 line 6: ring homomorphic add (Eq 3.47), ciphertext-only ──
-    ThresholdBfvBackend::Ciphertext enc_ring = g_thfhe_backend->add_many(c_j);
+    // AB7 (C10): FHE removed — the ring aggregate travels as PLAINTEXT sums;
+    // TRS below then signs the plaintext aggregate instead of a ciphertext.
+    ThresholdBfvBackend::Ciphertext enc_ring;
+    if (enable_fhe) enc_ring = g_thfhe_backend->add_many(c_j);
 
     // ── Algorithm 6 line 7: bind ciphertext into TRS message (Eq 3.48) ───────
     // H6: paper trs_message m = (Enc(A_ring), t, ν_S, ID_S, h(S)) — the wall-
@@ -1245,7 +1267,17 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     };
     const double   t_msg = Simulator::Now().GetSeconds();
     const uint64_t nu_S  = ++g_trs_ring_nonce_issued;
-    std::vector<uint8_t> msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
+    std::vector<uint8_t> msg;
+    if (enable_fhe) {
+        msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
+    } else {
+        // AB7: signed payload = plaintext ring sums (same binding structure)
+        uint64_t s;
+        std::memcpy(&s, &pt_speed_sum, 8); append_u64(msg, s);
+        std::memcpy(&s, &pt_px_sum,    8); append_u64(msg, s);
+        std::memcpy(&s, &pt_py_sum,    8); append_u64(msg, s);
+        std::memcpy(&s, &total_count,  8); append_u64(msg, s);
+    }
     append_u32(msg, g_trs_ring_t);              // t (threshold)
     append_u32(msg, closing_rsu);               // ID_S (ring identity)
     append_u32(msg, epoch);                      // window epoch
@@ -1254,6 +1286,14 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     append_u64(msg, nu_S);                       // ν_S (ring nonce, trs_message)
     for (uint32_t v : vehicle_union) append_u32(msg, v);   // h(S) material
 
+    // AB6 (C10): TRS gate removed — the aggregate proceeds UNSIGNED and the
+    // cloud accepts it without Eq 3.51 / trs_fresh. PARR counters are NOT
+    // touched (no gate ⇒ nothing verified or rejected; PARR is the full-vs-AB6
+    // ablation contrast).
+    if (!enable_trs) {
+        res.trs_verified = true;
+        res.sigma_bytes  = 0;
+    } else {
     // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
     std::vector<std::vector<uint8_t>> partials;
     std::vector<uint32_t> signers;
@@ -1297,16 +1337,24 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
         return true;
     }
     g_trs_verified_count++;
+    }  // enable_trs
 
-    // ── Eq 3.52: cloud blind global aggregate. Single ring cluster ⇒ M=1, so
-    // Enc(X_global) = Enc(A_ring); the mean is taken after decryption ──────────
-    ThresholdBfvBackend::Ciphertext enc_global = enc_ring;
-
-    // ── Algorithm 7 (THRESH-DEC): cloud(lead) + t−1 RSU partials (Eq 3.53–3.56)
-    std::vector<uint32_t> present;              // t−1 RSUs; cloud auto-added
-    for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++) present.push_back(j);
     std::vector<int64_t> out_vec;
-    res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
+    if (enable_fhe) {
+        // ── Eq 3.52: cloud blind global aggregate. Single ring cluster ⇒ M=1, so
+        // Enc(X_global) = Enc(A_ring); the mean is taken after decryption ──────
+        ThresholdBfvBackend::Ciphertext enc_global = enc_ring;
+
+        // ── Algorithm 7 (THRESH-DEC): cloud(lead) + t−1 RSU partials (Eq 3.53–3.56)
+        std::vector<uint32_t> present;          // t−1 RSUs; cloud auto-added
+        for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++) present.push_back(j);
+        res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
+    } else {
+        // AB7: no ciphertext — the "decrypted" aggregate IS the plaintext sums.
+        // The H7 post-aggregation envelope below still applies unchanged.
+        out_vec = { pt_speed_sum, pt_px_sum, pt_py_sum, total_count };
+        res.decrypt_ok = true;
+    }
     if (res.decrypt_ok && total_count > 0) {
         res.plaintext_mean_speed = (double)pt_speed_sum
                                  / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
@@ -2498,7 +2546,8 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         struct timespec t_lw_start, t_lw_end;
         clock_gettime(CLOCK_MONOTONIC, &t_lw_start);
         bool hmac_gate_pass = true;
-        if (vid < 10000) {  // skip HMAC check for RSU-injected ghost packets
+        // AB2 (C10): HMAC+nonce gate removed — every beacon passes unauthenticated.
+        if (enable_hmac_gate && vid < 10000) {  // skip HMAC check for RSU-injected ghost packets
             int v_idx = lkh_veh_idx(vid);
             if (v_idx >= 0 && v_idx < LKH_MAX_VEH && tag.GetHmacSet()) {
                 uint8_t recv_mac[8];

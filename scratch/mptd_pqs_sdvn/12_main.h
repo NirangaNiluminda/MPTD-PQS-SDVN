@@ -63,6 +63,19 @@ int main(int argc, char *argv[])
                   "Ablation variant: 0=Full, 1=A1 LW-only, 2=A2 GAT-only, 3=A3 AE-only, "
                   "4=A4 no-PQ, 5=A5 no-blockchain, 6=B1 Ghaleb-LTT baseline (default=1)",
                   ablation_mode);
+    cmd.AddValue ("ablation_ab",
+                  "C10: paper ablation AB1..AB11 (0=off). Full mode minus one mechanism: "
+                  "1=rules, 2=HMAC gate, 3=GAT, 4=LSTM-AE, 5=all AI (=mode 1), 6=TRS, "
+                  "7=FHE, 8=RSU lifecycle, 9=controller rotation, 10=blockchain (=mode 5), "
+                  "11=LKH tree (unicast rekey)",
+                  ablation_ab);
+    cmd.AddValue ("enable_rule_signatures", "AB1 toggle: 0=disable TP/MP rule scoring", enable_rule_signatures);
+    cmd.AddValue ("enable_hmac_gate", "AB2 toggle: 0=disable HMAC+nonce beacon gate", enable_hmac_gate);
+    cmd.AddValue ("enable_trs", "AB6 toggle: 0=skip TRS sign/verify in crypto pipeline", enable_trs);
+    cmd.AddValue ("enable_fhe", "AB7 toggle: 0=plaintext aggregates (TRS still signs)", enable_fhe);
+    cmd.AddValue ("enable_rsu_lifecycle", "AB8 toggle: 0=RSUs permanently trusted", enable_rsu_lifecycle);
+    cmd.AddValue ("enable_ctrl_rotation", "AB9 toggle: 0=single fixed controller", enable_ctrl_rotation);
+    cmd.AddValue ("use_lkh_tree", "AB11 toggle: 0=per-member unicast rekey instead of LKH tree", use_lkh_tree);
     cmd.AddValue ("enable_gat",
                   "R7f: force GAT spatial detector on(1)/off(0); -1=follow ablation_mode",
                   g_enable_gat_cli);
@@ -84,6 +97,31 @@ int main(int argc, char *argv[])
                   "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
                   g_mobility_source);
     cmd.Parse (argc, argv);
+
+    // ── C10: dispatch paper ablation AB1..AB11 onto the fine-grained toggles ──
+    // AB variants are "full mode minus one mechanism", so every AB except
+    // AB5 (≡ legacy mode 1) and AB10 (≡ legacy mode 5) forces ablation_mode=0.
+    if (ablation_ab != 0) {
+        ablation_mode = 0;
+        switch (ablation_ab) {
+            case 1:  enable_rule_signatures = false; break;
+            case 2:  enable_hmac_gate       = false; break;
+            case 3:  g_enable_gat_cli       = 0;     break;
+            case 4:  g_enable_lstm_ae_cli   = 0;     break;
+            case 5:  ablation_mode = 1;              break;
+            case 6:  enable_trs             = false; break;
+            case 7:  enable_fhe             = false; break;
+            case 8:  enable_rsu_lifecycle   = false; break;
+            case 9:  enable_ctrl_rotation   = false; break;
+            case 10: ablation_mode = 5; skip_blockchain = true; break;
+            case 11: use_lkh_tree           = false; break;
+            default:
+                std::cerr << "[ABLATION] invalid --ablation_ab=" << ablation_ab
+                          << " (valid 0..11)" << std::endl;
+                return 1;
+        }
+        std::cout << "[ABLATION] Paper variant AB" << ablation_ab << " active" << std::endl;
+    }
 
     // ── Apply ablation mode overrides ─────────────────────────────────────────
     // A4: disable TRS + FHE to measure cryptographic mitigation contribution (RQ5)

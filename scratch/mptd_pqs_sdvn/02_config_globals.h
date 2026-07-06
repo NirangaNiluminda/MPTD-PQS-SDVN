@@ -176,6 +176,32 @@ bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 //   0 = Full (no ablation)   : every component active
 int ablation_mode = 1;
 
+// ── C10: paper ablation variants AB1–AB11 (§4.1.2) ─────────────────────────
+// The paper's 11-way ablation removes ONE mechanism at a time from FULL mode.
+// --ablation_ab=N (1..11) selects the variant; 0 (default) = selector off,
+// legacy --ablation_mode governs alone. Dispatch in 12_main.h after Parse():
+//   AB1  rule signatures off (ψ TP-S1..MP-S4 zeroed)   → enable_rule_signatures=false
+//   AB2  HMAC+nonce beacon gate off                     → enable_hmac_gate=false
+//   AB3  GAT off                                        → g_enable_gat_cli=0
+//   AB4  LSTM-AE off                                    → g_enable_lstm_ae_cli=0
+//   AB5  full AI off (lightweight only)                 ≡ legacy ablation_mode=1
+//   AB6  TRS gate off (FHE stays on)                    → enable_trs=false
+//   AB7  FHE off (TRS signs plaintext aggregates)       → enable_fhe=false
+//   AB8  RSU 3-state lifecycle off (always trusted)     → enable_rsu_lifecycle=false
+//   AB9  multi-controller off (single fixed controller) → enable_ctrl_rotation=false
+//   AB10 blockchain off                                 ≡ legacy ablation_mode=5 + skip_blockchain
+//   AB11 LKH tree off (per-member unicast rekey)        → use_lkh_tree=false
+// All AB modes except AB5/AB10 force ablation_mode=0 (full baseline minus one).
+// Each toggle is also individually CLI-exposed for combined ablations.
+int  ablation_ab            = 0;
+bool enable_rule_signatures = true;   // AB1
+bool enable_hmac_gate       = true;   // AB2
+bool enable_trs             = true;   // AB6
+bool enable_fhe             = true;   // AB7
+bool enable_rsu_lifecycle   = true;   // AB8
+bool enable_ctrl_rotation   = true;   // AB9
+bool use_lkh_tree           = true;   // AB11
+
 // ── R7f: AI component toggles (paper §4.1.1 A2/A3 ablation) ────────────────
 // Independently enable the GAT spatial detector and the LSTM-AE temporal detector.
 // Defaults are derived from `ablation_mode` in 12_main.h after cmd.Parse():
