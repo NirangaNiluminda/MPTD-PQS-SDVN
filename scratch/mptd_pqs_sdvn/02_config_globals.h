@@ -264,6 +264,19 @@ double kappa_th              = 0.1;   // KL divergence detection threshold (Eq. 
 // implemented); 0.09 is calibrated to the rule-based branch's weight distribution.
 double psi_th    = 0.09;    // Lightweight mode isolation threshold (rule-based branch)
 
+// ── H5: HMAC replay protection (paper HMAC gate: freshness Δ_HMAC + cluster nonce cache) ──
+// Δ_HMAC: max age of an authentic beacon at the RSU. Beacons are sent every
+// T_b=100 ms with ~sub-ms propagation, so 0.5 s accepts all honest traffic with
+// wide margin while bounding the replay window to 5 beacon periods. The paper
+// leaves Δ_HMAC symbolic; value is CLI-overridable (--delta_hmac).
+double delta_hmac = 0.5;    // Δ_HMAC freshness window (s)
+
+// ── H6: TRS message freshness (paper trs_message/trs_fresh: ring nonce ν_S + Δ_TRS) ──
+// Δ_TRS: max age of a σ_TRS bundle at the cloud verify gate. The pipeline runs
+// once per IPFS window (L=10 beacons × T_b=100 ms = 1 s), so 2 s covers honest
+// sign→verify latency with margin. Paper leaves Δ_TRS symbolic; CLI-overridable.
+double delta_trs = 2.0;     // Δ_TRS freshness window (s)
+
 // ── MRTPA Attack Injection Parameters ─────────────────────────────────────
 double poisoning_intensity_theta  = 0.5;   // θ ∈ [0,1] deviation magnitude
 double max_position_deviation     = 50.0;  // Max position offset (m)
@@ -340,11 +353,13 @@ uint32_t total_trajectories_stored_blockchain = 0;
 uint32_t tdee_gt_count [MAX_RSUS] = {};
 uint32_t tdee_est_count[MAX_RSUS] = {};
 
-// ── PARR: TRS blockchain rejection accumulators (paper Eq. 4.3) ─────────────
-// parr_trs_rejected  = poisoned beacons flagged by the RSU lightweight detector
-//                      (flag=1, Eq 3.67 → counted as a TRS-layer rejection)
+// ── Lightweight detection-revoke accumulators (NOT PARR) ────────────────────
+// These count the LW detection-revoke path, reported as "RevRate". PARR (Eq 4.3)
+// is the CRYPTOGRAPHIC TRS-verify rejection rate and uses g_trs_rejected_count /
+// (g_trs_verified_count + g_trs_rejected_count) in compute_PARR() instead.
+// parr_trs_rejected   = poisoned beacons revoked by the RSU lightweight detector
+//                       (flag=1, Eq 3.67)
 // parr_poisoned_total = total poisoned beacons submitted to the blockchain ledger
-// PARR = parr_trs_rejected / parr_poisoned_total   (distinct from DR = TP/(TP+FN))
 uint32_t parr_trs_rejected   = 0;
 uint32_t parr_poisoned_total = 0;
 

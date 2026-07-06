@@ -287,13 +287,14 @@ RsuBeaconWindow rsu_window[MAX_RSUS] = {};
 //
 // Indexed by vehicle id (vid = nid - 2, range [0..total_size)) to match the
 // pattern used by vehicle_state[] / pre_registered_sybil[] above.
-#define LSTM_RING_SIZE 20    // matches WINDOW_SIZE in lstm_ae.py
+#define LSTM_RING_SIZE 10    // must match mptd_ai::LSTM_WINDOW_SIZE (trained arch window=10)
 struct VehicleLstmRing {
     float    pos_x   [LSTM_RING_SIZE];
     float    pos_y   [LSTM_RING_SIZE];
     float    speed   [LSTM_RING_SIZE];
     float    heading [LSTM_RING_SIZE];
     float    accel   [LSTM_RING_SIZE];
+    float    tau     [LSTM_RING_SIZE];   // SC-Trust score (6th AE feature, paper d=6)
     uint32_t count     = 0;      // total samples ever pushed (filled+wrapped)
     uint32_t head      = 0;      // next write index (wraps at LSTM_RING_SIZE)
 };
@@ -333,11 +334,11 @@ TpeObs   tpe_last_obs[total_size] = {};
 double   tpe_disp_sum  = 0.0;   // Σ √((p̂_x−gt_x)² + (p̂_y−gt_y)²)
 uint64_t tpe_disp_cnt  = 0;     // # comparisons accumulated
 
-// Push a 5-feature sample into vehicle vid's ring. Returns true when ring has
-// at least LSTM_RING_SIZE samples (i.e., a full window is available).
+// Push a 6-feature sample (5 kinematic + tau_i) into vehicle vid's ring.
+// Returns true when ring has at least LSTM_RING_SIZE samples (full window).
 static inline bool lstm_ring_push(uint32_t vid,
                                   float px, float py, float sp,
-                                  float hd, float ac) {
+                                  float hd, float ac, float tau) {
     if (vid >= (uint32_t)total_size) return false;
     VehicleLstmRing &r = vehicle_lstm_ring[vid];
     const uint32_t i = r.head;
@@ -346,14 +347,15 @@ static inline bool lstm_ring_push(uint32_t vid,
     r.speed  [i] = sp;
     r.heading[i] = hd;
     r.accel  [i] = ac;
+    r.tau    [i] = tau;
     r.head = (r.head + 1) % LSTM_RING_SIZE;
     r.count++;
     return r.count >= LSTM_RING_SIZE;
 }
 
-// Copy the ring into a row-major (LSTM_RING_SIZE × 5) buffer in chronological
-// order so the LSTM-AE sees the oldest sample first. Returns false if ring is
-// not yet full.
+// Copy the ring into a row-major (LSTM_RING_SIZE × 6) buffer in chronological
+// order so the LSTM-AE sees the oldest sample first (col 5 = tau_i, scaled
+// downstream by AiScaler). Returns false if ring is not yet full.
 static inline bool lstm_ring_dump(uint32_t vid, float *out_buf) {
     if (vid >= (uint32_t)total_size) return false;
     const VehicleLstmRing &r = vehicle_lstm_ring[vid];
@@ -361,11 +363,12 @@ static inline bool lstm_ring_dump(uint32_t vid, float *out_buf) {
     // Oldest sample is at index head (wraps around) once count >= size.
     for (uint32_t k = 0; k < LSTM_RING_SIZE; ++k) {
         const uint32_t idx = (r.head + k) % LSTM_RING_SIZE;
-        out_buf[k * 5 + 0] = r.pos_x  [idx];
-        out_buf[k * 5 + 1] = r.pos_y  [idx];
-        out_buf[k * 5 + 2] = r.speed  [idx];
-        out_buf[k * 5 + 3] = r.heading[idx];
-        out_buf[k * 5 + 4] = r.accel  [idx];
+        out_buf[k * 6 + 0] = r.pos_x  [idx];
+        out_buf[k * 6 + 1] = r.pos_y  [idx];
+        out_buf[k * 6 + 2] = r.speed  [idx];
+        out_buf[k * 6 + 3] = r.heading[idx];
+        out_buf[k * 6 + 4] = r.accel  [idx];
+        out_buf[k * 6 + 5] = r.tau    [idx];
     }
     return true;
 }

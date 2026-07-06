@@ -79,6 +79,16 @@ uint32_t cm_full_FN = 0;
 //
 // Reset implicitly per process — first sim run starts with empty set.
 std::unordered_set<uint32_t> g_ctrl_seen_vids;
+// C3: per-RSU-cell accepted-vehicle sets for spatial TDEE (ρ̂_cell, Eq 4.5).
+// A vehicle is attributed to the Voronoi cell of its REPORTED position, so a
+// poisoned position lands the vehicle in the wrong cell → spatial density
+// distortion, which TDEE must expose.
+std::unordered_set<uint32_t> g_ctrl_seen_cell[MAX_RSUS];
+// C3: ground-truth counterpart (ρ_gt_cell) — vehicles attributed to the cell
+// of their SUMO true position, sampled at the SAME beacon instants as ρ̂.
+// Sampled during the sim because ns-3 mobility models assert if queried after
+// Simulator::Destroy() (metrics-print time).
+std::unordered_set<uint32_t> g_gt_seen_cell[MAX_RSUS];
 
 // ── Helper: create directory (no-op if exists) ────────────────────────────────
 static void ensure_analytics_dir(const char *path)
@@ -223,7 +233,26 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
 
     // R7a: feed TDEE estimator. A beacon that PASSES detection (detected==false)
     // reaches the controller and contributes to its density estimate ρ̂(t).
-    if (!detected) g_ctrl_seen_vids.insert(vid);
+    if (!detected)
+    {
+        g_ctrl_seen_vids.insert(vid);
+        // C3: attribute the vehicle to the Voronoi cell of its REPORTED
+        // position — a poisoned position places it in the wrong cell, which
+        // is exactly the spatial distortion TDEE (Eq 4.5) must expose.
+        uint32_t cell = nearest_rsu_for_position((double)tag.GetPosX(),
+                                                 (double)tag.GetPosY());
+        if (cell < MAX_RSUS) g_ctrl_seen_cell[cell].insert(vid);
+    }
+    // C3: ρ_gt_cell sample — the vehicle's TRUE cell at this instant. Booked
+    // for every beacon (detected or not: the vehicle physically exists either
+    // way). Sybil-forged vids ≥ N_Vehicles are excluded (no real vehicle).
+    if (vid < N_Vehicles && g_mobility_provider
+        && g_mobility_provider->is_sumo_derived())
+    {
+        const Vector gt = g_mobility_provider->get_gt_position(vid);
+        uint32_t gcell = nearest_rsu_for_position(gt.x, gt.y);
+        if (gcell < MAX_RSUS) g_gt_seen_cell[gcell].insert(vid);
+    }
 }
 
 // ── TP-S1 Before/After Poison Log ─────────────────────────────────────────────
@@ -647,16 +676,17 @@ double compute_FPR_full()
 }
 
 // PARR: Poisoning Attack Rejection Rate (Eq. 4.3)
-// Fraction of poisoned blockchain submissions correctly rejected by the TRS layer.
-// A "TRS rejection" is counted per poisoned beacon flagged by the RSU lightweight
-// detector (flag=1, Eq 3.67). This is the per-beacon witness signal that feeds the
-// BFT revocation quorum (2f+1 distinct trusted RSUs within window T_w, Eq 3.65).
-// Unlike DR = TP/(TP+FN) (overall per-beacon detection rate), PARR is scoped to the
-// poisoned-beacon population and reflects the TRS-layer rejection outcome.
+// Fraction of RSU aggregates structurally rejected by the TRS threshold-verify
+// gate (Eq 3.51) before decryption — the purely CRYPTOGRAPHIC rejection signal,
+// independent of AI/lightweight detection. Numerator g_trs_rejected_count and
+// denominator (g_trs_verified_count + g_trs_rejected_count) are booked ONLY inside
+// run_full_mode_crypto_pipeline (ablation_mode ∉ {1,6}), so A1/B1 — which run no
+// TRS pipeline — report PARR = 0 by construction.
 double compute_PARR()
 {
-    if (parr_poisoned_total == 0) return 0.0;
-    return (double)parr_trs_rejected / (double)parr_poisoned_total;
+    const uint64_t total = g_trs_verified_count + g_trs_rejected_count;
+    if (total == 0) return 0.0;
+    return (double)g_trs_rejected_count / (double)total;
 }
 
 // CDER: Control Decision Error Rate (paper §4.1.2, Eq. 4.4)
@@ -683,10 +713,16 @@ double compute_CDER()
 //   ρ̂(t)    = controller's estimated density from accepted beacons
 //             (g_ctrl_seen_vids tracked in log_beacon_to_csv())
 //
-// R7a implementation:
-//   ρ_gt = N_Vehicles (count of real vehicles — provider gives the same value
-//          since the mobility model IS the source of truth for vehicle count)
-//   ρ̂    = |g_ctrl_seen_vids| (distinct vids whose beacons passed detection)
+// C3 implementation (per-cell spatial density, Voronoi RSU cells):
+//   ρ̂_cell    = |g_ctrl_seen_cell[r]| — distinct accepted vids attributed to
+//               cell r by the nearest-RSU of their REPORTED position
+//               (log_beacon_to_csv). Poisoned positions land in wrong cells.
+//   ρ_gt_cell = |g_gt_seen_cell[r]| — distinct REAL vehicles attributed to
+//               cell r by the nearest-RSU of their SUMO true position, sampled
+//               at the same beacon instants (booked in log_beacon_to_csv;
+//               post-Destroy get_gt_position calls assert in ns-3).
+//   TDEE      = mean over cells with ρ_gt_cell > 0 of
+//               |ρ̂_cell − ρ_gt_cell| / ρ_gt_cell
 //
 // Returns -1 only if the active mobility provider is NOT SUMO-derived
 // (paper §4.1.3 requires SUMO ground truth). For sumo_trace runs the value is
@@ -694,16 +730,28 @@ double compute_CDER()
 // misinterpretation of non-conformant values.
 //
 // Applicable metric for MP attacks {3,4,6,7} per paper §4.1.2 — Sybil attacks
-// inflate ρ̂ above N_Vehicles; TP attacks generally leave ρ̂ ≈ N_Vehicles.
+// inflate ρ̂_cell; TP position-poisoning shifts vehicles across cell borders.
+static uint32_t g_tdee_cells_scored = 0;  // for the print line
+
 double compute_TDEE()
 {
     if (!g_mobility_provider || !g_mobility_provider->is_sumo_derived()) {
         return -1.0;  // not paper-conformant under hardcoded mobility
     }
-    const double rho_gt = (double)N_Vehicles;
-    if (rho_gt < 1e-9) return 0.0;
-    const double rho_hat = (double)g_ctrl_seen_vids.size();
-    return std::fabs(rho_hat - rho_gt) / rho_gt;
+    const uint32_t active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? N_RSUs : MAX_RSUS;
+
+    double err_sum = 0.0;
+    uint32_t scored = 0;
+    for (uint32_t r = 0; r < active; ++r) {
+        if (g_gt_seen_cell[r].empty()) continue;  // empty cell: no GT density to compare
+        const double rho_gt  = (double)g_gt_seen_cell[r].size();
+        const double rho_hat = (double)g_ctrl_seen_cell[r].size();
+        err_sum += std::fabs(rho_hat - rho_gt) / rho_gt;
+        scored++;
+    }
+    g_tdee_cells_scored = scored;
+    if (scored == 0) return 0.0;
+    return err_sum / (double)scored;
 }
 
 // TPE: Trajectory Poisoning Exposure (Eq. 4.6)
@@ -777,7 +825,14 @@ void print_mptd_metrics()
                   << "  (Fusion, Eq 4.2)" << std::endl;
     }
     std::cout << "  PARR = " << compute_PARR()
-              << "  (TRS blockchain rejection; "
+              << "  (TRS-verify rejection, Eq 4.3; "
+              << g_trs_rejected_count << "/" << (g_trs_verified_count + g_trs_rejected_count)
+              << " aggregates rejected)" << std::endl;
+    // Separate (non-PARR) revocation-rate signal: poisoned beacons revoked via the
+    // lightweight detection path (Eq 3.67). Kept for reference — NOT the crypto PARR.
+    std::cout << "  RevRate = "
+              << (parr_poisoned_total ? (double)parr_trs_rejected / (double)parr_poisoned_total : 0.0)
+              << "  (LW detection-revoke; "
               << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned revoked)" << std::endl;
     // R8.4: per-beacon TRS verify outcomes (Paper §3.5.4 Algorithm 6).
     // Distinct from PARR (per-flagged-poisoned-beacon, Eq 3.67 / 4.3).
@@ -801,9 +856,10 @@ void print_mptd_metrics()
         const double tdee = compute_TDEE();
         const bool   sumo = g_mobility_provider && g_mobility_provider->is_sumo_derived();
         std::cout << "  TDEE = " << tdee << "  ("
-                  << (sumo ? "SUMO-derived, |ρ̂−ρ_gt|/ρ_gt" : "not sumo_derived → -1")
-                  << ", Eq.4.5; ρ̂=" << g_ctrl_seen_vids.size()
-                  << " ρ_gt=" << N_Vehicles << ")" << std::endl;
+                  << (sumo ? "SUMO-derived, per-cell mean |ρ̂−ρ_gt|/ρ_gt" : "not sumo_derived → -1")
+                  << ", Eq.4.5; cells scored=" << g_tdee_cells_scored
+                  << "/" << N_RSUs
+                  << " distinct ρ̂ vids=" << g_ctrl_seen_vids.size() << ")" << std::endl;
     }
     {
         const double tpe  = compute_TPE();

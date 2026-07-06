@@ -46,6 +46,8 @@ int main(int argc, char *argv[])
     cmd.AddValue ("architecture", "architecture", architecture);
     cmd.AddValue ("maxspeed", "maxspeed", maxspeed);
     cmd.AddValue ("lambda", "lambda", lambda);
+    cmd.AddValue ("delta_hmac", "H5 Delta_HMAC beacon freshness window (s)", delta_hmac);
+    cmd.AddValue ("delta_trs", "H6 Delta_TRS sigma_TRS freshness window (s)", delta_trs);
     cmd.AddValue ("attack_number", "attack_number", attack_number);
     cmd.AddValue ("experiment_number", "experiment_number", experiment_number);
     cmd.AddValue ("routing_test", "routing_test", routing_test);

@@ -1150,6 +1150,23 @@ struct FullModeCryptoResult {
 static uint64_t g_fullcrypto_runs       = 0;
 static double   g_fullcrypto_time_sum_ms = 0.0;
 
+// H6: ring nonce ν_S (paper trs_message) — monotonic per σ_TRS bundle, signed
+// into the message bytes; and the cloud's replay cache (last ν_S accepted at
+// the verify gate). Together with Δ_TRS these implement the trs_fresh gate.
+static uint64_t g_trs_ring_nonce_issued     = 0;
+static uint64_t g_trs_cloud_last_nonce_seen = 0;
+
+// H7: plausibility envelope for FHE aggregates (paper Alg PQ-FHE-TRS pre-enc
+// range check; THRESH-DEC post-dec envelope). Defined after
+// g_rsu_actual_pos_* below because the position box needs the actual topology.
+static bool fhe_aggregate_envelope_ok(double mean_speed, double mean_x,
+                                      double mean_y, int64_t count,
+                                      int64_t count_max, const char *stage);
+// H7: last valid decrypted aggregate — paper THRESH-DEC reuses the last valid
+// window's value when the freshly decrypted aggregate fails the envelope.
+static bool   g_fhe_last_valid_set        = false;
+static double g_fhe_last_valid_mean_speed = 0.0;
+
 // Returns true iff the pipeline executed (verified or rejected). Caller gates on
 // full mode + use_pq_crypto; this function additionally requires both backends
 // ready and only runs for the coordinator RSU.
@@ -1188,8 +1205,24 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
             s_speed += (int64_t)std::llround(rw.speed[i] * (double)ThresholdBfvBackend::SPEED_SCALE);
             s_px    += (int64_t)std::llround(rw.pos_x[i] * (double)ThresholdBfvBackend::POS_SCALE);
             s_py    += (int64_t)std::llround(rw.pos_y[i] * (double)ThresholdBfvBackend::POS_SCALE);
-            vehicle_union.push_back(rw.vid[i]);
         }
+        // H7 pre-encryption range check (Alg PQ-FHE-TRS): an implausible
+        // plaintext aggregate never enters the ring sum, so a compromised RSU
+        // cannot smuggle an out-of-envelope contribution through the
+        // homomorphic add (where it would be invisible until decryption).
+        if (!fhe_aggregate_envelope_ok(
+                (double)s_speed / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)N),
+                (double)s_px    / ((double)ThresholdBfvBackend::POS_SCALE   * (double)N),
+                (double)s_py    / ((double)ThresholdBfvBackend::POS_SCALE   * (double)N),
+                (int64_t)N, (int64_t)IPFS_WINDOW_L, "pre-enc")) {
+            cout << "[FHE-ENV-PRE-REJECT] RSU" << r
+                 << " window aggregate outside envelope → contribution dropped"
+                 << endl;
+            continue;
+        }
+        // (vid union filled only for ACCEPTED contributions so h(S) matches
+        // the ciphertexts actually summed into Enc(A_ring))
+        for (uint32_t i = 0; i < N; i++) vehicle_union.push_back(rw.vid[i]);
         std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
         c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
         total_count  += (int64_t)N;
@@ -1203,10 +1236,22 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     ThresholdBfvBackend::Ciphertext enc_ring = g_thfhe_backend->add_many(c_j);
 
     // ── Algorithm 6 line 7: bind ciphertext into TRS message (Eq 3.48) ───────
+    // H6: paper trs_message m = (Enc(A_ring), t, ν_S, ID_S, h(S)) — the wall-
+    // clock timestamp t and the monotonic ring nonce ν_S are INSIDE the signed
+    // bytes, so the cloud's freshness gate below is signature-protected: a
+    // replayed bundle cannot be given a fresh t/ν_S without invalidating σ_TRS.
+    auto append_u64 = [](std::vector<uint8_t> &v, uint64_t x) {
+        for (int b = 0; b < 8; b++) v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
+    };
+    const double   t_msg = Simulator::Now().GetSeconds();
+    const uint64_t nu_S  = ++g_trs_ring_nonce_issued;
     std::vector<uint8_t> msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
-    append_u32(msg, g_trs_ring_t);              // t
+    append_u32(msg, g_trs_ring_t);              // t (threshold)
     append_u32(msg, closing_rsu);               // ID_S (ring identity)
-    append_u32(msg, epoch);                      // timestamp surrogate
+    append_u32(msg, epoch);                      // window epoch
+    uint64_t t_bits; std::memcpy(&t_bits, &t_msg, 8);
+    append_u64(msg, t_bits);                     // t (timestamp, trs_message)
+    append_u64(msg, nu_S);                       // ν_S (ring nonce, trs_message)
     for (uint32_t v : vehicle_union) append_u32(msg, v);   // h(S) material
 
     // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
@@ -1222,8 +1267,25 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     if (!g_trs_backend->aggregate(partials, signers, sigma_trs)) return false;
     res.sigma_bytes = sigma_trs.size();
 
+    // ── Cloud-side trs_fresh gate (H6): reject stale/replayed bundles BEFORE
+    // signature verification. Honest pipeline signs and verifies within the
+    // same window close (age ≈ 0, ν_S strictly increasing); a replayed bundle
+    // fails the nonce cache even though its σ_TRS still verifies.
+    const double now_s = Simulator::Now().GetSeconds();
+    const bool fresh = (now_s - t_msg <= delta_trs) && (t_msg - now_s <= delta_trs)
+                    && (nu_S > g_trs_cloud_last_nonce_seen);
+    if (!fresh) {
+        cout << "[TRS-FRESH-FAIL] epoch=" << epoch << " age=" << (now_s - t_msg)
+             << "s Δ_TRS=" << delta_trs << " ν_S=" << nu_S
+             << " last=" << g_trs_cloud_last_nonce_seen
+             << " → σ_TRS rejected (trs_fresh)" << endl;
+    } else {
+        g_trs_cloud_last_nonce_seen = nu_S;
+    }
+
     // ── Cloud-side Eq 3.51: TRS-verify gate. Reject before any decryption ────
-    res.trs_verified = g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
+    res.trs_verified = fresh
+                    && g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
     if (!res.trs_verified) {
         g_trs_rejected_count++;                 // PARR numerator (Eq 4.3)
         clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1246,10 +1308,36 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     std::vector<int64_t> out_vec;
     res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
     if (res.decrypt_ok && total_count > 0) {
-        res.recovered_mean_speed = (double)out_vec[0]
-                                 / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
         res.plaintext_mean_speed = (double)pt_speed_sum
                                  / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
+        // H7 post-decryption envelope (Alg THRESH-DEC): validate the DECRYPTED
+        // aggregate against the plausibility envelope using only decrypted
+        // fields (the cloud must not trust plaintext-side state). On reject,
+        // reuse the last valid window's value per the paper; if no valid
+        // window exists yet, discard the aggregate outright.
+        const int64_t dec_cnt = out_vec[3];
+        const double  dm_spd  = dec_cnt > 0
+            ? (double)out_vec[0] / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)dec_cnt) : -1.0;
+        const double  dm_x    = dec_cnt > 0
+            ? (double)out_vec[1] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)dec_cnt) : 0.0;
+        const double  dm_y    = dec_cnt > 0
+            ? (double)out_vec[2] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)dec_cnt) : 0.0;
+        const int64_t cnt_max = (int64_t)n * (int64_t)IPFS_WINDOW_L;
+        if (fhe_aggregate_envelope_ok(dm_spd, dm_x, dm_y, dec_cnt, cnt_max, "post-dec")) {
+            res.recovered_mean_speed    = dm_spd;
+            g_fhe_last_valid_set        = true;
+            g_fhe_last_valid_mean_speed = dm_spd;
+        } else if (g_fhe_last_valid_set) {
+            res.recovered_mean_speed = g_fhe_last_valid_mean_speed;
+            cout << "[FHE-ENVELOPE-REJECT] epoch=" << epoch
+                 << " decrypted aggregate outside envelope → reusing last valid"
+                 << " window mean_speed=" << g_fhe_last_valid_mean_speed << endl;
+        } else {
+            res.decrypt_ok = false;
+            cout << "[FHE-ENVELOPE-REJECT] epoch=" << epoch
+                 << " decrypted aggregate outside envelope, no last-valid"
+                 << " window → aggregate discarded" << endl;
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1840,7 +1928,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         const float gat_i = gat_ok ? gat_scores[i] : 0.0f;
                         float ae_err = 0.0f;
                         if (g_ai_engine.has_lstm_ae()) {
-                            float ring_buf[LSTM_RING_SIZE * 5];
+                            float ring_buf[LSTM_RING_SIZE * 6];
                             if (lstm_ring_dump(vid_i, ring_buf)) {
                                 (void)g_ai_engine.score_lstm_ae(ring_buf, ae_err);
                             }
@@ -2427,6 +2515,35 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                          << " V" << (vid - 2)
                          << " HMAC verification FAILED → beacon rejected"
                          << " t=" << t << endl;
+                } else {
+                    // H5: replay protection on AUTHENTIC beacons — a captured
+                    // beacon re-sent within the key epoch carries a valid MAC,
+                    // so two extra gates are needed (paper HMAC spec):
+                    //  (a) freshness: age ≤ Δ_HMAC (timestamp is MAC-covered,
+                    //      so an attacker cannot forge a fresh one);
+                    //  (b) cluster nonce cache: timestamp strictly greater than
+                    //      the last accepted one for this vehicle, shared
+                    //      across all RSUs (catches replays inside Δ_HMAC and
+                    //      cross-RSU replays within the cluster).
+                    const double now_s = Simulator::Now().GetSeconds();
+                    const double t_bcn = tag.GetTimestamp();
+                    if (now_s - t_bcn > delta_hmac || t_bcn - now_s > delta_hmac) {
+                        hmac_gate_pass = false;
+                        cout << "[LKH-HMAC-STALE] RSU" << rsu_idx
+                             << " V" << (vid - 2)
+                             << " beacon age " << (now_s - t_bcn)
+                             << "s exceeds Δ_HMAC=" << delta_hmac
+                             << "s → rejected (replay window)" << endl;
+                    } else if (t_bcn <= g_hmac_last_seen_t[v_idx]) {
+                        hmac_gate_pass = false;
+                        cout << "[LKH-HMAC-REPLAY] RSU" << rsu_idx
+                             << " V" << (vid - 2)
+                             << " t=" << t_bcn << " ≤ last accepted "
+                             << g_hmac_last_seen_t[v_idx]
+                             << " → rejected (cluster nonce cache)" << endl;
+                    } else {
+                        g_hmac_last_seen_t[v_idx] = t_bcn;
+                    }
                 }
             } else if (v_idx >= 0 && !tag.GetHmacSet()) {
                 // No HMAC present — treat as HMAC failure (unauthenticated beacon)
@@ -2789,10 +2906,14 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // attacker-flipped values from a different code path.
         if (vid < (uint32_t)total_size) {
             last_psi_per_vehicle[vid] = rsu_lw.psi;
+            // 6th AE feature = tau_i. The trained scaler has tau mean=1.0
+            // scale=1.0, and the AE was trained on clean data where tau≡1.0
+            // (scaled→0.0). Feed the default trusted value to stay on-manifold
+            // and consistent with the GAT path (which uses TAU_DEFAULT=1.0).
             lstm_ring_push(vid,
                            (float)tag.GetPosX(), (float)tag.GetPosY(),
                            (float)tag.GetSpeed(), (float)tag.GetHeading(),
-                           (float)tag.GetAcceleration());
+                           (float)tag.GetAcceleration(), 1.0f);
         }
 
         // ── R4.a: SC-Trust + SC-Revoke at RSU (paper invariant #1, §3.5.5) ────
@@ -3173,6 +3294,43 @@ static uint32_t nearest_rsu_for_position(double px, double py)
         if (d2 < min_d2) { min_d2 = d2; nearest = (uint32_t)r; }
     }
     return nearest;
+}
+
+// H7: scenario-derived plausibility envelope for FHE aggregates (fwd-declared
+// above run_full_mode_crypto_pipeline). Bounds:
+//   speed ∈ [0, 1.1·max(s_max, maxspeed/3.6)] — scenario speed limit + 10 %
+//     headroom (SUMO traces respect the limit; s_max covers hardcoded runs);
+//   position within the ACTUAL RSU deployment box ± 2·R_max — every genuine
+//     vehicle lives inside RSU coverage in both hardcoded and SUMO scenarios;
+//   count ∈ [1, count_max] (≤ L beacons per contributing window).
+static bool fhe_aggregate_envelope_ok(double mean_speed, double mean_x,
+                                      double mean_y, int64_t count,
+                                      int64_t count_max, const char *stage)
+{
+    const int active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? (int)N_RSUs : MAX_RSUS;
+    double xmin = g_rsu_actual_pos_x[0], xmax = xmin;
+    double ymin = g_rsu_actual_pos_y[0], ymax = ymin;
+    for (int r = 1; r < active; r++) {
+        xmin = std::min(xmin, g_rsu_actual_pos_x[r]);
+        xmax = std::max(xmax, g_rsu_actual_pos_x[r]);
+        ymin = std::min(ymin, g_rsu_actual_pos_y[r]);
+        ymax = std::max(ymax, g_rsu_actual_pos_y[r]);
+    }
+    const double margin = 2.0 * R_max_comm;
+    const double v_env  = 1.1 * std::max(s_max, (double)maxspeed / 3.6);
+    const bool ok = count >= 1 && count <= count_max
+                 && mean_speed >= 0.0 && mean_speed <= v_env
+                 && mean_x >= xmin - margin && mean_x <= xmax + margin
+                 && mean_y >= ymin - margin && mean_y <= ymax + margin;
+    if (!ok) {
+        cout << "[FHE-ENVELOPE] " << stage << " reject:"
+             << " speed=" << mean_speed << " (max " << v_env << ")"
+             << " pos=(" << mean_x << "," << mean_y << ")"
+             << " box=[" << (xmin - margin) << "," << (xmax + margin) << "]x["
+             << (ymin - margin) << "," << (ymax + margin) << "]"
+             << " count=" << count << "/" << count_max << endl;
+    }
+    return ok;
 }
 
 // ── Link-Lifetime RSU Selection (§RSU-LL) ────────────────────────────────────

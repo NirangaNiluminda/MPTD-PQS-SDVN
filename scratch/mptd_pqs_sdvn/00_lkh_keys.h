@@ -126,6 +126,14 @@ static uint32_t g_vehicle_nonce   [LKH_MAX_VEH];
 static ns3::Ipv4Address g_vehicle_dsrc_ip[LKH_MAX_VEH];
 static bool             g_vehicle_ip_known[LKH_MAX_VEH];
 
+// H5 cluster replay cache: last beacon timestamp accepted through the full HMAC
+// gate, per vehicle, shared by ALL RSUs of the cluster (single sim process ⇒ one
+// table = the paper's RSU-cluster nonce cache). A beacon whose timestamp is not
+// strictly greater than this is a replay — same MAC would verify, so the MAC
+// alone cannot catch it. Updated ONLY on a full gate pass so forged/stale
+// beacons cannot poison the cache. 0.0 = nothing seen yet (beacons start >0).
+static double g_hmac_last_seen_t[LKH_MAX_VEH];
+
 // RSU ring-leaf keys — one per RSU. Used as the SC-Register leaf commitment
 // h(K_{u_j}); the TRS signing shares now come from the Joint-Feldman DKG in
 // 06b1 (Eq 3.25 dkg_trs), NOT from this array.

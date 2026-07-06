@@ -8,9 +8,9 @@
 //   Loads the two .onnx artifacts produced by analytics/ml/train.py:
 //     • gat_model.onnx     — Graph Attention Net, 6-dim per-vehicle features,
 //                             returns per-vehicle anomaly logit (N, 1)
-//     • lstm_ae_model.onnx — Temporal autoencoder over a 20-beacon sliding
-//                             window of 5-dim features, returns reconstruction
-//                             (B, 20, 5); anomaly = ||x − x_hat||²
+//     • lstm_ae_model.onnx — Temporal autoencoder over a 10-beacon sliding
+//                             window of 6-dim features [5 kinematic + tau_i],
+//                             returns reconstruction (B, 10, 6); anomaly = ||x − x_hat||²
 //   …plus the StandardScaler params (analytics/ml/models/scaler.json) and the
 //   LSTM-AE detection threshold θ_ae (analytics/ml/models/theta_ae.txt).
 //
@@ -119,9 +119,10 @@ static inline bool load_fusion_weights_json(const std::string &path, FusionParam
 // ────────────────────────────────────────────────────────────────────────────
 namespace mptd_ai {
 
-constexpr int    GAT_FEATURE_DIM = 6;          // pos_x, pos_y, speed, heading, accel, tau_i
-constexpr int    LSTM_FEATURE_DIM = 5;         // pos_x, pos_y, speed, heading, accel (no tau)
-constexpr int    LSTM_WINDOW_SIZE = 20;        // beacons per temporal window
+constexpr int    KINEMATIC_DIM   = 5;          // raw kinematic features: pos_x, pos_y, speed, heading, accel
+constexpr int    GAT_FEATURE_DIM = 6;          // 5 kinematic (scaled) + tau_i (raw, appended)
+constexpr int    LSTM_FEATURE_DIM = 6;         // 5 kinematic + tau_i — all 6 z-scaled (paper Table set-fullmode-ai, d=6)
+constexpr int    LSTM_WINDOW_SIZE = 10;        // beacons per temporal window (trained arch_{urban,rural,highway}.json all window=10)
 constexpr double R_MAX_GRAPH   = 300.0;        // metres — gat_detector.py R_MAX
 constexpr double PHI_MAX_GRAPH = 1.5707963267948966; // π/2 rad — gat_detector.py PHI_MAX
 constexpr float  TAU_DEFAULT   = 1.0f;         // SC-Trust default when not queried
@@ -133,12 +134,14 @@ constexpr float  TAU_DEFAULT   = 1.0f;         // SC-Trust default when not quer
 // Trivially-copyable struct so threads can share it lock-free.
 // ────────────────────────────────────────────────────────────────────────────
 struct AiScaler {
-    float mean [mptd_ai::LSTM_FEATURE_DIM] = {0,0,0,0,0};
-    float scale[mptd_ai::LSTM_FEATURE_DIM] = {1,1,1,1,1};
+    float mean [mptd_ai::LSTM_FEATURE_DIM] = {0,0,0,0,0,0};
+    float scale[mptd_ai::LSTM_FEATURE_DIM] = {1,1,1,1,1,1};
     bool  loaded = false;
 
     // Apply per-feature z-score normalization in place. Caller passes a buffer
-    // of length n_rows * LSTM_FEATURE_DIM in row-major order [row0:f0..f4, row1:...].
+    // of length n_rows * LSTM_FEATURE_DIM in row-major order [row0:f0..f5, row1:...].
+    // The 6th column is tau_i; the trained scaler has tau mean=1.0 scale=1.0, so
+    // a trusted vehicle (tau=1.0) maps to 0.0 — exactly what the AE saw in training.
     void apply(float *buf, int n_rows) const {
         if (!loaded) return;
         for (int r = 0; r < n_rows; ++r) {
@@ -272,8 +275,8 @@ public:
     // GAT inference: per-vehicle spatial anomaly logits.
     //
     // Input:
-    //   per_vehicle: row-major (N × 5) [pos_x, pos_y, speed, heading, accel]
-    //                in RAW (unscaled) units. Function normalizes internally.
+    //   per_vehicle: row-major (N × KINEMATIC_DIM=5) [pos_x, pos_y, speed,
+    //                heading, accel] in RAW (unscaled) units. Normalized internally.
     //   N: number of vehicle rows.
     //   tau (optional): per-vehicle SC-Trust score, length N. Pass nullptr to
     //                   use TAU_DEFAULT (1.0) for all.
@@ -288,21 +291,22 @@ public:
         if (!has_gat() || N <= 0) return false;
 
         // 1. Build (N × 6) z-scaled feature matrix.
-        //    Stride here is GAT_FEATURE_DIM (6); AiScaler::apply assumes
-        //    LSTM_FEATURE_DIM stride, so we inline the z-norm to match the
-        //    wider row layout. Column 5 (tau_i) is appended unscaled — matches
-        //    train.py which sets tau_col=1.0 *after* StandardScaler.
+        //    per_vehicle_raw stride is KINEMATIC_DIM (5); we scale the 5
+        //    kinematic columns and write into a wider GAT_FEATURE_DIM (6) row.
+        //    Column 5 (tau_i) is appended UNSCALED here — matches train.py which
+        //    sets the GAT tau_col=1.0 *after* StandardScaler. (Note the LSTM path
+        //    scales tau instead; see AiScaler::apply.)
         std::vector<float> feats(static_cast<size_t>(N) * mptd_ai::GAT_FEATURE_DIM);
         for (int i = 0; i < N; ++i) {
-            for (int f = 0; f < mptd_ai::LSTM_FEATURE_DIM; ++f) {
-                const float raw = per_vehicle_raw[i * mptd_ai::LSTM_FEATURE_DIM + f];
+            for (int f = 0; f < mptd_ai::KINEMATIC_DIM; ++f) {
+                const float raw = per_vehicle_raw[i * mptd_ai::KINEMATIC_DIM + f];
                 const float sc  = scaler_.loaded
                                 ? (raw - scaler_.mean[f]) /
                                   (scaler_.scale[f] == 0.0f ? 1.0f : scaler_.scale[f])
                                 : raw;
                 feats[i * mptd_ai::GAT_FEATURE_DIM + f] = sc;
             }
-            feats[i * mptd_ai::GAT_FEATURE_DIM + mptd_ai::LSTM_FEATURE_DIM] =
+            feats[i * mptd_ai::GAT_FEATURE_DIM + mptd_ai::KINEMATIC_DIM] =
                 tau ? tau[i] : mptd_ai::TAU_DEFAULT;
         }
 
@@ -313,18 +317,18 @@ public:
         src.reserve(static_cast<size_t>(N) * (N - 1));
         dst.reserve(static_cast<size_t>(N) * (N - 1));
         for (int i = 0; i < N; ++i) {
-            const float px_i = per_vehicle_raw[i * mptd_ai::LSTM_FEATURE_DIM + 0];
-            const float py_i = per_vehicle_raw[i * mptd_ai::LSTM_FEATURE_DIM + 1];
-            const float sp_i = per_vehicle_raw[i * mptd_ai::LSTM_FEATURE_DIM + 2];
-            const float hd_i = per_vehicle_raw[i * mptd_ai::LSTM_FEATURE_DIM + 3];
+            const float px_i = per_vehicle_raw[i * mptd_ai::KINEMATIC_DIM + 0];
+            const float py_i = per_vehicle_raw[i * mptd_ai::KINEMATIC_DIM + 1];
+            const float sp_i = per_vehicle_raw[i * mptd_ai::KINEMATIC_DIM + 2];
+            const float hd_i = per_vehicle_raw[i * mptd_ai::KINEMATIC_DIM + 3];
             const float vx_i = sp_i * std::cos(hd_i);
             const float vy_i = sp_i * std::sin(hd_i);
             for (int j = 0; j < N; ++j) {
                 if (i == j) continue;
-                const float px_j = per_vehicle_raw[j * mptd_ai::LSTM_FEATURE_DIM + 0];
-                const float py_j = per_vehicle_raw[j * mptd_ai::LSTM_FEATURE_DIM + 1];
-                const float sp_j = per_vehicle_raw[j * mptd_ai::LSTM_FEATURE_DIM + 2];
-                const float hd_j = per_vehicle_raw[j * mptd_ai::LSTM_FEATURE_DIM + 3];
+                const float px_j = per_vehicle_raw[j * mptd_ai::KINEMATIC_DIM + 0];
+                const float py_j = per_vehicle_raw[j * mptd_ai::KINEMATIC_DIM + 1];
+                const float sp_j = per_vehicle_raw[j * mptd_ai::KINEMATIC_DIM + 2];
+                const float hd_j = per_vehicle_raw[j * mptd_ai::KINEMATIC_DIM + 3];
                 const float dx = px_i - px_j, dy = py_i - py_j;
                 if (std::sqrt(dx*dx + dy*dy) > mptd_ai::R_MAX_GRAPH) continue;
                 const float vx_j = sp_j * std::cos(hd_j);
@@ -386,12 +390,14 @@ public:
 
     // ─────────────────────────────────────────────────────────────────────
     // LSTM-AE inference: temporal anomaly score = mean-squared reconstruction
-    // error of the 20-beacon window.
+    // error of the L-beacon window.
     //
     // Input:
-    //   window_raw: row-major (LSTM_WINDOW_SIZE × 5) RAW kinematics.
+    //   window_raw: row-major (LSTM_WINDOW_SIZE × LSTM_FEATURE_DIM = 10 × 6) RAW
+    //               features [pos_x, pos_y, speed, heading, accel, tau_i]. All 6
+    //               columns are z-scaled internally (tau via the scaler's 6th row).
     // Output:
-    //   recon_mse: scalar — averaged squared error over all 100 (=20·5) cells.
+    //   recon_mse: scalar — averaged squared error over all 60 (=10·6) cells.
     //   Returns false if has_lstm_ae()=false.
     // ─────────────────────────────────────────────────────────────────────
     bool score_lstm_ae(const float *window_raw, float &recon_mse) {
@@ -500,9 +506,10 @@ inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
 
 // Mock implementation of AiInferenceEngine when onnxruntime_cxx_api.h is missing
 namespace mptd_ai {
+constexpr int    KINEMATIC_DIM   = 5;
 constexpr int    GAT_FEATURE_DIM = 6;
-constexpr int    LSTM_FEATURE_DIM = 5;
-constexpr int    LSTM_WINDOW_SIZE = 20;
+constexpr int    LSTM_FEATURE_DIM = 6;
+constexpr int    LSTM_WINDOW_SIZE = 10;
 constexpr double R_MAX_GRAPH   = 300.0;
 constexpr double PHI_MAX_GRAPH = 1.5707963267948966;
 constexpr float  TAU_DEFAULT = 1.0f;
