@@ -1182,6 +1182,7 @@ struct PendingCryptoReq {
     double coo_fhe_ms, coo_trs_ms;
     uint32_t rsu_id, contrib;
     int64_t  total_count;
+    bool     poisoned = false;   // C4b: aggregate tampered post-signing (expect TRS reject)
 };
 static std::map<uint32_t, PendingCryptoReq> g_pending_crypto_req;
 
@@ -1335,10 +1336,22 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     append_u64(msg, nu_S);                       // ν_S (ring nonce, trs_message)
     for (uint32_t v : vehicle_union) append_u32(msg, v);   // h(S) material
 
+    // C4b (PARR reachability): when the ring coordinator is a compromised RSU it
+    // injects a poisoned aggregate every epoch it closes. Only the coordinator
+    // can do this and have it be TRS-rejectable — a compromised *non*-closing
+    // RSU's contribution is validly co-signed into Enc(A_ring) and is an insider
+    // residual (bounded by the envelope + trust decay), not a signature failure.
+    // The denominator is booked here so AB6 (no TRS gate) also counts injections
+    // and yields PARR = 0; full mode tampers the signed bundle in
+    // send_aggregate_to_cloud() so the cloud's Verify rejects it (numerator).
+    const bool parr_poison_inject =
+        (closing_rsu < MAX_RSUS) && compromised_rsu[closing_rsu];
+    if (parr_poison_inject) g_parr_injected++;   // Eq 4.3 denominator
+
     // AB6 (C10): TRS gate removed — the aggregate proceeds UNSIGNED and the
-    // cloud accepts it without Eq 3.51 / trs_fresh. PARR counters are NOT
-    // touched (no gate ⇒ nothing verified or rejected; PARR is the full-vs-AB6
-    // ablation contrast).
+    // cloud accepts it without Eq 3.51 / trs_fresh. A poisoned injection here is
+    // therefore never rejected (PARR = 0), which is exactly the full-vs-AB6
+    // ablation contrast.
     if (!enable_trs) {
         res.trs_verified = true;
         res.sigma_bytes  = 0;
@@ -1495,14 +1508,28 @@ static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
     PendingCryptoReq pr;
     pr.t0 = t0; pr.coo_fhe_ms = coo_fhe_ms; pr.coo_trs_ms = coo_trs_ms;
     pr.rsu_id = closing_rsu; pr.contrib = contrib; pr.total_count = total_count;
+
+    // C4b (PARR): a compromised coordinator perturbs the aggregate AFTER the
+    // honest ring signatures are aggregated. σ_TRS was computed over the intact
+    // msg, so the shipped (tampered) msg no longer verifies and the cloud's
+    // Verify (Eq. 3.53) rejects it — the only natural PARR numerator trigger.
+    // The denominator was already booked at the injection point in the pipeline.
+    std::vector<uint8_t> tx_msg = msg;
+    if (closing_rsu < MAX_RSUS && compromised_rsu[closing_rsu] && !tx_msg.empty()) {
+        tx_msg[0] ^= 0xFF;          // flip a ciphertext byte → breaks σ_TRS binding
+        pr.poisoned = true;
+        cout << "[C4b-PARR-INJECT] epoch=" << epoch
+             << " compromised coordinator RSU" << closing_rsu
+             << " tampered signed aggregate → cloud Verify must reject" << endl;
+    }
     g_pending_crypto_req[epoch] = pr;
 
     std::vector<uint8_t> frame;
     auto append_u32 = [&](uint32_t x){ for (int b=0;b<4;b++) frame.push_back((uint8_t)((x>>(b*8))&0xFF)); };
     append_u32(epoch);
     append_u32(ct_len);
-    append_u32((uint32_t)msg.size());
-    frame.insert(frame.end(), msg.begin(), msg.end());
+    append_u32((uint32_t)tx_msg.size());
+    frame.insert(frame.end(), tx_msg.begin(), tx_msg.end());
     append_u32((uint32_t)sigma_trs.size());
     frame.insert(frame.end(), sigma_trs.begin(), sigma_trs.end());
 
@@ -1650,6 +1677,15 @@ void SimpleUdpApplication::handle_cloud_reply_at_rsu(Ptr<Socket> socket)
     if (it == g_pending_crypto_req.end()) return;   // stale/duplicate — drop
     PendingCryptoReq pr = it->second;
     g_pending_crypto_req.erase(it);
+
+    // C4b (PARR numerator): a tampered aggregate that the cloud's TRS Verify
+    // rejected. A tampered aggregate that verified would be a missed poisoning
+    // (should not happen — σ_TRS binds the whole msg); log it if it ever does.
+    if (pr.poisoned) {
+        if (!trs_verified) g_parr_rejected++;
+        else cout << "[C4b-PARR-MISS] epoch=" << epoch
+                  << " tampered aggregate PASSED TRS verify (unexpected)" << endl;
+    }
 
     // PBPO (Eq 4.7): wall-clock t0→now would also count every unrelated sim
     // event processed while the request was in (simulated) flight, so the

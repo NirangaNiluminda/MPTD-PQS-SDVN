@@ -88,7 +88,7 @@ enum untouched. Outputs get an `_ab{N}` suffix + `ablation_ab` CSV column.
 | **AB3** | GAT | ✅ `g_enable_gat_cli=0` |
 | **AB4** | LSTM-AE | ✅ `g_enable_lstm_ae_cli=0` |
 | **AB5** | full AI (LW only) | ✅ ≡ `ablation_mode=1` |
-| **AB6** | TRS gate | ✅ `enable_trs=false` — unsigned aggregate, PARR counters untouched (0/0) |
+| **AB6** | TRS gate | ✅ `enable_trs=false` — unsigned aggregate; poisoned aggregates still injected but never rejected → PARR=0.0 vs full-mode 1.0 (C4b contrast) |
 | **AB7** | FHE pre-coord | ✅ `enable_fhe=false` — plaintext ring sums, TRS still binds payload, H7 envelope intact |
 | **AB8** | RSU 3-state lifecycle | ✅ `enable_rsu_lifecycle=false` — uniform-random endorsers over ALL RSUs |
 | **AB9** | multi-controller | ✅ `enable_ctrl_rotation=false` — controller 0 pinned |
@@ -123,7 +123,7 @@ CSV header: 10_metrics_csv.h:959. TTD helper: analytics/compute_ttd.py.
 | TDEE | all-baseline | ✅ CSV `TDEE` (−1 w/o SUMO) | run `--mobility_source=1` |
 | TPE | all-baseline | ✅ CSV `TPE` (−1 w/o SUMO) | run with SUMO |
 | PBPO | all-baseline | ✅ CSV `PBPO_LW/Full` | — |
-| PARR | ablation | ✅ CSV `PARR` | — |
+| PARR | ablation | ✅ CSV `PARR` (Eq 4.3, C4b) | full=1.0 / AB6=0.0; −1 when no compromised coordinator. AB6 f/n sweep must pin RSU0 compromised (`--rsu_seed`) |
 | FRR (revoke+demote) | ablation | ✅ CSV `FRR_revoke`/`FRR_demote` | demote = −1 w/o Fabric; live validation Stage 3 |
 | COO | ablation | ✅ CSV `COO_epoch/trs/fhe/dkg` | — |
 | BWO (ratio+scale) | ablation | ✅ CSV `BWO_ratio`/`BWO_scale` | scaling *sweep* = batch-run/analytics task |

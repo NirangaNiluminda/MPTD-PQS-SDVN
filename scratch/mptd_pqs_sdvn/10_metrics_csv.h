@@ -676,17 +676,20 @@ double compute_FPR_full()
 }
 
 // PARR: Poisoning Attack Rejection Rate (Eq. 4.3)
-// Fraction of RSU aggregates structurally rejected by the TRS threshold-verify
-// gate (Eq 3.51) before decryption — the purely CRYPTOGRAPHIC rejection signal,
-// independent of AI/lightweight detection. Numerator g_trs_rejected_count and
-// denominator (g_trs_verified_count + g_trs_rejected_count) are booked ONLY inside
-// run_full_mode_crypto_pipeline (ablation_mode ∉ {1,6}), so A1/B1 — which run no
-// TRS pipeline — report PARR = 0 by construction.
+// Paper definition: TRS-rejected poisoned aggregates / total poisoned aggregates
+// INJECTED. C4b wires a natural injector — a compromised ring coordinator that
+// tampers its signed aggregate post-signing (08_detection_engine.h) — so the
+// numerator g_parr_rejected and denominator g_parr_injected are booked only when
+// such an attacker is actually present and closing the ring. Returns -1 (N/A)
+// when no poisoned aggregate was injected (honest ring, or coordinator not
+// compromised), consistent with the other C5–C9 metrics. Full mode → ~1.0
+// (every tampered aggregate rejected at the TRS gate); AB6 (TRS off) → 0.0 (no
+// gate, injections pass). The raw crypto-gate tally g_trs_verified_count /
+// g_trs_rejected_count is still emitted separately for reference.
 double compute_PARR()
 {
-    const uint64_t total = g_trs_verified_count + g_trs_rejected_count;
-    if (total == 0) return 0.0;
-    return (double)g_trs_rejected_count / (double)total;
+    if (g_parr_injected == 0) return -1.0;
+    return (double)g_parr_rejected / (double)g_parr_injected;
 }
 
 // CDER: Control Decision Error Rate (paper §4.1.2, Eq. 4.4)
@@ -890,9 +893,11 @@ void print_mptd_metrics()
                   << "  (Fusion, Eq 4.2)" << std::endl;
     }
     std::cout << "  PARR = " << compute_PARR()
-              << "  (TRS-verify rejection, Eq 4.3; "
-              << g_trs_rejected_count << "/" << (g_trs_verified_count + g_trs_rejected_count)
-              << " aggregates rejected)" << std::endl;
+              << "  (Eq 4.3, poisoned-rejected/injected; "
+              << g_parr_rejected << "/" << g_parr_injected
+              << " poisoned aggregates rejected; -1 = none injected)"
+              << "  [TRS-gate tally " << g_trs_rejected_count << " rej / "
+              << g_trs_verified_count << " ok]" << std::endl;
     // Separate (non-PARR) revocation-rate signal: poisoned beacons revoked via the
     // lightweight detection path (Eq 3.67). Kept for reference — NOT the crypto PARR.
     std::cout << "  RevRate = "
