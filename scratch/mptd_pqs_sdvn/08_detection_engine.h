@@ -1228,6 +1228,35 @@ static const char *parr_poison_source(uint32_t coord)
     return nullptr;
 }
 
+// C4b: is this epoch's poisoned aggregate TRS-REJECTABLE?
+//   • A backbone MitM tampers a validly-signed bundle in transit → the σ_TRS
+//     binding is broken and Verify always fails, independent of f.
+//   • A compromised-RSU forgery is rejected ONLY while the compromised subset is
+//     a minority (f_actual < t_sign) that cannot assemble a valid threshold
+//     signature over its poisoned aggregate — honest members refuse to sign it.
+//     Once f_actual ≥ t_sign the colluders sign it with their own legitimate ring
+//     keys → Verify PASSES and PARR misses it. This is the fault-tolerance
+//     boundary the AB6 f/n sweep is meant to expose: the ring tolerates only
+//     f = ⌊(n-1)/3⌋ faults (n ≥ 3f+1) and t_sign = f+1.
+// Note: the honest pipeline signs with g_trs_ring_t partials, which is currently
+// initialised to t_decrypt (3), not t_sign (2) — a pre-existing t_sign/t_decrypt
+// conflation (see DESIGN_FLAWS_AUDIT §6.1). The forgery boundary uses the paper's
+// security threshold t_sign = f+1 derived from n, so PARR degrades at the true
+// fault limit rather than the (over-strict) g_trs_ring_t value.
+static bool parr_poison_rejectable(uint32_t coord)
+{
+    if (coord < MAX_RSUS && compromised_rsu[coord]) {
+        uint32_t f_actual = 0;
+        for (uint32_t r = 0; r < g_trs_ring_n && r < MAX_RSUS; r++)
+            if (compromised_rsu[r]) f_actual++;
+        const uint32_t f_tol  = (g_trs_ring_n >= 1) ? (g_trs_ring_n - 1) / 3 : 0;
+        const uint32_t t_sign = f_tol + 1;          // paper t_sign = f+1
+        return f_actual < t_sign;                   // minority ⇒ cannot forge
+    }
+    if (attack_number == 6) return true;            // in-transit tamper ⇒ always broken
+    return false;
+}
+
 // Returns true iff the pipeline executed (verified or rejected). Caller gates on
 // full mode + use_pq_crypto; this function additionally requires both backends
 // ready and only runs for the coordinator RSU.
@@ -1539,12 +1568,22 @@ static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
     // coordinator id passed by run_full_mode_crypto_pipeline.)
     std::vector<uint8_t> tx_msg = msg;
     const char *poison_src = parr_poison_source(closing_rsu);
-    if (poison_src && !tx_msg.empty()) {
-        tx_msg[0] ^= 0xFF;          // flip a ciphertext byte → breaks σ_TRS binding
+    if (poison_src) {
         pr.poisoned = true;
-        cout << "[C4b-PARR-INJECT] epoch=" << epoch << " " << poison_src
-             << " tampered signed aggregate (coord RSU" << closing_rsu
-             << ") → cloud Verify must reject" << endl;
+        if (parr_poison_rejectable(closing_rsu) && !tx_msg.empty()) {
+            tx_msg[0] ^= 0xFF;      // insufficient signers / in-transit tamper → σ_TRS breaks
+            cout << "[C4b-PARR-INJECT] epoch=" << epoch << " " << poison_src
+                 << " poisoned aggregate (coord RSU" << closing_rsu
+                 << ") → σ_TRS broken, cloud Verify must reject" << endl;
+        } else {
+            // f_actual ≥ t_sign: colluding compromised RSUs sign their poisoned
+            // aggregate with their own valid ring keys → σ_TRS verifies → PARR
+            // miss. Shipped intact (no tamper), so the cloud accepts it.
+            cout << "[C4b-PARR-FORGE] epoch=" << epoch << " " << poison_src
+                 << " valid σ_TRS forged over poisoned aggregate (coord RSU"
+                 << closing_rsu << ", f≥t_sign) → cloud Verify PASSES (PARR miss)"
+                 << endl;
+        }
     }
     g_pending_crypto_req[epoch] = pr;
 
@@ -1706,9 +1745,11 @@ void SimpleUdpApplication::handle_cloud_reply_at_rsu(Ptr<Socket> socket)
     // rejected. A tampered aggregate that verified would be a missed poisoning
     // (should not happen — σ_TRS binds the whole msg); log it if it ever does.
     if (pr.poisoned) {
-        if (!trs_verified) g_parr_rejected++;
+        if (!trs_verified) g_parr_rejected++;        // Eq 4.3 numerator (TRS caught it)
         else cout << "[C4b-PARR-MISS] epoch=" << epoch
-                  << " tampered aggregate PASSED TRS verify (unexpected)" << endl;
+                  << " poisoned aggregate PASSED TRS verify → PARR miss"
+                  << " (expected sub-threshold forgery f≥t_sign; H7 envelope is"
+                  << " the next gate)" << endl;
     }
 
     // PBPO (Eq 4.7): wall-clock t0→now would also count every unrelated sim

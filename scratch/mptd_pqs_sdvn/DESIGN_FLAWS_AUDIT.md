@@ -105,9 +105,24 @@ Per-RSU-cell **spatial** TDEE now implemented, keeping the hardcoded-mobility de
 
 Two adversaries drive PARR, via a shared `parr_poison_source(coord)` helper — a **compromised ring coordinator** (attacks 1/3) and a **backbone MitM** on the RSU→Cloud link (attack 6). The ring signing-coordinator role now **rotates round-robin** across the `n` ring members each epoch (`coordinator = epoch % n`), so a compromised RSU coordinates exactly `f/n` of epochs regardless of *which* RSU it is — PARR's poisoned-injection rate tracks the compromised fraction and no longer depends on pinning a specific RSU. `closing_rsu==0` still triggers one pipeline run per epoch (unchanged timing); the coordinator id is the logical signer that may tamper.
 
-Wiring: dedicated counters `g_parr_injected` / `g_parr_rejected` ([06b1_trs_backend.h](scratch/mptd_pqs_sdvn/06b1_trs_backend.h)); the denominator is booked at the pipeline injection point *before* the `enable_trs` branch so AB6 also counts injections; the tamper + numerator run only in full mode (`send_aggregate_to_cloud` → cloud Verify → `handle_cloud_reply_at_rsu`). `compute_PARR` now returns the paper Eq 4.3 ratio `g_parr_rejected / g_parr_injected`, or **−1 (N/A)** when no poisoned aggregate was injected, consistent with the C5–C9 −1 convention. The raw crypto-gate tally (`g_trs_verified_count`/`g_trs_rejected_count`) is retained separately for reference.
+**Sub-threshold forgery vs in-transit tamper (rejectability, `parr_poison_rejectable`).** A poisoned aggregate is TRS-rejectable only when the adversary cannot assemble a valid threshold signature over it:
+- **Backbone MitM** tampers a validly-signed bundle in transit → σ_TRS binding broken → Verify **always** fails (rejected), independent of f.
+- **Compromised-RSU forgery** is rejected **only while the compromised subset is a minority** `f_actual < t_sign` (honest members refuse to sign a poisoned aggregate). Once `f_actual ≥ t_sign` the colluders self-sign with their own legitimate ring keys → Verify **passes** → PARR misses it. The boundary uses the paper's `t_sign = f+1` with `f = ⌊(n-1)/3⌋` derived from `n` (n=4 → f=1 → t_sign=2), so PARR degrades at the true `n ≥ 3f+1` fault limit. Rejectable epochs flip a ciphertext byte (break σ_TRS); non-rejectable epochs ship intact and are logged `[C4b-PARR-FORGE]`.
 
-Smoke (a1/p30/s30, RngRun=1, skip_blockchain, build green): **attack 1** (compromised RSU, rotating coordinator) `--rsu_seed=51615783` → RSU0 compromised → 5/19 epochs poisoned (epoch%4==0), 5 injected / 5 rejected, **PARR = 1.0** (14 honest epochs verify+decrypt normally); `--rsu_seed=1314354143` → RSU2 compromised → same 5/5 PARR = 1.0 (first inject at epoch 2), confirming rotation removes the pin-RSU0 dependency. **Attack 6** (backbone MitM) → MitM taps the link every epoch → 19 injected / 19 rejected, **PARR = 1.0**. **AB6** (`--ablation_ab=6`, TRS off) → 5 injected, 0 rejected (no gate), **PARR = 0.0** — the RQ5 full-vs-AB6 structural contrast. Honest regression (attack 2, no compromised RSU, not MitM) → 0 injected, **PARR = −1**, all 19 epochs verify+decrypt normally. **Not modelled:** sub-threshold forgery (`f ≥ t_sign` colluding to produce a valid signature over a poisoned aggregate) — a larger change that would show PARR *degrading* past the fault threshold; left for a later pass.
+Wiring: dedicated counters `g_parr_injected` / `g_parr_rejected` ([06b1_trs_backend.h](scratch/mptd_pqs_sdvn/06b1_trs_backend.h)); the denominator is booked at the pipeline injection point *before* the `enable_trs` branch so AB6 also counts injections; the tamper + numerator run only in full mode (`send_aggregate_to_cloud` → cloud Verify → `handle_cloud_reply_at_rsu`). `compute_PARR` returns the paper Eq 4.3 ratio `g_parr_rejected / g_parr_injected`, or **−1 (N/A)** when no poisoned aggregate was injected, consistent with the C5–C9 −1 convention. The raw crypto-gate tally (`g_trs_verified_count`/`g_trs_rejected_count`) is retained separately.
+
+Smoke (a1/s30, RngRun=1, skip_blockchain, build green) — **f/n sweep (attack 1), the AB6 degradation curve:**
+
+| f/n (attack%) | compromised RSUs | poisoned epochs | rejected | **PARR** |
+|---|---|---|---|---|
+| 1/4 (25%) | 1 (< t_sign=2) | 5 | 5 (forgeries blocked — insufficient signers) | **1.0** |
+| 2/4 (50%) | 2 (≥ t_sign=2) | 9 | 0 (forgeries self-sign, all `[C4b-PARR-FORGE]`) | **0.0** |
+| 3/4 (75%) | 3 | 15 | 0 | **0.0** |
+| MitM (attack 6) | 0 | 19 | 19 (in-transit tamper always caught) | **1.0** |
+
+The denominator scales with f/n via the round-robin coordinator rotation; the 1/4→2/4 drop is the fault-tolerance boundary (ring tolerates only f=1). Also verified: rotation removes the pin-RSU0 dependency (`--rsu_seed=51615783`→RSU0 and `=1314354143`→RSU2 both give 5/5 PARR=1.0 at f=1); AB6 (`--ablation_ab=6`, TRS off) → 0 rejected / injected>0 → **PARR = 0.0** (full-vs-AB6 contrast); honest regression (attack 2) → **PARR = −1**, all epochs verify+decrypt normally.
+
+> **New finding — TRS signing threshold conflated with decryption threshold.** `init_trs_backend(n=4, t=3)` ([11_blockchain_setup.h](scratch/mptd_pqs_sdvn/11_blockchain_setup.h#L182)) sets `g_trs_ring_t=3`, and the honest pipeline signs with 3 partials — but the paper's **TRS signing threshold is `t_sign=f+1=2`** (the 3 is `t_decrypt=f+2`). The two thresholds are conflated into one global. The PARR forgery boundary sidesteps this by deriving `t_sign` from `n` per the paper, but the underlying signing path is over-strict (requires 3 signers where the paper wants 2). Proper fix = split `g_trs_sign_t=2` / `g_trs_decrypt_t=3` across the sign loop (08:~1352) and the decrypt present-set loops (08:~1432, cloud handler) — deferred as a separate item to avoid disturbing the wired FHE decryption path.
 
 ---
 
@@ -183,7 +198,7 @@ The paper's metrics section was rewritten to an **11-metric / 4-dimension** spec
 | TDEE | tdee | All baselines | ⚠️ `compute_TDEE` exists but wrong ground-truth defs (**C3**) |
 | TPE  | tpe  | All baselines | ⚠️ `compute_TPE` exists but reported-vs-SUMO not predicted-vs-SUMO (**C3/M4**) |
 | PBPO | pbpo | All baselines | ✅ `compute_PBPO` (LW + full timing) |
-| PARR | parr | **Ablation only** (full vs AB6) | ✅ **C4a+C4b resolved 2026-07-08** — rotating compromised-coordinator (attacks 1/3) + backbone-MitM (attack 6) injectors; `g_parr_rejected/g_parr_injected` (Eq 4.3), −1 when none injected. Full=1.0 / AB6=0.0 smoke-verified; f/n scales via round-robin rotation (no seed-pin) |
+| PARR | parr | **Ablation only** (full vs AB6) | ✅ **C4a+C4b resolved 2026-07-08** — rotating compromised-coordinator forgery (attacks 1/3) + backbone-MitM (attack 6); `g_parr_rejected/g_parr_injected` (Eq 4.3), −1 when none injected. f/n sweep: PARR 1.0 at f=1, **degrades to 0.0 at f≥t_sign=2** (sub-threshold forgery); MitM always 1.0; AB6=0.0 |
 | FRR  | frr_revoke / frr_demote | **Ablation only** (full vs AB10) | ❌ **NOT implemented** — no false-revoke/false-demote counters over honest set 𝓔_honest |
 | COO  | coo  | **Ablation only** (full vs AB6/AB7 + ECDSA variant) | ❌ **NOT implemented** as per-epoch Δt_TRS+Δt_FHE split (partial timing exists in `g_fullcrypto_time_sum_ms`); no DKG-setup Δt_DKG report |
 | BWO  | bwo_ratio / bwo_scale | **Ablation only** (full vs AB6/AB7/AB10/AB11) | ❌ **NOT implemented** — no byte accounting, no LKH-rekey scaling sweep |
@@ -298,5 +313,6 @@ Priority order, superseding §5 where they overlap:
 6. **M6–M8** (θ_S decision, GAT locked stats decision, window constant + paper table) — M6/M7 are **methodology decisions**, hold for supervisor
 7. **M3/M5** comment sweep + paper-text fixes (add: Urban L=20 table row; `Eq \ref{eq:fpr}` referenced in §model-selection though FPR was dropped as a metric; fold in dead `evidence_sign_and_verify` cleanup)
 8. **Eval-config decision**: Δ_HMAC=0.5 s vs 3.5 s (ns-3 ARP warm-up causes ~1% honest-stale FPs at 0.5 s — see §7.1 H5 resolution note) — hold for supervisor before batch runs
+9. **TRS `t_sign`/`t_decrypt` conflation** (surfaced by C4b forgery work): `g_trs_ring_t=3` drives both the sign loop (should be `t_sign=2`) and the decrypt present-set (correctly `t_decrypt=3`). Split into `g_trs_sign_t`/`g_trs_decrypt_t` — see §6.1 C4b "New finding" note. Low-risk but touches the wired FHE decrypt path, so isolated from the PARR change.
 
 ~~H5 Δ_HMAC + cluster replay cache~~ and ~~H6 ν_S/Δ_TRS (coordinator+cloud side)~~ and ~~H7 plausibility envelope~~ — all resolved 2026-07-05, see §7.1 resolution notes.

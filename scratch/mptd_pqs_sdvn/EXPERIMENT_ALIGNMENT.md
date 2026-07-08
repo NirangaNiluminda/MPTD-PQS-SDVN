@@ -123,7 +123,7 @@ CSV header: 10_metrics_csv.h:959. TTD helper: analytics/compute_ttd.py.
 | TDEE | all-baseline | ✅ CSV `TDEE` (−1 w/o SUMO) | run `--mobility_source=1` |
 | TPE | all-baseline | ✅ CSV `TPE` (−1 w/o SUMO) | run with SUMO |
 | PBPO | all-baseline | ✅ CSV `PBPO_LW/Full` | — |
-| PARR | ablation | ✅ CSV `PARR` (Eq 4.3, C4b) | full=1.0 / AB6=0.0; −1 when honest. Rotating compromised-coordinator (attacks 1/3, f/n scales via round-robin) + backbone-MitM (attack 6) triggers |
+| PARR | ablation | ✅ CSV `PARR` (Eq 4.3, C4b) | f/n sweep: 1.0 at f=1 → **0.0 at f≥t_sign=2** (sub-threshold forgery boundary); MitM (attack 6) always 1.0; AB6=0.0; −1 when honest |
 | FRR (revoke+demote) | ablation | ✅ CSV `FRR_revoke`/`FRR_demote` | demote = −1 w/o Fabric; live validation Stage 3 |
 | COO | ablation | ✅ CSV `COO_epoch/trs/fhe/dkg` | — |
 | BWO (ratio+scale) | ablation | ✅ CSV `BWO_ratio`/`BWO_scale` | scaling *sweep* = batch-run/analytics task |
