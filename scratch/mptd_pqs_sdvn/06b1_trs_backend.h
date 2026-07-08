@@ -894,6 +894,10 @@ static uint64_t g_trs_rejected_count = 0;
 // aggregate is never rejected and PARR reads 0.
 static uint64_t g_parr_injected = 0;
 static uint64_t g_parr_rejected = 0;
+// C4b: compromised RSUs in the current ACTIVE signing ring (set per epoch by
+// run_full_mode_crypto_pipeline from ring_ids). The forgery-rejectability test
+// compares this against t_sign — counting over the elected ring, not 0..n.
+static uint32_t g_ring_f_actual = 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // evidence_sign_and_verify — paper Algorithm 6 (PQ-TRS-SIGN), Eq. 3.47–3.49

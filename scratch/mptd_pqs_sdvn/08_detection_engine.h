@@ -1246,12 +1246,11 @@ static const char *parr_poison_source(uint32_t coord)
 static bool parr_poison_rejectable(uint32_t coord)
 {
     if (coord < MAX_RSUS && compromised_rsu[coord]) {
-        uint32_t f_actual = 0;
-        for (uint32_t r = 0; r < g_trs_ring_n && r < MAX_RSUS; r++)
-            if (compromised_rsu[r]) f_actual++;
+        // f_actual = compromised RSUs in the ACTIVE signing ring (set from
+        // ring_ids by run_full_mode_crypto_pipeline), not the hardcoded 0..n.
         const uint32_t f_tol  = (g_trs_ring_n >= 1) ? (g_trs_ring_n - 1) / 3 : 0;
         const uint32_t t_sign = f_tol + 1;          // paper t_sign = f+1
-        return f_actual < t_sign;                   // minority ⇒ cannot forge
+        return g_ring_f_actual < t_sign;            // minority ⇒ cannot forge
     }
     if (attack_number == 6) return true;            // in-transit tamper ⇒ always broken
     return false;
@@ -1263,26 +1262,39 @@ static bool parr_poison_rejectable(uint32_t coord)
 static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
                                           FullModeCryptoResult &res)
 {
-    // Only the ring coordinator drives one pipeline run per window (see note).
-    if (closing_rsu != 0) return false;
     if (!use_pq_crypto)   return false;
     // AB6/AB7 (C10): TRS and FHE are independently removable; each backend is
     // only required when its mechanism is enabled.
     if (enable_trs && (!g_trs_ready || !g_trs_backend)) return false;
     if (enable_fhe && (!g_thfhe_backend || !g_thfhe_backend->ready())) return false;
 
+    const uint32_t n = g_trs_ring_n;            // signing-ring size (parties)
+    // R9-fix: elect the ring as the first n ACTIVE RSUs (those that flushed an
+    // aggregation window this epoch), NOT the hardcoded RSUs 0..3. In a real SUMO
+    // map the low-index RSUs can sit in an empty cell, so a pinned RSU0
+    // coordinator never rolls over and the whole crypto pipeline (COO/PARR/BWO)
+    // stays silent. One pipeline run per window is driven by the lowest-index
+    // active RSU as coordinator.
+    std::vector<uint32_t> ring_ids;
+    for (uint32_t r = 0; r < (uint32_t)N_RSUs && r < MAX_RSUS && ring_ids.size() < n; r++)
+        if (rsu_last_window_valid[r]) ring_ids.push_back(r);
+    if (ring_ids.empty()) return false;
+    if (closing_rsu != ring_ids[0]) return false;   // only the coordinator drives it
+
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
     double coo_fhe_ms = 0.0, coo_trs_ms = 0.0, coo_seg = 0.0;   // C7 COO split
 
-    const uint32_t n = g_trs_ring_n;            // RSUs in the signing ring
-    // C4b: the ring signing-coordinator role rotates round-robin across the n
-    // members each epoch, so over a full rotation a compromised RSU coordinates
-    // exactly f/n of the time and PARR's poisoned-injection rate tracks the
-    // compromised fraction — no need to pin a specific RSU as compromised.
-    // closing_rsu==0 still triggers one pipeline run per epoch (unchanged
-    // timing); `coordinator` is the logical signer that may be compromised.
-    const uint32_t coordinator = (n > 0) ? (epoch % n) : 0;
+    // C4b: the signing-coordinator role rotates round-robin across the ACTIVE
+    // ring members each epoch, so a compromised RSU coordinates ~f/n of the time
+    // and PARR's poisoned-injection rate tracks the compromised fraction.
+    const uint32_t coordinator = ring_ids[epoch % ring_ids.size()];
+    // C4b: compromised count over the ACTUAL ring drives the forgery boundary.
+    g_ring_f_actual = 0;
+    for (uint32_t rr : ring_ids) if (rr < MAX_RSUS && compromised_rsu[rr]) g_ring_f_actual++;
+    cout << "[RING-ELECT] epoch=" << epoch << " coord=RSU" << ring_ids[0]
+         << " rot_coord=RSU" << coordinator << " ring_size=" << ring_ids.size()
+         << " ring_compromised=" << g_ring_f_actual << endl;
     auto append_u32 = [](std::vector<uint8_t> &v, uint32_t x) {
         for (int b = 0; b < 4; b++) v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
     };
@@ -1299,8 +1311,7 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     int64_t pt_px_sum     = 0;                  // AB7 plaintext-aggregate path
     int64_t pt_py_sum     = 0;
     uint32_t ct_len       = 0;
-    for (uint32_t r = 0; r < n && r < MAX_RSUS; r++) {
-        if (!rsu_last_window_valid[r]) continue;
+    for (uint32_t r : ring_ids) {           // active ring members (all valid)
         const RsuBeaconWindow &rw = rsu_last_window[r];
         const uint32_t N = rw.beacon_count;
         if (N == 0) continue;
