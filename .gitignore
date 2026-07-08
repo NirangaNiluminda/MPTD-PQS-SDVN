@@ -128,6 +128,7 @@ gat_detector/outputs/
 gat_detector/__pycache__/
 gat_detector/**/*.pyc
 gat_detector/.venv/
+gat_detector/data/
 
 # ── Local backups, experimental scans & archives (never committed; regeneratable) ─
 # Canonical maps/traces live at sumo/<scenario>/ and mobility/mobility_<scenario>_<spd>.tcl;
