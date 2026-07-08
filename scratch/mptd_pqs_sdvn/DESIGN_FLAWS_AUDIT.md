@@ -33,6 +33,7 @@ The problems are concentrated in **how the full mode connects to the metrics and
 | M6 | 🟡 Medium | Fusion uses bare S, not S/θ_S; θ_S never trained/loaded | Eq fusion | **New (v3, §7.2)** — methodology decision |
 | M7 | 🟡 Medium | GAT standardization is live snapshot-level, not locked per-node clean stats | Eq gat_score | **New (v3, §7.2)** — methodology decision |
 | M8 | 🟡 Medium | lstm_ae.py WINDOW_SIZE=20 vs deployed 10; paper table Urban L=20 stale | §model-selection | **New (v3, §7.2)** |
+| M9 | 🟡 Medium | **TRS signing threshold conflated with FHE decryption threshold** — `g_trs_ring_t=3` drives both, so the honest ring signs 3-of-4 where the paper's `t_sign=f+1=2`; the FHE decrypt present-set correctly wants `t_decrypt=f+2=3` | Eq trs_partial (t_sign) vs thresh_dec (t_decrypt) | **New 2026-07-08 (§7.5)** — open; surfaced by C4b forgery work |
 
 **Resolved & paper-correct (was suspect in May):** real PQC crypto pipeline; gated `CallSCTrust` (Alg 1 line 5); GAT graph (Eq 3.26); HMAC fail-fast (Alg 1/4); weighted ψ (Eq 3.20); LKH (Eq 3.21–3.25).
 
@@ -316,3 +317,23 @@ Priority order, superseding §5 where they overlap:
 9. **TRS `t_sign`/`t_decrypt` conflation** (surfaced by C4b forgery work): `g_trs_ring_t=3` drives both the sign loop (should be `t_sign=2`) and the decrypt present-set (correctly `t_decrypt=3`). Split into `g_trs_sign_t`/`g_trs_decrypt_t` — see §6.1 C4b "New finding" note. Low-risk but touches the wired FHE decrypt path, so isolated from the PARR change.
 
 ~~H5 Δ_HMAC + cluster replay cache~~ and ~~H6 ν_S/Δ_TRS (coordinator+cloud side)~~ and ~~H7 plausibility envelope~~ — all resolved 2026-07-05, see §7.1 resolution notes.
+
+---
+
+## 7.5 M9 — TRS `t_sign`/`t_decrypt` conflation (OPEN, 2026-07-08)
+
+**Symptom.** `init_trs_backend(/*n=*/4, /*t=*/3)` ([11_blockchain_setup.h:182](scratch/mptd_pqs_sdvn/11_blockchain_setup.h#L182)) sets the single global `g_trs_ring_t=3` and `generate_keys` builds a **3-of-4** TRS sharing. The honest Full-mode pipeline then signs with 3 partials ([08:~1413](scratch/mptd_pqs_sdvn/08_detection_engine.h#L1413)) and binds `t=3` into the signed message ([08:~1384](scratch/mptd_pqs_sdvn/08_detection_engine.h#L1384)).
+
+**Paper.** The two thresholds are distinct and both derived from the single security parameter `f` (=1 here, from `n ≥ 3f+1`):
+- **TRS signing** `t_sign = f+1 = 2` (Eq trs_partial) — a **2-of-4** ring signature.
+- **FHE decryption** `t_decrypt = f+2 = 3` (Eq thresh_dec) — a 3-of-5 coalition (2 RSU partials + Cloud).
+
+The code correctly configures the **FHE** backend at `threshold=3` (`init_threshold_fhe_backend(4, 3)`), but the **FHE decrypt present-set** loops size themselves from the *TRS* global instead of the FHE threshold ([08:~1495](scratch/mptd_pqs_sdvn/08_detection_engine.h#L1495), cloud handler [08:~1671](scratch/mptd_pqs_sdvn/08_detection_engine.h#L1671)): `for (j=0; j+1 < g_trs_ring_t && j < n; j++)`. It happens to yield the right count today *only because* `g_trs_ring_t==3==t_decrypt` — i.e. the decrypt path is correct by coincidence, and the sign path is wrong.
+
+**Impact.** The honest ring signs 3-of-4 where the paper wants 2-of-4 — a paper-conformance deviation that makes signing *stricter* than spec (a compromised subset would need 3, not 2, colluders to forge). **PARR results are unaffected**: the C4b forgery boundary derives `t_sign = f+1` from `n` directly (`parr_poison_rejectable`, [08](scratch/mptd_pqs_sdvn/08_detection_engine.h)), so it degrades at the paper-correct `f=2` regardless of the mis-set signing global. This is why M9 is Medium, not High — it is real but currently masked and does not corrupt any reported metric.
+
+**Fix (deferred — do NOT touch the wired FHE decrypt path casually).**
+1. Split the global into `g_trs_sign_t` (=`f+1`=2) and `g_trs_decrypt_t` (=`f+2`=3); set both in `init_trs_backend` (or derive `t_decrypt = t_sign+1`). Change the call to pass `t_sign=2`.
+2. Point the sign/aggregate/verify paths (06b1 aggregate/verify, 06b3 self-test, 08 sign loop + `msg` t-bind) at `g_trs_sign_t`.
+3. Point the FHE decrypt present-set loops (08:~1495, ~1671) at the **FHE** threshold — prefer `g_thfhe_backend->threshold()` (single source of truth) over a mirrored global.
+4. Re-run the crypto self-test (06b3 TRS-1..4 + PIPE) under the new 2-of-4 sharing and the Full-mode smoke to confirm verify still passes and decryption still recovers the aggregate. **Was mid-implementation when deferred; no code changed.**
