@@ -797,6 +797,71 @@ double compute_PBPO_LW()
     return pbpo_lw_time_sum_ms / (double)pbpo_lw_cnt;
 }
 
+// ── C5–C9: paper §4.2 metric additions (TTD/FRR/COO/BWO/TCL) ──────────────────
+// All emit −1 when the producing mechanism never ran in this configuration
+// (e.g. TCL without live Fabric, COO in LW-only ablation).
+
+// C5 TTD (s): mean over detected attackers of (first alert ≥ onset) − onset.
+// Same semantics as analytics/compute_ttd.py; undetected attackers excluded.
+double compute_TTD()
+{
+    double sum = 0.0; int cnt = 0;
+    for (int i = 0; i < total_size; i++)
+        if (g_ttd_first_poison[i] >= 0 && g_ttd_first_alert[i] >= 0) {
+            sum += g_ttd_first_alert[i] - g_ttd_first_poison[i];
+            cnt++;
+        }
+    return cnt > 0 ? sum / cnt : -1.0;
+}
+
+// C6 FRR_revoke: honest vehicles falsely revoked / honest vehicle population.
+double compute_FRR_revoke()
+{
+    uint32_t honest = 0;
+    for (uint32_t i = 0; i < N_Vehicles && i < (uint32_t)total_size; i++)
+        if (!mptd_vehicle_is_malicious_gt((int)i)) honest++;
+    return honest > 0 ? (double)g_frr_false_revokes / (double)honest : -1.0;
+}
+
+// C6 FRR_demote: honest RSUs falsely demoted from TRUSTED / honest RSU count.
+double compute_FRR_demote()
+{
+    if (!g_frr_demote_data) return -1.0;   // no on-chain lifecycle reads (skip_blockchain)
+    uint32_t honest = 0;
+    for (uint32_t j = 0; j < N_RSUs && j < MAX_RSUS; j++)
+        if (!compromised_rsu[j]) honest++;
+    return honest > 0 ? (double)g_frr_false_demotes / (double)honest : -1.0;
+}
+
+// C7 COO: mean per-epoch crypto wall-clock (ms), plus the Δt_TRS/Δt_FHE split.
+double compute_COO_epoch()
+{
+    return g_coo_epochs > 0
+         ? (g_coo_trs_ms_sum + g_coo_fhe_ms_sum) / (double)g_coo_epochs : -1.0;
+}
+double compute_COO_trs()
+{ return g_coo_epochs > 0 ? g_coo_trs_ms_sum / (double)g_coo_epochs : -1.0; }
+double compute_COO_fhe()
+{ return g_coo_epochs > 0 ? g_coo_fhe_ms_sum / (double)g_coo_epochs : -1.0; }
+
+// C8 BWO_ratio: security bytes (HMAC + FHE ct + σ_TRS + LKH rekey) over plain
+// BSM payload bytes. BWO_scale = LKH rekey messages sent this run (the
+// N_rekey-vs-|V_j| scaling curve comes from sweeping runs).
+double compute_BWO_ratio()
+{
+    if (g_bwo_base_bytes == 0) return -1.0;
+    const uint64_t sec = g_bwo_hmac_bytes + g_bwo_fhe_bytes
+                       + g_bwo_trs_bytes  + g_bwo_rekey_bytes;
+    return (double)sec / (double)g_bwo_base_bytes;
+}
+
+// C9 TCL (ms): mean Fabric sync-invoke submit→commit-ack; mean post-revocation
+// c_assigned reassignment commit.
+double compute_TCL_confirm()
+{ return g_tcl_confirm_cnt  > 0 ? g_tcl_confirm_ms_sum  / (double)g_tcl_confirm_cnt  : -1.0; }
+double compute_TCL_reassign()
+{ return g_tcl_reassign_cnt > 0 ? g_tcl_reassign_ms_sum / (double)g_tcl_reassign_cnt : -1.0; }
+
 // ── Print all metrics to stdout ────────────────────────────────────────────────
 void print_mptd_metrics()
 {
@@ -893,6 +958,29 @@ void print_mptd_metrics()
               << " beacons rejected (unregistered vid), "
               << g_registered_vids.size() << "/" << N_Vehicles
               << " vehicles on-chain (paper §3.5.5 Algorithm 7)" << std::endl;
+    // C5–C9 (paper §4.2 additions): −1 = mechanism did not run in this config
+    std::cout << "  TTD       = " << compute_TTD() << " s (first alert − onset,"
+              << " per detected attacker mean)" << std::endl;
+    std::cout << "  FRR       = revoke " << compute_FRR_revoke()
+              << " (" << g_frr_false_revokes << " false / "
+              << g_frr_revoked_total << " total revokes),"
+              << " demote " << compute_FRR_demote()
+              << " (" << g_frr_false_demotes << " false / "
+              << g_frr_demoted_total << " total demotes)" << std::endl;
+    std::cout << "  COO       = epoch " << compute_COO_epoch()
+              << " ms (TRS " << compute_COO_trs()
+              << " + FHE " << compute_COO_fhe()
+              << " over " << g_coo_epochs << " epochs),"
+              << " DKG " << g_coo_dkg_ms << " ms" << std::endl;
+    std::cout << "  BWO       = ratio " << compute_BWO_ratio()
+              << " (hmac=" << g_bwo_hmac_bytes << "B fhe=" << g_bwo_fhe_bytes
+              << "B trs=" << g_bwo_trs_bytes << "B rekey=" << g_bwo_rekey_bytes
+              << "B / base=" << g_bwo_base_bytes << "B),"
+              << " scale=" << g_bwo_rekey_pkts << " rekey msgs" << std::endl;
+    std::cout << "  TCL       = confirm " << compute_TCL_confirm()
+              << " ms (" << g_tcl_confirm_cnt << " invokes),"
+              << " reassign " << compute_TCL_reassign()
+              << " ms (" << g_tcl_reassign_cnt << " rollovers)" << std::endl;
     std::cout << "──────────────────────────────────────────────────────" << std::endl;
 }
 
@@ -1033,7 +1121,11 @@ void write_mptd_results_csv()
          << "PBPO_LW_ms,PBPO_Full_ms,"
          << "total_received,total_poisoned,total_stored,"
          << "trs_verified_count,trs_rejected_count,"   // R8.4: per-beacon σ_j outcomes
-         << "sc_register_rejects,sc_register_active\n"; // P6: SC-Register gate outcomes
+         << "sc_register_rejects,sc_register_active,"  // P6: SC-Register gate outcomes
+         << "TTD,FRR_revoke,FRR_demote,"                // C5/C6 (paper §4.2)
+         << "COO_epoch,COO_trs,COO_fhe,COO_dkg,"        // C7 (ms)
+         << "BWO_ratio,BWO_scale,"                      // C8
+         << "TCL_confirm,TCL_reassign\n";               // C9 (ms; −1 w/o Fabric)
 
     // Values
     fout << attack_number              << ","
@@ -1068,7 +1160,18 @@ void write_mptd_results_csv()
          << g_trs_verified_count                 << ","   // R8.4
          << g_trs_rejected_count                 << ","   // R8.4
          << unregistered_beacon_reject_count     << ","   // P6
-         << g_registered_vids.size()             << "\n"; // P6
+         << g_registered_vids.size()             << ","   // P6
+         << compute_TTD()                        << ","   // C5
+         << compute_FRR_revoke()                 << ","   // C6
+         << compute_FRR_demote()                 << ","   // C6
+         << compute_COO_epoch()                  << ","   // C7
+         << compute_COO_trs()                    << ","   // C7
+         << compute_COO_fhe()                    << ","   // C7
+         << g_coo_dkg_ms                         << ","   // C7
+         << compute_BWO_ratio()                  << ","   // C8
+         << g_bwo_rekey_pkts                     << ","   // C8 BWO_scale
+         << compute_TCL_confirm()                << ","   // C9
+         << compute_TCL_reassign()               << "\n"; // C9
     fout.close();
 
     // Also print to stdout and note the file written

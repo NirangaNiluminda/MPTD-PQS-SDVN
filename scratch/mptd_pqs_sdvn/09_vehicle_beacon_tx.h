@@ -256,6 +256,8 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	Ptr<Packet> packet1 = Create<Packet>(0);
 	packet1->AddPacketTag(tag);
 	lte_total_packet_size += packet1->GetSerializedSize();
+	g_bwo_base_bytes += tag.GetSerializedSize() - 8;   // C8 BWO: plain BSM payload
+	g_bwo_hmac_bytes += 8;                             //          + 8 B HMAC overhead
 	Simulator::Schedule(Seconds(0), &SimpleUdpApplication::SendPacket,
 	                    udp_app, packet1, dest_ip, dest_port);
 
@@ -378,6 +380,8 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 		Ptr<Packet> fake_pkt = Create<Packet>(0);
 		fake_pkt->AddPacketTag(fake_tag);
 		lte_total_packet_size += fake_pkt->GetSerializedSize();
+		g_bwo_base_bytes += fake_tag.GetSerializedSize() - 8;   // C8 BWO
+		g_bwo_hmac_bytes += 8;
 
 		// Stagger 5ms per stolen beacon so RSU sees distinct receive events
 		uint16_t stolen_port = g_option_b_active ? 6666 : 7777;
@@ -516,6 +520,8 @@ void inject_mp_s3_mitm_beacons(Ptr<SimpleUdpApplication> udp_app,
 		Ptr<Packet> mitm_pkt = Create<Packet>(0);
 		mitm_pkt->AddPacketTag(mitm_tag);
 		lte_total_packet_size += mitm_pkt->GetSerializedSize();
+		g_bwo_base_bytes += mitm_tag.GetSerializedSize() - 8;   // C8 BWO
+		g_bwo_hmac_bytes += 8;
 
 		uint16_t mitm_port = g_option_b_active ? 6666 : 7777;
 		Simulator::Schedule(Seconds(0.005 * (intercepted + 1)),

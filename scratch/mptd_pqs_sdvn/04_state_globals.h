@@ -65,6 +65,13 @@ VehicleBeaconState vehicle_state[total_size];
 // This ensures only pre-registered vehicles can be active Sybil in attack 3 enhanced mode.
 bool pre_registered_sybil[total_size];
 
+// C5 TTD: per-vehicle first-poison / first-alert sim timestamps (−1 = never).
+// Indexed by vehicle idx (NodeID−2); fake Sybil IDs ≥10000 fall outside and
+// are skipped, matching beacon_log.csv/compute_ttd.py semantics. Sentinels
+// set in init_vehicle_states() below.
+double g_ttd_first_poison[total_size];
+double g_ttd_first_alert[total_size];
+
 // Initialise all vehicle beacon state buffers
 void init_vehicle_states() {
     for (int i = 0; i < total_size; i++) {
@@ -73,6 +80,8 @@ void init_vehicle_states() {
         vehicle_state[i].drift_score  = 0.0;
         vehicle_state[i].is_malicious = false;
         pre_registered_sybil[i]       = false;  // cleared; set by declare_pre_registered_sybils()
+        g_ttd_first_poison[i]         = -1.0;   // C5 TTD sentinels
+        g_ttd_first_alert[i]          = -1.0;
         for (int j = 0; j < BEACON_HISTORY; j++) {
             vehicle_state[i].pos_x[j]     = 0.0;
             vehicle_state[i].pos_y[j]     = 0.0;
@@ -141,6 +150,59 @@ RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 // Set by declare_compromised_rsus() in 11_blockchain_transmission.h.
 bool compromised_rsu[MAX_RSUS] = {};
 
+// ── C5–C9: paper §4.2 metric instrumentation (FRR/COO/BWO/TCL; TTD arrays
+// live above init_vehicle_states which seeds their −1 sentinels) ─────────────
+// C6 FRR: false revocations of honest vehicles + false demotions of honest
+// RSUs (lifecycle TRUSTED→lower). Denominators are the honest populations.
+bool     g_frr_vehicle_revoked[total_size] = {};
+uint32_t g_frr_revoked_total   = 0;
+uint32_t g_frr_false_revokes   = 0;
+bool     g_frr_lifecycle_seen[MAX_RSUS] = {};
+bool     g_frr_rsu_was_trusted[MAX_RSUS] = {};
+uint32_t g_frr_demoted_total   = 0;
+uint32_t g_frr_false_demotes   = 0;
+bool     g_frr_demote_data     = false;   // any on-chain lifecycle read happened
+
+// C7/C9: monotonic wall-clock in ms (COO split timers, TCL Fabric latencies).
+inline double mptd_ms_now() {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec * 1000.0 + ts.tv_nsec / 1e6;
+}
+
+// C7 COO: per-epoch crypto wall-clock split (Δt_TRS, Δt_FHE) + one-time DKG.
+double   g_coo_trs_ms_sum = 0.0;
+double   g_coo_fhe_ms_sum = 0.0;
+uint64_t g_coo_epochs     = 0;
+double   g_coo_dkg_ms     = -1.0;
+
+// C8 BWO: byte accounting. base = plain BSM payload bytes (tag minus 8 B HMAC);
+// overhead = HMAC tags + FHE ciphertexts + σ_TRS + LKH rekey packets.
+uint64_t g_bwo_base_bytes  = 0;
+uint64_t g_bwo_hmac_bytes  = 0;
+uint64_t g_bwo_fhe_bytes   = 0;
+uint64_t g_bwo_trs_bytes   = 0;
+uint64_t g_bwo_rekey_bytes = 0;
+uint64_t g_bwo_rekey_pkts  = 0;   // BWO_scale: rekey messages per run
+
+// C9 TCL: Fabric latencies — synchronous invoke submit→commit-ack, and the
+// post-revocation c_assigned reassignment invoke. −1 without live Fabric.
+double   g_tcl_confirm_ms_sum  = 0.0;
+uint64_t g_tcl_confirm_cnt     = 0;
+double   g_tcl_reassign_ms_sum = 0.0;
+uint64_t g_tcl_reassign_cnt    = 0;
+
+// Ground-truth "vehicle is an attacker" = union of the per-attack node arrays
+// (declare_attackers() in 06a). Vehicles poisoned in transit by a compromised
+// RSU (attacks 1/3 RSU variants) are honest under this definition, so their
+// revocation counts toward FRR_revoke.
+inline bool mptd_vehicle_is_malicious_gt(int vi) {
+    if (vi < 0 || vi >= total_size) return false;
+    return tp_vehicle_nodes[vi] || heading_spoof_nodes[vi] ||
+           rsu_fabrication_nodes[vi] || sybil_mitm_nodes[vi] ||
+           beacon_suppression_nodes[vi];
+}
+
 // ── SC-Register: registered-vehicle cache (paper §3.5.5 Algorithm 7) ─────────
 // Populated by register_all_nodes() in 11_blockchain_setup.h on each successful
 // vehicle SCRegister commit. Read by the unregistered-vehicle gate in
@@ -173,6 +235,8 @@ uint64_t unregistered_beacon_reject_count = 0;
 //   Vehicle → DSRC unicast → RSU (HandleBeaconAtRSU) → CSMA → management_node
 // When false: legacy LTE path (Vehicle → LTE → management_node directly).
 Ipv4Address g_management_csma_ip;            // management_node CSMA IP (10.1.1.6)
+Ipv4Address g_cloud_csma_ip; 
+Ptr<Socket> g_rsu0_send_socket;
 Ipv4Address g_rsu_dsrc_ip[MAX_RSUS];                // RSU DSRC IPs from dsrc_interfaces (3.x.x.x)
 Ipv4Address g_rsu_csma_ip[MAX_RSUS];               // RSU CSMA IPs for management → RSU downlink (10.1.1.x)
 uint32_t    g_num_active_rsus   = 0;         // = N_RSUs when routing_test=true

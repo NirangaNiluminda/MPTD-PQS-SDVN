@@ -92,6 +92,7 @@ double data_transmission_frequency = 10.0;
 double data_transmission_period    = 1.0 / data_transmission_frequency;
 double link_lifetime_threshold     = 0.400;
 
+
 // ── Attack Scenario Selection (maps to paper §3.4) ─────────────────────────
 //   1 = TP-S1 : Malicious RSU trajectory poisoning          (Fig 3.1)
 //   2 = TP-S2 : Malicious vehicle trajectory poisoning      (Fig 3.2)

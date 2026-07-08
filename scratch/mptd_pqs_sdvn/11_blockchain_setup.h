@@ -178,6 +178,7 @@ void initialize_crypto_backends()
     // signing-latency baseline for RQ5 (paper §3.5.4, behind ITrsBackend).
     const TrsScheme trs_scheme = g_trs_classical_baseline
                                ? TrsScheme::Classical : TrsScheme::Dilithium;
+    const double coo_dkg_t0 = mptd_ms_now();   // C7 COO_dkg: TRS DKG + ThFHE keygen
     if (init_trs_backend(/*n=*/4, /*t=*/3, trs_scheme)) {
         std::cout << "[CRYPTO/TRS] " << g_trs_backend->scheme_name()
                   << " ready (n=" << g_trs_ring_n
@@ -204,6 +205,9 @@ void initialize_crypto_backends()
                   << (g_thfhe_backend ? (": " + g_thfhe_backend->last_error()) : "")
                   << " — Full-mode FHE-TRS pipeline (Alg 6/7) will be disabled\n";
     }
+    g_coo_dkg_ms = mptd_ms_now() - coo_dkg_t0;   // C7 COO_dkg (one-time setup)
+    std::cout << "[CRYPTO/COO] DKG+keygen setup latency = "
+              << g_coo_dkg_ms << " ms (COO_dkg)\n";
 
     // Single-key BFV retained ONLY for the 06b3 selftest's legacy sum/mean
     // checks; the live Full-mode aggregate path uses g_thfhe_backend above.
@@ -927,7 +931,13 @@ static void mptd_active_controller_refresh_loop(double period)
                 // Persist the new c_assigned(r_j) on-chain so SC-Trust's
                 // R^obs_ck(t) reconstruction (Table 3.2) follows the rollover
                 // (paper p.75). Sync invoke — cheap at the ~1 Hz refresh cadence.
+                // C9 TCL_reassign: wall-clock of the on-chain reassignment
+                // commit (detection lag is bounded by the 1 Hz refresh, not
+                // included here).
+                const double tcl_ra0 = mptd_ms_now();
                 CallSCSetRSUController(r, nc);
+                g_tcl_reassign_ms_sum += mptd_ms_now() - tcl_ra0;
+                g_tcl_reassign_cnt++;
             }
         }
     }

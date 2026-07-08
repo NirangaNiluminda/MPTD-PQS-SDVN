@@ -172,7 +172,11 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
                  << " nonce=" << g_vehicle_nonce[vi] << endl;
         }
 
-        if (err >= 0) packets_sent++;
+        if (err >= 0) {
+            packets_sent++;
+            g_bwo_rekey_pkts++;                       // C8 BWO_scale
+            g_bwo_rekey_bytes += rk.GetSerializedSize();
+        }
     }
 
     cout << "[LKH-REKEY] Revoked V" << (revoked_vehicle_id - 2)
@@ -212,6 +216,17 @@ static bool send_lkh_rekey_if_new(uint32_t vid, uint32_t rsu_id, double sim_time
 {
     if (!g_lkh_rekey_seen.insert(mptd_lkh_dedup_key(vid, rsu_id)).second) {
         return false;
+    }
+    // C6 FRR_revoke: count each vehicle's FIRST network-wide revocation (the
+    // per-RSU dedup above still lets 3 remote RSUs rekey the same vid); a
+    // false revoke is one whose target is outside every attacker GT set.
+    {
+        int vi = (int)vid - 2;
+        if (vi >= 0 && vi < total_size && !g_frr_vehicle_revoked[vi]) {
+            g_frr_vehicle_revoked[vi] = true;
+            g_frr_revoked_total++;
+            if (!mptd_vehicle_is_malicious_gt(vi)) g_frr_false_revokes++;
+        }
     }
     send_lkh_rekey_to_vehicles(vid, rsu_id, sim_time);
     return true;
@@ -1158,6 +1173,19 @@ struct FullModeCryptoResult {
 // Full-mode crypto PBPO accounting (paper Eq 4.7, per-window W = L·T_b split).
 static uint64_t g_fullcrypto_runs       = 0;
 static double   g_fullcrypto_time_sum_ms = 0.0;
+// R9: RSU-side pending-request table — keyed by epoch, holds the timing/
+// accounting state that used to just live on the stack while everything ran
+// in-process. Now the Cloud reply arrives asynchronously, so this bridges
+// send → reply.
+struct PendingCryptoReq {
+    struct timespec t0;
+    double coo_fhe_ms, coo_trs_ms;
+    uint32_t rsu_id, contrib;
+    int64_t  total_count;
+};
+static std::map<uint32_t, PendingCryptoReq> g_pending_crypto_req;
+
+
 
 // H6: ring nonce ν_S (paper trs_message) — monotonic per σ_TRS bundle, signed
 // into the message bytes; and the cloud's replay cache (last ν_S accepted at
@@ -1171,6 +1199,12 @@ static uint64_t g_trs_cloud_last_nonce_seen = 0;
 static bool fhe_aggregate_envelope_ok(double mean_speed, double mean_x,
                                       double mean_y, int64_t count,
                                       int64_t count_max, const char *stage);
+static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
+                                     const std::vector<uint8_t> &sigma_trs,
+                                     uint32_t epoch, uint32_t closing_rsu,
+                                     uint32_t contrib, int64_t total_count,
+                                     double coo_fhe_ms, double coo_trs_ms,
+                                     struct timespec t0, uint32_t ct_len);
 // H7: last valid decrypted aggregate — paper THRESH-DEC reuses the last valid
 // window's value when the freshly decrypted aggregate fails the envelope.
 static bool   g_fhe_last_valid_set        = false;
@@ -1192,6 +1226,7 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    double coo_fhe_ms = 0.0, coo_trs_ms = 0.0, coo_seg = 0.0;   // C7 COO split
 
     const uint32_t n = g_trs_ring_n;            // RSUs in the signing ring
     auto append_u32 = [](std::vector<uint8_t> &v, uint32_t x) {
@@ -1209,6 +1244,7 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     int64_t pt_speed_sum  = 0;                  // plaintext reference only
     int64_t pt_px_sum     = 0;                  // AB7 plaintext-aggregate path
     int64_t pt_py_sum     = 0;
+    uint32_t ct_len       = 0;
     for (uint32_t r = 0; r < n && r < MAX_RSUS; r++) {
         if (!rsu_last_window_valid[r]) continue;
         const RsuBeaconWindow &rw = rsu_last_window[r];
@@ -1239,7 +1275,9 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
         for (uint32_t i = 0; i < N; i++) vehicle_union.push_back(rw.vid[i]);
         if (enable_fhe) {
             std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
+            coo_seg = mptd_ms_now();
             c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
+            coo_fhe_ms += mptd_ms_now() - coo_seg;
         }
         contrib++;
         total_count  += (int64_t)N;
@@ -1255,7 +1293,11 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     // AB7 (C10): FHE removed — the ring aggregate travels as PLAINTEXT sums;
     // TRS below then signs the plaintext aggregate instead of a ciphertext.
     ThresholdBfvBackend::Ciphertext enc_ring;
-    if (enable_fhe) enc_ring = g_thfhe_backend->add_many(c_j);
+    if (enable_fhe) {
+        coo_seg = mptd_ms_now();
+        enc_ring = g_thfhe_backend->add_many(c_j);
+        coo_fhe_ms += mptd_ms_now() - coo_seg;
+    }
 
     // ── Algorithm 6 line 7: bind ciphertext into TRS message (Eq 3.48) ───────
     // H6: paper trs_message m = (Enc(A_ring), t, ν_S, ID_S, h(S)) — the wall-
@@ -1269,7 +1311,14 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     const uint64_t nu_S  = ++g_trs_ring_nonce_issued;
     std::vector<uint8_t> msg;
     if (enable_fhe) {
+        coo_seg = mptd_ms_now();
+        // msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
+        // coo_fhe_ms += mptd_ms_now() - coo_seg;
+        // g_bwo_fhe_bytes += msg.size();              // C8: ciphertext on the wire
         msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
+        coo_fhe_ms += mptd_ms_now() - coo_seg;
+        ct_len = (uint32_t)msg.size();
+        g_bwo_fhe_bytes += msg.size();              // C8: ciphertext on the wire
     } else {
         // AB7: signed payload = plaintext ring sums (same binding structure)
         uint64_t s;
@@ -1297,6 +1346,7 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
     std::vector<std::vector<uint8_t>> partials;
     std::vector<uint32_t> signers;
+    coo_seg = mptd_ms_now();
     for (uint32_t j = 0; j < g_trs_ring_t && j < g_trs_ring_n; j++) {
         std::vector<uint8_t> p;
         if (!g_trs_backend->partial_sign(msg, g_trs_ring_sks[j], p)) return false;
@@ -1305,7 +1355,9 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     }
     std::vector<uint8_t> sigma_trs;
     if (!g_trs_backend->aggregate(partials, signers, sigma_trs)) return false;
+    coo_trs_ms += mptd_ms_now() - coo_seg;
     res.sigma_bytes = sigma_trs.size();
+    g_bwo_trs_bytes += sigma_trs.size();        // C8: σ_TRS on the wire
 
     // ── Cloud-side trs_fresh gate (H6): reject stale/replayed bundles BEFORE
     // signature verification. Honest pipeline signs and verifies within the
@@ -1323,23 +1375,53 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
         g_trs_cloud_last_nonce_seen = nu_S;
     }
 
-    // ── Cloud-side Eq 3.51: TRS-verify gate. Reject before any decryption ────
-    res.trs_verified = fresh
-                    && g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
-    if (!res.trs_verified) {
+    // // ── Cloud-side Eq 3.51: TRS-verify gate. Reject before any decryption ────
+    // coo_seg = mptd_ms_now();
+    // res.trs_verified = fresh
+    //                 && g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
+    // coo_trs_ms += mptd_ms_now() - coo_seg;
+    // if (!res.trs_verified) {
+    //     g_trs_rejected_count++;                 // PARR numerator (Eq 4.3)
+    //     clock_gettime(CLOCK_MONOTONIC, &t1);
+    //     res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+    //                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    //     g_fullcrypto_runs++;
+    //     g_fullcrypto_time_sum_ms += res.elapsed_ms;
+    //     g_coo_trs_ms_sum += coo_trs_ms;         // C7 COO (reject path)
+    //     g_coo_fhe_ms_sum += coo_fhe_ms;
+    //     g_coo_epochs++;
+    //     res.ran = true;
+    //     return true;
+    // }
+
+    // ── R9: freshness stays local (cheap, RSU-side); everything from Eq 3.51
+    // onward now happens on the real Cloud node — send and return async.
+    if (!fresh) {
         g_trs_rejected_count++;                 // PARR numerator (Eq 4.3)
+        res.trs_verified = false;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
                        + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         g_fullcrypto_runs++;
         g_fullcrypto_time_sum_ms += res.elapsed_ms;
+        g_coo_trs_ms_sum += coo_trs_ms;         // C7 COO (reject path)
+        g_coo_fhe_ms_sum += coo_fhe_ms;
+        g_coo_epochs++;
         res.ran = true;
         return true;
     }
-    g_trs_verified_count++;
+
+    // send_aggregate_to_cloud(msg, sigma_trs, epoch, closing_rsu,
+    //                         contrib, total_count, coo_fhe_ms, coo_trs_ms, t0);
+    send_aggregate_to_cloud(msg, sigma_trs, epoch, closing_rsu,
+                            contrib, total_count, coo_fhe_ms, coo_trs_ms, t0, ct_len);
+    res.ran = true;
+    return true;   // async now — trs_verified/decrypt_ok/g_fullcrypto_* are
+                   // filled in later by handle_cloud_reply_at_rsu(), not here
     }  // enable_trs
 
     std::vector<int64_t> out_vec;
+
     if (enable_fhe) {
         // ── Eq 3.52: cloud blind global aggregate. Single ring cluster ⇒ M=1, so
         // Enc(X_global) = Enc(A_ring); the mean is taken after decryption ──────
@@ -1348,7 +1430,9 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
         // ── Algorithm 7 (THRESH-DEC): cloud(lead) + t−1 RSU partials (Eq 3.53–3.56)
         std::vector<uint32_t> present;          // t−1 RSUs; cloud auto-added
         for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++) present.push_back(j);
+        coo_seg = mptd_ms_now();
         res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
+        coo_fhe_ms += mptd_ms_now() - coo_seg;
     } else {
         // AB7: no ciphertext — the "decrypted" aggregate IS the plaintext sums.
         // The H7 post-aggregation envelope below still applies unchanged.
@@ -1393,8 +1477,200 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     g_fullcrypto_runs++;
     g_fullcrypto_time_sum_ms += res.elapsed_ms;
+    g_coo_trs_ms_sum += coo_trs_ms;             // C7 COO (Δt_TRS/Δt_FHE split)
+    g_coo_fhe_ms_sum += coo_fhe_ms;
+    g_coo_epochs++;
     res.ran = true;
     return true;
+}
+
+// R9: RSU-side — stash pending state, frame (msg, sigma_trs), send to Cloud.
+static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
+                                     const std::vector<uint8_t> &sigma_trs,
+                                     uint32_t epoch, uint32_t closing_rsu,
+                                     uint32_t contrib, int64_t total_count,
+                                     double coo_fhe_ms, double coo_trs_ms,
+                                     struct timespec t0, uint32_t ct_len)
+{
+    PendingCryptoReq pr;
+    pr.t0 = t0; pr.coo_fhe_ms = coo_fhe_ms; pr.coo_trs_ms = coo_trs_ms;
+    pr.rsu_id = closing_rsu; pr.contrib = contrib; pr.total_count = total_count;
+    g_pending_crypto_req[epoch] = pr;
+
+    std::vector<uint8_t> frame;
+    auto append_u32 = [&](uint32_t x){ for (int b=0;b<4;b++) frame.push_back((uint8_t)((x>>(b*8))&0xFF)); };
+    append_u32(epoch);
+    append_u32(ct_len);
+    append_u32((uint32_t)msg.size());
+    frame.insert(frame.end(), msg.begin(), msg.end());
+    append_u32((uint32_t)sigma_trs.size());
+    frame.insert(frame.end(), sigma_trs.begin(), sigma_trs.end());
+
+    // An IPv4/UDP datagram caps at 65507 B but the serialized FHE ciphertext
+    // alone is ~2 MB, so the frame ships as ≤60000 B chunks with a 12 B
+    // (epoch, idx, n_chunks) header; the Cloud reassembles per epoch.
+    static const size_t R9_CHUNK = 60000;
+    const uint32_t n_chunks = (uint32_t)((frame.size() + R9_CHUNK - 1) / R9_CHUNK);
+    uint32_t sent_ok = 0;
+    for (uint32_t ci = 0; ci < n_chunks; ci++) {
+        const size_t beg = (size_t)ci * R9_CHUNK;
+        const size_t len = std::min(R9_CHUNK, frame.size() - beg);
+        std::vector<uint8_t> chunk;
+        chunk.reserve(12 + len);
+        auto put_u32 = [&](uint32_t x){ for (int b=0;b<4;b++) chunk.push_back((uint8_t)((x>>(b*8))&0xFF)); };
+        put_u32(epoch); put_u32(ci); put_u32(n_chunks);
+        chunk.insert(chunk.end(), frame.begin()+beg, frame.begin()+beg+len);
+        Ptr<Packet> pkt = Create<Packet>(chunk.data(), chunk.size());
+        if (g_rsu0_send_socket->SendTo(pkt, 0, InetSocketAddress(g_cloud_csma_ip, 9090)) >= 0)
+            sent_ok++;
+    }
+    cout << "[R9-RSU-TX] epoch=" << epoch << " sent " << frame.size()
+         << "B to Cloud in " << sent_ok << "/" << n_chunks << " chunks" << endl;
+}
+
+// R9: Cloud-side — verify TRS, blind-decrypt, reply to RSU0.
+void SimpleUdpApplication::handle_cloud_receive(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    uint32_t sz = packet->GetSize();
+    if (sz < 12) return;
+    std::vector<uint8_t> chunk(sz);
+    packet->CopyData(chunk.data(), sz);
+
+    // Reassemble the ≤60000 B chunks (12 B header: epoch, idx, n_chunks) back
+    // into the full (msg, sigma_trs) frame before parsing. std::map keeps the
+    // chunks idx-ordered even if the backbone reorders delivery.
+    size_t hoff = 0;
+    auto read_hu32 = [&](){ uint32_t x=0; for(int b=0;b<4;b++) x |= ((uint32_t)chunk[hoff+b])<<(b*8); hoff+=4; return x; };
+    const uint32_t r_epoch = read_hu32();
+    const uint32_t r_idx   = read_hu32();
+    const uint32_t r_total = read_hu32();
+    static std::map<uint32_t, std::map<uint32_t, std::vector<uint8_t>>> reasm;
+    auto &parts = reasm[r_epoch];
+    parts[r_idx].assign(chunk.begin()+12, chunk.end());
+    if ((uint32_t)parts.size() < r_total) return;   // wait for the rest
+
+    std::vector<uint8_t> frame;
+    for (auto &p : parts) frame.insert(frame.end(), p.second.begin(), p.second.end());
+    reasm.erase(r_epoch);
+
+    size_t off = 0;
+    auto read_u32 = [&](){ uint32_t x=0; for(int b=0;b<4;b++) x |= ((uint32_t)frame[off+b])<<(b*8); off+=4; return x; };
+    uint32_t epoch   = read_u32();
+    uint32_t ct_len  = read_u32();
+    uint32_t msg_len = read_u32();
+    std::vector<uint8_t> msg(frame.begin()+off, frame.begin()+off+msg_len); off += msg_len;
+    uint32_t sig_len = read_u32();
+    std::vector<uint8_t> sigma_trs(frame.begin()+off, frame.begin()+off+sig_len);
+
+    // C7 COO: the verify/decrypt legs now run cloud-side — time them here and
+    // ship the split back in the reply so the RSU accumulates the full epoch.
+    double coo_seg = mptd_ms_now();
+    bool trs_verified = g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
+    const double cloud_trs_ms = mptd_ms_now() - coo_seg;
+    double cloud_fhe_ms = 0.0;
+
+    bool   decrypt_ok = false;
+    double recovered_mean_speed = -1.0;
+    if (trs_verified && enable_fhe) {
+        coo_seg = mptd_ms_now();
+        std::vector<uint8_t> ct_bytes(msg.begin(), msg.begin() + ct_len);
+        ThresholdBfvBackend::Ciphertext enc_ring =
+            g_thfhe_backend->deserialize_ciphertext(ct_bytes);
+        std::vector<uint32_t> present;
+        for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < g_trs_ring_n; j++) present.push_back(j);
+        std::vector<int64_t> out_vec;
+        decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_ring, present, 4, out_vec);
+        cloud_fhe_ms = mptd_ms_now() - coo_seg;
+        if (decrypt_ok && out_vec[3] > 0) {
+            double dm_spd = (double)out_vec[0] / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)out_vec[3]);
+            double dm_x   = (double)out_vec[1] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)out_vec[3]);
+            double dm_y   = (double)out_vec[2] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)out_vec[3]);
+            int64_t cnt_max = (int64_t)g_trs_ring_n * (int64_t)IPFS_WINDOW_L;
+            if (fhe_aggregate_envelope_ok(dm_spd, dm_x, dm_y, out_vec[3], cnt_max, "post-dec")) {
+                recovered_mean_speed = dm_spd;
+                g_fhe_last_valid_set = true;
+                g_fhe_last_valid_mean_speed = dm_spd;
+            } else if (g_fhe_last_valid_set) {
+                recovered_mean_speed = g_fhe_last_valid_mean_speed;
+            } else {
+                decrypt_ok = false;
+            }
+        }
+    } else if (trs_verified && !enable_fhe) {
+        decrypt_ok = true;   // AB7: plaintext path
+    }
+
+    if (!trs_verified) g_trs_rejected_count++;
+    else                g_trs_verified_count++;
+
+    std::vector<uint8_t> reply;
+    auto append_u32r = [&](uint32_t x){ for (int b=0;b<4;b++) reply.push_back((uint8_t)((x>>(b*8))&0xFF)); };
+    append_u32r(epoch);
+    reply.push_back(trs_verified ? 1 : 0);
+    reply.push_back(decrypt_ok   ? 1 : 0);
+    int64_t spd_fixed = (int64_t)std::llround(recovered_mean_speed * 1e6);
+    for (int b = 0; b < 8; b++) reply.push_back((uint8_t)((spd_fixed >> (b*8)) & 0xFF));
+    append_u32r((uint32_t)std::llround(cloud_trs_ms * 1000.0));   // C7: µs, cloud verify leg
+    append_u32r((uint32_t)std::llround(cloud_fhe_ms * 1000.0));   // C7: µs, cloud decrypt leg
+
+    Ptr<Packet> reply_pkt = Create<Packet>(reply.data(), reply.size());
+    m_cloud_reply_socket->SendTo(reply_pkt, 0, InetSocketAddress(g_rsu_csma_ip[0], 9092));
+
+    cout << "[R9-CLOUD] epoch=" << epoch
+         << " trs=" << (trs_verified ? "VERIFIED" : "REJECTED")
+         << " dec=" << (decrypt_ok ? "ok" : "fail")
+         << std::fixed << std::setprecision(3)
+         << " verify=" << cloud_trs_ms << "ms dec=" << cloud_fhe_ms << "ms" << endl;
+}
+
+void SimpleUdpApplication::handle_cloud_reply_at_rsu(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    uint32_t sz = packet->GetSize();
+    std::vector<uint8_t> frame(sz);
+    packet->CopyData(frame.data(), sz);
+
+    size_t off = 0;
+    auto read_u32 = [&](){ uint32_t x=0; for(int b=0;b<4;b++) x |= ((uint32_t)frame[off+b])<<(b*8); off+=4; return x; };
+    uint32_t epoch = read_u32();
+    bool trs_verified = frame[off++] != 0;
+    bool decrypt_ok   = frame[off++] != 0;
+    int64_t spd_fixed = 0;
+    for (int b = 0; b < 8; b++) spd_fixed |= ((int64_t)frame[off+b]) << (b*8);
+    off += 8;
+    double recovered_mean_speed = (double)spd_fixed / 1e6;
+    double cloud_trs_ms = 0.0, cloud_fhe_ms = 0.0;   // C7: cloud-side split (µs on wire)
+    if (off + 8 <= frame.size()) {
+        cloud_trs_ms = read_u32() / 1000.0;
+        cloud_fhe_ms = read_u32() / 1000.0;
+    }
+
+    auto it = g_pending_crypto_req.find(epoch);
+    if (it == g_pending_crypto_req.end()) return;   // stale/duplicate — drop
+    PendingCryptoReq pr = it->second;
+    g_pending_crypto_req.erase(it);
+
+    // PBPO (Eq 4.7): wall-clock t0→now would also count every unrelated sim
+    // event processed while the request was in (simulated) flight, so the
+    // per-epoch compute cost is the sum of the measured crypto segments.
+    double elapsed_ms = pr.coo_trs_ms + pr.coo_fhe_ms + cloud_trs_ms + cloud_fhe_ms;
+
+    g_fullcrypto_runs++;
+    g_fullcrypto_time_sum_ms += elapsed_ms;
+    g_coo_trs_ms_sum += pr.coo_trs_ms + cloud_trs_ms;
+    g_coo_fhe_ms_sum += pr.coo_fhe_ms + cloud_fhe_ms;
+    g_coo_epochs++;
+
+    cout << "[FULLCRYPTO] epoch=" << epoch
+         << " rings=" << pr.contrib
+         << " veh=" << pr.total_count
+         << " trs=" << (trs_verified ? "VERIFIED" : "REJECTED")
+         << " dec=" << (decrypt_ok ? "ok" : "fail")
+         << std::fixed << std::setprecision(3)
+         << " mean_speed_dec=" << recovered_mean_speed
+         << " " << std::setprecision(2) << elapsed_ms << "ms"
+         << " (Alg6/7 Eq 3.45-3.56, R9 networked)" << endl;
 }
 
 void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id)
@@ -1878,20 +2154,30 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             // and B1 (LTT baseline); TRS/FHE gated by use_pq_crypto (off for A4).
             // Independent of the AI block below — crypto runs even when GAT/AE are
             // disabled (A4/A5), preserving ablation isolation (paper §4.1.1).
+            // if (use_pq_crypto && ablation_mode != 1 && ablation_mode != 6) {
+            //     FullModeCryptoResult cr;
+            //     if (run_full_mode_crypto_pipeline(rsu_id, cw.window_epoch, cr) && cr.ran) {
+            //         cout << "[FULLCRYPTO] epoch=" << cw.window_epoch
+            //              << " rings=" << cr.contributing_rsus
+            //              << " veh=" << cr.total_vehicles
+            //              << " trs=" << (cr.trs_verified ? "VERIFIED" : "REJECTED")
+            //              << " sigma=" << cr.sigma_bytes << "B"
+            //              << " dec=" << (cr.decrypt_ok ? "ok" : "fail")
+            //              << std::fixed << std::setprecision(3)
+            //              << " mean_speed_dec=" << cr.recovered_mean_speed
+            //              << " mean_speed_pt=" << cr.plaintext_mean_speed
+            //              << " " << std::setprecision(2) << cr.elapsed_ms << "ms"
+            //              << " (Alg6/7 Eq 3.45-3.56)" << endl;
+            //     }
+            // }
+
             if (use_pq_crypto && ablation_mode != 1 && ablation_mode != 6) {
                 FullModeCryptoResult cr;
+                // R9: result is async now — real [FULLCRYPTO] line prints later
+                // from handle_cloud_reply_at_rsu() when the Cloud answers.
                 if (run_full_mode_crypto_pipeline(rsu_id, cw.window_epoch, cr) && cr.ran) {
-                    cout << "[FULLCRYPTO] epoch=" << cw.window_epoch
-                         << " rings=" << cr.contributing_rsus
-                         << " veh=" << cr.total_vehicles
-                         << " trs=" << (cr.trs_verified ? "VERIFIED" : "REJECTED")
-                         << " sigma=" << cr.sigma_bytes << "B"
-                         << " dec=" << (cr.decrypt_ok ? "ok" : "fail")
-                         << std::fixed << std::setprecision(3)
-                         << " mean_speed_dec=" << cr.recovered_mean_speed
-                         << " mean_speed_pt=" << cr.plaintext_mean_speed
-                         << " " << std::setprecision(2) << cr.elapsed_ms << "ms"
-                         << " (Alg6/7 Eq 3.45-3.56)" << endl;
+                    cout << "[FULLCRYPTO-SENT] epoch=" << cw.window_epoch
+                         << " → Cloud, awaiting reply" << endl;
                 }
             }
 
@@ -2203,6 +2489,20 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // Update confusion matrix + beacon CSV log
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
     if (tag.GetIsPoisoned()) parr_poisoned_total++;   // PARR denominator: total poisoned submissions
+
+    // C5 TTD: per-attacker onset/alert timestamps — t_start = first poisoned
+    // beacon, t_alert = first LW detection at/after onset (same semantics as
+    // analytics/compute_ttd.py over beacon_log.csv).
+    {
+        int vi = (int)vehicle_id - 2;
+        if (vi >= 0 && vi < total_size) {
+            double t_now = Simulator::Now().GetSeconds();
+            if (tag.GetIsPoisoned() && g_ttd_first_poison[vi] < 0)
+                g_ttd_first_poison[vi] = t_now;
+            if (detected && g_ttd_first_poison[vi] >= 0 && g_ttd_first_alert[vi] < 0)
+                g_ttd_first_alert[vi] = t_now;
+        }
+    }
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
                       tp_flags | (mp_flags << 5), psi);
 

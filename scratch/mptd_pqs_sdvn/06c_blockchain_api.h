@@ -220,6 +220,7 @@ static inline bool mptd_fabric_call_socket(
     const std::string& identity = "")
 {
     payload_out.clear();
+    const double tcl_t0 = mptd_ms_now();   // C9 TCL_confirm
 
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;
@@ -295,6 +296,13 @@ static inline bool mptd_fabric_call_socket(
     }
     // Payload is optional (FNF and many invokes return empty)
     mptd_decode_payload_field(resp, "payload", payload_out);
+    // C9 TCL_confirm: synchronous invoke wall-clock = submit → gateway commit
+    // ack (the daemon replies after Fabric SubmitTransaction returns, i.e.
+    // after ordering+commit). Queries and fire-and-forget sends are excluded.
+    if (action == "invoke" && !fire_and_forget) {
+        g_tcl_confirm_ms_sum += mptd_ms_now() - tcl_t0;
+        g_tcl_confirm_cnt++;
+    }
     return true;
 }
 
@@ -1238,6 +1246,23 @@ inline std::vector<RsuTrustView> CallSCGetAllRSUTrustScores()
         v.trusted = (mptd_json_str_after(js, "\"State\":", idAnchor) == "TRUSTED");
         out.push_back(v);
         pos = idAnchor + 12;   // advance past this anchor
+    }
+    // C6 FRR_demote: count TRUSTED→(non-TRUSTED) lifecycle transitions; a
+    // false demote is one hitting an RSU outside the compromised_rsu[] GT.
+    // First sighting of each RSU only seeds the baseline state.
+    for (const auto& v : out) {
+        if (v.rsu_idx >= MAX_RSUS) continue;
+        g_frr_demote_data = true;
+        if (!g_frr_lifecycle_seen[v.rsu_idx]) {
+            g_frr_lifecycle_seen[v.rsu_idx]  = true;
+            g_frr_rsu_was_trusted[v.rsu_idx] = v.trusted;
+            continue;
+        }
+        if (g_frr_rsu_was_trusted[v.rsu_idx] && !v.trusted) {
+            g_frr_demoted_total++;
+            if (!compromised_rsu[v.rsu_idx]) g_frr_false_demotes++;
+        }
+        g_frr_rsu_was_trusted[v.rsu_idx] = v.trusted;
     }
     return out;
 }

@@ -312,6 +312,12 @@ int main(int argc, char *argv[])
   CsmaHelper csma;
   csma.SetChannelAttribute ("DataRate", StringValue ("1000Mbps"));
   csma.SetChannelAttribute ("Delay", TimeValue (MicroSeconds (10)));
+  // R9: one crypto epoch ships a ~2 MB frame RSU0→Cloud as ~36 UDP chunks
+  // (~1500 IP fragments) enqueued at the same sim instant — the default
+  // 100-packet DropTail queue would drop most of them. Likewise ARP holds only
+  // 3 pending packets while resolving, which silently ate epoch 0's burst.
+  csma.SetQueue ("ns3::DropTailQueue<Packet>", "MaxSize", StringValue ("16384p"));
+  Config::SetDefault ("ns3::ArpCache::PendingQueueSize", UintegerValue (4096));
   
   NodeContainer csma_nodes;
   Ipv4AddressHelper address;
@@ -325,7 +331,8 @@ int main(int argc, char *argv[])
 	  csma_nodes.Add(controller_Node);
 	  csma_nodes.Add(management_Node);
 	  // R4.b: backup_controller_Node no longer joins the CSMA backhaul.
-	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
+      csma_nodes.Add(cloud_Node);	  
+      // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
 	  //   → management index = N_RSUs + 1 (unchanged from prior layout)
 	  csmaDevices = csma.Install (csma_nodes);
   	  address.SetBase ("10.1.0.0", "255.255.0.0");   // /16: CSMA backbone must hold up to 256 RSUs + controllers + mgmt (a /24's 254 hosts overflow at N_RSUs=256)
@@ -336,6 +343,9 @@ int main(int argc, char *argv[])
   	  //   → management index = N_RSUs + N_Controllers
   	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + N_Controllers);
   	  cout << "[OPT-B] management CSMA IP  = " << g_management_csma_ip << endl;
+      g_cloud_csma_ip = csmaInterfaces.GetAddress(N_RSUs + N_Controllers + 1);
+      cout << "[OPT-B] cloud CSMA IP = " << g_cloud_csma_ip << endl;
+
   	  // ── Store RSU CSMA IPs for management → RSU downlink (port 8888) ──────────────
   	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
   	  // RSU r is at csmaInterfaces index r → IPs 10.1.1.1 .. 10.1.1.4
@@ -434,6 +444,12 @@ int main(int argc, char *argv[])
   }
   RSU_apps.Start(Seconds(0.00));
   RSU_apps.Stop(Seconds(simTime));
+
+  // R9: install the socket app on the Cloud node too
+  Ptr <SimpleUdpApplication> cloud_app = Create <SimpleUdpApplication> ();
+  cloud_Node.Get(0)->AddApplication(cloud_app);
+  cloud_app->SetStartTime(Seconds(0.00));
+  cloud_app->SetStopTime(Seconds(simTime));
 
   Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
   Config::SetDefault("ns3::Ipv4GlobalRouting::RespondToInterfaceEvents", BooleanValue(true));

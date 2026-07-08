@@ -65,7 +65,7 @@ cross-cutting blockers below hit ALL five experiments:
 |---|---|---|---|---|
 | **1** `sec:exp1` | ρ_a × γ (6×3) | `--attack_percentage`, `stealth_fraction_theta_s` (02_config_globals.h:307) | MCC,TTD,CDER,TDEE,TPE,PBPO | ⚠️ confirm γ has a CLI binding for {0,0.7,1.0}; needs SUMO (TDEE/TPE) + full mode + B2/B3 |
 | **2** `sec:exp2` | speed {10,60,100,140} | `--maxspeed` (02_config_globals.h:71) + per-speed SUMO trace `mobility_<scen>_<spd>.tcl` | same 6 | ⚠️ trace file must exist for each speed×scenario; + full mode + B2/B3 |
-| **3** `sec:exp3` | N_v {100,200,300,400}, RSU scaled | `routing_test=false` + N via CLI | MCC,TTD,CDER,PBPO,**COO,BWO_ratio** | ❌ **deferred scale-up** (16/4 test vs ~200/25 SUMO); ❌ COO/BWO absent |
+| **3** `sec:exp3` | N_v {100,200,300,400}, RSU scaled | `routing_test=false` + N via CLI | MCC,TTD,CDER,PBPO,**COO,BWO_ratio** | ❌ **deferred scale-up** (16/4 test vs ~200/25 SUMO); ✅ COO/BWO emitted since 2026-07-06 (C5–C9) |
 | **4** `sec:exp4` | Threat Level 1–5 (σ×n_coord) | **none** | same 6 | ❌ no `threat_level`/`n_coord` knob (only attack 7 "coordinated" type) |
 | **5** `sec:exp5` | 7 attack variants, isolated | `--attack_number=1..7` | MCC,TTD,CDER,TDEE/TPE,PBPO | ✅ knob exists; needs full mode + B2/B3 + SUMO |
 
@@ -104,19 +104,30 @@ Net: **all 11 variants wired.** Smoke-tested AB2/AB6/AB7/AB11 + legacy-full regr
 
 CSV header: 10_metrics_csv.h:959. TTD helper: analytics/compute_ttd.py.
 
+> **RESOLVED (C5–C9, 2026-07-06):** all five missing families now emitted natively — 11 new CSV
+> columns after `sc_register_active`: `TTD, FRR_revoke, FRR_demote, COO_epoch, COO_trs, COO_fhe,
+> COO_dkg, BWO_ratio, BWO_scale, TCL_confirm, TCL_reassign` (−1 when the mechanism never ran).
+> Smoke (a1/p30/s30, skip_blockchain): full mode TTD=0.000 s (per-beacon detection fires on the
+> poisoned beacon itself), FRR_revoke=0.0625, COO epoch 193.99 ms (TRS 22.47 + FHE 171.53),
+> DKG 224.16 ms, BWO_ratio 148.17; AB7 cross-check COO_fhe=0.000 / epoch 0.49 ms / ratio 1.079.
+> Post-R9 re-verification (2026-07-08), through the networked RSU→Cloud path after the chunked-
+> transport fix: 19/19 epochs round-trip, COO epoch 236.01 ms (TRS 22.49 + FHE 213.53 — the Δ is
+> the cloud-side deserialize of the ~2 MB ciphertext); AB7 epoch 0.53 ms / ratio 1.079. Pass
+> `--rsu_seed` for reproducible smoke numbers (default 0 clock-seeds the compromised-RSU pick).
+
 | Metric | Scope | Producer today | Gap / stage |
 |---|---|---|---|
 | MCC | all-baseline | ✅ CSV `MCC` | — |
-| TTD | all-baseline | ⚠️ analytics/compute_ttd.py (from beacon_log) | ok; optionally add CSV col |
+| TTD | all-baseline | ✅ CSV `TTD` (matches analytics/compute_ttd.py semantics) | — |
 | CDER | all-baseline | ✅ CSV `CDER` | — |
 | TDEE | all-baseline | ✅ CSV `TDEE` (−1 w/o SUMO) | run `--mobility_source=1` |
 | TPE | all-baseline | ✅ CSV `TPE` (−1 w/o SUMO) | run with SUMO |
 | PBPO | all-baseline | ✅ CSV `PBPO_LW/Full` | — |
 | PARR | ablation | ✅ CSV `PARR` | — |
-| FRR (revoke+demote) | ablation | ❌ | Stage 3 — live Fabric |
-| COO | ablation | ❌ | Stage 2 — full-mode crypto timers |
-| BWO (ratio+scale) | ablation | ❌ | Stage 1–2 — byte counters + LKH sweep |
-| TCL (confirm+reassign) | ablation | ❌ | Stage 3 — Fabric latencies |
+| FRR (revoke+demote) | ablation | ✅ CSV `FRR_revoke`/`FRR_demote` | demote = −1 w/o Fabric; live validation Stage 3 |
+| COO | ablation | ✅ CSV `COO_epoch/trs/fhe/dkg` | — |
+| BWO (ratio+scale) | ablation | ✅ CSV `BWO_ratio`/`BWO_scale` | scaling *sweep* = batch-run/analytics task |
+| TCL (confirm+reassign) | ablation | ✅ CSV `TCL_confirm`/`TCL_reassign` | −1 w/o Fabric; live validation Stage 3 |
 | ~~FPR~~ | demoted | ✅ CSV `FPR` (keep for calibration) | drop from primary plots only |
 
 ---

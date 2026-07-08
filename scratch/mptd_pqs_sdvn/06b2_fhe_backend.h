@@ -392,6 +392,14 @@ public:
         const std::string &s = oss.str();
         return std::vector<uint8_t>(s.begin(), s.end());
     }
+    // R9: inverse of serialize_ciphertext — cloud rebuilds Enc(A_ring) from bytes.
+    Ciphertext deserialize_ciphertext(const std::vector<uint8_t> &bytes) const {
+        std::string s(bytes.begin(), bytes.end());
+        std::istringstream iss(s, std::ios::binary);
+        Ciphertext ct;
+        lbcrypto::Serial::Deserialize(ct, iss, lbcrypto::SerType::BINARY);
+        return ct;
+    }
 
     // ── Homomorphic addition — no secret key (Eq 3.47 ring, Eq 3.52 cloud) ───
     Ciphertext add(const Ciphertext &a, const Ciphertext &b) const { return ctx_->EvalAdd(a, b); }
@@ -663,6 +671,12 @@ public:
 
     std::vector<uint8_t> serialize_ciphertext(const Ciphertext& ct) const {
         return ct.data;
+    }
+    // R9: inverse for the no-OpenFHE stub — bytes are just the packed int64 slots.
+    Ciphertext deserialize_ciphertext(const std::vector<uint8_t>& bytes) const {
+        Ciphertext ct;
+        ct.data = bytes;
+        return ct;
     }
 
     Ciphertext add(const Ciphertext& a, const Ciphertext& b) const {

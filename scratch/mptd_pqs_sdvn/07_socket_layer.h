@@ -46,6 +46,8 @@ public:
     void HandleReadTwo(Ptr<Socket> socket);           // vehicle downlink receive [DL-VEH-RX]
     void handle_readone(Ptr<Socket> socket);          // RSU DSRC receive handler (professor's term)
     void handle_downlink_at_rsu(Ptr<Socket> socket);  // RSU receives management downlink → forwards to vehicles
+    void handle_cloud_receive(Ptr<Socket> socket);
+    void handle_cloud_reply_at_rsu(Ptr<Socket> socket);
     void HandleRekeyReceived(Ptr<Socket> socket);     // Vehicle: receives LKH rekey from RSU (port 5555)
 
     void SendPacket(Ptr<Packet> packet, Ipv4Address destination, uint16_t port);
@@ -63,6 +65,9 @@ private:
     Ptr<Socket> m_recv_socket2;
     Ptr<Socket> m_recv_socket3;      // RSU: DSRC beacon receive (port 6666) — Option B
     Ptr<Socket> m_recv_socket_dl;    // RSU: management downlink receive (port 8888)
+    Ptr<Socket> m_recv_socket_cloud;
+    Ptr<Socket> m_cloud_reply_socket;
+    Ptr<Socket> m_recv_socket_cloud_reply;
     Ptr<Socket> m_recv_socket_rekey; // Vehicle: LKH rekey messages from RSU (port 5555)
     uint16_t m_port1;
     uint16_t m_port2;
@@ -131,6 +136,7 @@ void SimpleUdpApplication::StartApplication()
                   (g_num_active_rsus > 0) &&
                   (nid >= g_first_rsu_node_id) &&
                   (nid <  g_first_rsu_node_id + g_num_active_rsus);
+    bool is_cloud = (nid == cloud_Node.Get(0)->GetId());
 
     if (is_rsu) {
         // ── RSU node: listen on port 6666 for vehicle DSRC beacons ───────────────
@@ -169,10 +175,33 @@ void SimpleUdpApplication::StartApplication()
         SetupReceiveSocket(m_recv_socket_dl, 8888);
         m_recv_socket_dl->SetRecvCallback(
             MakeCallback(&SimpleUdpApplication::handle_downlink_at_rsu, this));
+         // ── R9: RSU0 sends the TRS/FHE bundle to the Cloud on this socket ────────
+        if (nid - g_first_rsu_node_id == 0) g_rsu0_send_socket = m_send_socket;
+
+        // ── R9: RSU0-only — receive the Cloud's verify/decrypt result ───────────
+        if (nid - g_first_rsu_node_id == 0) {
+            m_recv_socket_cloud_reply = Socket::CreateSocket(GetNode(), tid);
+            SetupReceiveSocket(m_recv_socket_cloud_reply, 9092);
+            m_recv_socket_cloud_reply->SetRecvCallback(
+                MakeCallback(&SimpleUdpApplication::handle_cloud_reply_at_rsu, this));
+        }
 
         cout << "[OPT-B] RSU node " << nid
              << " (idx=" << (nid - g_first_rsu_node_id) << ")"
              << " listening on DSRC port 6666, downlink port 8888" << endl;
+    } else if (is_cloud) {
+        // ── Cloud/ITS Server node: receive TRS-signed FHE aggregates (R9) ────
+        m_recv_socket_cloud = Socket::CreateSocket(GetNode(), tid);
+        SetupReceiveSocket(m_recv_socket_cloud, 9090);   // new port: RSU→Cloud
+        m_recv_socket_cloud->SetRecvCallback(
+            MakeCallback(&SimpleUdpApplication::handle_cloud_receive, this));
+
+        // socket the Cloud uses to send its partial-decryption reply back
+        m_cloud_reply_socket = Socket::CreateSocket(GetNode(), tid);
+        m_cloud_reply_socket->Bind(InetSocketAddress(Ipv4Address::GetAny(), 9091));
+        m_cloud_reply_socket->SetAllowBroadcast(false);
+
+        cout << "[R9] Cloud node " << nid << " listening on port 9090" << endl;
     } else {
         // ── Management/vehicle node: standard socket setup ────────────────────────
         m_recv_socket1 = Socket::CreateSocket(GetNode(), tid);
