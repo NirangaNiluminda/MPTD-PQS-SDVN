@@ -1211,6 +1211,23 @@ static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
 static bool   g_fhe_last_valid_set        = false;
 static double g_fhe_last_valid_mean_speed = 0.0;
 
+// C4b (PARR): which adversary — if any — poisons the aggregate coordinated by
+// `coord` this epoch. Both triggers break the σ_TRS binding so the cloud's
+// Verify (Eq 3.53) rejects the aggregate before decryption:
+//   • compromised ring coordinator (attacks 1/3) tampers post-signing;
+//   • backbone MitM (attack 6) tampers the (Enc(A_ring), σ_TRS) bundle in
+//     transit on the RSU→Cloud link.
+// A compromised *non*-coordinating RSU is NOT counted here: its contribution is
+// validly co-signed into Enc(A_ring) and is an insider residual (bounded by the
+// H7 envelope + SC-Trust decay), which the paper excludes from TRS rejection.
+// Returns the source label, or nullptr when the aggregate is honest.
+static const char *parr_poison_source(uint32_t coord)
+{
+    if (coord < MAX_RSUS && compromised_rsu[coord]) return "compromised-coordinator";
+    if (attack_number == 6)                         return "backbone-MitM";
+    return nullptr;
+}
+
 // Returns true iff the pipeline executed (verified or rejected). Caller gates on
 // full mode + use_pq_crypto; this function additionally requires both backends
 // ready and only runs for the coordinator RSU.
@@ -1230,6 +1247,13 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     double coo_fhe_ms = 0.0, coo_trs_ms = 0.0, coo_seg = 0.0;   // C7 COO split
 
     const uint32_t n = g_trs_ring_n;            // RSUs in the signing ring
+    // C4b: the ring signing-coordinator role rotates round-robin across the n
+    // members each epoch, so over a full rotation a compromised RSU coordinates
+    // exactly f/n of the time and PARR's poisoned-injection rate tracks the
+    // compromised fraction — no need to pin a specific RSU as compromised.
+    // closing_rsu==0 still triggers one pipeline run per epoch (unchanged
+    // timing); `coordinator` is the logical signer that may be compromised.
+    const uint32_t coordinator = (n > 0) ? (epoch % n) : 0;
     auto append_u32 = [](std::vector<uint8_t> &v, uint32_t x) {
         for (int b = 0; b < 4; b++) v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
     };
@@ -1329,24 +1353,21 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
         std::memcpy(&s, &total_count,  8); append_u64(msg, s);
     }
     append_u32(msg, g_trs_ring_t);              // t (threshold)
-    append_u32(msg, closing_rsu);               // ID_S (ring identity)
+    append_u32(msg, coordinator);               // ID_S (rotating ring coordinator)
     append_u32(msg, epoch);                      // window epoch
     uint64_t t_bits; std::memcpy(&t_bits, &t_msg, 8);
     append_u64(msg, t_bits);                     // t (timestamp, trs_message)
     append_u64(msg, nu_S);                       // ν_S (ring nonce, trs_message)
     for (uint32_t v : vehicle_union) append_u32(msg, v);   // h(S) material
 
-    // C4b (PARR reachability): when the ring coordinator is a compromised RSU it
-    // injects a poisoned aggregate every epoch it closes. Only the coordinator
-    // can do this and have it be TRS-rejectable — a compromised *non*-closing
-    // RSU's contribution is validly co-signed into Enc(A_ring) and is an insider
-    // residual (bounded by the envelope + trust decay), not a signature failure.
-    // The denominator is booked here so AB6 (no TRS gate) also counts injections
-    // and yields PARR = 0; full mode tampers the signed bundle in
-    // send_aggregate_to_cloud() so the cloud's Verify rejects it (numerator).
-    const bool parr_poison_inject =
-        (closing_rsu < MAX_RSUS) && compromised_rsu[closing_rsu];
-    if (parr_poison_inject) g_parr_injected++;   // Eq 4.3 denominator
+    // C4b (PARR reachability): a compromised coordinator (attacks 1/3) or a
+    // backbone MitM (attack 6) injects a poisoned aggregate this epoch. The
+    // denominator is booked here — before the enable_trs branch — so AB6 (no TRS
+    // gate) also counts injections and yields PARR = 0; full mode tampers the
+    // signed bundle in send_aggregate_to_cloud() so the cloud's Verify rejects
+    // it (numerator).
+    const char *parr_src = parr_poison_source(coordinator);
+    if (parr_src) g_parr_injected++;             // Eq 4.3 denominator
 
     // AB6 (C10): TRS gate removed — the aggregate proceeds UNSIGNED and the
     // cloud accepts it without Eq 3.51 / trs_fresh. A poisoned injection here is
@@ -1426,7 +1447,7 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
 
     // send_aggregate_to_cloud(msg, sigma_trs, epoch, closing_rsu,
     //                         contrib, total_count, coo_fhe_ms, coo_trs_ms, t0);
-    send_aggregate_to_cloud(msg, sigma_trs, epoch, closing_rsu,
+    send_aggregate_to_cloud(msg, sigma_trs, epoch, coordinator,
                             contrib, total_count, coo_fhe_ms, coo_trs_ms, t0, ct_len);
     res.ran = true;
     return true;   // async now — trs_verified/decrypt_ok/g_fullcrypto_* are
@@ -1509,18 +1530,21 @@ static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
     pr.t0 = t0; pr.coo_fhe_ms = coo_fhe_ms; pr.coo_trs_ms = coo_trs_ms;
     pr.rsu_id = closing_rsu; pr.contrib = contrib; pr.total_count = total_count;
 
-    // C4b (PARR): a compromised coordinator perturbs the aggregate AFTER the
-    // honest ring signatures are aggregated. σ_TRS was computed over the intact
-    // msg, so the shipped (tampered) msg no longer verifies and the cloud's
-    // Verify (Eq. 3.53) rejects it — the only natural PARR numerator trigger.
-    // The denominator was already booked at the injection point in the pipeline.
+    // C4b (PARR): the aggregate is perturbed AFTER the honest ring signatures are
+    // aggregated — either by a compromised coordinator or a backbone MitM (see
+    // parr_poison_source). σ_TRS was computed over the intact msg, so the shipped
+    // (tampered) msg no longer verifies and the cloud's Verify (Eq. 3.53) rejects
+    // it — the PARR numerator trigger. The denominator was already booked at the
+    // injection point in the pipeline. (`closing_rsu` here is the rotating
+    // coordinator id passed by run_full_mode_crypto_pipeline.)
     std::vector<uint8_t> tx_msg = msg;
-    if (closing_rsu < MAX_RSUS && compromised_rsu[closing_rsu] && !tx_msg.empty()) {
+    const char *poison_src = parr_poison_source(closing_rsu);
+    if (poison_src && !tx_msg.empty()) {
         tx_msg[0] ^= 0xFF;          // flip a ciphertext byte → breaks σ_TRS binding
         pr.poisoned = true;
-        cout << "[C4b-PARR-INJECT] epoch=" << epoch
-             << " compromised coordinator RSU" << closing_rsu
-             << " tampered signed aggregate → cloud Verify must reject" << endl;
+        cout << "[C4b-PARR-INJECT] epoch=" << epoch << " " << poison_src
+             << " tampered signed aggregate (coord RSU" << closing_rsu
+             << ") → cloud Verify must reject" << endl;
     }
     g_pending_crypto_req[epoch] = pr;
 
