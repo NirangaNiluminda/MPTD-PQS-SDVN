@@ -2373,9 +2373,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         const float psi_i = (float)last_psi_per_vehicle[vid_i];
                         const float gat_i = gat_ok ? gat_scores[i] : 0.0f;
                         float ae_err = 0.0f;
+                        bool  ae_dumped = false;   // H8 diag
                         if (g_ai_engine.has_lstm_ae()) {
                             float ring_buf[LSTM_RING_SIZE * 6];
                             if (lstm_ring_dump(vid_i, ring_buf)) {
+                                ae_dumped = true;
                                 (void)g_ai_engine.score_lstm_ae(ring_buf, ae_err);
                             }
                         }
@@ -2405,6 +2407,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                              << " psi="     << std::fixed << std::setprecision(3) << psi_i
                              << " S="       << gat_i
                              << " ae_norm=" << fs.ae_norm
+                             << " ae_raw=" << std::setprecision(5) << ae_err
+                             << " dumped=" << (ae_dumped ? 1 : 0)
+                             << " gt_pois=" << (rw.is_poisoned[i] ? 1 : 0)
+                             << std::setprecision(3)
                              << " phi="     << fs.phi
                              << " full_anom=" << (fs.anomalous ? "YES" : "no")
                              << " (Eq 3.46)" << endl;

@@ -393,3 +393,48 @@ M6 (no θ_S), M7 (snapshot vs locked GAT stats), M8 (LSTM window train/deploy).
 `[AI-INIT]` block (GAT+LSTM-AE+fusion weights all loaded OK, so this is calibration/
 AE-scoring, not a missing-model failure). Was mid-diagnosis when deferred; **no code
 changed.**
+
+### 7.6.1 H8 — refined diagnosis after instrumentation (2026-07-09)
+
+Instrumented the fusion loop to log raw `ae_err`, ring-dump success, and the GT
+poison label per vehicle ([08 FUSION log](scratch/mptd_pqs_sdvn/08_detection_engine.h#L2402)),
+then ran full mode (a1/p50, RngRun=2, skip_blockchain). **The first hypothesis
+(dead AE) was wrong** — the earlier `ae_norm=0.000` was run-specific
+(RngRun=1 coordinate/scaler edge). Ground truth:
+
+- **The ring fills** (1099 dumped=1 vs 31 dumped=0) and **the AE discriminates**:
+  raw `ae_err` = 0.05–0.13 honest vs 0.21–0.38 poisoned-detectable vs ~0.003 for
+  *stealth* poison. So the AE works — it just cannot see the sub-0.5 m stealth
+  drift (it reconstructs a stealth-poisoned window as easily as a clean one).
+- **The real blocker is fusion scale/weight, three-fold:** (a) `λ_gat=0.668`
+  dominates but GAT is signal-less for RSU-side attack 1 (≈0.14); (b) the LW
+  composite `ψ` maxes ≈ 0.35 for poisoned yet the fusion tests `Φ>0.5` — LW itself
+  flags at `ψ_th=0.09`, so `ψ` **can never carry the fused decision at the 0.5
+  threshold** (a scale mismatch, not just a weight); (c) `θ_ae`/`Φ_th` are not
+  jointly calibrated to the runtime score distribution.
+- **Refit on the real runtime scores** (SLSQP, same objective as `train_fusion.py`,
+  which per its own docstring must match the C++ ε/θ_ae distribution — the deployed
+  Jun-3 master CSV lacks `gat_score`/`scaled_` cols, so the shipped weights were
+  **not** runtime-matched): best weights give **MCC 0.173** (raw ψ) / **0.247**
+  (ψ normalized by ψ_th) — still **below the LW reference 0.354** on the same
+  window-close rows (LW: TP286 FP0 TN289 **FN524**).
+
+**Conclusion (important, honest).** For **attack 1 (RSU-side trajectory poisoning)**
+full mode **cannot beat lightweight** by recalibration alone: GAT is architecturally
+signal-less (honest, spatially-normal vehicles) and the AE is **redundant with LW**
+(both catch abrupt poison, both miss the 70 %-stealth poison — the FN=524). The
+70 % stealth fraction (≤0.5 m/beacon drift) is the fundamental limiter: sub-threshold
+drift over a 10-beacon (1 s) window evades per-beacon rules **and** the temporal AE.
+Full mode's added value (GAT spatial) is real only for **spatial/Sybil attacks
+(MP-S1/S2)**, not RSU-side trajectory poisoning.
+
+**Revised fix (two tiers).**
+- *Tier 1 (calibration, makes full mode ≥ LW so it stops being a regression):*
+  normalize `ψ` by `ψ_th` inside `fuse_scores` so the fused decision preserves the
+  LW verdict, then recalibrate `Φ_th`/λ on a clean-vs-attack runtime set (not the
+  stale master). Target: `MCC_full ≈ MCC_LW`, not worse.
+- *Tier 2 (to actually exceed LW/baselines on stealth):* give the temporal detector
+  a **longer window / cumulative-drift feature** so it accumulates the sub-threshold
+  drift the 10-beacon AE misses (ties to M8 window; the paper's TP-S5 cumulative
+  drift score is the intended mechanism and should feed the AE or ψ). This is the
+  real lever for the stealth FN, and the honest path to full-mode superiority.
