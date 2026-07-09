@@ -30,6 +30,7 @@ The problems are concentrated in **how the full mode connects to the metrics and
 | H5 | 🟠 High | No Δ_HMAC freshness window / cluster replay cache (nonce ν_i itself OK) | HMAC beacon-auth spec | **✅ Resolved 2026-07-05** (§7.1, smoke-verified) |
 | H6 | 🟠 High | TRS messages lack ring nonce ν_S / Δ_TRS freshness — σ_TRS replayable | Eq trs_message/trs_fresh | **✅ Resolved 2026-07-05** (§7.1, smoke-verified) |
 | H7 | 🟠 High | Plausibility envelope checks absent at Enc() and THRESH-DEC (no last-valid fallback) | Alg pq_fhe_trs l.3, thresh_dec | **✅ Resolved 2026-07-05** (§7.1; C4b attack-path reachability still open) |
+| H8 | 🟠 High | **Full-mode fusion detects nothing** — 0 `full_anom` flags, per-window `max_phi≈0.23 < Φ_th=0.5` → `MCC_full=0.014` vs LW `MCC=0.429`. LSTM-AE contributes 0 (`ae_norm=0.000` always) and GAT is legitimately low for RSU-side attacks; blocks any *full-mode* vs-baseline comparison | Eq fusion/flag (3.46) | **New 2026-07-09 (§7.6)** — OPEN; runtime consequence of M6/M7/M8 + dead AE |
 | M6 | 🟡 Medium | Fusion uses bare S, not S/θ_S; θ_S never trained/loaded | Eq fusion | **New (v3, §7.2)** — methodology decision |
 | M7 | 🟡 Medium | GAT standardization is live snapshot-level, not locked per-node clean stats | Eq gat_score | **New (v3, §7.2)** — methodology decision |
 | M8 | 🟡 Medium | lstm_ae.py WINDOW_SIZE=20 vs deployed 10; paper table Urban L=20 stale | §model-selection | **New (v3, §7.2)** |
@@ -315,6 +316,7 @@ Priority order, superseding §5 where they overlap:
 7. **M3/M5** comment sweep + paper-text fixes (add: Urban L=20 table row; `Eq \ref{eq:fpr}` referenced in §model-selection though FPR was dropped as a metric; fold in dead `evidence_sign_and_verify` cleanup)
 8. **Eval-config decision**: Δ_HMAC=0.5 s vs 3.5 s (ns-3 ARP warm-up causes ~1% honest-stale FPs at 0.5 s — see §7.1 H5 resolution note) — hold for supervisor before batch runs
 9. **TRS `t_sign`/`t_decrypt` conflation** (surfaced by C4b forgery work): `g_trs_ring_t=3` drives both the sign loop (should be `t_sign=2`) and the decrypt present-set (correctly `t_decrypt=3`). Split into `g_trs_sign_t`/`g_trs_decrypt_t` — see §6.1 C4b "New finding" note. Low-risk but touches the wired FHE decrypt path, so isolated from the PARR change.
+10. **H8 — full-mode fusion detects nothing** (§7.6, surfaced 2026-07-09 by the full-mode-vs-baselines deliverable): `MCC_full=0.014`, 0 `full_anom` flags — the LSTM-AE is dead (`ae_norm=0`) and GAT is legitimately low for RSU-side attacks. **Blocks the full-mode superiority claim**; LW mode (0.429) is the only working detector today. Fix = instrument/repair the AE + recalibrate θ_ae/Φ_th on clean data (ties M6/M7/M8). This is "Option B" of the baseline comparison.
 
 ~~H5 Δ_HMAC + cluster replay cache~~ and ~~H6 ν_S/Δ_TRS (coordinator+cloud side)~~ and ~~H7 plausibility envelope~~ — all resolved 2026-07-05, see §7.1 resolution notes.
 
@@ -337,3 +339,57 @@ The code correctly configures the **FHE** backend at `threshold=3` (`init_thresh
 2. Point the sign/aggregate/verify paths (06b1 aggregate/verify, 06b3 self-test, 08 sign loop + `msg` t-bind) at `g_trs_sign_t`.
 3. Point the FHE decrypt present-set loops (08:~1495, ~1671) at the **FHE** threshold — prefer `g_thfhe_backend->threshold()` (single source of truth) over a mirrored global.
 4. Re-run the crypto self-test (06b3 TRS-1..4 + PIPE) under the new 2-of-4 sharing and the Full-mode smoke to confirm verify still passes and decryption still recovers the aggregate. **Was mid-implementation when deferred; no code changed.**
+
+## 7.6 H8 — Full-mode fusion detects nothing (OPEN, 2026-07-09)
+
+**Symptom.** In a full-mode run (`ablation_mode=0`, GAT+LSTM-AE loaded), the fused
+detector flags **zero** vehicles: `0 [FUSION-…] full_anom=yes` across a whole 30 s
+64-RSU/200-veh SUMO run; per-window `max_phi` tops out at ≈ 0.23, never reaching
+`Φ_th = 0.5`. Result: `MCC_full = 0.014` (≈ chance) while the lightweight
+`MCC = 0.429`. So **full mode is strictly worse than lightweight**, and a *full-mode*
+"proposed vs B1/B2/B3" comparison would lose — the reason the baseline runbook
+(GLOBAL_BASELINE_README) compares `ablation_mode=1` (LW) as "ours".
+
+**Diagnosis.** `Φ = λ_ψ·ψ + λ_gat·gat + λ_ae·ae_norm` with loaded weights
+`λ_ψ=0.05, λ_gat=0.668, λ_ae=0.282, Φ_th=0.5` and `θ_ae=0.2457`
+([06d_ai_inference.h fuse_scores:480](scratch/mptd_pqs_sdvn/06d_ai_inference.h#L480)).
+Two independent causes starve Φ:
+1. **LSTM-AE contributes nothing — `ae_norm=0.000` on every fused row.** `ae_norm =
+   min(ae_err/θ_ae, 1)`, so `ae_err ≈ 0`. Root cause not yet pinned: either
+   `lstm_ring_dump` returns false (per-vehicle ring never reaches `LSTM_RING_SIZE`
+   under SUMO churn/handover) so `ae_err` stays at its 0.0 init
+   ([08:2375-2381](scratch/mptd_pqs_sdvn/08_detection_engine.h#L2375)), **or**
+   `score_lstm_ae` reconstructs the (poisoned) trajectory with near-zero MSE
+   (bad AE / wrong feature scaling / θ_ae too high). This is the critical bug for
+   RSU-side attacks (TP-S1/attack 1): vehicles are honest and spatially normal, so
+   the **temporal AE is supposed to be the primary signal** — and it is dead.
+2. **GAT is legitimately low for RSU-side attacks.** `gat` is the raw sigmoid ∈[0,1]
+   (no θ_S — see M6), ≈ 0.145 typical (max ≈ 0.83 for a few rows). In attack 1 the
+   compromised RSU tampers beacons of spatially-normal honest vehicles, so the GAT
+   sees no coordinated spatial inconsistency → correctly low. With the AE dead, Φ ≈
+   `0.668·gat` ≈ 0.10, never crossing 0.5.
+
+**Why it matters.** Blocks the deliverable's *full-mode* superiority claim; full mode
+currently adds cost (crypto/AI) while *reducing* detection vs LW. Ties directly to
+M6 (no θ_S), M7 (snapshot vs locked GAT stats), M8 (LSTM window train/deploy).
+
+**Fix plan (later).**
+1. **Instrument the AE first.** Log raw `ae_err` (pre-norm) and `lstm_ring_dump`
+   success per fused vehicle; confirm whether the ring fills and whether `ae_err`
+   separates poisoned vs honest trajectories. This isolates cause 1a vs 1b.
+2. If the ring never fills under SUMO: relax the "full ring only" gate or seed the
+   ring on RSU handover so a vehicle keeps ≥ `LSTM_RING_SIZE` history across cells.
+3. If `ae_err` is tiny on poison: re-check AE feature scaling (`AiScaler`), the
+   deployed window (M8: 10 vs 20), and recalibrate `θ_ae` = median+κ·MAD on a
+   **clean** run's error distribution (paper method), so poisoned windows exceed it.
+4. Recalibrate `Φ_th` (and/or refit λ) on clean-vs-attack held-out data so the
+   operating point is real — **not** an ad-hoc threshold lowered until it "wins".
+5. Verify: full-mode re-run shows `full_anom` firing on poisoned rows and
+   `MCC_full` ≥ LW `MCC` (target: ≥ baselines), then run the full-mode vs B1/B2/B3
+   comparison (Option B).
+
+**Evidence.** `analytics/results/PEM_evidence/run_20260708_205016_a1_p50/full_run.log`
+— grep `FUSION-WIN` (all `full_anom=0`, `max_phi≤0.23`), `ae_norm=0.000`, and the
+`[AI-INIT]` block (GAT+LSTM-AE+fusion weights all loaded OK, so this is calibration/
+AE-scoring, not a missing-model failure). Was mid-diagnosis when deferred; **no code
+changed.**
