@@ -496,10 +496,19 @@ inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
         la /= sum_w;
     }
 
+    // H8 Tier-1: normalize ψ to its LW decision scale (ψ_th) so a lightweight
+    // detection (ψ>ψ_th) reaches [0,1] like the other components and can carry
+    // the fused Φ>Φ_th decision. Raw ψ maxes ~0.35 for poisoned and could never
+    // reach Φ_th=0.5, so the fusion silently discarded the LW signal → full<LW.
+    const float psi_denom = (psi_th > 1e-9 ? (float)psi_th : 1e-9f);
+    float psi_n = psi / psi_denom;
+    if (psi_n > 1.0f) psi_n = 1.0f;
+    if (psi_n < 0.0f) psi_n = 0.0f;
+
     const float used_gat = p.use_gat ? gat_score : 0.0f;
     const float used_ae  = p.use_ae  ? ae_norm   : 0.0f;
-    const float phi = lp * psi + lg * used_gat + la * used_ae;
-    return FusionScore{psi, used_gat, used_ae, phi, phi > p.phi_threshold};
+    const float phi = lp * psi_n + lg * used_gat + la * used_ae;
+    return FusionScore{psi_n, used_gat, used_ae, phi, phi > p.phi_threshold};
 }
 
 #else
@@ -604,10 +613,19 @@ inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
         la /= sum_w;
     }
 
+    // H8 Tier-1: normalize ψ to its LW decision scale (ψ_th) so a lightweight
+    // detection (ψ>ψ_th) reaches [0,1] like the other components and can carry
+    // the fused Φ>Φ_th decision. Raw ψ maxes ~0.35 for poisoned and could never
+    // reach Φ_th=0.5, so the fusion silently discarded the LW signal → full<LW.
+    const float psi_denom = (psi_th > 1e-9 ? (float)psi_th : 1e-9f);
+    float psi_n = psi / psi_denom;
+    if (psi_n > 1.0f) psi_n = 1.0f;
+    if (psi_n < 0.0f) psi_n = 0.0f;
+
     const float used_gat = p.use_gat ? gat_score : 0.0f;
     const float used_ae  = p.use_ae  ? ae_norm   : 0.0f;
-    const float phi = lp * psi + lg * used_gat + la * used_ae;
-    return FusionScore{psi, used_gat, used_ae, phi, phi > p.phi_threshold};
+    const float phi = lp * psi_n + lg * used_gat + la * used_ae;
+    return FusionScore{psi_n, used_gat, used_ae, phi, phi > p.phi_threshold};
 }
 
 #endif

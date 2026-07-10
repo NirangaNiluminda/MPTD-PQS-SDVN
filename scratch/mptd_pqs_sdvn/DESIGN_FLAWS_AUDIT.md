@@ -438,3 +438,31 @@ Full mode's added value (GAT spatial) is real only for **spatial/Sybil attacks
   drift the 10-beacon AE misses (ties to M8 window; the paper's TP-S5 cumulative
   drift score is the intended mechanism and should feed the AE or ψ). This is the
   real lever for the stealth FN, and the honest path to full-mode superiority.
+
+### 7.6.1 H8 Tier-1 partially applied (2026-07-09) — fusion regression removed
+
+**Root cause pinned.** The fused Φ silently dropped the lightweight signal: the paper
+Eq scales ψ into [0,1], but the code fed **raw** ψ (which maxes ≈ 0.35 for poisoned,
+0 for honest) straight into `Φ = λ_ψ·ψ + λ_gat·gat + λ_ae·ae`. With any reasonable λ,
+raw ψ ≤ 0.35 could never lift Φ past `Φ_th=0.5`, so full mode discarded LW entirely →
+`MCC_full=0.014` while LW=0.445. (The LSTM-AE is separately weak — `ae_raw≈0.003` on
+stealth poison vs `θ_ae=0.246` — but that is Tier-2.)
+
+**Tier-1 fix (applied).** Normalize ψ to its LW decision scale inside `fuse_scores`
+([06d_ai_inference.h](scratch/mptd_pqs_sdvn/06d_ai_inference.h)): `ψ_n = clip(ψ/ψ_th, 0, 1)`
+so a lightweight detection (ψ>ψ_th) reaches 1.0 and can carry Φ. Deployed ψ-dominant
+weights `λ=(0.55, 0.25, 0.20)` (runtime `analytics/ml/models/urban/fusion_weights.json`,
+gitignored) — `λ_ψ>0.5` guarantees `full ⊇ LW` (every LW flag → full flag) while honest
+ψ≡0 means **zero new false positives**.
+
+**Result (a1/p50, SUMO urban, RngRun=2, t=30):** `MCC_full` **0.014 → 0.452**, now ≈ LW
+(0.445), full confusion `TP=821 FP=63` (was `TP=6 FP=1`). The full-mode regression is
+**gone** — full mode no longer performs worse than lightweight.
+
+**Still open (Tier-2, keeps H8 on the queue).** Full mode now *matches* LW but does not
+yet *beat* it on RSU-side attacks (attack 1 has no spatial signal for GAT and the AE is
+weak). To make full > LW: (a) repair/retrain the LSTM-AE so `ae_raw` separates poisoned
+vs honest windows (feature scaling / window / retrain), and (b) demonstrate the GAT win on
+a **spatial** attack (attack 3 Sybil), where coordinated multi-vehicle inconsistency is
+exactly what per-beacon LW misses. Also: refit λ via `train_fusion.py` **with** the new
+ψ-normalization rather than the hand-set values above, and re-derive per-scenario weights.
