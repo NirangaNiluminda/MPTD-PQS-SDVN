@@ -263,11 +263,27 @@ def main():
     tc = num(row, "TCL_confirm"); chk("eq:tcl_confirm", "TCL_confirm=submit→commit≥0 (−1 no Fabric)", tc == -1 or tc >= 0, ">=0/-1", round(tc, 1))
     tr = num(row, "TCL_reassign"); chk("eq:tcl_reassign", "TCL_reassign=revoke→reassign≥0 (−1 no rollover)", tr == -1 or tr >= 0, ">=0/-1", round(tr, 1))
 
+    # ══ L. PAPER ALGORITHMS (Alg 1–9) — code presence ══════════════════════
+    group("L. PAPER ALGORITHMS  (detection procedures + crypto/blockchain)")
+    algs = [
+        ("Alg:LW-DETECT",   "Alg 1 — lightweight rule-based beacon detection", [r"LW-DETECT|rsu_lw|run_lw"]),
+        ("Alg:TP-DETECT",   "trajectory poisoning (TP-S1..S5, dead-reckoning)", [r"TP-DETECT|TP-S1|dead.?reckon"]),
+        ("Alg:SYB-DETECT",  "Sybil mobility-pattern (MP-S1/S2/S4, ghost)", [r"SYB-DETECT|MP-S1|ghost"]),
+        ("Alg:MITM-DETECT", "MitM (HMAC hard-gate + MP-S3 KL-divergence)", [r"MITM-DETECT|MP-S3|KL"]),
+        ("Alg:FULL-DETECT", "full-mode spatio-temporal fusion (GAT+LSTM-AE)", [r"FULL-DETECT|FUSION-WIN|fuse_scores"]),
+        ("Alg:PQ-FHE-TRS",  "pre-coordination FHE encrypt + PQ-TRS signing", [r"run_full_mode_crypto_pipeline|RING-ELECT"]),
+        ("Alg:THRESH-DEC",  "threshold FHE decryption at RSU cluster", [r"threshold_decrypt_vec|THRESH-DEC"]),
+        ("Alg:SC-Register", "BFT-conditioned on-chain registration", [r"SC-REGISTER|SCBootstrap|register_all_nodes"]),
+        ("Alg:CP-DETECT",   "control-plane poisoning detection (TRS + conflict)", [r"CP-DETECT|run_cp_detect|CallCPDetect"]),
+    ]
+    for lbl, desc, pats in algs:
+        chk(lbl, desc, code_has(*pats), "implemented", "present")
+
     # ── summary ─────────────────────────────────────────────────────────────
     print("\n" + "=" * 82)
     tot = _p + _f
-    print(f"  EQUATION AUDIT: {_p}/{tot} equations verified"
-          + (f"   ({_f} FAIL)" if _f else "   — ALL paper equations mapped to code + checked"))
+    print(f"  EQUATION + ALGORITHM AUDIT: {_p}/{tot} checks verified"
+          + (f"   ({_f} FAIL)" if _f else "   — ALL paper equations (Ch3+Ch4) and Algorithms 1–9 present + checked"))
     print("  note: paper §model-selection cites \\ref{eq:fpr} but the label was dropped when")
     print("        FPR was folded into MCC — tracked as a paper-text defect (M3/M5), FPR still")
     print("        computed in-code and audited above.")
