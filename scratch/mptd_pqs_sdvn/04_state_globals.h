@@ -364,7 +364,8 @@ struct VehicleLstmRing {
 };
 
 VehicleLstmRing vehicle_lstm_ring[total_size] = {};
-double          last_psi_per_vehicle[total_size] = {};
+double          last_psi_per_vehicle[total_size] = {};   // H8: SUM of ψ per vehicle within the window
+uint32_t        psi_cnt_per_vehicle[total_size]  = {};   // H8: beacon count, for the per-window MEAN ψ
 
 // ── R7e.4: Controller TPE predictor state (paper Eq 4.6) ──────────────────────
 // TPE = mean Euclidean displacement between controller's PREDICTED position

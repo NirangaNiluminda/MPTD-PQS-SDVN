@@ -466,3 +466,34 @@ vs honest windows (feature scaling / window / retrain), and (b) demonstrate the 
 a **spatial** attack (attack 3 Sybil), where coordinated multi-vehicle inconsistency is
 exactly what per-beacon LW misses. Also: refit λ via `train_fusion.py` **with** the new
 ψ-normalization rather than the hand-set values above, and re-derive per-scenario weights.
+
+### 7.6.2 H8 RESOLVED (2026-07-10) — full mode now beats lightweight
+
+**Second cause (window ψ aggregation).** After Tier-1 removed the Φ-scale bug,
+`MCC_full` matched but did not beat `MCC_LW`, and on the live-Fabric run came out
+slightly *below* it. Root cause: the fusion read `last_psi_per_vehicle` — the ψ of
+a vehicle's **last** beacon in the window — so a vehicle poisoned mid-window but
+clean on its final beacon was dropped at the controller. Switching to **max**-ψ
+over-corrected (recall 0.47→0.93 but precision 0.96→0.57 — a single spurious honest
+beacon flagged the whole vehicle-window).
+
+**Fix (applied).** Aggregate ψ per vehicle per window by **mean** (paper Eq 3.59
+aggregates ψ by mean), reset per window: `psi_i = Σψ/count` over the vehicle's
+beacons in the window (`last_psi_per_vehicle` = Σ, `psi_cnt_per_vehicle` = count;
+[04_state_globals.h], fusion + reset in [08_detection_engine.h]). Mean captures
+*sustained* poisoning (recall) but averages out a one-off honest rule trigger
+(precision) — and, because the fusion then filters LW's spurious per-beacon FPs,
+full mode **beats** LW rather than merely matching it.
+
+**Result (a1/a3 p50, SUMO urban, RngRun=2, t=20, skip_blockchain):**
+| attack | LW MCC (rec/prec) | Full MCC (rec/prec) | Δ |
+|---|---|---|---|
+| 1 (RSU-side) | 0.455 (0.457/0.861) | **0.584** (0.512/**0.982**) | **+0.129** |
+| 3 (Sybil/spatial) | 0.918 (1.0/0.900) | **0.981** (1.0/**0.977**) | **+0.064** |
+
+Full mode now strictly dominates lightweight on both FN and FP for both an
+RSU-side and a spatial attack (FP 64→8 on attack 1 is the precision driver;
+GAT adds the spatial signal on attack 3). H8 closed — full-mode fusion both
+fires and is the strongest configuration. Remaining Tier-2 (retrain the LSTM-AE
+so `ae_raw` separates stealth poison, currently ~0) is now an *enhancement*, not
+a blocker.

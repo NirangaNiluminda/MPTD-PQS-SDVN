@@ -2370,7 +2370,9 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                     for (int i = 0; i < N; ++i) {
                         const uint32_t vid_i = rw.vid[i];
                         if (vid_i >= (uint32_t)total_size) continue;
-                        const float psi_i = (float)last_psi_per_vehicle[vid_i];
+                        const float psi_i = psi_cnt_per_vehicle[vid_i] > 0
+                            ? (float)(last_psi_per_vehicle[vid_i] / psi_cnt_per_vehicle[vid_i])
+                            : 0.0f;   // H8: per-window MEAN ψ
                         const float gat_i = gat_ok ? gat_scores[i] : 0.0f;
                         float ae_err = 0.0f;
                         bool  ae_dumped = false;   // H8 diag
@@ -2561,6 +2563,14 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                         controllerID);
                                 }
                             }
+                        }
+                    }
+                    // H8: reset the per-window ψ mean accumulators for the vehicles
+                    // just fused so the next window starts fresh.
+                    for (int i = 0; i < N; ++i) {
+                        const uint32_t v = rw.vid[i];
+                        if (v < (uint32_t)total_size) {
+                            last_psi_per_vehicle[v] = 0.0; psi_cnt_per_vehicle[v] = 0;
                         }
                     }
                     if (fused_count > 0) {
@@ -3372,7 +3382,12 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // exactly what the LW-DETECT authority saw — no double-counting of
         // attacker-flipped values from a different code path.
         if (vid < (uint32_t)total_size) {
-            last_psi_per_vehicle[vid] = rsu_lw.psi;
+            // H8: accumulate ψ per vehicle within the window for a per-window MEAN
+            // (paper Eq 3.59 aggregates ψ by mean). Mean captures sustained
+            // poisoning (recall) without amplifying a single spurious honest-beacon
+            // ψ into a whole-window false positive (as max-ψ did). Reset per window.
+            last_psi_per_vehicle[vid] += rsu_lw.psi;
+            psi_cnt_per_vehicle[vid]++;
             // 6th AE feature = tau_i. The trained scaler has tau mean=1.0
             // scale=1.0, and the AE was trained on clean data where tau≡1.0
             // (scaled→0.0). Feed the default trusted value to stay on-manifold
