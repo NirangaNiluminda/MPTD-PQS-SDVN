@@ -5,6 +5,18 @@
 **Method:** paper-conformance audit. The paper is the only authority; existing code **and its comments** are treated as possibly wrong. This v2 re-run reads the paper PDF directly (§3.4.4, §3.5.2–3.5.5, §4.1) and cross-checks every claim against `file:line` — so each finding is now confirmed against the equation/figure, not inferred.
 **Pages read this session:** 38–53 (signatures, LKH, Alg 1), 54–71 (Alg 2–9, fusion, crypto, consensus), 72–82 (metrics + current results). Code: `scratch/mptd_pqs_sdvn/`.
 
+> **CURRENT STATUS (updated 2026-07-11).** The severity table and §0 below are the
+> *original* findings; most are now resolved (see the Status column + §6/§7 notes).
+> Live-system snapshot today: **full mode is the strongest detector** —
+> `MCC_full = 0.56 > LW MCC = 0.43` on the no-bypass live-Fabric run
+> (SUMO + Hyperledger Fabric + PQ crypto + GAT/LSTM), full-mode confusion
+> `TP=1388 FP=1`. All 🔴 Critical items and H5–H8 are resolved. **Open items are
+> now narrow:** M6/M7/M8 (methodology decisions — hold for supervisor), M9
+> (t_sign/t_decrypt code split, §7.5), and H8 Tier-2 (LSTM-AE retrain — an
+> enhancement, not a blocker). Note per supervisor: `verify_simulation.py` /
+> `equation_audit.py` are self-consistency checks, **not** a substitute for
+> manual hand-verification of the functional test.
+
 ---
 
 ## 0. Executive summary
@@ -30,7 +42,7 @@ The problems are concentrated in **how the full mode connects to the metrics and
 | H5 | 🟠 High | No Δ_HMAC freshness window / cluster replay cache (nonce ν_i itself OK) | HMAC beacon-auth spec | **✅ Resolved 2026-07-05** (§7.1, smoke-verified) |
 | H6 | 🟠 High | TRS messages lack ring nonce ν_S / Δ_TRS freshness — σ_TRS replayable | Eq trs_message/trs_fresh | **✅ Resolved 2026-07-05** (§7.1, smoke-verified) |
 | H7 | 🟠 High | Plausibility envelope checks absent at Enc() and THRESH-DEC (no last-valid fallback) | Alg pq_fhe_trs l.3, thresh_dec | **✅ Resolved 2026-07-05** (§7.1; C4b attack-path reachability still open) |
-| H8 | 🟠 High | **Full-mode fusion detects nothing** — 0 `full_anom` flags, per-window `max_phi≈0.23 < Φ_th=0.5` → `MCC_full=0.014` vs LW `MCC=0.429`. LSTM-AE contributes 0 (`ae_norm=0.000` always) and GAT is legitimately low for RSU-side attacks; blocks any *full-mode* vs-baseline comparison | Eq fusion/flag (3.46) | **New 2026-07-09 (§7.6)** — OPEN; runtime consequence of M6/M7/M8 + dead AE |
+| H8 | 🟠 High | **Full-mode fusion was silent** (`MCC_full=0.014`, 0 `full_anom`) — two causes: raw ψ never reached Φ_th (Tier-1) + window ψ aggregation used *last* beacon (mean-ψ). | Eq fusion/flag (3.46) | **✅ Resolved 2026-07-10** (§7.6.2) — ψ-normalization + per-window mean-ψ; full mode now **beats** LW (`MCC_full 0.56 > LW 0.43` live-Fabric; 0.584/0.981 skip-bc). Tier-2 (retrain LSTM-AE) = enhancement, not blocker |
 | M6 | 🟡 Medium | Fusion uses bare S, not S/θ_S; θ_S never trained/loaded | Eq fusion | **New (v3, §7.2)** — methodology decision |
 | M7 | 🟡 Medium | GAT standardization is live snapshot-level, not locked per-node clean stats | Eq gat_score | **New (v3, §7.2)** — methodology decision |
 | M8 | 🟡 Medium | lstm_ae.py WINDOW_SIZE=20 vs deployed 10; paper table Urban L=20 stale | §model-selection | **New (v3, §7.2)** |
@@ -316,7 +328,7 @@ Priority order, superseding §5 where they overlap:
 7. **M3/M5** comment sweep + paper-text fixes (add: Urban L=20 table row; `Eq \ref{eq:fpr}` referenced in §model-selection though FPR was dropped as a metric; fold in dead `evidence_sign_and_verify` cleanup)
 8. **Eval-config decision**: Δ_HMAC=0.5 s vs 3.5 s (ns-3 ARP warm-up causes ~1% honest-stale FPs at 0.5 s — see §7.1 H5 resolution note) — hold for supervisor before batch runs
 9. **TRS `t_sign`/`t_decrypt` conflation** (surfaced by C4b forgery work): `g_trs_ring_t=3` drives both the sign loop (should be `t_sign=2`) and the decrypt present-set (correctly `t_decrypt=3`). Split into `g_trs_sign_t`/`g_trs_decrypt_t` — see §6.1 C4b "New finding" note. Low-risk but touches the wired FHE decrypt path, so isolated from the PARR change.
-10. **H8 — full-mode fusion detects nothing** (§7.6, surfaced 2026-07-09 by the full-mode-vs-baselines deliverable): `MCC_full=0.014`, 0 `full_anom` flags — the LSTM-AE is dead (`ae_norm=0`) and GAT is legitimately low for RSU-side attacks. **Blocks the full-mode superiority claim**; LW mode (0.429) is the only working detector today. Fix = instrument/repair the AE + recalibrate θ_ae/Φ_th on clean data (ties M6/M7/M8). This is "Option B" of the baseline comparison.
+10. ~~**H8 — full-mode fusion detects nothing**~~ — **RESOLVED 2026-07-10** (§7.6.2). Two stacked causes fixed: (a) Tier-1 ψ-normalization so the LW signal reaches Φ_th, (b) per-window **mean-ψ** aggregation (Eq 3.59) so a vehicle poisoned anywhere in the window carries its score into the fusion. Full mode now **strictly beats** LW — `MCC_full 0.56 > LW 0.43` on the live-Fabric full-system run, 0.584 (attack 1) / 0.981 (attack 3) skip-blockchain. The full-mode superiority claim is now supported. Remaining Tier-2 (retrain the LSTM-AE so `ae_raw` separates stealth poison) is an *enhancement*, not a blocker.
 
 ~~H5 Δ_HMAC + cluster replay cache~~ and ~~H6 ν_S/Δ_TRS (coordinator+cloud side)~~ and ~~H7 plausibility envelope~~ — all resolved 2026-07-05, see §7.1 resolution notes.
 
@@ -340,7 +352,7 @@ The code correctly configures the **FHE** backend at `threshold=3` (`init_thresh
 3. Point the FHE decrypt present-set loops (08:~1495, ~1671) at the **FHE** threshold — prefer `g_thfhe_backend->threshold()` (single source of truth) over a mirrored global.
 4. Re-run the crypto self-test (06b3 TRS-1..4 + PIPE) under the new 2-of-4 sharing and the Full-mode smoke to confirm verify still passes and decryption still recovers the aggregate. **Was mid-implementation when deferred; no code changed.**
 
-## 7.6 H8 — Full-mode fusion detects nothing (OPEN, 2026-07-09)
+## 7.6 H8 — Full-mode fusion detects nothing (RESOLVED 2026-07-10 — see §7.6.2; history below)
 
 **Symptom.** In a full-mode run (`ablation_mode=0`, GAT+LSTM-AE loaded), the fused
 detector flags **zero** vehicles: `0 [FUSION-…] full_anom=yes` across a whole 30 s
@@ -497,3 +509,14 @@ GAT adds the spatial signal on attack 3). H8 closed — full-mode fusion both
 fires and is the strongest configuration. Remaining Tier-2 (retrain the LSTM-AE
 so `ae_raw` separates stealth poison, currently ~0) is now an *enhancement*, not
 a blocker.
+
+**End-to-end confirmation (live Fabric, no bypass).** Re-verified on the full
+no-bypass run `run_20260710_102920_a1_p50` (`skip_blockchain=false`,
+`routing_algorithm=4`, SUMO urban, t=30, 64/64 RSUs `bootstrap OK`, 0 failed):
+`MCC = 0.429` (LW) vs **`MCC_full = 0.560`** (full), with full-mode confusion
+`TP=1388 FP=1 TN=859 FN=842` → recall 0.622 / precision **0.999** vs LW
+0.520 / 0.962. So full mode beats lightweight on *both* recall and precision
+in the complete system (live ledger + PQ crypto + AI), not just the fast
+skip-blockchain path. `verify_simulation.py` 17/17 and `equation_audit.py`
+101/101 pass on this run (note: those are self-consistency checks — see the
+manual-verification follow-up, they are not a substitute for hand-inspection).
