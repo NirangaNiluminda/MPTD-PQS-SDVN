@@ -45,6 +45,13 @@ int main(int argc, char *argv[])
     cmd.AddValue ("mobility_scenario", "mobility_scenario", mobility_scenario);
     cmd.AddValue ("architecture", "architecture", architecture);
     cmd.AddValue ("maxspeed", "maxspeed", maxspeed);
+    // Sensitivity-analysis knobs (paper §4.3.4 grid-search tables). Each maps to
+    // the LW-detector global it calibrates; swept one-at-a-time by run_sensitivity.sh.
+    cmd.AddValue ("psi_th",         "composite alert threshold psi_th (Eq 3.21)",        psi_th);
+    cmd.AddValue ("kappa_th",       "MP-S3 KL-divergence threshold kappa_th (Eq 3.18)",  kappa_th);
+    cmd.AddValue ("delta_th",       "TP-S5 drift threshold delta_th, m (Eq 3.20)",       delta_th);
+    cmd.AddValue ("drift_window_k", "TP-S5 drift observation window, beacons",           drift_window_k);
+    cmd.AddValue ("k_sybil",        "MP-S1 Sybil density factor K_sybil (Eq 3.8)",       K_sybil);
     cmd.AddValue ("lambda", "lambda", lambda);
     cmd.AddValue ("delta_hmac", "H5 Delta_HMAC beacon freshness window (s)", delta_hmac);
     cmd.AddValue ("delta_trs", "H6 Delta_TRS sigma_TRS freshness window (s)", delta_trs);
