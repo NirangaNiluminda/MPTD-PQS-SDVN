@@ -17,7 +17,8 @@ import numpy as np, pandas as pd
 import onnxruntime as ort
 
 ML = os.path.dirname(os.path.abspath(__file__))
-L, D, KAPPA = 10, 6, 3.0
+L, D = 10, 6
+KAPPA = float(os.environ.get("MPTD_KAPPA", "3.0"))   # AE MAD/σ factor (sweepable)
 COLS = ["pos_x", "pos_y", "speed", "heading", "accel"]
 
 

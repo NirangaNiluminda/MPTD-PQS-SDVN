@@ -91,9 +91,11 @@ def _safe_div(num, den):
 
 
 def compute_mcc(tp, fp, tn, fn):
-    """Eq. 4.1 — Matthews Correlation Coefficient."""
-    denom = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
-    return (tp * tn - fp * fn) / (denom ** 0.5 + 1e-9) if denom else 0.0
+    """Eq. 4.1 — ε-smoothed MCC (defined at class absence, e.g. ρ_a=0)."""
+    e = 1e-12
+    num   = (tp + e) * (tn + e) - (fp + e) * (fn + e)
+    denom = ((tp + fp + e) * (tp + fn + e) * (tn + fp + e) * (tn + fn + e)) ** 0.5
+    return num / denom
 
 
 # NOTE: PARR/CDER/TDEE/TPE proxy formulas were removed (2026-06-10). These four

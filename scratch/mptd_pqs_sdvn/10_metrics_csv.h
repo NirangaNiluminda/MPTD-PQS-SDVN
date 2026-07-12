@@ -644,9 +644,13 @@ void log_controller_poison(double sim_t,
 double compute_MCC()
 {
     double tp = cm_TP, fp = cm_FP, tn = cm_TN, fn = cm_FN;
-    double denom = std::sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn));
-    if (denom < 1e-9) return 0.0;
-    return (tp*tn - fp*fn) / denom;
+    // Eq 4.1: ε-smoothed MCC — removes the undefined 0/0 when a class is absent
+    // (e.g. ρ_a=0 → no attackers → TP=FN=0). ε=1e-12 is negligible for any
+    // non-degenerate confusion matrix, so real MCC values are unchanged.
+    const double e = 1e-12;
+    double num   = (tp+e)*(tn+e) - (fp+e)*(fn+e);
+    double denom = std::sqrt((tp+fp+e)*(tp+fn+e)*(tn+fp+e)*(tn+fn+e));
+    return num / denom;
 }
 
 // FPR: False Positive Rate  —  FP / (FP + TN)
@@ -663,9 +667,11 @@ double compute_FPR()
 double compute_MCC_full()
 {
     double tp = cm_full_TP, fp = cm_full_FP, tn = cm_full_TN, fn = cm_full_FN;
-    double denom = std::sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn));
-    if (denom < 1e-9) return 0.0;
-    return (tp*tn - fp*fn) / denom;
+    // Eq 4.1: ε-smoothed MCC (see compute_MCC) — defined at class absence.
+    const double e = 1e-12;
+    double num   = (tp+e)*(tn+e) - (fp+e)*(fn+e);
+    double denom = std::sqrt((tp+fp+e)*(tp+fn+e)*(tn+fp+e)*(tn+fn+e));
+    return num / denom;
 }
 
 double compute_FPR_full()
