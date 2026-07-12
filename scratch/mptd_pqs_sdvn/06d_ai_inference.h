@@ -248,6 +248,19 @@ public:
                       << theta_ae_ << std::endl;
         }
 
+        // Option A (Eq 3.46): θ_S — GAT spatial calibration threshold, sits next
+        // to the GAT model (models/shared/theta_s.txt). Falls back to the compiled
+        // default g_theta_s if missing.
+        if (!gat_path.empty()) {
+            std::string ts_path =
+                gat_path.substr(0, gat_path.find_last_of('/') + 1) + "theta_s.txt";
+            std::ifstream tsf(ts_path);
+            if (tsf) { tsf >> g_theta_s;
+                std::cout << "[AI-INIT] θ_S loaded: " << g_theta_s << std::endl; }
+            else std::cerr << "[AI-INIT] θ_S file missing, using fallback "
+                           << g_theta_s << std::endl;
+        }
+
         // Fusion weights
         if (!weights_path.empty()) {
             if (!load_fusion_weights_json(weights_path, g_fusion)) {
@@ -505,7 +518,15 @@ inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
     if (psi_n > 1.0f) psi_n = 1.0f;
     if (psi_n < 0.0f) psi_n = 0.0f;
 
-    const float used_gat = p.use_gat ? gat_score : 0.0f;
+    // Option A (Eq 3.46): the GAT model now emits the RAW spatial anomaly score
+    // S_i = ||(x'−x̄'_clean)/σ'_clean||₂; normalise by θ_S and clip to [0,1] so it
+    // is a comparable weighted-average term (was raw sigmoid before).
+    float used_gat = 0.0f;
+    if (p.use_gat) {
+        used_gat = gat_score / (g_theta_s > 1e-9f ? g_theta_s : 1e-9f);
+        if (used_gat > 1.0f) used_gat = 1.0f;
+        if (used_gat < 0.0f) used_gat = 0.0f;
+    }
     const float used_ae  = p.use_ae  ? ae_norm   : 0.0f;
     const float phi = lp * psi_n + lg * used_gat + la * used_ae;
     return FusionScore{psi_n, used_gat, used_ae, phi, phi > p.phi_threshold};
@@ -622,7 +643,15 @@ inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
     if (psi_n > 1.0f) psi_n = 1.0f;
     if (psi_n < 0.0f) psi_n = 0.0f;
 
-    const float used_gat = p.use_gat ? gat_score : 0.0f;
+    // Option A (Eq 3.46): the GAT model now emits the RAW spatial anomaly score
+    // S_i = ||(x'−x̄'_clean)/σ'_clean||₂; normalise by θ_S and clip to [0,1] so it
+    // is a comparable weighted-average term (was raw sigmoid before).
+    float used_gat = 0.0f;
+    if (p.use_gat) {
+        used_gat = gat_score / (g_theta_s > 1e-9f ? g_theta_s : 1e-9f);
+        if (used_gat > 1.0f) used_gat = 1.0f;
+        if (used_gat < 0.0f) used_gat = 0.0f;
+    }
     const float used_ae  = p.use_ae  ? ae_norm   : 0.0f;
     const float phi = lp * psi_n + lg * used_gat + la * used_ae;
     return FusionScore{psi_n, used_gat, used_ae, phi, phi > p.phi_threshold};

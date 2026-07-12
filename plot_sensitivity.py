@@ -22,11 +22,12 @@ OUT = os.path.dirname(os.path.abspath(CSV))
 
 # paper-selected (bold) value per parameter, and pretty labels
 SEL   = {"psi_th":0.09, "kappa_th":0.50, "delta_th":10.0,
-         "maxspeed":100, "drift_window":10, "k_sybil":5.0}
+         "maxspeed":100, "drift_window":10, "k_sybil":5.0, "phi_th":0.5108}
 LABEL = {"psi_th":r"$\psi_{th}$ (composite alert)", "kappa_th":r"$\kappa_{th}$ (KL, nats)",
          "delta_th":r"$\delta_{th}$ (drift, m)", "maxspeed":r"$s_{max}$ (km/h)",
-         "drift_window":"drift window (beacons)", "k_sybil":"Sybil density factor"}
-ORDER = ["psi_th","kappa_th","delta_th","maxspeed","drift_window","k_sybil"]
+         "drift_window":"drift window (beacons)", "k_sybil":"Sybil density factor",
+         "phi_th":r"$\Phi_{th}$ (fusion decision)", "attack_pct":r"$\rho_a$ (attack \%)"}
+ORDER = ["psi_th","kappa_th","delta_th","maxspeed","drift_window","k_sybil","phi_th","attack_pct"]
 
 def fnum(x):
     try: return float(x)
@@ -107,7 +108,9 @@ open(os.path.join(OUT,"sensitivity_tables.tex"),"w").write("\n".join(tex))
 # "sensitivity sweeps as a text message"). Plain text, chat-pasteable. #
 # ------------------------------------------------------------------ #
 # plain-text labels for the chat message (the plots keep the LaTeX ones)
-TXTLABEL = {"psi_th":"psi_th (composite alert threshold)",
+TXTLABEL = {"phi_th":"Phi_th (fusion decision threshold)",
+            "attack_pct":"rho_a (attack penetration %)",
+            "psi_th":"psi_th (composite alert threshold)",
             "kappa_th":"kappa_th (KL divergence, nats)",
             "delta_th":"delta_th (drift threshold, m)",
             "maxspeed":"s_max (speed bound, km/h)",

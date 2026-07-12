@@ -52,6 +52,7 @@ int main(int argc, char *argv[])
     cmd.AddValue ("delta_th",       "TP-S5 drift threshold delta_th, m (Eq 3.20)",       delta_th);
     cmd.AddValue ("drift_window_k", "TP-S5 drift observation window, beacons",           drift_window_k);
     cmd.AddValue ("k_sybil",        "MP-S1 Sybil density factor K_sybil (Eq 3.8)",       K_sybil);
+    cmd.AddValue ("s_max_kmh",      "TP-S1/MP-S4 detection speed bound (km/h); overrides s_max, decoupled from --maxspeed/trace", g_s_max_cli_kmh);
     cmd.AddValue ("lambda", "lambda", lambda);
     cmd.AddValue ("delta_hmac", "H5 Delta_HMAC beacon freshness window (s)", delta_hmac);
     cmd.AddValue ("delta_trs", "H6 Delta_TRS sigma_TRS freshness window (s)", delta_trs);
@@ -61,6 +62,11 @@ int main(int argc, char *argv[])
     cmd.AddValue ("routing_algorithm", "routing_algorithm", routing_algorithm);
     cmd.AddValue ("qf", "qf", qf);
     cmd.AddValue ("attack_percentage", "attack_percentage", attack_percentage);
+    cmd.AddValue ("stealth_fraction",
+                  "Exp1 attack intensity gamma: fraction of injected beacons using the "
+                  "stealth (low-magnitude) perturbation vs abrupt. {1.0 stealth-only, "
+                  "0.70 mixed(default), 0.0 abrupt-only}",
+                  stealth_fraction_theta_s);
     cmd.AddValue ("rsu_seed", "RSU compromise random seed (0=random each run)", rsu_seed);
     cmd.AddValue ("sybil_registration_pct",
                   "Attack 3 enhanced mode: % of vehicles pre-registered as Sybil at startup "
@@ -104,6 +110,9 @@ int main(int argc, char *argv[])
                   "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
                   g_mobility_source);
     cmd.Parse (argc, argv);
+    // --s_max_kmh: detection speed bound, decoupled from --maxspeed (which drives
+    // the SUMO trace filename mobility_<tag>_<speed>.tcl). km/h → m/s for TP-S1/MP-S4/MP-S3.
+    if (g_s_max_cli_kmh > 0.0) s_max = g_s_max_cli_kmh / 3.6;
 
     // ── C10: dispatch paper ablation AB1..AB11 onto the fine-grained toggles ──
     // AB variants are "full mode minus one mechanism", so every AB except
@@ -179,9 +188,19 @@ int main(int argc, char *argv[])
         if (mobility_scenario == 1) scenario_sub = "rural";
         else if (mobility_scenario == 2) scenario_sub = "highway";
 
-        const std::string gat_path     = g_enable_gat
-                                         ? NS3_ROOT "/analytics/ml/models/shared/gat_model.onnx"
-                                         : std::string();
+        // GAT is now per-scenario (Phase-1b clean stats + θ_S re-derived on each
+        // scenario's clean SUMO traces — recalibrate_gat_per_scenario.py). The
+        // shared urban-only GAT mis-scored fast rural/highway motion (inflated
+        // FPR). θ_S auto-loads from the same directory (see below), so pointing
+        // gat_path at models/<scenario>/ swaps the threshold too. Fall back to
+        // the shared model if a scenario file is absent.
+        std::string gat_scen_path = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/gat_model.onnx";
+        {
+            std::ifstream gtest(gat_scen_path);
+            if (!gtest.good())
+                gat_scen_path = NS3_ROOT "/analytics/ml/models/shared/gat_model.onnx";
+        }
+        const std::string gat_path     = g_enable_gat ? gat_scen_path : std::string();
         const std::string lstm_ae_path = g_enable_lstm_ae
                                          ? NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/lstm_ae_model.onnx"
                                          : std::string();

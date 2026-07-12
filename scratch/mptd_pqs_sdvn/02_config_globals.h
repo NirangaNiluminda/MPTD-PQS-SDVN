@@ -239,6 +239,7 @@ double R_max_comm = 270.0;  // Max V2V/V2I communication range (m); 41 dBm DSRC 
 // ── Trajectory Poisoning Detection Thresholds (§3.4.4) ────────────────────
 // TP-S1: Kinematic position feasibility
 double s_max = 33.33;       // Max road speed ~120 km/h (m/s)
+double g_s_max_cli_kmh = -1.0;  // --s_max_kmh override (km/h); -1 = keep default s_max. Decoupled from --maxspeed (which drives the SUMO trace file).
 
 // TP-S2: Heading rate deviation
 double omega_max = 0.5236;  // Max angular velocity (rad/s) = 30 deg/s
@@ -290,6 +291,7 @@ double kappa_th              = 0.1;   // KL divergence detection threshold (Eq. 
 // Previous value 0.30 was set for a fully-trained GAT+LSTM-AE system (not yet
 // implemented); 0.09 is calibrated to the rule-based branch's weight distribution.
 double psi_th    = 0.09;    // Lightweight mode isolation threshold (rule-based branch)
+float  g_theta_s = 8.560697f;  // Option A (Eq 3.46): GAT spatial calibration θ_S (95th pctl of clean S_i). Overridden from models/shared/theta_s.txt at AI init.
 
 // ── H5: HMAC replay protection (paper HMAC gate: freshness Δ_HMAC + cluster nonce cache) ──
 // Δ_HMAC: max age of an authentic beacon at the RSU. Beacons are sent every
