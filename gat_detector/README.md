@@ -276,6 +276,7 @@ records val MCC (mean +/- std) and FPR, picks the best. Writes
 
     python score.py --scenario urban --data_root data
     python score.py --scenario rural --data_root data
+    python score.py --scenario highway --data_root data
     # -> outputs/<scenario>_scores.csv
 
 ## Run all three at once

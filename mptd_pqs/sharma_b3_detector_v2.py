@@ -360,13 +360,16 @@ def compute_metrics(y_true: np.ndarray,
     Return MCC, FPR, PARR, CDER, TDEE, TPE, PBPO for one test fold.
     Same definitions as the Ercan B2 detector.
     """
-    if len(np.unique(y_true)) < 2 or len(np.unique(y_pred)) < 2:
-        mcc = 0.0
-    else:
-        mcc = matthews_corrcoef(y_true, y_pred)
-
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+
+    # ε-smoothed MCC (Eq 4.1) — matches the C++ MPTD-PQS pipeline (ε=1e-12) so the
+    # baseline MCC is comparable in degenerate / class-imbalance cases (raw
+    # sklearn matthews_corrcoef returns 0 there, diverging from MPTD-PQS).
+    _e   = 1e-12
+    _num = (tp + _e) * (tn + _e) - (fp + _e) * (fn + _e)
+    _den = ((tp + fp + _e) * (tp + fn + _e) * (tn + fp + _e) * (tn + fn + _e)) ** 0.5
+    mcc  = float(_num / _den)
 
     fpr  = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     parr = tp / n_total if n_total > 0 else 0.0

@@ -175,7 +175,12 @@ def compute_metrics(y_true: np.ndarray,
     cm             = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
-    mcc  = float(matthews_corrcoef(y_true, y_pred))
+    # ε-smoothed MCC (Eq 4.1) — matches the C++ MPTD-PQS pipeline (ε=1e-12) so the
+    # baseline MCC is comparable in degenerate / class-imbalance cases.
+    _e   = 1e-12
+    _num = (tp + _e) * (tn + _e) - (fp + _e) * (fn + _e)
+    _den = ((tp + fp + _e) * (tp + fn + _e) * (tn + fp + _e) * (tn + fn + _e)) ** 0.5
+    mcc  = float(_num / _den)
     fpr  = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     parr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 

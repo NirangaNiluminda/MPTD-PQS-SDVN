@@ -17,6 +17,7 @@ Edge condition (paper Eq. 3.21, 3.38): BOTH must hold:
 Output:  S_i(t) ∈ [0,1] — spatial anomaly score per vehicle (Eq. 3.42)
 """
 
+import os
 import torch
 import torch.nn as nn
 from torch_geometric.nn import GATConv
@@ -27,6 +28,15 @@ R_MAX       = 300.0         # maximum communication range (metres)
 PHI_MAX     = np.pi / 2     # max heading divergence for edge (90° — urban VANET)
 FEATURE_DIM = 6             # [pos_x, pos_y, speed, heading, accel, tau_i]
 TAU_INIT    = 1.0           # default trust score when blockchain unavailable
+
+# Hyperparameters overridable via env for the Phase-2 sensitivity sweeps
+# (#7 arch, #15 dropout, #18 LeakyReLU slope). Defaults = current deployed model.
+_GAT_DROPOUT = float(os.environ.get("MPTD_GAT_DROPOUT", "0.1"))
+_GAT_HEADS   = int(os.environ.get("MPTD_GAT_HEADS",   "4"))
+_GAT_HIDDEN  = int(os.environ.get("MPTD_GAT_HIDDEN",  "32"))
+_GAT_EMB     = int(os.environ.get("MPTD_GAT_EMB",     "16"))
+_GAT_NSLOPE  = float(os.environ.get("MPTD_GAT_NSLOPE", "0.2"))
+_GAT_ACT     = os.environ.get("MPTD_GAT_ACT", "elu").lower()   # 'elu' (code) or 'leaky' (paper)
 
 
 class GATDetector(nn.Module):
@@ -40,12 +50,12 @@ class GATDetector(nn.Module):
     Output shape: (N, 1)   spatial anomaly score S_i ∈ [0,1]
     """
 
-    def __init__(self, in_dim: int = FEATURE_DIM, hidden: int = 32, heads: int = 4):
+    def __init__(self, in_dim: int = FEATURE_DIM, hidden: int = _GAT_HIDDEN, heads: int = _GAT_HEADS):
         super().__init__()
-        self.conv1 = GATConv(in_dim, hidden, heads=heads, dropout=0.1)
-        # concat=True → output dim = hidden * heads = 128
-        self.conv2 = GATConv(hidden * heads, 16, heads=1, concat=False, dropout=0.1)
-        self.act   = nn.ELU()
+        self.conv1 = GATConv(in_dim, hidden, heads=heads, dropout=_GAT_DROPOUT, negative_slope=_GAT_NSLOPE)
+        # concat=True → output dim = hidden * heads
+        self.conv2 = GATConv(hidden * heads, _GAT_EMB, heads=1, concat=False, dropout=_GAT_DROPOUT, negative_slope=_GAT_NSLOPE)
+        self.act   = nn.LeakyReLU(_GAT_NSLOPE) if _GAT_ACT.startswith("leaky") else nn.ELU()
         # Learnable score head: linear projection of the raw z-score L2 norm
         # into the sigmoid's "useful" range. Without these, the bare
         # sigmoid(L2-norm-of-16-dim-z-score) saturates near 1.0 for ALL nodes

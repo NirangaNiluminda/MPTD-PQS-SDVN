@@ -21,13 +21,23 @@ CSV = sys.argv[1] if len(sys.argv) > 1 else "sensitivity.csv"
 OUT = os.path.dirname(os.path.abspath(CSV))
 
 # paper-selected (bold) value per parameter, and pretty labels
-SEL   = {"psi_th":0.09, "kappa_th":0.50, "delta_th":10.0,
-         "maxspeed":100, "drift_window":10, "k_sybil":5.0, "phi_th":0.5108}
+SEL   = {"psi_th":0.05, "kappa_th":0.50, "delta_th":5.0,
+         "maxspeed":100, "drift_window":15, "k_sybil":4.0, "phi_th":0.5108,
+         "kappa_ae":3.0, "stealth_gamma":0.7,
+         "phi_max":1.570796, "dropout":0.6, "lr":0.005, "weight_decay":0.0005,
+         "gat_heads":4, "gat_hidden":32, "leaky_slope":0.2}
 LABEL = {"psi_th":r"$\psi_{th}$ (composite alert)", "kappa_th":r"$\kappa_{th}$ (KL, nats)",
          "delta_th":r"$\delta_{th}$ (drift, m)", "maxspeed":r"$s_{max}$ (km/h)",
          "drift_window":"drift window (beacons)", "k_sybil":"Sybil density factor",
-         "phi_th":r"$\Phi_{th}$ (fusion decision)", "attack_pct":r"$\rho_a$ (attack \%)"}
-ORDER = ["psi_th","kappa_th","delta_th","maxspeed","drift_window","k_sybil","phi_th","attack_pct"]
+         "phi_th":r"$\Phi_{th}$ (fusion decision)", "attack_pct":r"$\rho_a$ (attack \%)",
+         "kappa_ae":r"$\kappa$ (AE MAD factor)", "stealth_gamma":r"$\gamma$ (stealth proportion)",
+         "phi_max":r"$\phi_{max}$ (edge heading, rad)", "dropout":"GAT dropout",
+         "lr":"GAT learning rate", "weight_decay":"GAT weight decay",
+         "gat_heads":"GAT attention heads", "gat_hidden":"GAT hidden dim",
+         "leaky_slope":"LeakyReLU slope"}
+ORDER = ["psi_th","kappa_th","delta_th","maxspeed","drift_window","k_sybil",
+         "phi_max","dropout","lr","weight_decay","gat_heads","gat_hidden","leaky_slope",
+         "kappa_ae","phi_th","attack_pct","stealth_gamma"]
 
 def fnum(x):
     try: return float(x)
@@ -110,6 +120,8 @@ open(os.path.join(OUT,"sensitivity_tables.tex"),"w").write("\n".join(tex))
 # plain-text labels for the chat message (the plots keep the LaTeX ones)
 TXTLABEL = {"phi_th":"Phi_th (fusion decision threshold)",
             "attack_pct":"rho_a (attack penetration %)",
+            "kappa_ae":"kappa (AE MAD sensitivity factor)",
+            "stealth_gamma":"gamma (attack intensity / stealth proportion)",
             "psi_th":"psi_th (composite alert threshold)",
             "kappa_th":"kappa_th (KL divergence, nats)",
             "delta_th":"delta_th (drift threshold, m)",

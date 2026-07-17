@@ -353,7 +353,7 @@ public:
                 }
                 const float cos_a = (vx_i*vx_j + vy_i*vy_j) / (n_i * n_j);
                 if (std::acos(std::max(-1.0f, std::min(1.0f, cos_a)))
-                    > (float)mptd_ai::PHI_MAX_GRAPH) continue;
+                    > (float)g_phi_max_graph) continue;   // #9 sensitivity: runtime phi_max
                 src.push_back(i);
                 dst.push_back(j);
             }

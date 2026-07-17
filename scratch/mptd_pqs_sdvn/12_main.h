@@ -67,6 +67,15 @@ int main(int argc, char *argv[])
                   "stealth (low-magnitude) perturbation vs abrupt. {1.0 stealth-only, "
                   "0.70 mixed(default), 0.0 abrupt-only}",
                   stealth_fraction_theta_s);
+    cmd.AddValue ("phi_max",
+                  "#9 sensitivity: GAT edge heading-divergence bound (radians); two "
+                  "vehicles are graph neighbours only if heading diff <= phi_max "
+                  "(default pi/2=1.5708)",
+                  g_phi_max_graph);
+    cmd.AddValue ("fhe_ring_dim",
+                  "#12 sensitivity: force FHE ring dimension N (0=auto for L5; "
+                  "e.g. 32768 or 65536). Larger N = safer but slower crypto (COO_fhe).",
+                  g_fhe_ring_dim);
     cmd.AddValue ("rsu_seed", "RSU compromise random seed (0=random each run)", rsu_seed);
     cmd.AddValue ("sybil_registration_pct",
                   "Attack 3 enhanced mode: % of vehicles pre-registered as Sybil at startup "
@@ -163,6 +172,8 @@ int main(int argc, char *argv[])
         case 2: ab_gat_default = true;  ab_ae_default = false; break;   // A2
         case 3: ab_gat_default = false; ab_ae_default = true;  break;   // A3
         case 6: ab_gat_default = false; ab_ae_default = false; break;   // B1
+        case 7: ab_gat_default = true;  ab_ae_default = false; break;   // B2 standalone GAT (ψ excluded in scoring)
+        case 8: ab_gat_default = false; ab_ae_default = true;  break;   // B3 standalone AE  (ψ excluded in scoring)
         case 4: case 5: case 0: default: /* both true */          break;
     }
     g_enable_gat     = (g_enable_gat_cli     >= 0) ? (g_enable_gat_cli     != 0) : ab_gat_default;

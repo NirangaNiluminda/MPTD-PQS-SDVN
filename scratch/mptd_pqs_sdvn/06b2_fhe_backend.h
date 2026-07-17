@@ -111,6 +111,7 @@ public:
             // NIST Level 5 (supervisor requirement 2026-06): 256-bit
             // post-quantum security, consistent with the threshold backend.
             params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
+            if (g_fhe_ring_dim > 0) params.SetRingDim(g_fhe_ring_dim);  // #12 sensitivity override
 
             ctx_ = lbcrypto::GenCryptoContext(params);
             ctx_->Enable(lbcrypto::PKE);
@@ -316,10 +317,12 @@ public:
             params.SetMultipartyMode(lbcrypto::NOISE_FLOODING_MULTIPARTY);
             params.SetThresholdNumOfParties(n_parties_);
             params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
+            if (g_fhe_ring_dim > 0) params.SetRingDim(g_fhe_ring_dim);  // #12 sensitivity override
             // NIST Level 5 (supervisor requirement 2026-06): 256-bit
             // post-quantum security. Paper Table 3.13. OpenFHE auto-selects
             // a ring dimension large enough to meet HEStd_256_quantum.
             params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
+            if (g_fhe_ring_dim > 0) params.SetRingDim(g_fhe_ring_dim);  // #12 sensitivity override
 
             ctx_ = lbcrypto::GenCryptoContext(params);
             ctx_->Enable(lbcrypto::PKE);

@@ -174,7 +174,14 @@ bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 //   4 = A4  Full, no PQ      : Rules + HMAC + GAT + AE, TRS/FHE disabled (use_pq_crypto=false)
 //   5 = A5  Full, no BC      : Rules + HMAC + GAT + AE, blockchain SC calls skipped
 //   6 = B1  Ghaleb (2014)    : LTT baseline — speed plausibility + cross-RSU reachability only
+//   7 = B2  Standalone GAT   : SOTA GAT baseline — decision purely S_i > θ_S, NO ψ tier
+//   8 = B3  Standalone AE    : SOTA LSTM-AE baseline — decision purely ε_i > θ_ae, NO ψ tier
 //   0 = Full (no ablation)   : every component active
+// NOTE: modes 2/3 keep the ψ composite tier active inside fuse_scores() (lp always
+// on), so "A2 GAT-only"/"A3 AE-only" are really ψ+GAT / ψ+AE ablations. Modes 7/8
+// are the GENUINE standalone SOTA baselines: the scored full-mode confusion matrix
+// is driven by the single detector's native threshold alone (08_detection_engine.h),
+// with no ψ contamination — the correct control for a "superior to SOTA" claim.
 int ablation_mode = 1;
 
 // ── C10: paper ablation variants AB1–AB11 (§4.1.2) ─────────────────────────
@@ -292,6 +299,8 @@ double kappa_th              = 0.1;   // KL divergence detection threshold (Eq. 
 // implemented); 0.09 is calibrated to the rule-based branch's weight distribution.
 double psi_th    = 0.09;    // Lightweight mode isolation threshold (rule-based branch)
 float  g_theta_s = 8.560697f;  // Option A (Eq 3.46): GAT spatial calibration θ_S (95th pctl of clean S_i). Overridden from models/shared/theta_s.txt at AI init.
+double g_phi_max_graph = 1.5707963267948966;  // π/2 — GAT edge heading-divergence bound φmax (#9 sensitivity; runtime override of mptd_ai::PHI_MAX_GRAPH, set via --phi_max)
+uint32_t g_fhe_ring_dim = 0;  // #12 sensitivity: 0=auto (OpenFHE picks N for L5); >0 forces params.SetRingDim(N), e.g. 32768/65536. Set via --fhe_ring_dim.
 
 // ── H5: HMAC replay protection (paper HMAC gate: freshness Δ_HMAC + cluster nonce cache) ──
 // Δ_HMAC: max age of an authentic beacon at the RSU. Beacons are sent every

@@ -348,12 +348,16 @@ void inject_mp_s2_stolen_beacons(Ptr<SimpleUdpApplication> udp_app,
 		fake_tag.SetSpeed(tx_spd);
 		fake_tag.SetHeading(tx_hdg);
 		fake_tag.SetAcceleration(tx_acc);
-		// Timestamp = scheduled send time (not NOW) so that when the management node
-		// pushes this beacon into vehicle_state[honest_vid], the stored timestamp
-		// reflects the 5ms stagger and tdiff > 0 in the MP-S4 transit-impossibility
-		// check (d/tdiff > s_max).  Using Now() here (same as the real vehicle's
-		// beacon) would give tdiff=0 → guard fails → MP-S4 never fires on stolen beacon.
-		double fake_ts = Simulator::Now().GetSeconds() + 0.005 * (stolen_count + 1);
+		// Timestamp: Sybil identities forged by ONE attacker share a single hardware
+		// clock (paper §3.4.2 / MP-S2 "Synchronized Beacon Timing", Eq 3.17), so the
+		// stolen-ID beacons are emitted near-SIMULTANEOUSLY — a sub-millisecond clock
+		// jitter, NOT a 5–10ms stagger. This keeps |t_a − t_b| < τ_sync (=1ms) so the
+		// MP-S2 synchronized-timing signature (08_detection_engine.h:464) fires as the
+		// paper intends (the primary detector for impersonation), while the small
+		// POSITIVE offset still gives tdiff > 0 for the MP-S4 ghost-transit guard
+		// (d/tdiff > s_max holds — d is large). The previous 5–10ms stagger exceeded
+		// τ_sync and silently bypassed the paper's MP-S2 detector → ~33% recall.
+		double fake_ts = Simulator::Now().GetSeconds() + 0.0002 * (stolen_count + 1);
 		fake_tag.SetTimestamp(fake_ts);
 		fake_tag.SetIsPoisoned(true);               // impersonation beacon = poisoned
 		fake_tag.SetAttackType(4);

@@ -39,10 +39,11 @@ PER_RUN_CSV   = os.path.normpath(os.path.join(ML_DIR, "..", "results", "beacon_l
 BEACON_CSV    = MASTER_CSV if os.path.exists(MASTER_CSV) else PER_RUN_CSV
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS_GAT  = 30
+EPOCHS_GAT  = int(os.environ.get("MPTD_GAT_EPOCHS", "30"))
 EPOCHS_AE   = 40
 BATCH_SIZE  = 32
-LR          = 1e-3
+LR          = float(os.environ.get("MPTD_GAT_LR", "1e-3"))          # #16 sensitivity
+WEIGHT_DECAY = float(os.environ.get("MPTD_GAT_WD", "0.0"))          # #17 (paper 5e-4, was unapplied)
 
 # ---------------------------------------------------------------------------
 # Synthetic data generator (when beacon_log.csv is absent)
@@ -200,11 +201,15 @@ def build_gat_dataset(df: pd.DataFrame):
 
 def train_gat(df: pd.DataFrame) -> GATDetector:
     print("[train] Training GAT detector …")
+    # Deterministic init + training so hyperparameter sweeps isolate the knob
+    # (not random-init noise). Fixed seed → 1 run per value is a fair comparison.
+    _seed = int(os.environ.get("MPTD_SEED", "42"))
+    torch.manual_seed(_seed); np.random.seed(_seed)
     graphs = build_gat_dataset(df)
     train_g, val_g = train_test_split(graphs, test_size=0.2, random_state=42)
 
     model = GATDetector().to(DEVICE)
-    opt   = torch.optim.Adam(model.parameters(), lr=LR)
+    opt   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)  # #17
     loss_fn = nn.BCELoss()
 
     for epoch in range(EPOCHS_GAT):

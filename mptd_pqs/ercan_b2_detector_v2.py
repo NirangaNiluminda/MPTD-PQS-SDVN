@@ -350,7 +350,13 @@ def compute_metrics(y_true: np.ndarray,
     cm           = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
-    mcc  = float(matthews_corrcoef(y_true, y_pred))
+    # ε-smoothed MCC (Eq 4.1) — matches the C++ MPTD-PQS pipeline (ε=1e-12) so the
+    # baseline MCC is comparable in degenerate / class-imbalance cases (raw
+    # sklearn matthews_corrcoef returns 0 there, diverging from MPTD-PQS).
+    _e   = 1e-12
+    _num = (tp + _e) * (tn + _e) - (fp + _e) * (fn + _e)
+    _den = ((tp + fp + _e) * (tp + fn + _e) * (tn + fp + _e) * (tn + fn + _e)) ** 0.5
+    mcc  = float(_num / _den)
     fpr  = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     parr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
@@ -598,11 +604,17 @@ def load_mptd_pqs_metrics(datasets_root: str) -> pd.DataFrame:
                 continue
             row = df.iloc[0]
             tdee = float(row.get("TDEE", -1))
+            # FULL-mode fusion detection: prefer MCC_full/FPR_full (Eq 3.46 fused
+            # Φ decision, ε-smoothed) — the proposed method's real output. Fall back
+            # to LW MCC/FPR only if the full-mode columns are absent (mode-1 runs).
+            _mcc_full = float(row.get("MCC_full", 0.0))
+            _fpr_full = float(row.get("FPR_full", 0.0))
+            _has_full = ("MCC_full" in df.columns) and (abs(_mcc_full) > 1e-9 or abs(_fpr_full) > 1e-9)
             rows.append({
                 "attack":     atk,
                 "attack_pct": pct,
-                "MCC":        float(row.get("MCC",  0.0)),
-                "FPR":        float(row.get("FPR",  0.0)),
+                "MCC":        (_mcc_full if _has_full else float(row.get("MCC", 0.0))),
+                "FPR":        (_fpr_full if _has_full else float(row.get("FPR", 0.0))),
                 "PARR":       float(row.get("PARR", 0.0)),
                 "CDER":       float(row.get("CDER", 0.0)),
                 "TDEE":       (float("nan") if tdee < 0 else tdee),

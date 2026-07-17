@@ -2385,8 +2385,16 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         }
                         const FusionScore fs = fuse_scores(
                             psi_i, gat_i, ae_err, theta_ae);
+                        // Standalone SOTA baselines (B2/B3): score the full-mode
+                        // decision on a SINGLE detector's native threshold, WITHOUT
+                        // the ψ composite tier (modes 2/3 keep ψ on via fuse_scores,
+                        // so they are ψ+GAT / ψ+AE — not true SOTA). mode 7 = pure
+                        // GAT (S_i > θ_S); mode 8 = pure LSTM-AE (ε_i > θ_ae).
+                        bool full_flag = fs.anomalous;
+                        if      (ablation_mode == 7) full_flag = (gat_i  > (float)g_theta_s);
+                        else if (ablation_mode == 8) full_flag = (ae_err > theta_ae);
                         fused_count++;
-                        if (fs.anomalous) full_flag_count++;
+                        if (full_flag) full_flag_count++;
                         phi_sum += fs.phi;
                         if (fs.phi > phi_max) phi_max = fs.phi;
 
@@ -2401,7 +2409,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         // invariant #3 (LW skip-on-pass) is untouched.
                         if (ablation_mode != 1 && ablation_mode != 6) {
                             update_confusion_matrix_full(
-                                rw.is_poisoned[i], fs.anomalous);
+                                rw.is_poisoned[i], full_flag);
                         }
                         cout << "[FUSION-RSU" << rsu_id << "] epoch="
                              << cw.window_epoch
@@ -2414,7 +2422,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                              << " gt_pois=" << (rw.is_poisoned[i] ? 1 : 0)
                              << std::setprecision(3)
                              << " phi="     << fs.phi
-                             << " full_anom=" << (fs.anomalous ? "YES" : "no")
+                             << " full_anom=" << (full_flag ? "YES" : "no")
                              << " (Eq 3.46)" << endl;
 
                         // ── Paper-aligned Eq 3.57 controller evidence (TASK ①-L) ──
