@@ -186,13 +186,15 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     // R7b: read ground-truth pose from mobility provider (== ns-3 MobilityModel).
     // Falls back to reported pose if provider is absent (shouldn't happen post-R7a).
     //
-    // INDEX FIX (2026-07-19): `vid` here is the beacon tag's vehicle_id, which is set
-    // to the ns-3 NodeID (`tag.SetVehicleId(nid)` in 09_vehicle_beacon_tx.h). But
-    // get_gt_position() indexes the Vehicle_Nodes container by 0-based vehicle index
-    // (NodeID − 2; nodes 0/1 are management/other). Passing the NodeID read a DIFFERENT
-    // (often unstepped/static) node → gt_pos decoupled ~900m from the reporting vehicle
-    // and gt_speed≈0 in the 200-node SUMO config. Convert to the container index first.
-    const uint32_t v_idx = (vid >= 2) ? (vid - 2) : 0;
+    // INDEX FIX (2026-07-20): `vid` here is the beacon tag's vehicle_id = ns-3 NodeID
+    // (`tag.SetVehicleId(nid)` in 09_vehicle_beacon_tx.h). get_gt_position() indexes
+    // Vehicle_Nodes by the 0-based LOCAL vehicle index. Vehicles are created AFTER the
+    // RSUs/controllers/mgmt/cloud nodes, so the first vehicle's NodeID is
+    // g_first_vehicle_node_id (NOT 2). Convert with that base — same conversion the
+    // TPE accumulator (08_detection_engine.h:2251) and socket layer (07:281) use.
+    // (The earlier hardcoded `vid-2` was off by the true base → read an adjacent
+    //  unrelated vehicle → ~800 m gt error.)
+    const uint32_t v_idx = (vid >= g_first_vehicle_node_id) ? (vid - g_first_vehicle_node_id) : 0;
     double gt_x = tag.GetPosX(), gt_y = tag.GetPosY(), gt_spd = tag.GetSpeed();
     if (g_mobility_provider) {
         Vector p = g_mobility_provider->get_gt_position(v_idx);

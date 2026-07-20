@@ -2707,7 +2707,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // beacon, t_alert = first LW detection at/after onset (same semantics as
     // analytics/compute_ttd.py over beacon_log.csv).
     {
-        int vi = (int)vehicle_id - 2;
+        // Local vehicle index: vehicle NodeIDs start at g_first_vehicle_node_id
+        // (after the RSU/controller/mgmt/cloud nodes), NOT at 2. The old hardcoded
+        // `-2` landed the onset/alert timestamps in wrong (often OOB) slots → TTD≈0.
+        int vi = (int)vehicle_id - (int)g_first_vehicle_node_id;
         if (vi >= 0 && vi < total_size) {
             double t_now = Simulator::Now().GetSeconds();
             if (tag.GetIsPoisoned() && g_ttd_first_poison[vi] < 0)

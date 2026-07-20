@@ -248,7 +248,7 @@ void SampleBoundedDrift(int vid, double &drift_x, double &drift_y,
     }
 
     // Deterministic per-(vid, beacon_count) RNG → reproducible across runs
-    uint32_t seed = 12345u * (uint32_t)vid + (uint32_t)drift_beacon_count[vid] + 7919u;
+    uint32_t seed = 12345u * (uint32_t)vid + (uint32_t)drift_beacon_count[vid] + 7919u + run_seed*100003u;
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> uni01(0.0, 1.0);
 
@@ -435,7 +435,7 @@ void declare_pre_registered_sybils()
 
     int count = 0;
     for (int i = 0; i < (int)N_Vehicles; i++) {
-        pre_registered_sybil[i] = GetBooleanWithProbability(sybil_registration_pct, i + 500);
+        pre_registered_sybil[i] = GetBooleanWithProbability(sybil_registration_pct, i + 500 + run_seed*100003u);
         if (pre_registered_sybil[i]) count++;
     }
 
@@ -458,7 +458,7 @@ void declare_pre_registered_sybils()
 void declare_attackers()
 {
     for (uint32_t i = 0; i < N_Vehicles; i++) {  // active count, not capacity (256)
-        bool attacking_state = GetBooleanWithProbability(attack_percentage, i);
+        bool attacking_state = GetBooleanWithProbability(attack_percentage, i + run_seed*100003u);
 
         tp_vehicle_nodes[i]         = present_tp_vehicle_attack         ? attacking_state : false;
         heading_spoof_nodes[i]      = present_heading_spoof_attack      ? attacking_state : false;
@@ -520,9 +520,9 @@ void declare_compromised_rsus()
     for (int r = 0; r < n_active; r++) candidates.push_back(r);
 
     // Seed the RNG
-    uint32_t actual_seed = (rsu_seed == 0)
-        ? (uint32_t)std::chrono::system_clock::now().time_since_epoch().count()
-        : rsu_seed;
+    uint32_t actual_seed = (rsu_seed != 0) ? rsu_seed
+                         : (run_seed > 0 ? (run_seed * 2654435761u + 12345u)
+                                         : (uint32_t)std::chrono::system_clock::now().time_since_epoch().count());
     std::mt19937 rng(actual_seed);
     std::shuffle(candidates.begin(), candidates.end(), rng);
 

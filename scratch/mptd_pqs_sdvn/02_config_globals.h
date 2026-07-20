@@ -85,6 +85,15 @@ int g_mobility_source = 0;  // MOBILITY_SRC_HARDCODED
 // Example: --rsu_seed=42 --attack_percentage=40 → always same 2 RSUs
 uint32_t rsu_seed = 0;
 
+// Unified multi-seed control (2026-07-20). --seed=N sets run_seed=N, which:
+//   (1) seeds the ns-3 RNG via RngSeedManager::SetRun(N) in 12_main.h, and
+//   (2) is mixed into the attack randomness (attacker selection, stealth drift,
+//       RSU-compromise shuffle) so that different --seed values produce genuinely
+//       different runs (mean±std over ≥3 seeds). Default 1 = reproducible baseline.
+// Without this, the attack seeds were fixed per-vehicle (12345*vid) → every run
+// identical → multi-seed std≈0.
+uint32_t run_seed = 1;
+
 // Paper §3.4.4 IEEE 802.11p BSM rate: 10 Hz → T_b = 100 ms (Eq 3.9).
 // Detection gate s_max·T_b = 3.33 m is keyed to this; do not change without
 // re-calibrating all per-beacon thresholds (TP-S1..S5, ε_max stealth/abrupt).

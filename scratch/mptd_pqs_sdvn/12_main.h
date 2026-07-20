@@ -78,6 +78,7 @@ int main(int argc, char *argv[])
                   "e.g. 32768 or 65536). Larger N = safer but slower crypto (COO_fhe).",
                   g_fhe_ring_dim);
     cmd.AddValue ("rsu_seed", "RSU compromise random seed (0=random each run)", rsu_seed);
+    cmd.AddValue ("seed", "Unified run seed (ns-3 RngRun + attack randomness) for multi-seed mean±std runs", run_seed);
     cmd.AddValue ("sybil_registration_pct",
                   "Attack 3 enhanced mode: % of vehicles pre-registered as Sybil at startup "
                   "(0=original ghost-ID mode, >0=behavioural detection via MP-S3 KL)",
@@ -120,6 +121,11 @@ int main(int argc, char *argv[])
                   "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
                   g_mobility_source);
     cmd.Parse (argc, argv);
+    // Multi-seed: drive the ns-3 global RNG from --seed so stochastic ns-3 elements
+    // (channel, propagation, jitter) vary per seed. The attack-side randomness is
+    // additionally mixed with run_seed in 06a_attack_models.h. (2026-07-20)
+    ns3::RngSeedManager::SetSeed (1);
+    ns3::RngSeedManager::SetRun (run_seed > 0 ? run_seed : 1);
     // --s_max_kmh: detection speed bound, decoupled from --maxspeed (which drives
     // the SUMO trace filename mobility_<tag>_<speed>.tcl). km/h → m/s for TP-S1/MP-S4/MP-S3.
     if (g_s_max_cli_kmh > 0.0) s_max = g_s_max_cli_kmh / 3.6;
