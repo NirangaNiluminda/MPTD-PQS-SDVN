@@ -351,7 +351,11 @@ RsuBeaconWindow rsu_window[MAX_RSUS] = {};
 //
 // Indexed by vehicle id (vid = nid - 2, range [0..total_size)) to match the
 // pattern used by vehicle_state[] / pre_registered_sybil[] above.
-#define LSTM_RING_SIZE 10    // must match mptd_ai::LSTM_WINDOW_SIZE (trained arch window=10)
+#define LSTM_RING_SIZE 50    // physical ring capacity (max over scenarios; urban AE window=50, rural/highway=10)
+// Runtime AE window (≤ LSTM_RING_SIZE): set at AI init from the loaded lstm_ae ONNX
+// input shape [1, g_lstm_window, 6] so C++ feeds exactly what the model expects
+// (urban=50 after sir Step 4, rural/highway=10). Defaults to 10 until AI init runs.
+int g_lstm_window = 10;
 struct VehicleLstmRing {
     float    pos_x   [LSTM_RING_SIZE];
     float    pos_y   [LSTM_RING_SIZE];
@@ -366,6 +370,7 @@ struct VehicleLstmRing {
 VehicleLstmRing vehicle_lstm_ring[total_size] = {};
 double          last_psi_per_vehicle[total_size] = {};   // H8: SUM of ψ per vehicle within the window
 uint32_t        psi_cnt_per_vehicle[total_size]  = {};   // H8: beacon count, for the per-window MEAN ψ
+uint32_t        last_sigmask_per_vehicle[total_size] = {}; // richer-feat: most-recent LW sig_mask (ψ sub-scores / which rule-checks fired) per vehicle, fed to the multi-task GAT for attack-type ID
 
 // ── R7e.4: Controller TPE predictor state (paper Eq 4.6) ──────────────────────
 // TPE = mean Euclidean displacement between controller's PREDICTED position
@@ -415,7 +420,7 @@ static inline bool lstm_ring_push(uint32_t vid,
     r.tau    [i] = tau;
     r.head = (r.head + 1) % LSTM_RING_SIZE;
     r.count++;
-    return r.count >= LSTM_RING_SIZE;
+    return r.count >= (uint32_t)g_lstm_window;   // full = enough for the runtime window
 }
 
 // Copy the ring into a row-major (LSTM_RING_SIZE × 6) buffer in chronological
@@ -424,10 +429,13 @@ static inline bool lstm_ring_push(uint32_t vid,
 static inline bool lstm_ring_dump(uint32_t vid, float *out_buf) {
     if (vid >= (uint32_t)total_size) return false;
     const VehicleLstmRing &r = vehicle_lstm_ring[vid];
-    if (r.count < LSTM_RING_SIZE) return false;
-    // Oldest sample is at index head (wraps around) once count >= size.
-    for (uint32_t k = 0; k < LSTM_RING_SIZE; ++k) {
-        const uint32_t idx = (r.head + k) % LSTM_RING_SIZE;
+    const uint32_t win = (uint32_t)g_lstm_window;
+    if (r.count < win) return false;
+    // Dump the last `win` samples in chronological order (oldest first). With a
+    // 50-slot physical ring the newest is at head-1; walk back `win` from there.
+    const uint32_t oldest = (r.head + LSTM_RING_SIZE - win) % LSTM_RING_SIZE;
+    for (uint32_t k = 0; k < win; ++k) {
+        const uint32_t idx = (oldest + k) % LSTM_RING_SIZE;
         out_buf[k * 6 + 0] = r.pos_x  [idx];
         out_buf[k * 6 + 1] = r.pos_y  [idx];
         out_buf[k * 6 + 2] = r.speed  [idx];

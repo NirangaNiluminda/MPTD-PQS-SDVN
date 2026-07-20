@@ -371,7 +371,14 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     {
         double a_reported = std::fabs(vs.accel[curr]);
         double a_implied  = std::fabs(vs.speed[curr] - vs.speed[prev]) / dt;
-        if (a_reported > a_max || a_implied > a_max)
+        // (c) Direct speed-magnitude plausibility (2026-07-20): flag a reported
+        //     speed above the physical maximum s_max. This is the missing tell for
+        //     the MP-S3 MitM (attack 6), which injects a CONSTANT extreme speed
+        //     (~66 m/s): Δspeed=0 evades the a_implied check above, and a plausible
+        //     position evades TP-S1, so only the raw speed value exposes it. Honest
+        //     urban speed ≤ s_max (max ~23 m/s), so FPR≈0. Folded into TP-S3 (bit 2)
+        //     to keep the signature width at 9 bits.
+        if (a_reported > a_max || a_implied > a_max || vs.speed[curr] > s_max)
             violated |= (1 << 2);
     }
 
@@ -1964,14 +1971,27 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         double real_spd = tag.GetSpeed();
         double real_hdg = tag.GetHeading();
         double t_mp4    = Simulator::Now().GetSeconds();
-        // Systematic speed elevation: shifts regional distribution ~25-50% above normal.
-        // kl_approx = |fake_spd - mean| / (mean + s_max*0.1); with mean≈15, fake≈22-30 m/s:
-        // (22-15)/18.3 ≈ 0.38 per vehicle — collectively shifts distribution > κ_th=1.5.
-        double shift    = 1.0 + 0.5 * poisoning_intensity_theta
-                              + 0.2 * poisoning_intensity_theta * std::sin(t_mp4 * 0.3);
-        double fake_spd = real_spd * shift;
-        // Slight heading noise to corrupt mobility pattern vectors
-        double fake_hdg = real_hdg + 0.15 * poisoning_intensity_theta * std::sin(t_mp4 * 0.7);
+        double shift, fake_spd, fake_hdg;
+        if (stealthy_control_plane) {
+            // STEALTHY MP-S4: leave the beacon essentially untouched (a +5% step
+            // would trip the implied-acceleration TP-S3 rule). The attack here is
+            // purely control-plane — the malicious controller corrupts its global
+            // model and keeps issuing WRONG_ROUTING. Beacons stay plausible so
+            // Ercan/Sharma/ψ are blind; CP-DETECT catches the controller via the
+            // persistent controller-vs-RSU consensus conflict.
+            shift    = 1.0;
+            fake_spd = real_spd;
+            fake_hdg = real_hdg;
+        } else {
+            // Systematic speed elevation: shifts regional distribution ~25-50% above normal.
+            // kl_approx = |fake_spd - mean| / (mean + s_max*0.1); with mean≈15, fake≈22-30 m/s:
+            // (22-15)/18.3 ≈ 0.38 per vehicle — collectively shifts distribution > κ_th=1.5.
+            shift    = 1.0 + 0.5 * poisoning_intensity_theta
+                           + 0.2 * poisoning_intensity_theta * std::sin(t_mp4 * 0.3);
+            fake_spd = real_spd * shift;
+            // Slight heading noise to corrupt mobility pattern vectors
+            fake_hdg = real_hdg + 0.15 * poisoning_intensity_theta * std::sin(t_mp4 * 0.7);
+        }
         // Soft cap: keep below 2×s_max to remain "plausibly elevated" for global bias
         double sp_ceil = s_max * 2.0;
         fake_spd = (fake_spd > sp_ceil) ? sp_ceil : fake_spd;
@@ -2013,12 +2033,26 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         double real_py  = tag.GetPosY();
         double real_spd = tag.GetSpeed();
         double t_cp     = Simulator::Now().GetSeconds();
-        // Controller applies sinusoidal position drift + speed perturbation
-        double fake_px  = real_px  + poisoning_intensity_theta * max_position_deviation
-                                   * std::sin(t_cp * 1.1);
-        double fake_py  = real_py  + poisoning_intensity_theta * max_position_deviation
-                                   * std::cos(t_cp * 0.9);
-        double fake_spd = real_spd * (1.0 + poisoning_intensity_theta * std::sin(t_cp * 2.3));
+        double fake_px, fake_py, fake_spd;
+        if (stealthy_control_plane) {
+            // STEALTHY TP-S3: pure control-plane attack — the vehicle→RSU beacon is
+            // left plausible (unchanged) so beacon-level detectors (Ercan/Sharma/ψ)
+            // are blind; the malice lives entirely in the controller's downlink,
+            // which keeps issuing WRONG_ROUTING. Only CP-DETECT's controller-vs-RSU
+            // consensus catches it. (Any per-beacon position/speed edit — even a
+            // slow ramp — trips the RSU's dead-reckoning/acceleration rules, so a
+            // truly stealthy control-plane attack must not touch the beacon.)
+            fake_px  = real_px;
+            fake_py  = real_py;
+            fake_spd = real_spd;
+        } else {
+            // Controller applies sinusoidal position drift + speed perturbation
+            fake_px  = real_px  + poisoning_intensity_theta * max_position_deviation
+                                * std::sin(t_cp * 1.1);
+            fake_py  = real_py  + poisoning_intensity_theta * max_position_deviation
+                                * std::cos(t_cp * 0.9);
+            fake_spd = real_spd * (1.0 + poisoning_intensity_theta * std::sin(t_cp * 2.3));
+        }
         // Clamp to simulation area (kept as ternary for legibility; std::max
         // is now safe after R6.5 renamed the global `max` macro to MPTD_MAX_NEIGHBORS).
         fake_px  = (fake_px  < min_position_x) ? min_position_x : (fake_px  > max_position_x ? max_position_x : fake_px);
@@ -2073,7 +2107,12 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                        (attack_number == 5) || (attack_number == 6))
                    && (vehicle_id < (uint32_t)total_size)
                    && tag.GetIsPoisoned()
-                   && !sybil_mitm_nodes[vehicle_id]; // intercepted/stolen ID = honest vehicle
+                   && !sybil_mitm_nodes[vehicle_id]  // intercepted/stolen ID = honest vehicle
+                   // STEALTHY TP-S3: do NOT restore. The small constant offset must
+                   // PERSIST as the baseline so consecutive poisoned beacons are
+                   // self-consistent (no jump) → LW/ψ stays blind (rsu_anomalous=0),
+                   // leaving CP-DETECT's controller-vs-RSU consensus the only catch.
+                   && !(stealthy_control_plane && attack_number == 5);
     VehicleBeaconState vs_backup;
     if (save_state)
         vs_backup = vehicle_state[vehicle_id];
@@ -2310,19 +2349,29 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                 const int N = (int)rw.beacon_count;
                 if (N > 0) {
                     // ── 1. GAT spatial scores (one per row of the L-beacon window) ──
-                    std::vector<float> feats5(N * 5);
+                    std::vector<float>    feats5(N * 5);
+                    std::vector<float>    gat_psi(N, 0.0f);   // richer-feat: per-vehicle mean ψ
+                    std::vector<uint32_t> gat_sig(N, 0u);     // richer-feat: per-vehicle sig_mask (ψ sub-scores)
                     for (int i = 0; i < N; ++i) {
                         feats5[i*5 + 0] = (float)rw.pos_x[i];
                         feats5[i*5 + 1] = (float)rw.pos_y[i];
                         feats5[i*5 + 2] = (float)rw.speed[i];
                         feats5[i*5 + 3] = (float)rw.heading[i];
                         feats5[i*5 + 4] = (float)rw.accel[i];
+                        const uint32_t v = rw.vid[i];
+                        if (v < (uint32_t)total_size) {
+                            gat_psi[i] = psi_cnt_per_vehicle[v] > 0
+                                ? (float)(last_psi_per_vehicle[v] / psi_cnt_per_vehicle[v]) : 0.0f;
+                            gat_sig[i] = last_sigmask_per_vehicle[v];
+                        }
                     }
                     std::vector<float> gat_scores;
+                    std::vector<int>   gat_attack_types;   // k̂_i per vehicle (multi-task GAT)
                     bool gat_ok = false;
                     if (g_ai_engine.has_gat()) {
                         gat_ok = g_ai_engine.score_gat(
-                            feats5.data(), N, nullptr, gat_scores);
+                            feats5.data(), N, nullptr, gat_scores, &gat_attack_types,
+                            gat_psi.data(), gat_sig.data());
                     }
                     if (gat_ok) {
                         double smin = gat_scores[0], smax = gat_scores[0], smean = 0.0;
@@ -2383,8 +2432,28 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 (void)g_ai_engine.score_lstm_ae(ring_buf, ae_err);
                             }
                         }
+                        // Attack-conditioned fusion (revised eq:fusion): k̂_i from
+                        // the multi-task GAT selects the λ^(k̂) weight set. -1 →
+                        // global λ fallback (no per-attack sets or GAT off).
+                        const int k_hat_i = (gat_ok && i < (int)gat_attack_types.size())
+                                          ? gat_attack_types[i] : -1;
+                        // sir Change 1: attack-conditioned ψ. Recompute the LW
+                        // composite from this vehicle's sig_mask with the weight
+                        // vector for k̂ (or the aggregate w when k̂=-1, i.e. GAT
+                        // unconfident — the Change-2 gate). Sums to 1 → same scale
+                        // as the global-weighted ψ that fuse_scores normalises by ψ_th.
+                        float psi_fuse = psi_i;
+                        if (g_fusion.has_sig_weights) {
+                            const uint32_t sm = last_sigmask_per_vehicle[vid_i];
+                            const float *w = (k_hat_i >= 0 && k_hat_i < FusionParams::K_ATTACK)
+                                             ? g_fusion.sig_w_k[k_hat_i] : g_fusion.sig_w_global;
+                            float s = 0.0f;
+                            for (int b = 0; b < FusionParams::N_SIG; ++b)
+                                if ((sm >> b) & 1u) s += w[b];
+                            psi_fuse = s;
+                        }
                         const FusionScore fs = fuse_scores(
-                            psi_i, gat_i, ae_err, theta_ae);
+                            psi_fuse, gat_i, ae_err, theta_ae, k_hat_i);
                         // Standalone SOTA baselines (B2/B3): score the full-mode
                         // decision on a SINGLE detector's native threshold, WITHOUT
                         // the ψ composite tier (modes 2/3 keep ψ on via fuse_scores,
@@ -2393,6 +2462,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         bool full_flag = fs.anomalous;
                         if      (ablation_mode == 7) full_flag = (gat_i  > (float)g_theta_s);
                         else if (ablation_mode == 8) full_flag = (ae_err > theta_ae);
+                        // Hard speed-bound override (physical-impossibility rule): a
+                        // reported speed above s_max is a definite fabrication (MP-S3
+                        // MitM ~66 m/s) regardless of the soft fusion score / GAT
+                        // routing. Full mode only (not the standalone-tier ablations).
+                        else full_flag = full_flag || (rw.speed[i] > s_max);
                         fused_count++;
                         if (full_flag) full_flag_count++;
                         phi_sum += fs.phi;
@@ -2422,6 +2496,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                              << " gt_pois=" << (rw.is_poisoned[i] ? 1 : 0)
                              << std::setprecision(3)
                              << " phi="     << fs.phi
+                             << " khat="    << k_hat_i
+                             << " gatflag=" << (k_hat_i >= 0 ? 1 : 0)
                              << " full_anom=" << (full_flag ? "YES" : "no")
                              << " (Eq 3.46)" << endl;
 
@@ -2579,6 +2655,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         const uint32_t v = rw.vid[i];
                         if (v < (uint32_t)total_size) {
                             last_psi_per_vehicle[v] = 0.0; psi_cnt_per_vehicle[v] = 0;
+                            last_sigmask_per_vehicle[v] = 0;
                         }
                     }
                     if (fused_count > 0) {
@@ -3396,6 +3473,13 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // ψ into a whole-window false positive (as max-ψ did). Reset per window.
             last_psi_per_vehicle[vid] += rsu_lw.psi;
             psi_cnt_per_vehicle[vid]++;
+            // Richer-feature: keep the most-recent sig_mask (which LW rule-checks
+            // fired = the ψ sub-scores) for this vehicle; the multi-task GAT uses
+            // its 9 bits to identify the attack TYPE (k̂) for λ-routing. Per-beacon
+            // (not OR-accumulated) to match the per-tick training snapshot. This is
+            // byte-identical to the beacon_log.csv sig_mask column the GAT trained
+            // on: tp_flags(bits0-4) | mp_flags<<5(bits5-8); CP bits excluded.
+            last_sigmask_per_vehicle[vid] = rsu_lw.tp_flags | (rsu_lw.mp_flags << 5);
             // 6th AE feature = tau_i. The trained scaler has tau mean=1.0
             // scale=1.0, and the AE was trained on clean data where tau≡1.0
             // (scaled→0.0). Feed the default trusted value to stay on-manifold

@@ -306,6 +306,35 @@ def load_scenario(scenario_dir: str, seed: int = 42) -> Optional[pd.DataFrame]:
     return extract_features(aug, seed=seed)
 
 
+def paper_rule_predict(feat_df: pd.DataFrame, ci: float = 2.576) -> np.ndarray:
+    """Ercan 2021 RSSI plausibility decision — NO TRAINING, NO OUR-DATA FITTING.
+
+    Ercan's distinctive contribution is the mismatch between the DECLARED
+    distance to the RSU (dist_decl, from the possibly-faked BSM position) and
+    the distance ESTIMATED from RSSI (d_hat), which cannot be spoofed because
+    received power depends on the true propagation distance (Eqs 8-11).
+
+    Instead of an ML classifier (which the paper trains, but sir's rule forbids
+    training on our data), we flag a message when the declared and RSSI-based
+    distances disagree beyond the log-normal shadowing model's own CI. The
+    RSSI distance estimate is multiplicative-lognormal with
+        σ_d = SIGMA_DB / (10 · N_EXP)   [in log10 units],
+    so the decision is a pure z-test on log-distance at the 99% level
+    (ci=2.576) — the threshold comes from the 802.11p propagation model, never
+    from our labels.
+
+    NOTE: only fires where a real-position log exists (a1/a2/a4); for attacks
+    with no true-position log (a3/a5/a6/a7) real==declared → d_hat≈dist_decl →
+    no RSSI signal, which is the honest outcome for a position-falsification
+    detector on non-position attacks.
+    """
+    sigma_d = SIGMA_DB / (10.0 * N_EXP)          # log10 std of the distance estimate
+    dd = np.maximum(feat_df["dist_decl"].values, D0)
+    dh = np.maximum(feat_df["d_hat"].values,     D0)
+    z  = np.abs(np.log10(dd) - np.log10(dh)) / max(sigma_d, 1e-9)
+    return (z > ci).astype(int)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  CLASSIFIERS  (Section III-C)
 # ─────────────────────────────────────────────────────────────────────────────

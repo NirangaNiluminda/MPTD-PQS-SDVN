@@ -58,10 +58,14 @@ def embed(m, x, ei):
 
 
 class GATDetectorSI(nn.Module):
-    """Shared conv weights; locked clean stats; forward returns RAW S_i."""
+    """Shared conv weights; locked clean stats. forward returns (RAW S_i, atk):
+    S_i is the z-scored embedding L2 norm (fusion GAT term), and atk are the
+    per-attack-type head probabilities ŷ_i^(k) (argmax → k̂_i selects the
+    attack-conditioned fusion weights)."""
     def __init__(self, base, mu, sig):
         super().__init__()
         self.conv1, self.conv2, self.act = base.conv1, base.conv2, base.act
+        self.cls_heads = base.cls_heads           # multi-task per-attack heads
         self.register_buffer("mu_clean",  mu.view(1, -1))
         self.register_buffer("sig_clean", sig.view(1, -1))
 
@@ -69,7 +73,9 @@ class GATDetectorSI(nn.Module):
         e = self.act(self.conv1(x, edge_index))
         e = self.act(self.conv2(e, edge_index))
         z = (e - self.mu_clean) / self.sig_clean
-        return z.norm(dim=1, keepdim=True)
+        s_i = z.norm(dim=1, keepdim=True)
+        atk = torch.sigmoid(self.cls_heads(e))     # (N, K)
+        return s_i, atk
 
 
 def recalibrate(scen):
@@ -101,13 +107,15 @@ def recalibrate(scen):
 
     si = GATDetectorSI(model, mu, sig).eval()
     n = 16
-    dummy_x  = torch.randn(n, 6)
+    from gat_detector import FEATURE_DIM
+    dummy_x  = torch.randn(n, FEATURE_DIM)
     dummy_ei = torch.tensor([[i for i in range(n)], [i for i in range(n)]], dtype=torch.long)
     out_onnx  = os.path.join(outdir, "gat_model.onnx")     # C++ loads this per scenario
     out_theta = os.path.join(outdir, "theta_s.txt")
     torch.onnx.export(si, (dummy_x, dummy_ei), out_onnx,
-        input_names=["x", "edge_index"], output_names=["scores"],
-        dynamic_axes={"x": {0: "N"}, "edge_index": {1: "E"}, "scores": {0: "N"}},
+        input_names=["x", "edge_index"], output_names=["scores", "attack_probs"],
+        dynamic_axes={"x": {0: "N"}, "edge_index": {1: "E"},
+                      "scores": {0: "N"}, "attack_probs": {0: "N"}},
         opset_version=16, dynamo=False)
     open(out_theta, "w").write(f"{theta_s:.6f}\n")
     print(f"[{scen}] -> {out_onnx}\n[{scen}] -> {out_theta}  (θ_S={theta_s:.6f})")

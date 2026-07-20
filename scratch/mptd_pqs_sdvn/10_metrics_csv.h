@@ -185,10 +185,18 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
 
     // R7b: read ground-truth pose from mobility provider (== ns-3 MobilityModel).
     // Falls back to reported pose if provider is absent (shouldn't happen post-R7a).
+    //
+    // INDEX FIX (2026-07-19): `vid` here is the beacon tag's vehicle_id, which is set
+    // to the ns-3 NodeID (`tag.SetVehicleId(nid)` in 09_vehicle_beacon_tx.h). But
+    // get_gt_position() indexes the Vehicle_Nodes container by 0-based vehicle index
+    // (NodeID − 2; nodes 0/1 are management/other). Passing the NodeID read a DIFFERENT
+    // (often unstepped/static) node → gt_pos decoupled ~900m from the reporting vehicle
+    // and gt_speed≈0 in the 200-node SUMO config. Convert to the container index first.
+    const uint32_t v_idx = (vid >= 2) ? (vid - 2) : 0;
     double gt_x = tag.GetPosX(), gt_y = tag.GetPosY(), gt_spd = tag.GetSpeed();
     if (g_mobility_provider) {
-        Vector p = g_mobility_provider->get_gt_position(vid);
-        Vector v = g_mobility_provider->get_gt_velocity(vid);
+        Vector p = g_mobility_provider->get_gt_position(v_idx);
+        Vector v = g_mobility_provider->get_gt_velocity(v_idx);
         gt_x   = p.x;
         gt_y   = p.y;
         gt_spd = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
@@ -246,12 +254,12 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     // C3: ρ_gt_cell sample — the vehicle's TRUE cell at this instant. Booked
     // for every beacon (detected or not: the vehicle physically exists either
     // way). Sybil-forged vids ≥ N_Vehicles are excluded (no real vehicle).
-    if (vid < N_Vehicles && g_mobility_provider
+    if (v_idx < N_Vehicles && g_mobility_provider
         && g_mobility_provider->is_sumo_derived())
     {
-        const Vector gt = g_mobility_provider->get_gt_position(vid);
+        const Vector gt = g_mobility_provider->get_gt_position(v_idx);   // container index, not NodeID
         uint32_t gcell = nearest_rsu_for_position(gt.x, gt.y);
-        if (gcell < MAX_RSUS) g_gt_seen_cell[gcell].insert(vid);
+        if (gcell < MAX_RSUS) g_gt_seen_cell[gcell].insert(v_idx);
     }
 }
 

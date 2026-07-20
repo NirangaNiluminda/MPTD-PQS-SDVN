@@ -57,6 +57,7 @@ int main(int argc, char *argv[])
     cmd.AddValue ("delta_hmac", "H5 Delta_HMAC beacon freshness window (s)", delta_hmac);
     cmd.AddValue ("delta_trs", "H6 Delta_TRS sigma_TRS freshness window (s)", delta_trs);
     cmd.AddValue ("attack_number", "attack_number", attack_number);
+    cmd.AddValue ("stealthy_control_plane", "TP-S3/MP-S4 stealthy mode: small plausible controller falsification (beacon detectors blind, CP-DETECT still catches)", stealthy_control_plane);
     cmd.AddValue ("experiment_number", "experiment_number", experiment_number);
     cmd.AddValue ("routing_test", "routing_test", routing_test);
     cmd.AddValue ("routing_algorithm", "routing_algorithm", routing_algorithm);

@@ -26,8 +26,21 @@ import numpy as np
 
 R_MAX       = 300.0         # maximum communication range (metres)
 PHI_MAX     = np.pi / 2     # max heading divergence for edge (90° — urban VANET)
-FEATURE_DIM = 6             # [pos_x, pos_y, speed, heading, accel, tau_i]
+# Richer node features (supervisor "special attack attention" patch): the 5
+# kinematic dims + tau are augmented with the composite plausibility score ψ and
+# the 9-bit sig_mask (which LW rule-checks fired) — i.e. the ψ SUB-scores. These
+# give the multi-task heads the per-attack identity signature the kinematics lack
+# (e.g. Sybil vs position-drift), so k̂ = argmax head routes correctly.
+SIG_BITS    = 9             # sig_mask width (max observed 511 → 9 bits)
+FEATURE_DIM = 7 + SIG_BITS  # [pos_x,pos_y,speed,heading,accel, tau, psi, b0..b8] = 16
 TAU_INIT    = 1.0           # default trust score when blockchain unavailable
+
+# Multi-task GAT (supervisor patch, 2026-07): the single binary classification
+# head is replaced by K per-attack-type heads (paper §3.4.3, revised eq:gat_cls).
+# K matches the seven attack variants of the threat model (Experiment 5).
+# Head k emits ŷ_i^(k) = σ(w_cls^(k)ᵀ x'_i + b_cls^(k)); the predicted attack
+# type k̂_i = argmax_k ŷ_i^(k) selects the attack-conditioned fusion weights.
+ATTACK_CLASSES = int(os.environ.get("MPTD_GAT_ATTACK_CLASSES", "7"))
 
 # Hyperparameters overridable via env for the Phase-2 sensitivity sweeps
 # (#7 arch, #15 dropout, #18 LeakyReLU slope). Defaults = current deployed model.
@@ -50,12 +63,20 @@ class GATDetector(nn.Module):
     Output shape: (N, 1)   spatial anomaly score S_i ∈ [0,1]
     """
 
-    def __init__(self, in_dim: int = FEATURE_DIM, hidden: int = _GAT_HIDDEN, heads: int = _GAT_HEADS):
+    def __init__(self, in_dim: int = FEATURE_DIM, hidden: int = _GAT_HIDDEN, heads: int = _GAT_HEADS,
+                 attack_classes: int = ATTACK_CLASSES):
         super().__init__()
+        self.attack_classes = attack_classes
         self.conv1 = GATConv(in_dim, hidden, heads=heads, dropout=_GAT_DROPOUT, negative_slope=_GAT_NSLOPE)
         # concat=True → output dim = hidden * heads
         self.conv2 = GATConv(hidden * heads, _GAT_EMB, heads=1, concat=False, dropout=_GAT_DROPOUT, negative_slope=_GAT_NSLOPE)
         self.act   = nn.LeakyReLU(_GAT_NSLOPE) if _GAT_ACT.startswith("leaky") else nn.ELU()
+        # Multi-task classification heads (revised eq:gat_cls): one linear head
+        # per attack class, each mapping the shared 16-dim embedding x'_i to a
+        # per-attack detection logit. The shared encoder benefits from all K
+        # supervised tasks simultaneously (cross-attack regularisation), while
+        # each head keeps the per-attack discriminative signal a specialist has.
+        self.cls_heads = nn.Linear(_GAT_EMB, attack_classes)  # w_cls^(k), b_cls^(k) stacked
         # Learnable score head: linear projection of the raw z-score L2 norm
         # into the sigmoid's "useful" range. Without these, the bare
         # sigmoid(L2-norm-of-16-dim-z-score) saturates near 1.0 for ALL nodes
@@ -66,11 +87,15 @@ class GATDetector(nn.Module):
         self.score_scale = nn.Parameter(torch.tensor(1.0))
         self.score_bias  = nn.Parameter(torch.tensor(-4.0))  # init near sigmoid origin
 
-    def forward(self, x: torch.Tensor, edge_index: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
         """
-        Returns S_i ∈ [0,1] per node: sigmoid-mapped L2-norm of z-score of
-        the GAT embedding (paper Eq. 3.42, with a learnable affine to keep
-        the sigmoid out of its saturated tail).
+        Returns a tuple ``(S_i, atk)``:
+          • S_i  (N, 1)  spatial anomaly score ∈ [0,1] — sigmoid-mapped L2-norm
+                         of the z-score of the GAT embedding (paper Eq. 3.42);
+                         still feeds the fusion GAT term min(S_i/θ_S, 1).
+          • atk  (N, K)  per-attack-type detection probabilities ŷ_i^(k)
+                         (revised eq:gat_cls). argmax over K gives the predicted
+                         attack type k̂_i used to select fusion weights.
         """
         emb = self.act(self.conv1(x, edge_index))   # (N, hidden*heads)
         emb = self.act(self.conv2(emb, edge_index)) # (N, 16) — x'_i
@@ -84,7 +109,11 @@ class GATDetector(nn.Module):
         # Affine + sigmoid — learnable shift/scale keeps the output away from
         # the saturated tail of sigmoid where gradients vanish.
         logit = self.score_scale * s_i + self.score_bias
-        return torch.sigmoid(logit)                 # (N, 1)
+        score = torch.sigmoid(logit)                # (N, 1)
+
+        # Per-attack-type heads on the shared embedding x'_i (revised eq:gat_cls).
+        atk = torch.sigmoid(self.cls_heads(emb))    # (N, K)
+        return score, atk
 
 
 # ---------------------------------------------------------------------------
@@ -211,5 +240,26 @@ def score_snapshot(model: GATDetector, features: np.ndarray,
     data = snapshot_to_graph(features)
     data = data.to(device)
     with torch.no_grad():
-        scores = model(data.x, data.edge_index)  # (N, 1)
+        scores, _atk = model(data.x, data.edge_index)  # (N, 1), (N, K)
     return scores.cpu().squeeze(-1).numpy()
+
+
+def score_snapshot_multitask(model: "GATDetector", features: np.ndarray,
+                             device: torch.device = torch.device("cpu")):
+    """
+    Like score_snapshot but also returns the predicted attack type k̂_i per node.
+    Returns (S_i (N,), k_hat (N,) int in [0, K-1]). Degenerate 1-node snapshots
+    return zeros and attack type 0.
+    """
+    if features.shape[1] == 5:
+        tau_col  = np.full((len(features), 1), TAU_INIT, dtype=np.float32)
+        features = np.hstack([features, tau_col])
+    if features.shape[0] < 2:
+        n = features.shape[0]
+        return np.zeros((n,), dtype=np.float32), np.zeros((n,), dtype=np.int64)
+    model.eval()
+    data = snapshot_to_graph(features).to(device)
+    with torch.no_grad():
+        scores, atk = model(data.x, data.edge_index)
+    k_hat = atk.argmax(dim=1).cpu().numpy().astype(np.int64)
+    return scores.cpu().squeeze(-1).numpy(), k_hat

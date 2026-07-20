@@ -170,7 +170,46 @@ CLI flag.)
 
 > The authoritative attack-number → signature map is the comment block at the
 > top of `scratch/mptd_pqs_sdvn/06a_attack_models.h`. Check it before quoting a
-> mapping in the report.
+> mapping in the report. (Current code: 1=TP-S1 RSU drift, 2=TP-S2 vehicle,
+> 3=MP-S1 Sybil, 4=MP-S2 impersonation, **5=TP-S3 control-plane**, 6=MP-S3 MitM,
+> **7=MP-S4 control-plane**.)
+
+### 3a. `--stealthy_control_plane` — the two malicious-controller attacks (a5, a7)
+
+Attacks **5 (TP-S3)** and **7 (MP-S4)** are the *control-plane* attacks: the SDN
+controller is compromised. This flag chooses **how visible** that compromise is.
+**It only affects attacks 5 and 7 — all other attacks ignore it.**
+
+| Value | Behaviour | Beacon detectors (ψ, Ercan, Sharma) | CP-DETECT (ours) |
+|-------|-----------|-------------------------------------|------------------|
+| **`true` (DEFAULT)** — **stealthy** | Controller leaves the vehicle→RSU beacon *plausible/unchanged*; the malice is purely its WRONG_ROUTING downlink. | **Blind** — poisoned beacons are feature-identical to honest ⇒ MCC ≈ 0 | **Catches it** — controller-vs-RSU consensus conflict (≈89/91 epochs, flag_c=1) |
+| `false` — **loud** (legacy) | Controller injects large per-beacon drift (a5 ≈16 m position; a7 +25–50 % speed) that leaks into the beacon. | Catch the *symptom* (they detect a5/a7 without ever modelling the controller) | Also fires |
+
+Why it matters: the loud version lets beacon-only baselines "detect" a control-plane
+attack they don't model — because the drift leaks into the beacon. The realistic
+(stealthy, default) version keeps beacons clean, so **only CP-DETECT** flags the
+compromised controller. This is the demonstrated payoff of modelling a malicious
+controller. Note: a truly stealthy control-plane attack must **not touch the beacon
+at all** — even a +5 % speed edit trips the RSU's implied-acceleration rule (TP-S3,
+`|Δspeed|/dt > a_max`) and a small position step trips TP-S1.
+
+**How to run (stealthy is the default, so a plain a5/a7 run is already stealthy):**
+```bash
+# stealthy control-plane (DEFAULT) — baselines blind, CP-DETECT catches
+LD_LIBRARY_PATH="$PWD/build/lib:$HOME/.local/lib:$HOME/.local/lib64" \
+  ./build/scratch/mptd_pqs_sdvn/mptd_pqs_sdvn \
+  --mobility_source=1 --mobility_scenario=0 --maxspeed=60 --skip_blockchain=true \
+  --ablation_mode=0 --attack_number=5 --attack_percentage=50 --simTime=30
+#   (attack_number=7 for MP-S4; add --stealthy_control_plane=false for the loud contrast)
+
+# verify: expect ψ blind + CP-DETECT high, e.g.
+#   grep -c 'anomalous=YES'  <log>      # low (beacons look clean)
+#   grep 'CP-DETECT = '      <log>      # ~89/91 CTRL_COMPROMISED, flag_c=1
+```
+
+> ⚠️ The archived G50 dataset was generated with the **loud** a5/a7. If you want the
+> dataset / SOTA figures to reflect the stealthy default, regenerate the a5/a7
+> traces (they are the only attacks this flag changes).
 
 ---
 

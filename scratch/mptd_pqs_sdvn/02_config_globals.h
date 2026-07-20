@@ -157,6 +157,22 @@ inline int attacker_class_for(int attack_num)
 }
 
 bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
+// STEALTHY control-plane mode (a5 = TP-S3, a7 = MP-S4) — DEFAULT.
+//   The malicious controller leaves the vehicle→RSU beacon PLAUSIBLE (unchanged):
+//   the attack lives entirely in its control-plane WRONG_ROUTING decisions.
+//   → Beacon-level detectors (ψ, Ercan, Sharma) are BLIND by construction
+//     (poisoned beacons are feature-identical to honest).
+//   → Only CP-DETECT (controller-vs-RSU consensus, Algorithm 7) catches it,
+//     because the compromised controller keeps issuing WRONG_ROUTING that the
+//     honest RSUs disagree with.
+//   This is the realistic control-plane threat and the intended default.
+//
+//   Set --stealthy_control_plane=false for the legacy "LOUD" variant, where the
+//   controller injects a large per-beacon drift (a5: ~16 m position; a7: +25-50%
+//   speed) that leaks into the beacon so ANY beacon detector catches the symptom
+//   (used only to show the contrast — beacon baselines then also "detect" a5/a7).
+//   NOTE: only affects attack_number 5 and 7; other attacks are unchanged.
+bool stealthy_control_plane = true;
 
 // ── R4.b: backup-controller flag removed (paper has no backup controller) ──
 // The paper specifies CP-DETECT (Algorithm 7, §3.5.5) — when ≥f+1 RSUs disagree
@@ -255,9 +271,14 @@ double omega_max = 0.5236;  // Max angular velocity (rad/s) = 30 deg/s
 double a_max = 4.0;         // Max vehicle acceleration (m/s²)
 
 // TP-S4/TP-S5: Dead-reckoning and drift
-double delta_th = 10.0;     // Dead-reckoning residual threshold (m)
-// Calibration: delta_th=10.0m accommodates honest direction changes in the random-waypoint
-// mobility model (90° turn at 50 km/h gives residual ~9.8m; must stay below delta_th).
+double delta_th = 5.0;      // Dead-reckoning residual threshold (m)
+// Calibration (2026-07-20, sir Step 5): swept δ_th∈{5,7.5,10,12.5,15} offline on the
+// G50 SUMO drift attack (our a2). δ_th=5.0 is the max-MCC value with FPR≤0.05: it lifts
+// the drift-signature recall on poisoned beacons hugely (TP-S5 0.18→0.96) at ZERO honest
+// FP cost — SUMO honest trajectories are smooth (0.1s beacons), so honest dead-reckoning
+// residual ≈0 even at highway speed (verified urban/rural/highway: honest fire 0/15077).
+// Old value 10.0 was tuned for the random-waypoint model (large honest turn residuals);
+// under SUMO it was needlessly high and missed the stealth drift. a2 MCC 0.945→0.948.
 static bool g_save_restore_context = false;  // unused placeholder
 int    drift_window_k = 10; // Window size k for cumulative drift score
 
@@ -271,6 +292,12 @@ double rho_v   = 0.01;      // Vehicle density (vehicles/m²)
 // Beacons are staggered T_b/N apart in 12_main.h (≈6.25ms for 16 vehicles).
 // tau_sync=1ms < 6.25ms stagger → honest vehicles are NOT flagged.
 // Attacker colluders who send within 1ms of each other ARE flagged.
+// Calibration (2026-07-20, sir Step 6): swept τ_sync∈{1,2,5,10}ms × ρ_sync∈{0.6..0.9}
+// on the G50 impersonation attack (our a4). KEPT τ_sync=1ms — widening is
+// COUNTERPRODUCTIVE: with 200 SUMO vehicles at 0.1s beacons, honest beacons routinely
+// coincide within a few ms, so honest MP-S2 fire explodes 0.00→0.09→0.40→0.67 at
+// τ=1→2→5→10ms. τ=1ms already gives clean separation (0.21/0.00). a4 is caught by
+// MP-S1 (0.96/0.00) regardless, so τ_sync has ~zero leverage on a4's overall MCC.
 double tau_sync  = 0.001;   // 1ms synchronization detection window (s)
 double rho_sync  = 0.8;     // Co-occurrence rate threshold
 

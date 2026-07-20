@@ -27,7 +27,7 @@ HELD  = sys.argv[2] if len(sys.argv) > 2 else "/home/sdvn_mobility_flooding/ns-a
 OUT   = sys.argv[3] if len(sys.argv) > 3 else "live_results/heldout_pct"
 os.makedirs(OUT, exist_ok=True)
 ATTACKS = [1,2,3,4,5,6,7]
-TRAIN_PCTS = [30,60,90]          # existing RngRun=1 data → combined training
+TRAIN_PCTS = [30,90]          # p60 archive is RngRun=2 (test) — drop to avoid leakage
 TEST_PCTS  = [0,20,40,60,80,100] # held-out penetration sweep
 CONTROL = {5,7}
 
