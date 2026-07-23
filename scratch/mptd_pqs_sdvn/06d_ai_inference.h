@@ -718,8 +718,14 @@ inline FusionScore fuse_scores(float psi, float gat_score, float ae_err,
         base_ae  = p.lam_ae_k[attack_type];
     }
 
-    // Build the active-weight vector and renormalise.
-    float lp = base_psi;
+    // Build the active-weight vector and renormalise. AB1 (interpretation b):
+    // when the rule-signature tier is ablated, the ψ term is REMOVED from the
+    // fusion — so its weight must be excluded from the sum, exactly like use_gat
+    // (AB3) and use_ae (AB4). Without this, λ_ψ (=0.51) stays in the denominator
+    // while ψ=0, capping φ at λ_gat+λ_ae=0.50 (never > the 0.5 threshold) → the
+    // recalibrated GAT can never drive a detection. Renormalising GAT+AE to [0,1]
+    // lets the now-informative GAT carry the AB1 decision.
+    float lp = enable_rule_signatures ? base_psi : 0.0f;
     float lg = p.use_gat ? base_gat : 0.0f;
     float la = p.use_ae  ? base_ae  : 0.0f;
     const float sum_w = lp + lg + la;
