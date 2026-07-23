@@ -728,7 +728,7 @@ uint32_t run_cp_detect(BsmBeaconTag &tag)
     // For attack 5 (TP-S3): detection relies on kinematic signatures (TP-S1..S5)
     // because only attack_pct% of beacons are actually modified at the control plane.
     if (controller_malicious_assumption &&
-        (attack_number == 5 || attack_number == 7))
+        (attack_number == 5 || attack_number == 7 || g_combined_attack))
         return 1;
     return 0;
 }
@@ -1022,20 +1022,24 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     }
     g_save_restore_context = false;  // reset after detection to prevent leakage
 
-    // AB1 (C10): rule signatures removed — detectors still run so shared state
-    // (windows, density trackers) stays warm for the AI components, but their
-    // TP/MP flags are zeroed so ψ, fusion and every decision ignore them.
+    // AB1 (C10) — interpretation (b), sir 2026-07-21: the rule-signature TIER's own
+    // DETECTION is removed (its lightweight decision + its ψ fusion contribution),
+    // but sig_mask and ψ REMAIN as GAT INPUT FEATURES. The proposed GAT model was
+    // built with these rule-derived attributes and must still operate under the
+    // ablation — so we do NOT zero the tp/mp flags here (they feed r.sig_violated →
+    // last_sigmask_per_vehicle → gat_sig, and r.psi → last_psi_per_vehicle → gat_psi,
+    // the GAT's node features). The ψ FUSION TERM is forced to 0 at the fuse site;
+    // here we only disable the rule-based lightweight decision.
     // CP-DETECT (Alg 4) is a separate mechanism and stays active.
-    if (!enable_rule_signatures) {
-        r.tp_flags = 0;
-        r.mp_flags = 0;
-    }
 
-    // 3. Composite sig bitmask + lightweight score gate (Eq. 3.20)
+    // 3. Composite sig bitmask (still feeds the GAT input even under AB1)
     r.sig_violated = r.tp_flags | (r.mp_flags << 5) | (r.cp_flags << 9);
-    r.anomalous    = run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4));
+    r.anomalous    = enable_rule_signatures
+                   ? run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4))
+                   : (r.cp_flags != 0);   // AB1: rule-based LW off; CP-DETECT stays
 
-    // 4. ψ_i(t) — same weights as run_lightweight_score (used for SC-Trust)
+    // 4. ψ_i(t) — kept so ψ feeds the GAT input (gat_psi). The ψ *fusion term* is
+    //    zeroed in AB1 at the fuse site (psi_fuse), NOT here.
     {
         uint32_t all_f = r.tp_flags | (r.mp_flags << 5);
         for (int k = 0; k < 9; k++)
@@ -1965,8 +1969,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // of detector quality. The gate restores a valid clean/poisoned ground-truth
     // partition so MCC (Eq. 4.1) is well-defined. CDER (Eq. 4.4) remains the primary
     // metric for MP-S4 since it is fundamentally a control-plane attack.
-    if (attack_number == 7 && controller_malicious_assumption &&
-        GetBooleanWithProbability(attack_percentage, vehicle_id))
+    if ((attack_number == 7 || (g_combined_attack && (vehicle_id % 2 == 0))) &&
+        controller_malicious_assumption &&
+        GetBooleanWithProbability(attack_percentage, vehicle_id) &&
+        !(g_combined_attack && tag.GetIsPoisoned()))   // combined: even veh → a7, honest beacons only
     {
         double real_spd = tag.GetSpeed();
         double real_hdg = tag.GetHeading();
@@ -2025,9 +2031,10 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // Paper §3.4.1 (Figure 3.3): SDN controller (management node) intercepts honest
     // vehicle beacons and modifies position + speed before forwarding to other planes.
     // HandleBeaconReceived() runs at the management node → this IS the control plane.
-    if (attack_number == 5 &&
+    if ((attack_number == 5 || (g_combined_attack && (vehicle_id % 2 == 1))) &&
         controller_malicious_assumption &&
-        GetBooleanWithProbability(attack_percentage, vehicle_id))
+        GetBooleanWithProbability(attack_percentage, vehicle_id) &&
+        !(g_combined_attack && tag.GetIsPoisoned()))   // combined: odd veh → a5, honest beacons only
     {
         double real_px  = tag.GetPosX();
         double real_py  = tag.GetPosY();
@@ -2442,8 +2449,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         // vector for k̂ (or the aggregate w when k̂=-1, i.e. GAT
                         // unconfident — the Change-2 gate). Sums to 1 → same scale
                         // as the global-weighted ψ that fuse_scores normalises by ψ_th.
-                        float psi_fuse = psi_i;
-                        if (g_fusion.has_sig_weights) {
+                        // AB1 (b): remove the ψ FUSION TERM (the rule-signature tier's
+                        // contribution to the full-mode decision) while sig_mask/ψ still
+                        // feed the GAT input above → φ = λ_gat·gat + λ_ae·ae for AB1.
+                        float psi_fuse = enable_rule_signatures ? psi_i : 0.0f;
+                        if (enable_rule_signatures && g_fusion.has_sig_weights) {
                             const uint32_t sm = last_sigmask_per_vehicle[vid_i];
                             const float *w = (k_hat_i >= 0 && k_hat_i < FusionParams::K_ATTACK)
                                              ? g_fusion.sig_w_k[k_hat_i] : g_fusion.sig_w_global;
@@ -2484,6 +2494,23 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         if (ablation_mode != 1 && ablation_mode != 6) {
                             update_confusion_matrix_full(
                                 rw.is_poisoned[i], full_flag);
+                        }
+                        // C5 TTD (alert side): the alert timestamp must come from the
+                        // FUSION decision so TTD responds to the ablation. The previous
+                        // alert assignment (per-beacon `detected` in handle_readone) fired
+                        // on the same call — and with the same t_now — as the onset
+                        // assignment, so alert==onset and TTD collapsed to 0.000 in every
+                        // run. `detected` is also ablation-inert (beacon_log.csv is
+                        // byte-identical FULL vs AB1), so it cannot measure AB1/AB3/AB4.
+                        // INDEX BASE: vid_i is a NodeId (tag.GetVehicleId(), see 08:3029),
+                        // whereas g_ttd_* is indexed by (NodeId - g_first_vehicle_node_id)
+                        // — the same transform used at the onset site. Do not drop it.
+                        {
+                            const int vi_ttd = (int)vid_i - (int)g_first_vehicle_node_id;
+                            if (full_flag && vi_ttd >= 0 && vi_ttd < total_size &&
+                                g_ttd_first_poison[vi_ttd] >= 0 &&
+                                g_ttd_first_alert[vi_ttd]  <  0)
+                                g_ttd_first_alert[vi_ttd] = Simulator::Now().GetSeconds();
                         }
                         cout << "[FUSION-RSU" << rsu_id << "] epoch="
                              << cw.window_epoch
@@ -2715,8 +2742,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             double t_now = Simulator::Now().GetSeconds();
             if (tag.GetIsPoisoned() && g_ttd_first_poison[vi] < 0)
                 g_ttd_first_poison[vi] = t_now;
-            if (detected && g_ttd_first_poison[vi] >= 0 && g_ttd_first_alert[vi] < 0)
-                g_ttd_first_alert[vi] = t_now;
+            // ALERT side intentionally NOT set here: `detected` is the immediate
+            // per-beacon flag, which (a) fires in this same call with this same
+            // t_now — making alert==onset and TTD==0 — and (b) is ablation-inert.
+            // The alert timestamp is now taken from the FUSION decision (full_flag),
+            // see the C5 TTD block next to update_confusion_matrix_full() above.
         }
     }
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
@@ -2773,8 +2803,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // CDER (Eq.4.4) stays well-defined: exactly one control decision per beacon —
     // R2 fast-path for {2,3,4,6,clean}; controller-here for {1,5,7}.
     if (g_option_b_active && rsu_id < N_RSUs && g_mgmt_downlink_socket &&
-        (attack_number == 1 || attack_number == 5 || attack_number == 7)) {
-        bool malicious_ctrl = (attack_number == 5 || attack_number == 7);
+        (attack_number == 1 || attack_number == 5 || attack_number == 7 || g_combined_attack)) {
+        bool malicious_ctrl = (attack_number == 5 || attack_number == 7 || g_combined_attack);
 
         uint8_t  alert_type;
         double   spd_advice;
@@ -3217,9 +3247,11 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // ── TP-S1: Compromised RSU modifies trajectory (paper §3.4.1 Figure 3.1) ──
         // compromised_rsu[] already reflects attack_percentage via declare_compromised_rsus().
         // No second per-vehicle gate — ALL vehicles at a compromised RSU are poisoned.
-        if (attack_number == 1 &&
+        if ((attack_number == 1 ||
+             (g_combined_attack && rsu_idx < MAX_RSUS && g_rsu_attack[rsu_idx] == 1)) &&
             rsu_idx < N_RSUs &&
-            compromised_rsu[rsu_idx])
+            compromised_rsu[rsu_idx] &&
+            !(g_combined_attack && tag.GetIsPoisoned()))   // combined: only poison HONEST beacons
         {
             double real_px  = tag.GetPosX();
             double real_py  = tag.GetPosY();
@@ -3288,9 +3320,11 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         //   ghost packets are sent first; the real beacon follows. CSMA FIFO guarantees
         //   ghosts arrive at the controller before the real beacon → count is pre-inflated
         //   when the real beacon arrives → density check fires on the real beacon. ✓
-        if (attack_number == 3 &&
+        if ((attack_number == 3 ||
+             (g_combined_attack && rsu_idx < MAX_RSUS && g_rsu_attack[rsu_idx] == 3)) &&
             rsu_idx < N_RSUs &&
-            compromised_rsu[rsu_idx])
+            compromised_rsu[rsu_idx] &&
+            !(g_combined_attack && tag.GetIsPoisoned()))   // combined: only poison HONEST beacons
         {
             // Step 3: Mark real beacon as poisoned (ground-truth provenance flag)
             tag.SetIsPoisoned(true);

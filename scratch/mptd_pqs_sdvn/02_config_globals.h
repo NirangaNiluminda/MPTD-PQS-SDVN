@@ -126,7 +126,7 @@ int attack_percentage = 40;  // % of nodes that are malicious (0-100, avoid 100)
 int sybil_registration_pct = 0;
 
 const char* attack_scenario_name[] = {
-    "",                                                    // 0 unused
+    "COMBINED:All7AttackTypes",                            // 0 combined-attack mode
     "TP-S1:MaliciousRSU-TrajectoryPoisoning",             // 1
     "TP-S2:MaliciousVehicle-TrajectoryPoisoning",         // 2
     "MP-S1:Sybil-CompromisedRSU",                        // 3
@@ -183,6 +183,12 @@ bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 //   NOTE: only affects attack_number 5 and 7; other attacks are unchanged.
 bool stealthy_control_plane = true;
 
+// Verbose per-beacon stdout ([DSRC-TX], [LL-SEL]) — OFF by default. These fire
+// once per vehicle per beacon interval; at 200 vehicles over a 300 s run they
+// balloon the log to ~280 MB and make the run I/O-bound (~2.3 h). Gated so long
+// sweeps stay fast/small; set --verbose_tx=true to re-enable for debugging.
+bool g_verbose_tx = false;
+
 // ── R4.b: backup-controller flag removed (paper has no backup controller) ──
 // The paper specifies CP-DETECT (Algorithm 7, §3.5.5) — when ≥f+1 RSUs disagree
 // with the controller's submission, the controller is excluded from consensus
@@ -229,6 +235,33 @@ int ablation_mode = 1;
 int  ablation_ab            = 0;
 bool enable_rule_signatures = true;   // AB1
 bool enable_hmac_gate       = true;   // AB2
+
+// ── a6 (MP-S3) faithful in-transit modification ──────────────────────────────
+// Default false = legacy a6 behaviour (fabricate a fresh unauthenticated beacon
+// addressed to the ATTACKER's RSU). That model never reaches the HMAC gate: the
+// RSU geographic filter (08_detection_engine.h) drops it because the claimed
+// victim position belongs to another RSU zone, so HMAC is never consulted.
+//
+// When true, a6 models a real man-in-the-middle per the paper threat model:
+//   (1) the relayed beacon is addressed to the RSU serving the CLAIMED position,
+//       so it survives the geographic filter, and
+//   (2) it carries the victim's HMAC computed over the victim's ORIGINAL
+//       kinematics, then the payload is modified → MAC no longer matches →
+//       lkh_verify_beacon_hmac() fails (in-transit modification detected).
+// The attacker never obtains K_i, so it cannot mint a fresh valid MAC; it only
+// replays the original MAC over altered content — exactly a real MitM's power.
+//
+// Kept OFF by default so combined-attack runs (AB1, E1–E5) are byte-identical
+// to previously collected results. Enable per-run with --faithful_mitm=1.
+bool g_faithful_mitm        = false;
+
+// a6 stealth regime (paper gamma=1.0, Eq 3.5). Default false = abrupt/blatant
+// forgery, which trips the psi speed bound on 100% of beacons and makes the HMAC
+// gate redundant. When true the forged kinematics stay INSIDE the feasibility
+// envelope (speed <= 0.9*s_max, position step <= epsilon_max_stealth = 0.5 m <
+// the 3.33 m gate), so psi cannot fire and HMAC is the only instant detector.
+// Requires --faithful_mitm=1 to be meaningful (the stale MAC is what HMAC catches).
+bool g_mitm_stealth         = false;
 bool enable_trs             = true;   // AB6
 bool enable_fhe             = true;   // AB7
 bool enable_rsu_lifecycle   = true;   // AB8
@@ -614,6 +647,20 @@ double   AIFS        = 0.0;
 
 // ── Malicious node flags for location-based attacks (11_routing) ──────────
 bool tp_vehicle_nodes[total_size]         = {};  // TP-S2: malicious vehicle trajectory poisoning
+
+// ── Combined-attack mode (--attack_number=0): all 7 attack types active in ONE
+// run, the "combined attack" default sir specifies for the ablation and E1–E4.
+// g_veh_attack[i] = the attack type assigned to malicious vehicle i (0 = honest;
+// else 2/4/6 for the vehicle-level TP-S2/MP-S2/MP-S3). The RSU-level (a1,a3) and
+// controller-level (a5,a7) attacks are activated globally alongside. This lets a
+// single run yield every metric (TPE from TP attacks, TDEE from MP attacks,
+// CP-DETECT from the controller attacks). Set after cmd.Parse() in 12_main.h.
+bool g_combined_attack = false;
+int  g_veh_attack[total_size] = {};
+// Effective attack type for a vehicle: per-node in combined mode, else the global.
+inline int veh_atk(uint32_t vid, int global_atk) {
+    return (g_combined_attack && vid < (uint32_t)total_size) ? g_veh_attack[vid] : global_atk;
+}
 
 NS_LOG_COMPONENT_DEFINE ("mptd_pqs_sdvn");
 

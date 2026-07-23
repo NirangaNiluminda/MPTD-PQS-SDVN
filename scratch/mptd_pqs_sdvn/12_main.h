@@ -58,6 +58,7 @@ int main(int argc, char *argv[])
     cmd.AddValue ("delta_trs", "H6 Delta_TRS sigma_TRS freshness window (s)", delta_trs);
     cmd.AddValue ("attack_number", "attack_number", attack_number);
     cmd.AddValue ("stealthy_control_plane", "TP-S3/MP-S4 stealthy mode: small plausible controller falsification (beacon detectors blind, CP-DETECT still catches)", stealthy_control_plane);
+    cmd.AddValue ("verbose_tx", "verbose per-beacon [DSRC-TX]/[LL-SEL] stdout (off by default; bloats long runs)", g_verbose_tx);
     cmd.AddValue ("experiment_number", "experiment_number", experiment_number);
     cmd.AddValue ("routing_test", "routing_test", routing_test);
     cmd.AddValue ("routing_algorithm", "routing_algorithm", routing_algorithm);
@@ -95,6 +96,14 @@ int main(int argc, char *argv[])
                   ablation_ab);
     cmd.AddValue ("enable_rule_signatures", "AB1 toggle: 0=disable TP/MP rule scoring", enable_rule_signatures);
     cmd.AddValue ("enable_hmac_gate", "AB2 toggle: 0=disable HMAC+nonce beacon gate", enable_hmac_gate);
+    cmd.AddValue ("mitm_stealth",
+                  "a6 stealth regime: 0=abrupt (default, trips psi speed bound), "
+                  "1=kinematically-plausible drift (psi cannot fire; HMAC sole detector)",
+                  g_mitm_stealth);
+    cmd.AddValue ("faithful_mitm",
+                  "a6 model: 0=legacy injection (default, preserves combined-attack results), "
+                  "1=faithful in-transit modification (relay to claimed-position RSU + stale victim MAC)",
+                  g_faithful_mitm);
     cmd.AddValue ("enable_trs", "AB6 toggle: 0=skip TRS sign/verify in crypto pipeline", enable_trs);
     cmd.AddValue ("enable_fhe", "AB7 toggle: 0=plaintext aggregates (TRS still signs)", enable_fhe);
     cmd.AddValue ("enable_rsu_lifecycle", "AB8 toggle: 0=RSUs permanently trusted", enable_rsu_lifecycle);
@@ -121,6 +130,10 @@ int main(int argc, char *argv[])
                   "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
                   g_mobility_source);
     cmd.Parse (argc, argv);
+    // Combined-attack mode: --attack_number=0 activates all attack types in one run
+    // (sir's ablation/E1–E4 default). Vehicle attacks (a2/a4/a6) are assigned per-node
+    // in declare_attackers(); RSU (a1/a3) + controller (a5/a7) layers activate alongside.
+    g_combined_attack = (attack_number == 0);
     // Multi-seed: drive the ns-3 global RNG from --seed so stochastic ns-3 elements
     // (channel, propagation, jitter) vary per seed. The attack-side randomness is
     // additionally mixed with run_seed in 06a_attack_models.h. (2026-07-20)
@@ -205,6 +218,17 @@ int main(int argc, char *argv[])
         std::string scenario_sub = "urban";
         if (mobility_scenario == 1) scenario_sub = "rural";
         else if (mobility_scenario == 2) scenario_sub = "highway";
+        // Combined-attack mode (--attack_number=0) uses a SEPARATE calibration
+        // (θ_S/θ_ae/fusion_weights re-derived on the heavily-attacked combined graph,
+        // where clean beacons sit at higher GAT-S). The single-attack calibration in
+        // models/urban/ is left untouched. Only urban has a combined set for now;
+        // rural/highway fall through to their standard calibration.
+        if (g_combined_attack && mobility_scenario == 0) {
+            std::string cdir = std::string(NS3_ROOT) + "/analytics/ml/models/urban_combined/gat_model.onnx";
+            std::ifstream ctest(cdir);
+            if (ctest.good()) { scenario_sub = "urban_combined";
+                std::cout << "[AI-INIT] combined-attack calibration → models/urban_combined/" << std::endl; }
+        }
 
         // GAT is now per-scenario (Phase-1b clean stats + θ_S re-derived on each
         // scenario's clean SUMO traces — recalibrate_gat_per_scenario.py). The
@@ -2209,6 +2233,18 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // Wiring the env-gated arm here guarantees the +0.5s drainer tick regardless
   // of attack/percentage selection. Paper §3.5.5 Eq 3.58 cross-RSU broadcast.
   mptd_arm_event_drainer_if_env();
+
+  // C5 TTD: seed the onset/alert sentinels to -1. These are file-scope globals, so
+  // C++ zero-initialises them to 0.0 — and compute_TTD() treats ">= 0" as "recorded".
+  // Without this every one of the total_size slots looks recorded with onset==alert,
+  // so TTD collapsed to exactly 0.0000 in every run ever produced. init_vehicle_states()
+  // in 04_state_globals.h seeds these, but it is DEFINED AND NEVER CALLED; only these
+  // two arrays actually differ from zero-init, so we seed them here rather than call
+  // it (calling it would also clear pre_registered_sybil[] and clobber attacker setup).
+  for (int i = 0; i < total_size; i++) {
+      g_ttd_first_poison[i] = -1.0;
+      g_ttd_first_alert[i]  = -1.0;
+  }
 
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();

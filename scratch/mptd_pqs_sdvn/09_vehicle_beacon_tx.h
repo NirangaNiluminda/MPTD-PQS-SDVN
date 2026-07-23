@@ -119,7 +119,7 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			                                          vid, is_mal);
 			uint32_t geo_rsu = nearest_rsu_for_position(real_px, real_py);
 			nearest_rsu_idx  = ll_rsu;
-			if (ll_rsu != geo_rsu) {
+			if (g_verbose_tx && ll_rsu != geo_rsu) {
 				cout << "[LL-SEL] V" << nid
 				     << " LL→RSU" << ll_rsu
 				     << " (nearest=RSU" << geo_rsu << ")"
@@ -161,8 +161,11 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			double vy = real_spd * std::sin(real_hdg);
 			Vector fvel(vx, vy, 0.0);
 			Vector facc(0.0, 0.0, 0.0);
+			// Combined mode: each malicious vehicle runs its OWN assigned attack
+			// type (g_veh_attack[vid]); single-attack mode uses the global.
+			int eatk = veh_atk(vid, attack_number);
 			PoisonTrajectoryByType(fpos, fvel, facc, poisoning_intensity_theta,
-			                       attack_number);
+			                       eatk);
 			// attack 3 (MP-S1 Sybil): no vehicle-level modification (is_mal=false), skip.
 			// attack 5 (TP-S3 Control-plane): vehicles are honest, case not reached.
 			// attack 6 (MP-S3 MitM): extreme speed must reach detector unclamped.
@@ -173,8 +176,8 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			//   attack 7 (MP-S4 Coordinated):   speed amplification for distribution corruption
 			//   attack 3 + sybil_reg_pct > 0:   speed ~66 m/s for MP-S3 KL detection (enhanced mode)
 			// EnforceRealism would clamp velocity to s_max=33.33 m/s and nullify the signal.
-			if (attack_number != 6 && attack_number != 7 &&
-			    !(attack_number == 3 && sybil_registration_pct > 0)) {
+			if (eatk != 6 && eatk != 7 &&
+			    !(eatk == 3 && sybil_registration_pct > 0)) {
 				EnforceRealism(fpos, fvel, facc);
 			}
 			tx_px  = fpos.x;
@@ -262,9 +265,10 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	                    udp_app, packet1, dest_ip, dest_port);
 
 	if (g_option_b_active) {
-		cout << "[DSRC-TX] V" << nid << " → RSU" << nearest_rsu_idx
-		     << " (" << dest_ip << ":" << dest_port << ") at "
-		     << Simulator::Now().GetSeconds() << endl;
+		if (g_verbose_tx)
+			cout << "[DSRC-TX] V" << nid << " → RSU" << nearest_rsu_idx
+			     << " (" << dest_ip << ":" << dest_port << ") at "
+			     << Simulator::Now().GetSeconds() << endl;
 		// ── A7-STEP1/STEP2: All vehicles transmit HONEST beacons (data plane clean) ──
 		// Paper Fig 3.7 §3.4.2: Vehicles and RSUs operate correctly — no data-plane
 		// poisoning. Even vehicles alternate Step 1, odd vehicles alternate Step 2.
@@ -285,7 +289,7 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	// Attack model defined in 06a_attack_models.h (declare_attack_states, attack_number==4).
 	// Execution: malicious vehicle calls inject_mp_s2_stolen_beacons() to send
 	// extra beacon packets claiming stolen vehicle identities at this vehicle's position.
-	if (attack_number == 4 && is_mal)
+	if (veh_atk(vid, attack_number) == 4 && is_mal)
 		inject_mp_s2_stolen_beacons(udp_app, nid, tx_px, tx_py,
 		                             tx_spd, tx_hdg, tx_acc, dest_ip);
 
@@ -297,7 +301,7 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	// Paper steps: ①honest sends → ②MitM intercepts → ④MitM forwards modified
 	// beacon to RSU with victim's ID but amplified speed → ⑤RSU sends both
 	// legitimate and poisoned data to controller → ⑥controller model corrupted.
-	if (attack_number == 6 && is_mal)
+	if (veh_atk(vid, attack_number) == 6 && is_mal)
 		inject_mp_s3_mitm_beacons(udp_app, nid, real_px, real_py, dest_ip);
 
 	// MP-S4 (attack_number=7): controller-malicious-only attack — vehicles are honest.
@@ -508,7 +512,40 @@ void inject_mp_s3_mitm_beacons(Ptr<SimpleUdpApplication> udp_app,
 		double fake_acc = poisoning_intensity_theta * 0.35 * a_max
 		                * (1.0 + 0.2 * std::sin(t * 1.3 + (double)vid));
 
+		// ── Stealth regime (--mitm_stealth=1, default OFF) ───────────────────────
+		// The abrupt values above are kinematically IMPOSSIBLE: spd_floor (35-45 m/s)
+		// exceeds s_max=33.33, and the position drift (0.10-0.20 x 50 m = 5-10 m per
+		// beacon) exceeds the s_max*T_b = 3.33 m gate. Measured consequence: the psi
+		// rule tier flags 100% of forged beacons on the speed bound alone, so the HMAC
+		// gate is fully redundant and AB2 cannot show its contribution.
+		//
+		// The stealth regime is the paper's own gamma=1.0 case (Eq 3.5,
+		// epsilon_max_stealth = 0.5 m < 3.33 m gate). Every perturbation stays INSIDE
+		// the kinematic feasibility envelope, so psi cannot fire — the modification is
+		// physically plausible and only the cryptographic MAC check can detect it.
+		// This makes the adversary STRONGER, not weaker; it is the honest threat model
+		// for "HMAC is the only mechanism that catches in-transit modification".
+		if (g_mitm_stealth) {
+			// Speed: modest perturbation, hard-capped below s_max so the speed-bound
+			// signature cannot trip. No spd_floor.
+			mitm_spd = real_spd * (1.0 + 0.25 * poisoning_intensity_theta);
+			const double spd_cap = 0.90 * s_max;
+			if (mitm_spd > spd_cap) mitm_spd = spd_cap;
+			// Position: drift accumulates over interception steps, but each beacon's
+			// increment is epsilon_max_stealth (0.5 m) — well under the per-beacon gate.
+			// Cumulative offset is what poisons the trajectory; the per-step delta is
+			// what keeps it invisible to the rule tier.
+			double drift = epsilon_max_stealth * (double)step;
+			if (drift > max_position_deviation) drift = max_position_deviation;
+			fake_px = vic_pos.x + drift * std::sin(t * 0.9 + (double)vid);
+			fake_py = vic_pos.y + drift * std::cos(t * 0.7 + (double)vid);
+			// Acceleration: keep well inside a_max so the accel signature stays quiet.
+			fake_acc = 0.10 * a_max;
+		}
+
 		// ── Step ④: Forward poisoned packet to RSU under victim's identity ────────
+		double mitm_ts = t + 0.005 * (intercepted + 1);
+
 		BsmBeaconTag mitm_tag;
 		mitm_tag.SetVehicleId(victim_nid);          // ← victim's identity (preserved)
 		mitm_tag.SetPosition(fake_px, fake_py);     // ← slight location drift
@@ -516,10 +553,37 @@ void inject_mp_s3_mitm_beacons(Ptr<SimpleUdpApplication> udp_app,
 		mitm_tag.SetHeading(real_hdg);              // ← victim's real heading (believable)
 		mitm_tag.SetAcceleration(fake_acc);         // ← positive accel (coherent with spd)
 		// Stagger timestamp: 5ms per victim so RSU sees distinct receive events
-		mitm_tag.SetTimestamp(t + 0.005 * (intercepted + 1));
+		mitm_tag.SetTimestamp(mitm_ts);
 		mitm_tag.SetIsPoisoned(true);
 		mitm_tag.SetAttackType(6);
 		mitm_tag.SetSigViolated(0);
+
+		// ── Faithful in-transit modification (--faithful_mitm=1, default OFF) ────
+		// Legacy behaviour sends an UNAUTHENTICATED beacon to the attacker's own
+		// RSU. It is discarded by the RSU geographic filter before the HMAC gate
+		// (claimed victim position maps to a different RSU zone), so HMAC never
+		// sees the attack. Both defects are corrected here:
+		//   (1) attach the victim's MAC computed over the victim's ORIGINAL
+		//       kinematics; the payload above is already the MODIFIED content, so
+		//       lkh_verify_beacon_hmac() recomputes over the forged values and the
+		//       MAC mismatches → in-transit modification is detected (HMAC-FAIL).
+		//       K_i is never disclosed to the attacker: it replays the captured
+		//       MAC, it cannot mint a fresh valid one.
+		//   (2) address the relayed frame to the RSU serving the CLAIMED position
+		//       so it survives the geographic filter, as a real MitM relaying into
+		//       the victim's neighbourhood would.
+		if (g_faithful_mitm) {
+			int vic_idx = lkh_veh_idx(victim_nid);
+			if (vic_idx >= 0 && vic_idx < LKH_MAX_VEH) {
+				uint8_t stale_mac[LKH_HMAC_TRUNC];
+				// Sign the victim's UNMODIFIED kinematics (pre-tamper state).
+				lkh_compute_beacon_hmac(vic_idx,
+				                        vic_pos.x, vic_pos.y,
+				                        real_spd, real_hdg, 0.0,
+				                        mitm_ts, victim_nid, stale_mac);
+				mitm_tag.SetHmac(stale_mac);
+			}
+		}
 
 		Ptr<Packet> mitm_pkt = Create<Packet>(0);
 		mitm_pkt->AddPacketTag(mitm_tag);
@@ -527,10 +591,16 @@ void inject_mp_s3_mitm_beacons(Ptr<SimpleUdpApplication> udp_app,
 		g_bwo_base_bytes += mitm_tag.GetSerializedSize() - 8;   // C8 BWO
 		g_bwo_hmac_bytes += 8;
 
+		Ipv4Address mitm_dest = dest_ip;
 		uint16_t mitm_port = g_option_b_active ? 6666 : 7777;
+		if (g_faithful_mitm && g_option_b_active && g_num_active_rsus > 0) {
+			uint32_t claim_rsu = nearest_rsu_for_position(fake_px, fake_py);
+			if (claim_rsu < (uint32_t)g_num_active_rsus)
+				mitm_dest = g_rsu_dsrc_ip[claim_rsu];
+		}
 		Simulator::Schedule(Seconds(0.005 * (intercepted + 1)),
 		                    &SimpleUdpApplication::SendPacket,
-		                    udp_app, mitm_pkt, dest_ip, mitm_port);
+		                    udp_app, mitm_pkt, mitm_dest, mitm_port);
 
 		// TPE: speed-displacement proxy for MitM injection beacons (speed error × T_b)
 		// TDEE is computed at management node via density counts; no send-side accumulation.

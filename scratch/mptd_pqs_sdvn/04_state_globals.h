@@ -149,6 +149,10 @@ RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 // compromised_rsu[i] = true means RSU i intercepts+modifies vehicle data.
 // Set by declare_compromised_rsus() in 11_blockchain_transmission.h.
 bool compromised_rsu[MAX_RSUS] = {};
+// Combined-attack mode: per-RSU attack type for compromised RSUs (0=none/honest,
+// 1=TP-S1 drift, 3=MP-S1 ghost). Compromised RSUs are partitioned across a1/a3 so
+// no single RSU runs both. Set in declare_compromised_rsus() when attack_number==0.
+int g_rsu_attack[MAX_RSUS] = {};
 
 // ── C5–C9: paper §4.2 metric instrumentation (FRR/COO/BWO/TCL; TTD arrays
 // live above init_vehicle_states which seeds their −1 sentinels) ─────────────
