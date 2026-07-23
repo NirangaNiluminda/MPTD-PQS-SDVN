@@ -147,3 +147,6 @@ mobility/mobility_rural3k_*.tcl
 
 
 
+
+# Python bytecode (any depth)
+__pycache__/
