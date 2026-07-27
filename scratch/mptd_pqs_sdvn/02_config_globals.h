@@ -262,7 +262,71 @@ bool g_faithful_mitm        = false;
 // the 3.33 m gate), so psi cannot fire and HMAC is the only instant detector.
 // Requires --faithful_mitm=1 to be meaningful (the stale MAC is what HMAC catches).
 bool g_mitm_stealth         = false;
+
+// Per-run isolation of the shared live-results dir (analytics/results/<scenario>/).
+// The per-beacon logs (beacon_log.csv, ghost_identity_log.csv, …) are written to
+// that ONE dir and only copied to the per-attack dataset folder at run end, so two
+// CONCURRENT sims of different attacks clobber each other's beacon_log (MCC is safe
+// — it comes from in-memory counters — but beacon-level analysis is corrupted).
+// With --per_pid_results=1 the live dir becomes <scenario>_pid<PID>/, isolating each
+// process so its beacon_log is clean even under parallel sweeps. Default OFF so the
+// running sweep's paths are byte-identical. (2026-07-25)
+bool g_per_pid_results      = false;
+
+// AB3 sweep variable: n_coord — the number of COORDINATED Sybil identities a
+// compromised RSU fabricates per intercepted vehicle (paper Fig 3.4 Steps 4-5,
+// previously the hardcoded N_ghost=4 in 08_detection_engine.h). GAT's unique
+// contribution is spatial relational detection of coordinated attacks, so this
+// is the variable that stresses it. Default 4 = the previous hardcoded value,
+// so every already-collected result is byte-identical.
+int  g_n_coord              = 4;
+
+// AB5 / E2 uniform-speed traces (--uniform_speed_trace). The default traces use
+// REALISTIC per-road OSM speed limits, so a vehicle's actual speed is set by map
+// topology, not by --maxspeed (measured: mobility_urban_60.tcl has 2234 distinct
+// speeds, max 29.98 m/s). That is correct for E1/E5/AB1-AB4, but it confounds a
+// SPEED sweep: v would not be a clean experimental variable.
+// build_sumo_trace.sh UNIFORM_SPEED_MS=<m/s> emits a companion trace where every
+// vType maxSpeed, speedFactor=1, speedDev=0 AND every road edge speed is pinned to
+// the target. Those live under the "<tag>_uniform" tag so they sit BESIDE the
+// realistic ones — mobility_urban_60.tcl (used by the completed AB1 + running AB2
+// sweeps) is never overwritten. RSU layout is speed-independent and keeps the base
+// tag. Default false = existing behaviour for every other experiment.
+bool g_uniform_speed_trace  = false;
+
+// AB3 Phase 1: paper-faithful MP-S1 identity-density signature (--honest_mp_s1).
+// The legacy MP-S1 (08_detection_engine.h) ANDs the density check with two
+// non-paper shortcuts: (a) ghost_seen_flag — fires on the synthetic ghost ID
+// marker vid>=10000, and (b) tag.GetIsPoisoned() — the GROUND-TRUTH poison label.
+// Together these make MP-S1 a label-assisted oracle: FP=0 by construction and every
+// ghost trivially caught, so GAT can never contribute (AB3 anti-informative). When
+// true, MP-S1 implements ONLY paper Eq. mp_s1 — the identity-density check on
+// OBSERVABLE beacon data (count > threshold) — with no synthetic-ID flag and no
+// ground-truth gate. Default false so all existing single/combined results are
+// byte-identical; enable for AB3 and the paper-faithful redo.
+bool g_honest_mp_s1         = false;
+// Honest-MP-S1 density threshold multiplier: threshold = ceil((N_v/N_r) * k). The
+// naive k=1 (mean density) flags ~48% of clean urban traffic; k≈2.3 lifts the
+// threshold to the clean 95th-pct (~7) so honest clustering doesn't false-positive.
+double g_mp_s1_density_k    = 2.3;
+
+// AB3 Phase 2: GAT-evasive distributed Sybil (--sybil_gat_evasive). The legacy a3
+// clusters n_coord ghosts at ONE RSU (density spike → MP-S1 trivially fires) and never
+// routes them through the GAT scoring path (0 fusion entries), so GAT cannot contribute.
+// When true, each ghost is instead: (1) placed near a DISTINCT RSU so per-RSU density
+// stays ≤1 (evades even paper-faithful MP-S1), (2) given plausible kinematics — speed
+// ≤ s_max, constant heading so no TP-S1/S2/S3 fire — but a heading INCONSISTENT with
+// local flow (spatial-relational outlier), (3) de-synced in time (evades MP-S2), and
+// (4) ROUTED through ipfs_push_and_maybe_flush() so the GAT actually scores it. Goal:
+// rules can no longer catch the Sybils (FN>0 in lightweight) but GAT can (spatial
+// anomaly) — the configuration that isolates GAT's contribution. Requires
+// --honest_mp_s1=1 to be meaningful. Default false: legacy a3 is byte-identical.
+bool g_sybil_gat_evasive    = false;
 bool enable_trs             = true;   // AB6
+// AB6 f/n sweep: force exactly F of the n signing-ring members compromised so
+// PARR degrades along the BFT tolerance boundary. -1 = off (legacy behaviour:
+// f_actual emerges randomly from attack_percentage/rsu_seed). 0..n = controlled.
+int  g_trs_compromised_f    = -1;
 bool enable_fhe             = true;   // AB7
 bool enable_rsu_lifecycle   = true;   // AB8
 bool enable_ctrl_rotation   = true;   // AB9
@@ -281,6 +345,26 @@ int g_enable_gat_cli      = -1;   // -1 = follow ablation_mode, 0/1 = explicit
 int g_enable_lstm_ae_cli  = -1;   // -1 = follow ablation_mode, 0/1 = explicit
 bool g_enable_gat         = true; // effective value after dispatch (R7f)
 bool g_enable_lstm_ae     = true; // effective value after dispatch (R7f)
+// AB4: per-run override of the GLOBAL fusion lambda_ae (--lambda_ae). -1 = off,
+// i.e. use fusion_weights.json as-is. Rescales psi/gat to 1-lambda_ae keeping
+// their ratio. Exists because the deployed lambda_ae=0.3071 caps the AE's vote
+// below phi_th=0.5, so on stealth drift it cannot move any decision; the
+// per-attack lambda_sets can't be used instead because k_hat is -1 on every
+// decision. Per-run so AB4 needs no change to the shared JSON.
+double g_lambda_ae_cli    = -1.0;
+
+// AB3: per-run override of the GLOBAL fusion lambda_gat (--lambda_gat). -1 = off.
+// Mirrors --lambda_ae above (rescales psi/ae to 1-lambda_gat keeping their ratio).
+// Exists because the deployed lambda_gat=0.1857 (and every per-attack k-set, max
+// 0.3) caps GAT's vote below phi_th=0.5. The AB3 evasive Sybil (--sybil_gat_evasive)
+// is deliberately engineered so psi and the LSTM-AE stay ~0 (plausible kinematics,
+// no temporal signature) — GAT is meant to be the SOLE discriminator (see
+// g_sybil_gat_evasive comment above) — but with the deployed weights, a perfectly
+// discriminative GAT (S >> theta_S) still can't cross Phi_th alone: verified
+// 2026-07-27, GAT-on vs GAT-off gave BYTE-IDENTICAL fused confusion matrices
+// (TP=0/FN=79 both ways) even after fixing GAT's stale calibration. Same
+// k_hat=-1 caveat as lambda_ae — the per-attack sets are dead at deploy.
+double g_lambda_gat_cli   = -1.0;
 
 // ── Stage 7: Post-Quantum Crypto flag ──────────────────────────────────────
 // Forced false automatically when ablation_mode == 4 (set in 12_main.h after cmd.Parse).
@@ -421,7 +505,7 @@ double max_acceleration_deviation = 5.0;   // Max acceleration offset (m/s²)
 //                                    TP-S1 single-beacon + extra via TP-S4/S5 cumulative
 //     k_max                = 50    → accumulator reset every 50 beacons (~5 s at 10 Hz),
 //                                    approximating handover stitch (Eq 3.4 W_s).
-double epsilon_max_stealth           = 0.5;   // m per beacon (Eq 3.5 stealth bound, < gate)
+double epsilon_max_stealth           = 0.5;   // AB4 sweep variable (--eps_max)   // m per beacon (Eq 3.5 stealth bound, < gate)
 double epsilon_min_abrupt            = 7.0;   // m per beacon (above gate at theta=0.5)
 double epsilon_max_abrupt            = 12.0;  // m per beacon (abrupt ceiling)
 double stealth_fraction_theta_s      = 0.7;   // fraction of beacons drawn from stealth
@@ -482,6 +566,25 @@ uint32_t pbpo_cnt         = 0;
 // WRONG_ROUTING always wrong; CLEAN for poisoned = FN; ATTACK_DETECTED for clean = FP.
 uint32_t ctrl_decisions_total = 0;
 uint32_t ctrl_decisions_wrong = 0;
+// CDER_full (additive, AB4/AB5): the per-beacon RSU CDER above is LIGHTWEIGHT by
+// architecture — the RSU emits its control decision immediately, before the
+// window-close fusion verdict exists, so ctrl_decisions_* can never reflect the
+// AI layer and comes out identical for FULL vs an ML-tier ablation. CDER_full
+// scores the controller's RETROSPECTIVE fusion verdict (full_flag) against ground
+// truth at the fusion site, so the control-plane error responds to GAT+AE. Stays
+// 0 in lightweight modes (1/6) where no fusion runs → compute_CDER_full()
+// returns -1 there, and the lightweight run's own ctrl_decisions_* (LW) is used.
+uint32_t ctrl_full_total = 0;
+uint32_t ctrl_full_wrong = 0;
+// AB6 f/n sweep: aggregate-plane control decisions. The controller issues one
+// ring-level (macro) control decision per TRS epoch from the verified aggregate;
+// when TRS ADMITS a poisoned aggregate (forge), that decision — affecting the
+// ring's total_count vehicles — is wrong. Folded into compute_CDER() so CDER
+// degrades as f rises (CDER_agg ≈ 1−PARR). Only booked when g_trs_compromised_f>=0,
+// so zero effect on non-AB6 runs. Vehicle-weighted (total_count) for visibility
+// against the per-beacon CDER denominator.
+uint64_t g_agg_ctrl_total = 0;
+uint64_t g_agg_ctrl_wrong = 0;
 // PBPO_LW: RSU-side lightweight HMAC gate processing time (Eq.4.7, lightweight mode)
 // Separate from PBPO_Full (controller-side full detection pipeline).
 double   pbpo_lw_time_sum_ms = 0.0;
@@ -581,6 +684,23 @@ int routing_algorithm = 0;
 // the master training CSV can be built without a working Fabric environment.
 // Defaults to false (production behaviour preserved).
 bool skip_blockchain                           = false;
+
+// ── Tiered blockchain commit strategy (paper §3.5.5, tab:set-blockchain) ──────
+// Per-beacon SYNCHRONOUS Fabric commits are impractical at the 100 ms beacon
+// rate (each consensus round-trip blocks the RSU pipeline). Four tiers:
+//   T1 immediate  — revocation / controller reassignment (kept synchronous)
+//   T2 per-epoch  — trust threshold crossings, TRS sigs, RSU lifecycle
+//   T3 batched    — ordinary anomaly evidence E_j(t): buffered per-RSU, flushed
+//                   as ONE batched tx every g_t_batch s OR g_n_commit entries
+//   T4 off-chain  — raw beacon windows + per-beacon scores → IPFS, hash only
+// Security invariant preserved: BFT revocation (eq:bft_revoke_rsu) counts
+// distinct RSU submissions within T_w; g_t_batch << T_w so all batches land
+// inside the window. Values chosen: T_batch=10 s (≪ T_w≈60 s, 6 batches/window,
+// 10× fewer commits than per-second), N_commit=50 (flushes before T_batch under
+// high-penetration bursts → no buffer overflow; T_batch dominates at low load).
+bool   g_tiered_commit = true;   // enable Tier-3 batched evidence commit
+double g_t_batch       = 10.0;   // Tier-3 batch interval (s)  {5,10,20,30}, ≪ T_w
+int    g_n_commit      = 50;     // Tier-3 batch size (entries) {10,25,50,100}
 bool beacon_suppression_nodes[total_size]     = {};  // reserved: beacon vanishing/drop attack
 bool heading_spoof_nodes[total_size]          = {};  // TP-S2: heading/velocity exaggeration
 bool rsu_fabrication_nodes[total_size]        = {};  // reserved: RSU fabrication

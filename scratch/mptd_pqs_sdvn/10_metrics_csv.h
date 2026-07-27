@@ -145,8 +145,16 @@ static inline const char* mptd_scenario_name() {
         default: return "urban";
     }
 }
+// Scenario tag for the live-results dir, optionally suffixed with the PID so
+// concurrent runs don't share beacon_log.csv (see g_per_pid_results). export_run_dataset
+// MUST use this same tag so it copies from the process's own live dir.
+static inline std::string mptd_scenario_tag() {
+    std::string t = mptd_scenario_name();
+    if (g_per_pid_results) t += "_pid" + std::to_string((long)getpid());
+    return t;
+}
 static inline std::string mptd_results_dir() {
-    return std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_name() + "/";
+    return std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_tag() + "/";
 }
 
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
@@ -718,12 +726,27 @@ double compute_PARR()
 // Fallback (Option B inactive / no downlink decisions): beacon-level (FP+FN)/total.
 double compute_CDER()
 {
-    if (ctrl_decisions_total > 0)
-        return (double)ctrl_decisions_wrong / (double)ctrl_decisions_total;
+    // AB6: fold in aggregate-plane (ring macro) control decisions so CDER degrades
+    // as TRS admits more poison at high f. g_agg_* are 0 outside AB6 sweep mode
+    // (g_trs_compromised_f<0), so this is identity for every other experiment.
+    const uint64_t w = (uint64_t)ctrl_decisions_wrong + g_agg_ctrl_wrong;
+    const uint64_t t = (uint64_t)ctrl_decisions_total + g_agg_ctrl_total;
+    if (t > 0)
+        return (double)w / (double)t;
     // Fallback: beacon-level confusion matrix (FP+FN)/total
     double total = (double)(cm_TP + cm_FP + cm_TN + cm_FN);
     if (total < 1e-9) return 0.0;
     return (double)(cm_FP + cm_FN) / total;
+}
+
+// CDER_full — control-plane decision error scored against the FUSION verdict
+// (GAT+AE), so it responds to the AI layer (unlike compute_CDER() which is the
+// RSU's immediate lightweight decision, LW-only by architecture). Returns -1 in
+// lightweight modes (1/6) where no fusion runs — callers then use compute_CDER().
+double compute_CDER_full()
+{
+    if (ctrl_full_total == 0) return -1.0;
+    return (double)ctrl_full_wrong / (double)ctrl_full_total;
 }
 
 // TDEE: Traffic Density Estimation Error (Eq. 4.5, dimensionless)
@@ -936,6 +959,13 @@ void print_mptd_metrics()
     else
         std::cout << "  CDER = " << compute_CDER()
                   << "  (beacon-level (FP+FN)/total fallback, Eq.4.4, lower=better)" << std::endl;
+    // CDER_full: control error against the FUSION verdict (responds to the AI layer).
+    // -1 in lightweight modes (no fusion) — there compute_CDER() above is the metric.
+    std::cout << "  CDER_full = " << compute_CDER_full()
+              << "  (fusion-verdict control error: " << ctrl_full_wrong
+              << "/" << ctrl_full_total
+              << " wrong, AI-layer-sensitive, lower=better; -1=lightweight/no fusion)"
+              << std::endl;
     // TDEE: live when --mobility_source=sumo_trace; otherwise -1 per paper conformance.
     // TPE:  live dead-reckoning predictor (08_detection_engine.h) vs SUMO ground truth.
     {
@@ -1049,8 +1079,9 @@ static void export_run_dataset(const std::string &metrics_src)
     }
 
     // per-scenario folder (option A); no trailing slash so the existing
-    // `results + "/..."` joins below stay correct.
-    const std::string results = std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_name();
+    // `results + "/..."` joins below stay correct. Uses mptd_scenario_tag() so a
+    // --per_pid_results run copies from ITS OWN live dir, not the shared one.
+    const std::string results = std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_tag();
 
     // NOTE: the folder key includes _m{ablation_mode}. Without it, two ablation
     // variants at the same scenario/attack/pct (e.g. AB5 lightweight vs full mode)

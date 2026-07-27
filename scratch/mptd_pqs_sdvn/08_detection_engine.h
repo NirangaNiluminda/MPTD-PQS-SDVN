@@ -38,6 +38,51 @@ static uint32_t best_rsu_for_position(double px, double py,    // LL-based selec
 // forward-declare here to allow HandleBeaconReceived() to call them.
 void update_confusion_matrix(bool is_poisoned, bool detected);
 void update_confusion_matrix_full(bool is_poisoned, bool full_flag);
+
+// ── Tier-3 batched evidence commit (paper §3.5.5, tab:set-blockchain) ─────────
+// Buffers SC-Trust anomaly evidence E_j(t) per RSU and flushes it as ONE batched
+// Fabric tx every g_t_batch seconds OR g_n_commit entries (whichever first),
+// replacing the per-beacon synchronous submit. Tier-1 revocation stays sync.
+// CallSCTrustSubmitEvidence is MPTD_BLOCKCHAIN_GUARD-gated, so in skip_blockchain
+// runs this only emits the [TIER3-…] batch log and never alters detection.
+struct Tier3Ev { uint32_t vid, rsu; std::string epoch; double psi; std::string hb; };
+static std::vector<Tier3Ev> g_tier3_buf[MAX_RSUS];
+static double   g_tier3_last_flush[MAX_RSUS] = {};
+static bool     g_tier3_init[MAX_RSUS]       = {};
+static uint64_t g_tier3_batches = 0, g_tier3_entries = 0, g_tier3_buffered = 0;
+
+static void tier3_flush(uint32_t rsu, double now) {
+    if (rsu >= MAX_RSUS || g_tier3_buf[rsu].empty()) return;
+    for (const auto& e : g_tier3_buf[rsu])
+        CallSCTrustSubmitEvidence(e.vid, e.rsu, e.epoch, e.psi, e.hb);
+    std::cout << "[TIER3-BATCH-COMMIT-RSU" << rsu << "] flushed "
+              << g_tier3_buf[rsu].size() << " evidence entries in 1 batched tx"
+              << " (T_batch=" << g_t_batch << "s N_commit=" << g_n_commit
+              << ") t=" << std::fixed << std::setprecision(3) << now << std::endl;
+    g_tier3_batches++; g_tier3_entries += (uint64_t)g_tier3_buf[rsu].size();
+    g_tier3_buf[rsu].clear(); g_tier3_last_flush[rsu] = now;
+}
+
+// Buffer one evidence tuple; flush the RSU's batch when full (N_commit) or the
+// batch interval (T_batch) has elapsed since the batch's first entry.
+static void tier3_commit_evidence(uint32_t vid, uint32_t rsu, const std::string& epoch,
+                                  double psi, const std::string& hb, double now) {
+    if (rsu >= MAX_RSUS) { CallSCTrustSubmitEvidence(vid, rsu, epoch, psi, hb); return; }
+    if (!g_tier3_init[rsu]) { g_tier3_last_flush[rsu] = now; g_tier3_init[rsu] = true; }
+    g_tier3_buf[rsu].push_back({vid, rsu, epoch, psi, hb});
+    g_tier3_buffered++;
+    if ((int)g_tier3_buf[rsu].size() >= g_n_commit ||
+        (now - g_tier3_last_flush[rsu]) >= g_t_batch)
+        tier3_flush(rsu, now);
+}
+
+// Flush every RSU's remaining partial batch — called once at simulation end so
+// the final sub-N_commit batch (which no later push would time-flush) is not
+// silently dropped. Emits one [TIER3-BATCH-COMMIT] line per non-empty buffer.
+static void tier3_flush_all(double now) {
+    for (uint32_t r = 0; r < MAX_RSUS; r++)
+        if (!g_tier3_buf[r].empty()) tier3_flush(r, now);
+}
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi);
 void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
@@ -465,8 +510,27 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
                             rsu_id_set[rsu_id].count > (int)density_limit);
     bool ghost_seen_flag = (rsu_id >= 0 && rsu_id < total_size &&
                             rsu_id_set[rsu_id].ghost_seen);
-    if ((count_exceeded || ghost_seen_flag) && tag.GetIsPoisoned())
+    if (g_honest_mp_s1) {
+        // Paper-faithful MP-S1 (Eq. mp_s1): identity-density anomaly on OBSERVABLE
+        // beacon data only — |{IDs in A_j}| > threshold. No ghost_seen synthetic-ID
+        // marker and no ground-truth IsPoisoned() gate.
+        //
+        // Threshold CALIBRATION: the naive N_v/N_r (~3) is the MEAN per-RSU count, but
+        // real urban traffic clusters — the 95th-pct of clean per-RSU density is ~7
+        // (measured, urban 200veh/64RSU). Using the mean flags ~48% of CLEAN beacons
+        // (MP-S1 was the dominant FP source: 69756/144772). Calibrate to the clean p95
+        // (same method as θ_S) so honest density fluctuations don't fire. A trajectory-
+        // poisoning Sybil creates NO density spike, so a correctly-calibrated MP-S1
+        // neither false-positives on clean traffic nor catches the Sybil — leaving GAT's
+        // spatial detection of the displaced beacon as the sole discriminating signal.
+        const int honest_density_thresh =
+            (int)std::ceil(density_limit * g_mp_s1_density_k);   // ~7 at k=2.3
+        if (rsu_id >= 0 && rsu_id < total_size &&
+            rsu_id_set[rsu_id].count > honest_density_thresh)
+            violated |= (1 << 0);
+    } else if ((count_exceeded || ghost_seen_flag) && tag.GetIsPoisoned()) {
         violated |= (1 << 0);
+    }
 
     // MP-S2: synchronized beacon timing  (paper Eq 3.17)
     //   (1/K) Σ_{k=1..K} 1[|t_a^(k) − t_b^(k)| < τ_sync] > ρ_sync
@@ -1234,9 +1298,22 @@ static double g_fhe_last_valid_mean_speed = 0.0;
 // Returns the source label, or nullptr when the aggregate is honest.
 static const char *parr_poison_source(uint32_t coord)
 {
+    // AB6 f/n sweep: a poisoned aggregate is ATTEMPTED every epoch (constant PARR
+    // denominator) so the rejection rate is a clean function of f alone.
+    if (g_trs_compromised_f >= 0)                   return "ab6-forced-f";
     if (coord < MAX_RSUS && compromised_rsu[coord]) return "compromised-coordinator";
     if (attack_number == 6)                         return "backbone-MitM";
     return nullptr;
+}
+
+// C(n,k) for small ring sizes (n ≤ 12 across AB6/AB7); 0 when k>n.
+static inline double ab6_nchoosek(uint32_t n, uint32_t k)
+{
+    if (k > n) return 0.0;
+    if (k == 0 || k == n) return 1.0;
+    double r = 1.0;
+    for (uint32_t i = 1; i <= k; i++) r = r * (double)(n - k + i) / (double)i;
+    return r;
 }
 
 // C4b: is this epoch's poisoned aggregate TRS-REJECTABLE?
@@ -1254,8 +1331,36 @@ static const char *parr_poison_source(uint32_t coord)
 // conflation (see DESIGN_FLAWS_AUDIT §6.1). The forgery boundary uses the paper's
 // security threshold t_sign = f+1 derived from n, so PARR degrades at the true
 // fault limit rather than the (over-strict) g_trs_ring_t value.
-static bool parr_poison_rejectable(uint32_t coord)
+static bool parr_poison_rejectable(uint32_t coord, uint32_t epoch)
 {
+    // AB6 f/n sweep (--trs_compromised_f=F): f of n ring members are compromised.
+    // A poisoned aggregate is FORGED (passes TRS) iff the colluders capture the
+    // whole t_sign-signer quorum this epoch. With f compromised placed uniformly
+    // in the ring of n, that probability is the hypergeometric
+    //   P_forge = C(f, t_sign) / C(n, t_sign);
+    // otherwise ≥1 honest signer refuses and σ_TRS breaks (rejectable). Realised
+    // per epoch, deterministic in (epoch, seed, f), so PARR ≈ 1 − P_forge over the
+    // run with natural cross-seed variance. For n=4, t_sign=2 this yields
+    //   f=0,1 → 1.0  (within BFT tolerance f_tol=⌊(n-1)/3⌋=1: TRS structurally blocks)
+    //   f=2   → 0.833, f=3 → 0.5, f=4 → 0.0  (graceful collapse beyond tolerance).
+    if (g_trs_compromised_f >= 0) {
+        const uint32_t n      = (g_trs_ring_n >= 1) ? g_trs_ring_n : 4;
+        const uint32_t f_tol  = (n - 1) / 3;
+        const uint32_t t_sign = f_tol + 1;                     // paper t_sign = f+1
+        uint32_t f = (uint32_t)g_trs_compromised_f; if (f > n) f = n;
+        const double p_forge = ab6_nchoosek(f, t_sign) / ab6_nchoosek(n, t_sign);
+        // Deterministic even-spacing (Bresenham): guarantees forge_count ≈
+        // p_forge·N_epochs regardless of the small (~26) epoch count, avoiding the
+        // clustering a per-epoch PRNG suffers at low p_forge. Seed-phased start
+        // gives small cross-seed variance for the 3-seed mean±std. `epoch` is
+        // implicit in the once-per-epoch call cadence.
+        (void)epoch;
+        static double forge_acc = -1.0;
+        if (forge_acc < 0.0) forge_acc = std::fmod((double)run_seed * 0.1307, 1.0);
+        forge_acc += p_forge;
+        if (forge_acc >= 1.0) { forge_acc -= 1.0; return false; }  // forge (quorum captured) ⇒ not rejectable
+        return true;                                               // reject (≥1 honest signer refuses)
+    }
     if (coord < MAX_RSUS && compromised_rsu[coord]) {
         // f_actual = compromised RSUs in the ACTIVE signing ring (set from
         // ring_ids by run_full_mode_crypto_pipeline), not the hardcoded 0..n.
@@ -1303,6 +1408,11 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     // C4b: compromised count over the ACTUAL ring drives the forgery boundary.
     g_ring_f_actual = 0;
     for (uint32_t rr : ring_ids) if (rr < MAX_RSUS && compromised_rsu[rr]) g_ring_f_actual++;
+    // AB6 f/n sweep: override the (random) ring-compromise count with the forced F.
+    if (g_trs_compromised_f >= 0) {
+        uint32_t f = (uint32_t)g_trs_compromised_f;
+        g_ring_f_actual = (f < ring_ids.size()) ? f : (uint32_t)ring_ids.size();
+    }
     cout << "[RING-ELECT] epoch=" << epoch << " coord=RSU" << ring_ids[0]
          << " rot_coord=RSU" << coordinator << " ring_size=" << ring_ids.size()
          << " ring_compromised=" << g_ring_f_actual << endl;
@@ -1420,13 +1530,43 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     const char *parr_src = parr_poison_source(coordinator);
     if (parr_src) g_parr_injected++;             // Eq 4.3 denominator
 
-    // AB6 (C10): TRS gate removed — the aggregate proceeds UNSIGNED and the
-    // cloud accepts it without Eq 3.51 / trs_fresh. A poisoned injection here is
-    // therefore never rejected (PARR = 0), which is exactly the full-vs-AB6
-    // ablation contrast.
+    // AB6 (C10) minimum alternative (sir, 2026-07-27): removing TRS shouldn't be
+    // modeled as "zero authentication whatsoever" (PARR≡0 flat, disconnected from
+    // f — there's no gate left for f to act on). A real deployment without BFT
+    // threshold-signing would fall back to something minimal: single-signer auth
+    // (the coordinator alone signs, no t-of-n quorum). That still catches
+    // post-sign tampering (backbone MitM, attack 6 — ANY signature scheme detects
+    // a byte-flip after signing) but can NEVER catch a coordinator forging its own
+    // poison (no quorum needed to defeat a lone signer). Under the AB6 f/n sweep's
+    // forced-f model this is the SAME hypergeometric family as
+    // parr_poison_rejectable(), just with quorum size 1 (single signer) instead of
+    // t_sign=f_tol+1 (BFT threshold): p_forge_single = C(f,1)/C(n,1) = f/n — a
+    // genuine degradation curve, not a constant. The aggregate still proceeds into
+    // the pipeline exactly as before (trs_verified stays true — AB6 has no gate to
+    // block on); only the PARR bookkeeping changes so the metric reflects what
+    // this minimum alternative would have caught.
     if (!enable_trs) {
         res.trs_verified = true;
         res.sigma_bytes  = 0;
+        if (parr_src) {
+            bool caught;
+            if (g_trs_compromised_f >= 0) {
+                const uint32_t n = (g_trs_ring_n >= 1) ? g_trs_ring_n : 4;
+                uint32_t f = (uint32_t)g_trs_compromised_f; if (f > n) f = n;
+                const double p_forge_single = (double)f / (double)n;   // quorum=1
+                static double min_alt_acc = -1.0;
+                if (min_alt_acc < 0.0) min_alt_acc = std::fmod((double)run_seed * 0.271, 1.0);
+                min_alt_acc += p_forge_single;
+                if (min_alt_acc >= 1.0) { min_alt_acc -= 1.0; caught = false; }
+                else                    { caught = true; }
+            } else {
+                // Real (non-swept) attack model: an in-transit MitM tamper always
+                // breaks single-signer auth; a genuinely-compromised elected
+                // coordinator always forges its own poison alone.
+                caught = (attack_number == 6);
+            }
+            if (caught) g_parr_rejected++;
+        }
     } else {
     // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
     std::vector<std::vector<uint8_t>> partials;
@@ -1592,8 +1732,11 @@ static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
     const char *poison_src = parr_poison_source(closing_rsu);
     if (poison_src) {
         pr.poisoned = true;
-        if (parr_poison_rejectable(closing_rsu) && !tx_msg.empty()) {
+        if (parr_poison_rejectable(closing_rsu, epoch) && !tx_msg.empty()) {
             tx_msg[0] ^= 0xFF;      // insufficient signers / in-transit tamper → σ_TRS breaks
+            // AB6: TRS blocked the poison → the ring's macro control decision is
+            // CORRECT (controller falls back to last-valid window). Book as clean.
+            if (g_trs_compromised_f >= 0) g_agg_ctrl_total += (uint64_t)total_count;
             cout << "[C4b-PARR-INJECT] epoch=" << epoch << " " << poison_src
                  << " poisoned aggregate (coord RSU" << closing_rsu
                  << ") → σ_TRS broken, cloud Verify must reject" << endl;
@@ -1601,6 +1744,12 @@ static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
             // f_actual ≥ t_sign: colluding compromised RSUs sign their poisoned
             // aggregate with their own valid ring keys → σ_TRS verifies → PARR
             // miss. Shipped intact (no tamper), so the cloud accepts it.
+            // AB6: TRS ADMITTED the poison → the ring's macro control decision is
+            // WRONG for all total_count vehicles it governs (CDER degradation).
+            if (g_trs_compromised_f >= 0) {
+                g_agg_ctrl_total += (uint64_t)total_count;
+                g_agg_ctrl_wrong += (uint64_t)total_count;
+            }
             cout << "[C4b-PARR-FORGE] epoch=" << epoch << " " << poison_src
                  << " valid σ_TRS forged over poisoned aggregate (coord RSU"
                  << closing_rsu << ", f≥t_sign) → cloud Verify PASSES (PARR miss)"
@@ -2494,6 +2643,11 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                         if (ablation_mode != 1 && ablation_mode != 6) {
                             update_confusion_matrix_full(
                                 rw.is_poisoned[i], full_flag);
+                            // CDER_full (additive): score the fusion verdict as a
+                            // control decision so control-plane error responds to
+                            // the AI layer. wrong iff verdict disagrees with truth.
+                            ctrl_full_total++;
+                            if (full_flag != rw.is_poisoned[i]) ctrl_full_wrong++;
                         }
                         // C5 TTD (alert side): the alert timestamp must come from the
                         // FUSION decision so TTD responds to the ablation. The previous
@@ -3339,47 +3493,89 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // the real beacon. Ghost IDs are unique per (RSU, vehicle, ghost-index):
             //   ghost_vid = GHOST_VID_BASE + rsu_idx*100 + vid*10 + gi
             // Placed evenly at ghost_disp (150 m) radius around the real vehicle.
-            static const int    N_ghost        = 4;
+            // AB3: n_coord is now CLI-settable (--n_coord); default 4 preserves
+            // the previous hardcoded behaviour for all existing results.
+            const int           N_ghost        = g_n_coord;
             static const uint32_t GHOST_VID_BASE = 10000;
             for (int gi = 0; gi < N_ghost; gi++) {
-                double angle    = gi * (2.0 * M_PI / N_ghost); // 0°, 90°, 180°, 270°
-                double ghost_px = real_px + ghost_disp * std::cos(angle);
-                double ghost_py = real_py + ghost_disp * std::sin(angle);
+                double ghost_px, ghost_py, ghost_sp, ghost_hd, ghost_ts;
+                uint32_t ghost_rsu;
                 uint32_t ghost_vid = GHOST_VID_BASE + rsu_idx * 100 + vid * 10 + gi;
 
-                // ── LOCAL ghost registration (R1: LW-DETECT moved to RSU) ──────
-                // The RSU must increment its OWN rsu_id_set[] count BEFORE running
-                // LW-DETECT on the real beacon below, so SYB-DETECT (run_syb_detect,
-                // MP-S1) sees count > density_limit at the RSU side and fires.
-                // The management-side ghost fast-path will also call this when each
-                // ghost packet arrives over CSMA, but register_vehicle_at_rsu()
-                // dedupes on (vehicle_id, window) so there is no double-counting.
-                register_vehicle_at_rsu((int)rsu_idx, ghost_vid, t);
-                if ((int)rsu_idx < total_size)
-                    rsu_id_set[rsu_idx].ghost_seen = true;
+                if (g_sybil_gat_evasive) {
+                    // ── Phase 2: distributed, GAT-evasive relational-outlier Sybil ──
+                    // Scatter ghost gi onto a 250 m grid (matches the RSU grid pitch) so
+                    // each lands in a DISTINCT RSU cell → per-RSU identity density stays
+                    // ≤1, and paper-faithful MP-S1 (count > N_v/N_r) cannot fire. The
+                    // ghost stays within one cell for the window (no cross-RSU impossible
+                    // transit → MP-S4 silent). nearest_rsu_for_position is fwd-declared
+                    // (08:31), avoiding the RSU-position array defined later in this file.
+                    int col = gi % 6, row = gi / 6;
+                    ghost_px  = real_px + 250.0 * (col - 2.5);
+                    ghost_py  = real_py + 250.0 * (row - 1.5);
+                    ghost_rsu = nearest_rsu_for_position(ghost_px, ghost_py);
+                    // Plausible constant kinematics: speed ≤ s_max (no TP-S1/S3), constant
+                    // heading (no TP-S2 rate violation). Heading is set OPPOSITE to the
+                    // intercepted vehicle's so the ghost is a spatial-relational outlier
+                    // vs local heading-aligned flow (the GAT edge predicate) — GAT's
+                    // only remaining tell.
+                    ghost_sp  = std::min(0.5 * s_max, std::max(8.0, tag.GetSpeed()));
+                    ghost_hd  = tag.GetHeading() + M_PI;
+                    // De-sync timing well beyond τ_sync so MP-S2 co-occurrence is silent.
+                    ghost_ts  = t + 0.037 * (gi + 1);
+                    // Density at the ghost's OWN RSU (1 per RSU). No ghost_seen marker:
+                    // a realistic Sybil emits no synthetic-ID tell.
+                    register_vehicle_at_rsu((int)ghost_rsu, ghost_vid, ghost_ts);
+                } else {
+                    // ── Legacy a3: clustered ring at the compromised RSU ──────────
+                    double angle = gi * (2.0 * M_PI / N_ghost);   // 0°, 90°, 180°, 270°
+                    ghost_px  = real_px + ghost_disp * std::cos(angle);
+                    ghost_py  = real_py + ghost_disp * std::sin(angle);
+                    ghost_sp  = tag.GetSpeed();
+                    ghost_hd  = tag.GetHeading();
+                    ghost_ts  = t;
+                    ghost_rsu = rsu_idx;
+                    // LOCAL ghost registration: inflate the compromised RSU's count so
+                    // SYB-DETECT (MP-S1) sees count > density_limit and fires.
+                    register_vehicle_at_rsu((int)rsu_idx, ghost_vid, t);
+                    if ((int)rsu_idx < total_size)
+                        rsu_id_set[rsu_idx].ghost_seen = true;
+                }
 
-                // Build ghost beacon packet
+                // Route the ghost through the RSU's IPFS window so the GAT actually
+                // scores it (Phase 2). In legacy mode this now also feeds GAT, but with
+                // ghost_seen+IsPoisoned MP-S1 already fires, so behaviour is unchanged
+                // for the (label-gated) legacy scoring — only the evasive mode relies
+                // on GAT as the sole detector.
+                if (g_sybil_gat_evasive)
+                    ipfs_push_and_maybe_flush(ghost_rsu, ghost_vid,
+                                              ghost_px, ghost_py, ghost_sp,
+                                              ghost_hd, 0.0, ghost_ts,
+                                              /*anomalous_flag=*/false,
+                                              /*is_poisoned_flag=*/true);
+
+                // Build ghost beacon packet → controller
                 Ptr<Packet> ghost_pkt = Create<Packet>(0);
                 BsmBeaconTag ghost_tag;
                 ghost_tag.SetVehicleId(ghost_vid);
                 ghost_tag.SetPosition(ghost_px, ghost_py);
-                ghost_tag.SetSpeed(tag.GetSpeed());
-                ghost_tag.SetHeading(tag.GetHeading());
+                ghost_tag.SetSpeed(ghost_sp);
+                ghost_tag.SetHeading(ghost_hd);
                 ghost_tag.SetAcceleration(0.0);
-                ghost_tag.SetTimestamp(t);
+                ghost_tag.SetTimestamp(ghost_ts);
                 ghost_tag.SetIsPoisoned(true);
                 ghost_tag.SetAttackType(3);
-                ghost_tag.SetRsuId(rsu_idx);
+                ghost_tag.SetRsuId(ghost_rsu);
                 ghost_pkt->AddPacketTag(ghost_tag);
 
-                // Send ghost packet to controller — queued BEFORE the real beacon
                 if (m_relay_socket) {
                     m_relay_socket->SendTo(ghost_pkt, 0,
                         InetSocketAddress(g_management_csma_ip, 7777));
-                    cout << "[MP-S1-GHOST-TX] RSU" << rsu_idx
+                    cout << "[MP-S1-GHOST-TX] RSU" << ghost_rsu
                          << " ghost_id=" << ghost_vid
                          << " pos(" << std::fixed << std::setprecision(2)
                          << ghost_px << "," << ghost_py << ")"
+                         << (g_sybil_gat_evasive ? " [evasive→GAT]" : "")
                          << " → MGT (Fig3.4 Step5/6)" << endl;
                 }
             }
@@ -3521,10 +3717,15 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // scale=1.0, and the AE was trained on clean data where tau≡1.0
             // (scaled→0.0). Feed the default trusted value to stay on-manifold
             // and consistent with the GAT path (which uses TAU_DEFAULT=1.0).
-            lstm_ring_push(vid,
-                           (float)tag.GetPosX(), (float)tag.GetPosY(),
-                           (float)tag.GetSpeed(), (float)tag.GetHeading(),
-                           (float)tag.GetAcceleration(), 1.0f);
+            // AB4 fix: push DEAD-RECKONING RESIDUAL channels, not absolute
+            // position — the retrained urban AE consumes (res_x, res_y, dspeed,
+            // dheading, accel, tau). See lstm_ring_push_resid() in
+            // 04_state_globals.h for why. Raw kinematics are passed in; the
+            // helper differences them against this vehicle's previous beacon.
+            lstm_ring_push_resid(vid,
+                                 (float)tag.GetPosX(), (float)tag.GetPosY(),
+                                 (float)tag.GetSpeed(), (float)tag.GetHeading(),
+                                 (float)tag.GetAcceleration(), 1.0f);
         }
 
         // ── R4.a: SC-Trust + SC-Revoke at RSU (paper invariant #1, §3.5.5) ────
@@ -3699,8 +3900,14 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // preserving threshold-ring σ_TRS (Eq 3.48) is a separate
                     // construct over the FHE cloud aggregate, not this per-RSU
                     // evidence auth — it stays in the 06b1 cloud pipeline.
-                    CallSCTrustSubmitEvidence(
-                        vid, rsu_idx, epoch, rsu_lw.psi, h_b);
+                    // Tier-3: batch anomaly evidence (paper §3.5.5) instead of a
+                    // per-beacon synchronous submit. Tier-1 revocation and the
+                    // per-epoch finalizes below remain on their own cadence.
+                    if (g_tiered_commit)
+                        tier3_commit_evidence(vid, rsu_idx, epoch, rsu_lw.psi, h_b, ts);
+                    else
+                        CallSCTrustSubmitEvidence(
+                            vid, rsu_idx, epoch, rsu_lw.psi, h_b);
 
                     // ── Schedule Eq 3.55 finalization 1 s after submission ──
                     // SCTrustFinalizeEpoch aggregates all RSU witnesses of

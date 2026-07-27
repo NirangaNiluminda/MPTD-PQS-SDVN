@@ -333,7 +333,8 @@ public:
               const std::string &lstm_ae_path,
               const std::string &scaler_path,
               const std::string &theta_path,
-              const std::string &weights_path = "") {
+              const std::string &weights_path = "",
+              const std::string &gat_scaler_path = "") {
         Ort::SessionOptions opts;
         opts.SetIntraOpNumThreads(1);              // determinism for PBPO timing
         opts.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_BASIC);
@@ -379,6 +380,21 @@ public:
             std::cout << "[AI-INIT] scaler loaded: " << scaler_path << std::endl;
         }
 
+        // GAT-specific scaler (2026-07-27 fix). Defaults to the same scaler_ used
+        // above when no separate path is given, so every scenario except urban_a3
+        // is byte-identical to before this change.
+        if (!gat_scaler_path.empty()) {
+            if (!load_scaler_json(gat_scaler_path, gat_scaler_)) {
+                std::cerr << "[AI-INIT] gat_scaler.json load failed: " << gat_scaler_path
+                          << " (falling back to shared scaler for GAT)" << std::endl;
+                gat_scaler_ = scaler_;
+            } else {
+                std::cout << "[AI-INIT] GAT-specific scaler loaded: " << gat_scaler_path << std::endl;
+            }
+        } else {
+            gat_scaler_ = scaler_;
+        }
+
         // θ_ae — adaptive LSTM-AE threshold. Falls back to a conservative
         // value if file is missing (won't trip alarms but won't block init).
         std::ifstream tf(theta_path);
@@ -408,6 +424,51 @@ public:
             if (!load_fusion_weights_json(weights_path, g_fusion)) {
                 std::cerr << "[AI-INIT] fusion weights load failed: " << weights_path << std::endl;
             } else {
+                // ── AB4: per-run lambda_ae override (--lambda_ae, default -1 = off) ──
+                // The deployed global lambda_ae=0.3071 caps the AE's fusion vote below
+                // the phi_th=0.5 bar, so on sub-gate stealth drift (where psi ~0.008
+                // and GAT flags 0.000) the AE cannot move ANY decision — measured: 0
+                // beacons change when its term is removed, making AB4 vacuous. The
+                // per-attack lambda_sets cannot fix this because k_hat is -1 on every
+                // decision (the multi-task attack-type heads collapse at deploy), so
+                // the global set is always what applies.
+                //
+                // This flag rescales ONLY the global triple, keeping the psi:gat ratio,
+                // and only for runs that pass it — the JSON on disk and every other
+                // experiment are untouched.
+                if (g_lambda_ae_cli >= 0.0) {
+                    const float la  = (float)g_lambda_ae_cli;
+                    const float rem = g_fusion.lambda_psi + g_fusion.lambda_gat;
+                    const float k   = (rem > 1e-9f) ? (1.0f - la) / rem : 0.0f;
+                    const float op = g_fusion.lambda_psi, og = g_fusion.lambda_gat,
+                                oa = g_fusion.lambda_ae;
+                    g_fusion.lambda_psi *= k;
+                    g_fusion.lambda_gat *= k;
+                    g_fusion.lambda_ae   = la;
+                    std::cout << "[AI-INIT] lambda_ae OVERRIDE (--lambda_ae): ("
+                              << op << ", " << og << ", " << oa << ") -> ("
+                              << g_fusion.lambda_psi << ", " << g_fusion.lambda_gat
+                              << ", " << g_fusion.lambda_ae << ")  [psi:gat ratio kept; "
+                              << "JSON on disk unchanged]" << std::endl;
+                }
+                // ── AB3: per-run lambda_gat override (--lambda_gat, default -1 = off) ──
+                // Mirrors the lambda_ae override above. Rescales ONLY the global triple,
+                // keeping the psi:ae ratio, and only for runs that pass it.
+                if (g_lambda_gat_cli >= 0.0) {
+                    const float lg  = (float)g_lambda_gat_cli;
+                    const float rem = g_fusion.lambda_psi + g_fusion.lambda_ae;
+                    const float k   = (rem > 1e-9f) ? (1.0f - lg) / rem : 0.0f;
+                    const float op = g_fusion.lambda_psi, og = g_fusion.lambda_gat,
+                                oa = g_fusion.lambda_ae;
+                    g_fusion.lambda_psi *= k;
+                    g_fusion.lambda_ae  *= k;
+                    g_fusion.lambda_gat  = lg;
+                    std::cout << "[AI-INIT] lambda_gat OVERRIDE (--lambda_gat): ("
+                              << op << ", " << og << ", " << oa << ") -> ("
+                              << g_fusion.lambda_psi << ", " << g_fusion.lambda_gat
+                              << ", " << g_fusion.lambda_ae << ")  [psi:ae ratio kept; "
+                              << "JSON on disk unchanged]" << std::endl;
+                }
                 std::cout << "[AI-INIT] fusion weights loaded: " << weights_path
                           << " (lambda_psi=" << g_fusion.lambda_psi
                           << " lambda_gat=" << g_fusion.lambda_gat
@@ -481,9 +542,9 @@ public:
             // cols 0..4 — z-scaled kinematics
             for (int f = 0; f < mptd_ai::KINEMATIC_DIM; ++f) {
                 const float raw = per_vehicle_raw[i * mptd_ai::KINEMATIC_DIM + f];
-                row[f] = scaler_.loaded
-                       ? (raw - scaler_.mean[f]) /
-                         (scaler_.scale[f] == 0.0f ? 1.0f : scaler_.scale[f])
+                row[f] = gat_scaler_.loaded
+                       ? (raw - gat_scaler_.mean[f]) /
+                         (gat_scaler_.scale[f] == 0.0f ? 1.0f : gat_scaler_.scale[f])
                        : raw;
             }
             // col 5 — tau (raw), matches train.py tau_col appended after scaling
@@ -667,6 +728,16 @@ private:
     std::unique_ptr<Ort::Session>  gat_session_;
     std::unique_ptr<Ort::Session>  lstm_session_;
     AiScaler                       scaler_;
+    // GAT-specific scaler (2026-07-27). scaler_ above is loaded from scaler.json
+    // and, after the AB4 dead-reckoning-residual fix, holds RESIDUAL feature stats
+    // for the LSTM-AE (lstm_ring_push_resid() in 08_detection_engine.h feeds it
+    // residual deltas). score_gat() below still feeds ABSOLUTE pos_x/pos_y/speed/
+    // heading/accel — z-scoring those through the residual-fitted scaler produced
+    // |z| in the thousands (measured), saturating GAT for clean and poisoned
+    // beacons alike. gat_scaler_ is a SEPARATE scaler dedicated to GAT's absolute-
+    // position inputs; init() defaults it to scaler_ when no gat_scaler_path is
+    // given, so every scenario except urban_a3 is byte-identical to before.
+    AiScaler                       gat_scaler_;
     float                          theta_ae_ = 0.05f;   // fallback if file missing
     bool                           ready_    = false;
 };
@@ -787,7 +858,9 @@ public:
               const std::string &lstm_ae_path,
               const std::string &scaler_path,
               const std::string &theta_path,
-              const std::string &weights_path = "") {
+              const std::string &weights_path = "",
+              const std::string &gat_scaler_path = "") {
+        (void)gat_scaler_path;
         theta_ae_ = 0.05f;
         ready_ = false;
         if (!weights_path.empty()) {

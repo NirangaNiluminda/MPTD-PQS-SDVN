@@ -31,7 +31,7 @@ from lstm_ae        import LSTMAEDetector, build_windows, calibrate_threshold, W
 # Paths
 # ---------------------------------------------------------------------------
 ML_DIR        = os.path.dirname(__file__)
-MODEL_DIR     = os.path.join(ML_DIR, "models")
+MODEL_DIR     = os.environ.get("MPTD_MODEL_DIR", os.path.join(ML_DIR, "models"))
 # R7c: prefer the sweep-built master training file when present; fall back to
 # the per-run beacon_log.csv (overwritten by the sim) so single-run debug works.
 MASTER_CSV    = os.path.normpath(os.path.join(ML_DIR, "data", "beacon_train_master.csv"))

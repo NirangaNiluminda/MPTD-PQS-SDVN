@@ -997,6 +997,25 @@ inline void CallSCTrustSubmitEvidence(
     mptd_fabric_invoke_async("SCTrustSubmitEvidence", args);
 }
 
+// P4 identity-pool guard, local copy: 06c is included BEFORE 11_blockchain_setup.h
+// (mptd_scregister::ca_identity_enabled lives there), so it can't be called from
+// here directly — this mirrors that function's exact body so the two stay in
+// sync without an include-order dependency. Bug this fixes: CallSCControllerSubmitEvidence
+// / CallCPDetectCheck / CallCPDetectCheckAsync used to stamp "ctrl<N>"
+// UNCONDITIONALLY, ignoring MPTD_CA_IDENTITY=0; when the per-controller wallet
+// slot isn't enrolled, every one of those calls fails at identity load, so a
+// controller conflict can never be observed on-chain and
+// excludeAndReassignController never fires — TCL_reassign stays -1 forever
+// regardless of attack intensity.
+static inline bool mptd_06c_ca_identity_enabled()
+{
+    static bool on = []() {
+        const char* e = std::getenv("MPTD_CA_IDENTITY");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 // ── CallSCControllerSubmitEvidence — Eq 3.57 controller evidence tuple ───────
 // E_c(t) = (vehicleID, Φ_i(t), epoch, h(X_i(t)), σ_c^sub)
 // Written by the SDN controller (peer #2 in the Fabric organization mapping)
@@ -1021,7 +1040,14 @@ inline void CallSCControllerSubmitEvidence(
     std::vector<std::string> args = {
         vehId, ctrlId, epoch, phiStr, beaconHash, sig
     };
-    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args, "ctrl" + std::to_string(controllerID));
+    // P4 guard (same fix as CallCPDetectCheck above): without this, an
+    // unenrolled "ctrl<N>" wallet slot makes EVERY CSUBM write fail at
+    // identity load — CPDetectCheck then has no controller evidence to
+    // compare against even once ITS identity is fixed, so the conflict can
+    // never be observed regardless of attack intensity.
+    std::string submit_id = mptd_06c_ca_identity_enabled()
+                                ? ("ctrl" + std::to_string(controllerID)) : "";
+    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args, submit_id);
 }
 
 // ── CallSCTrustFinalizeEpoch — Eq 3.55 EMA + T_rev gate ──────────────────────
@@ -1077,7 +1103,9 @@ inline std::string CallCPDetectCheck(
     std::vector<std::string> args = {
         MakeVehId(vehicleID), epoch
     };
-    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args, "ctrl" + std::to_string(controllerID));
+    std::string submit_id = mptd_06c_ca_identity_enabled()
+                                ? ("ctrl" + std::to_string(controllerID)) : "";
+    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args, submit_id);
 }
 
 // ── CallCPDetectCheckAsync — fire-and-forget variant ─────────────────────────
@@ -1099,7 +1127,9 @@ inline void CallCPDetectCheckAsync(
     };
     // controllerID = c_assigned(r_j) of the window's RSU (matches CSUBM
     // submitter; follows reassignment via rsu_controller_ID[]).
-    mptd_fabric_invoke_async("CPDetectCheck", args, "ctrl" + std::to_string(controllerID));
+    std::string submit_id = mptd_06c_ca_identity_enabled()
+                                ? ("ctrl" + std::to_string(controllerID)) : "";
+    mptd_fabric_invoke_async("CPDetectCheck", args, submit_id);
 }
 
 // ── CallSCRSUFinalizeEpoch — RSU SC-Trust EMA (Eq rsu_trust / rsu_misbehave) ──

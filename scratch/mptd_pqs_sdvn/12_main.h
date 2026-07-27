@@ -96,6 +96,56 @@ int main(int argc, char *argv[])
                   ablation_ab);
     cmd.AddValue ("enable_rule_signatures", "AB1 toggle: 0=disable TP/MP rule scoring", enable_rule_signatures);
     cmd.AddValue ("enable_hmac_gate", "AB2 toggle: 0=disable HMAC+nonce beacon gate", enable_hmac_gate);
+    cmd.AddValue ("sybil_gat_evasive",
+                  "AB3 Phase 2: 0=legacy a3 (ghosts clustered at one RSU, bypass GAT). "
+                  "1=distributed GAT-evasive Sybil (1 ghost/RSU, plausible kinematics, "
+                  "de-synced, relational-outlier heading, routed through GAT). Use with "
+                  "--honest_mp_s1=1 to isolate GAT's contribution.",
+                  g_sybil_gat_evasive);
+    cmd.AddValue ("honest_mp_s1",
+                  "AB3 Phase 1: 0=legacy MP-S1 (default; density OR ghost-ID marker, "
+                  "gated on ground-truth poison label). 1=paper-faithful MP-S1 (Eq. mp_s1: "
+                  "identity-density check on observable data only, no label leakage).",
+                  g_honest_mp_s1);
+    cmd.AddValue ("uniform_speed_trace",
+                  "AB5/E2: load the uniform-speed trace mobility_<tag>_uniform_<v>.tcl "
+                  "(every vType + road edge pinned to v; speedFactor=1, speedDev=0) "
+                  "instead of the realistic per-road-limit trace. Default 0.",
+                  g_uniform_speed_trace);
+    cmd.AddValue ("n_coord",
+                  "AB3 sweep: coordinated Sybil identities per compromised RSU "
+                  "(paper Fig 3.4 N_ghost; default 4). Use with --attack_number=3 "
+                  "(= sir's a4, Sybil-via-compromised-RSU).",
+                  g_n_coord);
+    cmd.AddValue ("eps_max",
+                  "AB4 sweep: stealth drift bound epsilon_max in m per beacon "
+                  "(Eq 3.5; default 0.5, must stay < the s_max*T_b = 3.33 m gate). "
+                  "Use with --attack_number=2 (= sir's a1, TP-via-malicious-vehicle).",
+                  epsilon_max_stealth);
+    cmd.AddValue ("lambda_ae",
+                  "AB4: per-run override of the GLOBAL fusion lambda_ae in [0,1] "
+                  "(default -1 = use fusion_weights.json unchanged). psi/gat are "
+                  "rescaled to 1-lambda_ae keeping their ratio. Needed because the "
+                  "deployed lambda_ae=0.3071 caps the AE's vote below phi_th=0.5, so "
+                  "on sub-gate stealth drift it cannot move any decision; the "
+                  "per-attack lambda_sets don't apply because k_hat is -1 always.",
+                  g_lambda_ae_cli);
+    cmd.AddValue ("lambda_gat",
+                  "AB3: per-run override of the GLOBAL fusion lambda_gat in [0,1] "
+                  "(default -1 = use fusion_weights.json unchanged). psi/ae are "
+                  "rescaled to 1-lambda_gat keeping their ratio. Needed because the "
+                  "deployed lambda_gat=0.1857 caps GAT's vote below phi_th=0.5, so on "
+                  "the evasive Sybil (--sybil_gat_evasive, psi/ae~0 by design) GAT "
+                  "alone can never move a fused decision no matter how well-calibrated; "
+                  "the per-attack lambda_sets don't apply because k_hat is -1 always.",
+                  g_lambda_gat_cli);
+    cmd.AddValue ("poison_theta",
+                  "AB4 sweep: attack deviation scale theta in [0,1] (default 0.5). "
+                  "Scales max_position_deviation / max_velocity_deviation in "
+                  "PoisonTrajectoryByType(); LOWER = stealthier, so the per-beacon "
+                  "psi rules and the spatial GAT stop saturating and the temporal "
+                  "LSTM-AE becomes the discriminating tier.",
+                  poisoning_intensity_theta);
     cmd.AddValue ("mitm_stealth",
                   "a6 stealth regime: 0=abrupt (default, trips psi speed bound), "
                   "1=kinematically-plausible drift (psi cannot fire; HMAC sole detector)",
@@ -104,7 +154,12 @@ int main(int argc, char *argv[])
                   "a6 model: 0=legacy injection (default, preserves combined-attack results), "
                   "1=faithful in-transit modification (relay to claimed-position RSU + stale victim MAC)",
                   g_faithful_mitm);
+    cmd.AddValue ("per_pid_results",
+                  "1=isolate the live results dir per PID (analytics/results/<scenario>_pid<PID>/) so "
+                  "concurrent sims don't clobber each other's beacon_log.csv; default 0 (shared)",
+                  g_per_pid_results);
     cmd.AddValue ("enable_trs", "AB6 toggle: 0=skip TRS sign/verify in crypto pipeline", enable_trs);
+    cmd.AddValue ("trs_compromised_f", "AB6 f/n sweep: force F of n ring members compromised (0..n); -1=off", g_trs_compromised_f);
     cmd.AddValue ("enable_fhe", "AB7 toggle: 0=plaintext aggregates (TRS still signs)", enable_fhe);
     cmd.AddValue ("enable_rsu_lifecycle", "AB8 toggle: 0=RSUs permanently trusted", enable_rsu_lifecycle);
     cmd.AddValue ("enable_ctrl_rotation", "AB9 toggle: 0=single fixed controller", enable_ctrl_rotation);
@@ -124,6 +179,16 @@ int main(int argc, char *argv[])
                   "(for training-data sweeps without a working Fabric env); "
                   "default=false",
                   skip_blockchain);
+    cmd.AddValue ("tiered_commit",
+                  "Tiered blockchain commit (paper §3.5.5): 1=Tier-3 batch anomaly "
+                  "evidence (default), 0=per-beacon synchronous submit",
+                  g_tiered_commit);
+    cmd.AddValue ("t_batch",
+                  "Tier-3 batch commit interval seconds (<< T_w); default 10",
+                  g_t_batch);
+    cmd.AddValue ("n_commit",
+                  "Tier-3 batch commit size in evidence entries; default 50",
+                  g_n_commit);
     cmd.AddValue ("mobility_source",
                   "Mobility provider: 0=hardcoded 16-veh ConstantVelocity (default, "
                   "fast smoke tests), 1=sumo_trace (Ns2MobilityHelper on .tcl from "
@@ -134,6 +199,13 @@ int main(int argc, char *argv[])
     // (sir's ablation/E1–E4 default). Vehicle attacks (a2/a4/a6) are assigned per-node
     // in declare_attackers(); RSU (a1/a3) + controller (a5/a7) layers activate alongside.
     g_combined_attack = (attack_number == 0);
+    // AB3 (attack 3 = RSU ghost injection / trajectory poisoning) MUST use the
+    // paper-faithful, density-calibrated MP-S1. The legacy MP-S1 path (count>N_v/N_r,
+    // ~3) flags ~48% of honest beacons at ghost-inflated RSU cells, burying GAT's
+    // signal under false positives. Force the honest path on for attack 3 so the
+    // ablation reads GAT's true spatial contribution to the 60m-displaced Sybils.
+    // (--honest_mp_s1 still overrides for other attacks.)  (2026-07-24)
+    if (attack_number == 3) g_honest_mp_s1 = true;
     // Multi-seed: drive the ns-3 global RNG from --seed so stochastic ns-3 elements
     // (channel, propagation, jitter) vary per seed. The attack-side randomness is
     // additionally mixed with run_seed in 06a_attack_models.h. (2026-07-20)
@@ -229,6 +301,19 @@ int main(int argc, char *argv[])
             if (ctest.good()) { scenario_sub = "urban_combined";
                 std::cout << "[AI-INIT] combined-attack calibration → models/urban_combined/" << std::endl; }
         }
+        // AB3 / single-attack a3 (MP-S1 Sybil-via-compromised-RSU): the single-attack
+        // θ_S=8.31 in models/urban/ is ~70x too low — clean in-sim S p95≈18, poisoned
+        // S≈360-720, so 8.31 saturates the GAT term for 43% of CLEAN beacons → GAT
+        // becomes anti-informative (removing it IMPROVES MCC_full). urban_a3/ re-derives
+        // θ_S=18.4 (95th pct of clean in-sim S; same method as urban_combined) while
+        // symlinking the untouched model. Selected only when attack_number==3 so every
+        // other single-attack run is byte-identical.
+        else if (attack_number == 3 && mobility_scenario == 0) {
+            std::string a3dir = std::string(NS3_ROOT) + "/analytics/ml/models/urban_a3/gat_model.onnx";
+            std::ifstream a3test(a3dir);
+            if (a3test.good()) { scenario_sub = "urban_a3";
+                std::cout << "[AI-INIT] a3 Sybil calibration → models/urban_a3/ (θ_S recalibrated)" << std::endl; }
+        }
 
         // GAT is now per-scenario (Phase-1b clean stats + θ_S re-derived on each
         // scenario's clean SUMO traces — recalibrate_gat_per_scenario.py). The
@@ -249,8 +334,22 @@ int main(int argc, char *argv[])
         const std::string scaler_path  = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/scaler.json";
         const std::string theta_path   = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/theta_ae.txt";
         const std::string weights_path = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/fusion_weights.json";
+        // 2026-07-27 fix: scaler.json (shared with the LSTM-AE) was overwritten by the
+        // AB4 dead-reckoning-residual fix — incompatible with GAT's absolute-position
+        // inputs (measured |z| in the thousands, saturating GAT for clean and poisoned
+        // beacons alike). urban_a3/gat_scaler.json holds the original absolute-position
+        // stats (mean/scale ~ pos_x 1755±545 etc., matching this scenario's real map
+        // scale) dedicated to GAT only; the LSTM-AE keeps using scaler_path unaffected.
+        // Scoped to urban_a3 only — every other scenario passes "" and is byte-identical.
+        std::string gat_scaler_path;
+        if (scenario_sub == "urban_a3") {
+            std::string gspath = NS3_ROOT "/analytics/ml/models/urban_a3/gat_scaler.json";
+            std::ifstream gstest(gspath);
+            if (gstest.good()) gat_scaler_path = gspath;
+        }
         const bool ai_ok = g_ai_engine.init(gat_path, lstm_ae_path,
-                                            scaler_path, theta_path, weights_path);
+                                            scaler_path, theta_path, weights_path,
+                                            gat_scaler_path);
         std::cout << "[AI-INIT] engine ready=" << (ai_ok ? "YES" : "NO")
                   << " gat=" << (g_ai_engine.has_gat() ? "YES" : "NO")
                   << " lstm_ae=" << (g_ai_engine.has_lstm_ae() ? "YES" : "NO")
@@ -349,6 +448,59 @@ int main(int argc, char *argv[])
               g_mobility_source = MOBILITY_SRC_HARDCODED;
           }
       }
+      // ── Derive the map bounds from the trace (was hardcoded 0..2000) ────────
+      // min/max_position_* clamp poisoned coordinates in EnforceRealism() and at
+      // the TP-S1/MP-S1 injection sites. They were fixed at a 2000x2000 synthetic
+      // map, but every SUMO scenario has its own frame (urban x 664..2663,
+      // rural x 2842..5848, autobahn x 2755..3086). A stale bound silently pins
+      // out-of-range poisoned beacons to the boundary: it replaces the intended
+      // attack with a teleport AND hands the LSTM-AE a frozen (trivially
+      // reconstructable) coordinate, inverting its anomaly score. Derive per run
+      // so the clamp only rejects genuinely off-map fabrication.
+      if (!trace_path.empty()) {
+          std::ifstream bfin(trace_path);
+          if (bfin.is_open()) {
+              double xmn=1e18, xmx=-1e18, ymn=1e18, ymx=-1e18;
+              std::string bl;
+              while (std::getline(bfin, bl)) {
+                  std::size_t sp;
+                  if ((sp = bl.find(" set X_ ")) != std::string::npos) {
+                      double v = std::atof(bl.c_str() + sp + 8);
+                      if (v < xmn) xmn = v;
+                      if (v > xmx) xmx = v;
+                  } else if ((sp = bl.find(" set Y_ ")) != std::string::npos) {
+                      double v = std::atof(bl.c_str() + sp + 8);
+                      if (v < ymn) ymn = v;
+                      if (v > ymx) ymx = v;
+                  } else if ((sp = bl.find("setdest ")) != std::string::npos) {
+                      double x = 0.0, y = 0.0, sv = 0.0;
+                      if (std::sscanf(bl.c_str() + sp + 8, "%lf %lf %lf", &x, &y, &sv) >= 2) {
+                          if (x < xmn) xmn = x;
+                          if (x > xmx) xmx = x;
+                          if (y < ymn) ymn = y;
+                          if (y > ymx) ymx = y;
+                      }
+                  }
+              }
+              if (xmn <= xmx && ymn <= ymx) {
+                  const double bmargin = 100.0;   // headroom: never bind on sub-gate drift
+                  min_position_x = xmn - bmargin;  max_position_x = xmx + bmargin;
+                  min_position_y = ymn - bmargin;  max_position_y = ymx + bmargin;
+                  std::cout << "[MAP-BOUNDS] derived from trace: x ["
+                            << min_position_x << ", " << max_position_x << "]  y ["
+                            << min_position_y << ", " << max_position_y
+                            << "]  (trace extent x " << xmn << ".." << xmx
+                            << "  y " << ymn << ".." << ymx << ")" << std::endl;
+              } else {
+                  std::cout << "[MAP-BOUNDS] no coordinates parsed from "
+                            << trace_path << " — keeping defaults" << std::endl;
+              }
+          } else {
+              std::cout << "[MAP-BOUNDS] cannot open " << trace_path
+                        << " — keeping defaults" << std::endl;
+          }
+      }
+
       g_mobility_provider = create_mobility_provider(g_mobility_source, trace_path);
       std::cout << "[MOBILITY] provider=" << g_mobility_provider->provider_name()
                 << " sumo_derived="
@@ -2248,6 +2400,20 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
+
+  // ── Tier-3 batched-commit: flush trailing partial batches + summary ──────
+  // (paper §3.5.5) The time-flush only fires on a subsequent same-RSU push, so
+  // each RSU's final sub-N_commit batch is drained here. The summary reports how
+  // much anomaly evidence was buffered vs committed as batched Fabric txs.
+  if (g_tiered_commit) {
+      tier3_flush_all(simTime);
+      std::cout << "[TIER3-SUMMARY] evidence_buffered=" << g_tier3_buffered
+                << " batches_committed=" << g_tier3_batches
+                << " entries_committed=" << g_tier3_entries
+                << " (T_batch=" << g_t_batch << "s N_commit=" << g_n_commit << ")"
+                << std::endl;
+  }
+
   Simulator::Destroy();
 
   // ── Write MPTD-PQS metrics CSV (Stage 4) ─────────────────────────────────

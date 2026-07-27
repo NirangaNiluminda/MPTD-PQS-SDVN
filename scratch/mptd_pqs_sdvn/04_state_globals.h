@@ -427,6 +427,53 @@ static inline bool lstm_ring_push(uint32_t vid,
     return r.count >= (uint32_t)g_lstm_window;   // full = enough for the runtime window
 }
 
+// ── AB4 fix: dead-reckoning RESIDUAL features for the LSTM-AE ───────────────
+// The urban AE was retrained (2026-07-26) on residual channels. Rationale: the
+// previous model consumed ABSOLUTE position normalised by ~545 m (scaler.json),
+// so the 0.6-3.2 m TP-S1 stealth drift landed at ~0.005 in normalised units —
+// an order of magnitude below the reconstruction noise floor. Measured in-sim
+// ROC-AUC was 0.463, i.e. no signal, so AB4 could never show a contribution.
+//
+// TP-S1 modifies POSITION ONLY and leaves the reported speed/heading honest, so
+//     res(t) = [p(t) - p(t-1)] - v(t)*T_b*[cos h(t), sin h(t)]
+// isolates the injected per-beacon increment directly. Held-out on disjoint
+// vehicles: eMCC 0.546 vs 0.160 and FPR 0.003 vs 0.852 against the absolute
+// model — the gain is in threshold CALIBRATION (honest residuals cluster at 0),
+// not in raw ranking power.
+//
+// The ring SLOTS are reused unchanged (pos_x->res_x, pos_y->res_y,
+// speed->dspeed, heading->dheading) so the [L,6] tensor layout and the
+// scaler.json column order stay identical; only the channel MEANING changed —
+// scaler.json feature_names records the new semantics.
+static float lstm_prev_px [total_size] = {};
+static float lstm_prev_py [total_size] = {};
+static float lstm_prev_sp [total_size] = {};
+static float lstm_prev_hd [total_size] = {};
+static bool  lstm_prev_set[total_size] = {};
+
+static inline bool lstm_ring_push_resid(uint32_t vid,
+                                        float px, float py, float sp,
+                                        float hd, float ac, float tau) {
+    if (vid >= (uint32_t)total_size) return false;
+    float rx = 0.0f, ry = 0.0f, dsp = 0.0f, dhd = 0.0f;
+    if (lstm_prev_set[vid]) {
+        const float dx = px - lstm_prev_px[vid];
+        const float dy = py - lstm_prev_py[vid];
+        rx  = dx - sp * (float)T_b * std::cos(hd);
+        ry  = dy - sp * (float)T_b * std::sin(hd);
+        dsp = sp - lstm_prev_sp[vid];
+        dhd = hd - lstm_prev_hd[vid];
+        while (dhd >   (float)M_PI) dhd -= 2.0f * (float)M_PI;   // wrap to (-pi, pi]
+        while (dhd <= -(float)M_PI) dhd += 2.0f * (float)M_PI;
+    }
+    // First beacon of a vehicle has no predecessor: residual stays 0, which is
+    // on-manifold for the clean-trained model, and the ring needs L samples anyway.
+    lstm_prev_px [vid] = px;  lstm_prev_py [vid] = py;
+    lstm_prev_sp [vid] = sp;  lstm_prev_hd [vid] = hd;
+    lstm_prev_set[vid] = true;
+    return lstm_ring_push(vid, rx, ry, dsp, dhd, ac, tau);
+}
+
 // Copy the ring into a row-major (LSTM_RING_SIZE × 6) buffer in chronological
 // order so the LSTM-AE sees the oldest sample first (col 5 = tau_i, scaled
 // downstream by AiScaler). Returns false if ring is not yet full.
