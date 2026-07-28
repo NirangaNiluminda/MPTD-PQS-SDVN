@@ -5,36 +5,38 @@
 // 1–2s per-call `peer chaincode invoke` fork-exec-tls-handshake overhead.
 //
 // Paper invariants satisfied:
-//   • Invariant 1 — RSU→Fabric direct. The daemon runs co-located with the
+//   - Invariant 1 — RSU→Fabric direct. The daemon runs co-located with the
 //     RSU process; the Unix socket is process-local. No controller relay,
 //     no centralized proxy across the network.
-//   • Invariant 6 — no centralized bottleneck. A daemon per RSU node would
+//   - Invariant 6 — no centralized bottleneck. A daemon per RSU node would
 //     give true per-RSU gateway isolation; the current single-daemon mode
 //     mirrors the legacy `fabric_invoke.sh` behaviour and is fine for the
 //     SDN-controller-as-peer simulation we run today.
 //
 // Wire protocol:
-//   Each accept() takes ONE JSON line in, writes ONE JSON line back, closes.
 //
-//   Request:
-//     {"action": "invoke" | "query",
-//      "function": "<chaincode-fn>",
-//      "args":     ["arg1", "arg2", ...]}
+//	Each accept() takes ONE JSON line in, writes ONE JSON line back, closes.
 //
-//   Response:
-//     {"ok": true,  "payload": "<chaincode-return-bytes-as-utf8>"}
-//   or
-//     {"ok": false, "error":   "<error-message>"}
+//	Request:
+//	  {"action": "invoke" | "query",
+//	   "function": "<chaincode-fn>",
+//	   "args":     ["arg1", "arg2", ...]}
+//
+//	Response:
+//	  {"ok": true,  "payload": "<chaincode-return-bytes-as-utf8>"}
+//	or
+//	  {"ok": false, "error":   "<error-message>"}
 //
 // Bring-up:
-//   Defaults match the fabric-samples test-network layout. Overrides via env:
-//     FABRIC_GW_SOCKET=/tmp/mptd_fabric.sock
-//     FABRIC_GW_MSP_ID=Org1MSP
-//     FABRIC_GW_CRYPTO_PATH=/home/niranga/fabric-samples/test-network/organizations/peerOrganizations/org1.example.com
-//     FABRIC_GW_PEER_ENDPOINT=localhost:7051
-//     FABRIC_GW_PEER=peer0.org1.example.com
-//     FABRIC_GW_CHANNEL=mychannel
-//     FABRIC_GW_CHAINCODE=trajectory
+//
+//	Defaults match the fabric-samples test-network layout. Overrides via env:
+//	  FABRIC_GW_SOCKET=/tmp/mptd_fabric.sock
+//	  FABRIC_GW_MSP_ID=Org1MSP
+//	  FABRIC_GW_CRYPTO_PATH=/home/niranga/fabric-samples/test-network/organizations/peerOrganizations/org1.example.com
+//	  FABRIC_GW_PEER_ENDPOINT=localhost:7051
+//	  FABRIC_GW_PEER=peer0.org1.example.com
+//	  FABRIC_GW_CHANNEL=mychannel
+//	  FABRIC_GW_CHAINCODE=trajectory
 //
 // Fallback contract: if the socket file does not exist, the NS-3 client falls
 // back to `fabric_invoke.sh`, so removing the daemon = automatic legacy mode.
@@ -50,10 +52,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/rand"
 	"net"
 	"os"
 	"os/signal"
 	"path"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -118,15 +123,27 @@ func loadConfig() config {
 			allow = append(allow, s)
 		}
 	}
+	gatewayPeer := envOr("FABRIC_GW_PEER", "peer0.org1.example.com")
+	// certPath/keyPath/tlsCertPath used to hardcode the literal "org1.example.com"
+	// / "peer0.org1.example.com" org domain regardless of FABRIC_GW_PEER, so any
+	// non-default org (e.g. this project's "rsu.example.com") failed at daemon
+	// startup with "read TLS cert .../peer0.org1.example.com/... no such file".
+	// Derive the org domain from gatewayPeer instead (everything after the first
+	// '.'), so overriding FABRIC_GW_PEER alone is sufficient.
+	orgDomain := gatewayPeer
+	if idx := strings.Index(gatewayPeer, "."); idx >= 0 {
+		orgDomain = gatewayPeer[idx+1:]
+	}
+	adminUser := envOr("FABRIC_GW_ADMIN_USER", "User1")
 	return config{
 		socketPath:    envOr("FABRIC_GW_SOCKET", "/tmp/mptd_fabric.sock"),
 		mspID:         envOr("FABRIC_GW_MSP_ID", "Org1MSP"),
 		cryptoPath:    crypto,
-		certPath:      crypto + "/users/User1@org1.example.com/msp/signcerts",
-		keyPath:       crypto + "/users/User1@org1.example.com/msp/keystore",
-		tlsCertPath:   crypto + "/peers/peer0.org1.example.com/tls/ca.crt",
+		certPath:      crypto + "/users/" + adminUser + "@" + orgDomain + "/msp/signcerts",
+		keyPath:       crypto + "/users/" + adminUser + "@" + orgDomain + "/msp/keystore",
+		tlsCertPath:   crypto + "/peers/" + gatewayPeer + "/tls/ca.crt",
 		peerEndpoint:  envOr("FABRIC_GW_PEER_ENDPOINT", "dns:///localhost:7051"),
-		gatewayPeer:   envOr("FABRIC_GW_PEER", "peer0.org1.example.com"),
+		gatewayPeer:   gatewayPeer,
 		channelName:   envOr("FABRIC_GW_CHANNEL", "mychannel"),
 		chaincodeName: envOr("FABRIC_GW_CHAINCODE", "trajectory"),
 		eventsPath:    envOr("FABRIC_GW_EVENTS_PATH", "/tmp/mptd_fabric_events.jsonl"),
@@ -298,10 +315,10 @@ func (p *idPool) gatewayFromMSP(name string) (*client.Gateway, error) {
 		client.WithSign(sign),
 		client.WithHash(hash.SHA256),
 		client.WithClientConnection(p.conn),
-		client.WithEvaluateTimeout(5*time.Second),
-		client.WithEndorseTimeout(15*time.Second),
-		client.WithSubmitTimeout(15*time.Second),
-		client.WithCommitStatusTimeout(1*time.Minute),
+		client.WithEvaluateTimeout(gwEvaluateTimeout),
+		client.WithEndorseTimeout(gwEndorseTimeout),
+		client.WithSubmitTimeout(gwSubmitTimeout),
+		client.WithCommitStatusTimeout(gwCommitTimeout),
 	)
 }
 
@@ -353,15 +370,150 @@ type response struct {
 	Error   string `json:"error,omitempty"`
 }
 
-// The Fabric Gateway client's Contract.{Submit,Evaluate}Transaction are
+// The Fabric Gateway client's Contract.{Submit,Endorse}Transaction are
 // concurrency-safe per the fabric-gateway SDK contract — multiple goroutines
 // can endorse/submit in parallel and the orderer handles ordering. We do NOT
 // serialize here; doing so would defeat the whole point of switching off the
 // shell shim (which serialized on fork-exec contention).
+//
+// Root cause of the near-100% fire-and-forget failure rate observed under
+// combined-attack load (200 vehicles × 64 RSUs bursting SCControllerSubmitEvidence
+// / CPDetectCheck within a few sim-seconds): fully UNBOUNDED goroutine fan-out
+// with no retry meant every burst threw thousands of concurrent Submit calls at
+// the peers/orderer at once. Two distinct failure modes fell out of that:
+//   - MVCC_READ_CONFLICT (status 11): many goroutines' transactions land in the
+//     SAME ordering block and read-then-write overlapping ledger keys (e.g. the
+//     per-vehicle CP-DETECT disagreement window / per-controller ControllerFlag
+//     record CPDetectCheck maintains) — Fabric's optimistic concurrency control
+//     validates only the FIRST writer per key per block and invalidates the
+//     rest. This is expected/transient by Fabric's own design — the documented
+//     client-side answer is to resubmit, not to avoid the race.
+//   - DeadlineExceeded / Aborted: the burst simply outran the 15s endorse/submit
+//     timeouts because thousands of goroutines queued on the same handful of
+//     endorsing peers at once.
+//
+// Neither failure was ever retried — the goroutine just logged and dropped the
+// transaction, so the on-chain evidence trail was silently incomplete no matter
+// how strong the underlying detection signal was.
+//
+// Fix: (a) bound how many fire-and-forget submits are in flight at once via a
+// semaphore, which directly lowers same-block key collisions and endorse-queue
+// backlog; (b) bounded retry with jittered backoff for the known-transient
+// error classes. Both are env-tunable so this can be re-scaled without a
+// rebuild if the network capacity changes.
+var (
+	fireForgetSem     chan struct{}
+	fireForgetRetries = mustAtoiEnv("FABRIC_GW_FF_RETRIES", 4)
+	fireForgetBackoff = mustAtoiEnv("FABRIC_GW_FF_BACKOFF_MS", 150)
+	// Gateway timeouts. The stock 15s endorse/submit values are too aggressive
+	// for a 64-peer/5-orderer cluster on a contended host: measured block
+	// production was ~15s/tx, so submits were expiring at exactly the moment
+	// their transaction was about to be ordered ("submit timeout expired while
+	// broadcasting to ordering service"). Retrying a SLOW operation doesn't
+	// help — it just doubles the wait — so prefer one attempt with a generous
+	// timeout (see syncRetries=0) over several impatient ones.
+	gwEndorseTimeout  = time.Duration(mustAtoiEnv("FABRIC_GW_ENDORSE_SEC", 60)) * time.Second
+	gwSubmitTimeout   = time.Duration(mustAtoiEnv("FABRIC_GW_SUBMIT_SEC", 60)) * time.Second
+	gwCommitTimeout   = time.Duration(mustAtoiEnv("FABRIC_GW_COMMIT_SEC", 120)) * time.Second
+	gwEvaluateTimeout = time.Duration(mustAtoiEnv("FABRIC_GW_EVALUATE_SEC", 15)) * time.Second
+
+	// syncRetries defaults to 0 (single attempt, no retry) — deliberately far
+	// below fireForgetRetries. Two reasons:
+	//  1. SubmitTransaction blocks for commit confirmation on top of
+	//     endorse/submit, so each attempt is expensive; stacking retries pushed
+	//     a BLOCKING sync call past 7 minutes and hung the C++ client in
+	//     unix_stream_data_wait with no error ever surfacing (observed in v7).
+	//  2. Now that the real fault is fixed (orderer3/4 had a channel join
+	//     record but no loaded channel, so ~40% of submits were routed into a
+	//     black hole), the residual failures are SLOWNESS, not breakage.
+	//     Retrying slow work doubles the wait; waiting longer once is correct —
+	//     hence the generous gw*Timeout values above.
+	// Fire-and-forget keeps its retries: it never blocks a caller.
+	syncRetries = mustAtoiEnv("FABRIC_GW_SYNC_RETRIES", 0)
+)
+
+func mustAtoiEnv(k string, def int) int {
+	if v := os.Getenv(k); v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
+	}
+	return def
+}
+
+func initFireForgetSem() {
+	n := mustAtoiEnv("FABRIC_GW_MAX_INFLIGHT", 24)
+	if n < 1 {
+		n = 1
+	}
+	fireForgetSem = make(chan struct{}, n)
+}
+
+// isRetryableSubmitErr matches the transient failure classes documented above.
+// Anything else (bad args, chaincode logic rejection, revoked identity, etc.)
+// is a real error and is NOT retried.
+func isRetryableSubmitErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "MVCC_READ_CONFLICT") ||
+		strings.Contains(s, "PHANTOM_READ_CONFLICT") ||
+		strings.Contains(s, "DeadlineExceeded") ||
+		strings.Contains(s, "endorsement timeout") ||
+		strings.Contains(s, "code = Aborted") ||
+		strings.Contains(s, "code = Unavailable")
+}
+
+// submitWithRetry retries transient Fabric-level failures (see isRetryableSubmitErr)
+// with jittered backoff. Shared by both the fire-and-forget path and the
+// synchronous invoke path — SCBootstrapRSU/SCRegister etc. are blocking
+// invokes and were seeing the exact same transient "channel creation request
+// not allowed" / MVCC / timeout errors under load with zero retry, since only
+// the fire-and-forget path had this originally.
+func submitWithRetry(contract *client.Contract, fn string, args []string, maxRetries int) ([]byte, error) {
+	var payload []byte
+	var err error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		payload, err = contract.SubmitTransaction(fn, args...)
+		if err == nil {
+			return payload, nil
+		}
+		if !isRetryableSubmitErr(err) || attempt == maxRetries {
+			break
+		}
+		backoff := time.Duration(fireForgetBackoff*(1<<attempt)) * time.Millisecond
+		backoff += time.Duration(rand.Intn(fireForgetBackoff)) * time.Millisecond
+		time.Sleep(backoff)
+	}
+	return payload, err
+}
+
+// submitFireAndForget bounds concurrency (semaphore) and retries transient
+// Fabric-level failures with jittered backoff before giving up and logging.
+// Safe to retry more aggressively than the sync path: this never blocks a
+// client, so a long worst-case retry budget just delays a background log
+// line, not a caller.
+func submitFireAndForget(contract *client.Contract, fn string, args []string) {
+	fireForgetSem <- struct{}{}
+	defer func() { <-fireForgetSem }()
+
+	if _, err := submitWithRetry(contract, fn, args, fireForgetRetries); err != nil {
+		log.Printf("[fabric-gw] fire-and-forget submit %s: %v", fn, err)
+	}
+}
 
 func handleConn(c net.Conn, pool *idPool) {
 	defer c.Close()
-	c.SetDeadline(time.Now().Add(60 * time.Second))
+	// Per-connection deadline. Must exceed the worst case of the gw*Timeout
+	// budget below it, or the client's socket read blocks past its own timeout
+	// with no error ever surfacing (observed: stuck in unix_stream_data_wait
+	// for 7+ minutes). Env-tunable so a contended host can effectively remove
+	// the ceiling — on a busy 64-peer cluster it is better to let boot-time
+	// registration take as long as it needs and SUCCEED than to expire early
+	// and leave RSUs/vehicles unregistered, which silently corrupts the run.
+	c.SetDeadline(time.Now().Add(
+		time.Duration(mustAtoiEnv("FABRIC_GW_CONN_DEADLINE_SEC", 900)) * time.Second))
 	rd := bufio.NewReader(c)
 	wr := bufio.NewWriter(c)
 	defer wr.Flush()
@@ -404,14 +556,10 @@ func handleConn(c net.Conn, pool *idPool) {
 			// here — the caller has already moved on, by design.
 			writeOk(wr, "")
 			wr.Flush()
-			go func(fn string, args []string) {
-				if _, err := contract.SubmitTransaction(fn, args...); err != nil {
-					log.Printf("[fabric-gw] fire-and-forget submit %s: %v", fn, err)
-				}
-			}(req.Function, append([]string(nil), req.Args...))
+			go submitFireAndForget(contract, req.Function, append([]string(nil), req.Args...))
 			return
 		}
-		payload, err := contract.SubmitTransaction(req.Function, req.Args...)
+		payload, err := submitWithRetry(contract, req.Function, req.Args, syncRetries)
 		if err != nil {
 			writeErr(wr, fmt.Sprintf("submit %s: %v", req.Function, err))
 			return
@@ -559,6 +707,7 @@ func runEventListener(ctx context.Context, network *client.Network,
 // ─────────────────────────────────────────────────────────────────────────────
 
 func main() {
+	initFireForgetSem()
 	cfg := loadConfig()
 	log.Printf("[fabric-gw] socket=%s mspID=%s peer=%s channel=%s ccname=%s",
 		cfg.socketPath, cfg.mspID, cfg.peerEndpoint, cfg.channelName, cfg.chaincodeName)
@@ -583,10 +732,10 @@ func main() {
 		client.WithSign(sign),
 		client.WithHash(hash.SHA256),
 		client.WithClientConnection(conn),
-		client.WithEvaluateTimeout(5*time.Second),
-		client.WithEndorseTimeout(15*time.Second),
-		client.WithSubmitTimeout(15*time.Second),
-		client.WithCommitStatusTimeout(1*time.Minute),
+		client.WithEvaluateTimeout(gwEvaluateTimeout),
+		client.WithEndorseTimeout(gwEndorseTimeout),
+		client.WithSubmitTimeout(gwSubmitTimeout),
+		client.WithCommitStatusTimeout(gwCommitTimeout),
 	)
 	if err != nil {
 		log.Fatalf("gateway connect: %v", err)

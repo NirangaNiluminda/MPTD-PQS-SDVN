@@ -2376,6 +2376,25 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
     // skip_blockchain. Must precede register_all_nodes() so the fresh
     // registrations are not rejected as duplicates of the prior run.
     CallSCResetLedger();
+
+    // Push the simulation's ACTUAL detection threshold into the ledger config.
+    // Without this the chaincode silently uses its fallback PsiAnomalyTh=0.5
+    // while RSUs decide anomalies at psi_th=0.09 — the same symbol ψ_th holding
+    // two different values in two components. Effect: an RSU submits evidence it
+    // considers anomalous (median ψ=0.15; 57% of beacons exceed 0.09), the
+    // chaincode recomputes flag^rsu = 1[ψ > 0.5] and gets 0 (only 11% qualify),
+    // so the directional conflict (1−flag^ctrl)·flag^rsu (Eq 3.66) collapses to
+    // 0, controller trust never decays off 1.0, and CP-DETECT / SC-Revoke can
+    // never fire regardless of attack intensity.
+    //
+    // NumRSUs stays 4 ON PURPOSE: fByzantine(n)=(n-1)/3, so n=4 ⇒ f=1 ⇒
+    // 2f+1=3, matching the 3 endorsements register_one() actually collects.
+    // Passing the true 64 would demand 2f+1=43 endorsements and break every
+    // registration.
+    CallSCInitNetworkConfig(/*numRSUs=*/4, /*alpha=*/0.3,
+                            /*tauWarn=*/0.5, /*tauMin=*/0.3,
+                            /*tRev=*/3, /*psiAnomalyTh=*/psi_th);
+
     register_all_nodes();
   }
 

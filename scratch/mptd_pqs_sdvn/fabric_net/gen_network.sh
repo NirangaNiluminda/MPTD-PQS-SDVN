@@ -363,6 +363,11 @@ cmd_channel() {
       --client-cert "${od}/tls/server.crt" --client-key "${od}/tls/server.key"
   done
   log "peer channel join: ${N_PEERS} peers"
+  # FABRIC_CFG_PATH is pinned to ${GEN} above (so configtxgen finds configtx.yaml),
+  # but the `peer` CLI also needs core.yaml on that same path — cryptogen never
+  # renders one there. Without this the join loop fails immediately with
+  # "Config File core Not Found" and every peer stays unjoined.
+  [ -f "${GEN}/core.yaml" ] || cp "${FAB_ROOT}/config/core.yaml" "${GEN}/core.yaml"
   export CORE_PEER_TLS_ENABLED=true
   export CORE_PEER_LOCALMSPID="${RSU_MSP}"
   export CORE_PEER_TLS_ROOTCERT_FILE="${crypto}/peerOrganizations/${ORG_DOMAIN}/peers/peer0.${ORG_DOMAIN}/tls/ca.crt"
@@ -389,11 +394,42 @@ cmd_down() {
   if [ -f "${GEN}/compose.yaml" ]; then
     docker compose -p "${COMPOSE_PROJECT}" -f "${GEN}/compose.yaml" down -v || true
   fi
-  docker rm -f $(docker ps -aq --filter "network=${DOCKER_NET}") 2>/dev/null || true
+  # Force-remove leftovers on our network, but EXCLUDE co-tenants that merely
+  # attach to it for observability (Hyperledger Explorer + its Postgres, the
+  # CCAAS chaincode container). Filtering on network alone repeatedly nuked
+  # Explorer during rebuilds, which is not this script's business to delete.
+  local leftovers
+  leftovers=$(docker ps -aq --filter "network=${DOCKER_NET}" 2>/dev/null \
+    | while read -r c; do
+        n=$(docker inspect -f '{{.Name}}' "$c" 2>/dev/null | sed 's|^/||')
+        case "$n" in explorer*|*explorerdb*|*ccaas*) ;; *) echo "$c" ;; esac
+      done)
+  [ -n "$leftovers" ] && docker rm -f $leftovers >/dev/null 2>&1 || true
+  # `compose down -v` only removes volumes it still knows about. If it partially
+  # failed (64 peers is a lot), or containers were force-removed first, the peer
+  # ledger volumes are ORPHANED rather than deleted — and a later cmd_up happily
+  # re-attaches them, silently reviving the old channel config / old CA. Sweep
+  # them explicitly so a rebuild is always a real rebuild.
+  local stale
+  stale=$(docker volume ls -q --filter "name=^${COMPOSE_PROJECT}_" 2>/dev/null)
+  if [ -n "$stale" ]; then
+    echo "$stale" | xargs -r docker volume rm -f >/dev/null 2>&1 || true
+    log "removed $(echo "$stale" | wc -l) stale ${COMPOSE_PROJECT}_* volumes"
+  fi
   ok "Network down"
 }
 
 cmd_all() {
+  # cmd_down FIRST — non-negotiable. cmd_gen regenerates the CA and every cert,
+  # but peer ledger volumes are NOT recreated by cmd_up if they already exist.
+  # Skipping the teardown therefore yields a Frankenstein network: new CA on
+  # disk, but peers still attached to OLD volumes holding the OLD channel
+  # config and OLD CA root. Those peers reject every identity signed by the new
+  # CA with "creator org unknown / certificate signed by unknown authority",
+  # which surfaces as ~40% random write failures, silent ResetLedger failures
+  # (-> duplicate identities), and lost RSU/controller registrations. Diagnosed
+  # the hard way 2026-07-27: 60/64 peers were still on June-17 volumes.
+  cmd_down
   cmd_gen "$@"; cmd_genesis; cmd_up; sleep 3; cmd_channel; cmd_deploy
 }
 

@@ -244,10 +244,22 @@ static inline bool mptd_fabric_call_socket(
         return false;
     }
 
-    // 30 s budget covers worst-case Fabric commit (~1–2 s in practice) plus
-    // headroom for endorsement retries. Matches the daemon's per-conn deadline.
+    // Socket timeout. Deliberately very large: it is the LAST ceiling above the
+    // daemon's per-conn deadline and the gateway's endorse/submit/commit
+    // budget. On a contended 64-peer cluster, boot-time registration submits
+    // can legitimately take minutes; expiring early does NOT fail fast, it
+    // leaves the RSU/vehicle unregistered and silently corrupts the run (and
+    // in the worst case the client blocks in unix_stream_data_wait with no
+    // error at all, because the daemon still answers — just later than the
+    // client stopped listening). Prefer "slow but complete" over "fast but
+    // half-registered"; override with MPTD_FABRIC_SOCK_TIMEOUT_SEC.
     struct timeval tv;
-    tv.tv_sec  = 30;
+    {
+        const char* e = std::getenv("MPTD_FABRIC_SOCK_TIMEOUT_SEC");
+        long secs = (e && *e) ? std::strtol(e, nullptr, 10) : 800;
+        if (secs < 1) secs = 800;
+        tv.tv_sec = secs;
+    }
     tv.tv_usec = 0;
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));

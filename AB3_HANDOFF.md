@@ -346,6 +346,125 @@ that work.
    worth checking after the scaler fix, but it's no longer the primary suspect for the
    MCC collapse.
 
+### Fix applied and confirmed (2026-07-27) — minimal scope, urban_a3 only
+
+Implemented per the recommendation above, scoped to `urban_a3` only (no other scenario
+touched):
+
+- `06d_ai_inference.h`: added a dedicated `gat_scaler_` member + optional
+  `gat_scaler_path` param to `AiInferenceEngine::init()` (both the real ONNX-backed class
+  and the mock fallback, for signature compatibility). `score_gat()` now z-scores through
+  `gat_scaler_` instead of the shared `scaler_`. Defaults to `scaler_` when no path is
+  given, so every scenario except `urban_a3` is byte-identical to before.
+- `12_main.h`: computes `gat_scaler_path` only when `scenario_sub == "urban_a3"`,
+  pointing at a new file; empty (old behaviour) everywhere else.
+- New file `analytics/ml/models/urban_a3/gat_scaler.json` — the absolute-position stats
+  from `urban/scaler.json.bak_pre_resid` (pre-AB4, matches this topology's real
+  pos_x/pos_y range).
+- Rebuilt clean (`./waf build --targets=mptd_pqs_sdvn`), no errors.
+
+**30s real-topology re-test results** (same config as §8's original 300s run: ρ_a=0.20,
+n_coord=4, `--lambda_gat=0.7`, seed=1):
+
+| | Broken (original, §8) | Scaler fix only | + θ_S recalibrated to 42.62 |
+|---|---|---|---|
+| MCC_full | **-0.209** (300s) | 0.192 (30s) | **0.247** (30s) |
+| FPR_full | **0.987** | 0.817 | **0.191** |
+| GAT-SCORE range | ~100,000+ (both clean & poison) | 4.6–62.8 (sane) | same (sane) |
+
+GAT-SCORE values dropped from the ~100,000+ range straight to single/double digits
+immediately after the scaler fix, confirming the root cause. Raw-S mining from the
+scaler-fix-only run showed real (if overlapping) separation: `clean p50=15.66 p95=42.62`,
+`poison p50=25.43 min=17.93`. Recalibrating `theta_s.txt` to this topology's own clean
+p95 (42.62 — mined from that same run, no extra sim needed) dropped FPR from 82% → 19%
+and *improved* MCC despite recall falling from 100% → 47% (many of those "hits" were only
+hits because the threshold was absurdly low). `theta_s.txt.bak_toy_calib` preserves the
+original 7.667544 for revert.
+
+**300s validation — CONFIRMED (2026-07-27).** Same command as §8's original broken run,
+now with both fixes:
+
+| | Broken (original, §8) | Scaler fix (30s) | + θ_S recal (30s) | **Both, 300s (final)** |
+|---|---|---|---|---|
+| MCC_full | -0.209 | 0.192 | 0.247 | **0.520** |
+| FPR_full | 0.987 | 0.817 | 0.191 | **0.021** |
+| TP/FP/TN/FN | 2662/67008/866/475 | 510/2010/450/0 | 240/470/1990/270 | 1690/1417/66457/1447 |
+| TTD | 3.42s | 0.89s | 3.39s | 12.9s |
+
+At full duration/larger sample: `clean p50=10.05 p90=17.07 p95=21.09 max=62.80`,
+`poison p50=29.13 p25=17.65 p10=12.09 min=4.27`. Real separation, though recall caps
+around 54% (TP/(TP+FN)=1690/3137) due to tail overlap. Note the real 300s clean p95
+(21.09) is actually *lower* than the deployed θ_S=42.62 (mined from a smaller 30s
+sample) — the current threshold is if anything slightly conservative, which is why FPR
+(2.1%) came in even better than the 30s test suggested. Could be tightened further using
+this run's own p95, but not necessary — 2.1% FPR / 0.52 MCC is a solid, legitimately
+working operating point.
+
+**Status: the scaler + θ_S fix is done and confirmed at both 30s and 300s.**
+
+## 10. Full n_coord sweep — RESULTS (2026-07-27/28)
+
+Ran on the real topology, all `--simTime=300 --attack_number=3 --attack_percentage=20
+--seed=1 --skip_blockchain=true --sybil_gat_evasive=1`, frozen calibration
+(`theta_s.txt=42.62`, `--lambda_gat=0.7`, GAT-dedicated scaler). Full =
+`--ablation_mode=0 --lambda_gat=0.7`; GAT-off = `--ablation_ab=3` (no lambda_gat needed —
+GAT term fully renormalised away). n_coord=4 was the validation point from §8; included
+here as a real sweep data point too.
+
+| n_coord | Full MCC | GAT-off MCC | **Δ (GAT's contribution)** | Full TTD | GAT-off TTD | Full CDER | GAT-off CDER | Full FPR | GAT-off FPR |
+|---|---|---|---|---|---|---|---|---|---|
+| 1  | 0.667 | -0.060 | **+0.727** | 12.89s | 97.97s  | 0.039 | 0.117 | 0.021 | 0.058 |
+| 2  | 0.666 | -0.060 | **+0.726** | 12.89s | 97.97s  | 0.039 | 0.117 | 0.021 | 0.058 |
+| 4  | 0.520 | -0.049 | **+0.569** | 12.90s | 97.97s  | 0.040 | 0.100 | 0.021 | 0.058 |
+| 5  | 0.473 | -0.047 | **+0.520** | 12.89s | 97.97s  | 0.041 | 0.096 | 0.021 | 0.058 |
+| 10 | 0.345 | -0.042 | **+0.387** | 12.89s | 118.12s | 0.038 | 0.085 | 0.021 | 0.058 |
+| 20 | 0.414 | -0.038 | **+0.452** | 12.89s | 118.23s | 0.028 | 0.082 | 0.018 | 0.062 |
+
+Logs: `SWEEP_nc{1,2,5,10,20}_{full,gatoff}.log` + `AB3_REAL_FIXED_300s.log`/
+`AB3_REAL_GAToff_300s.log` (n_coord=4 pair) in the scratchpad dir (not committed).
+
+### The trend — and it's the opposite of the original hypothesis
+
+**GAT's marginal contribution (Δ) shrinks as n_coord grows from 1 to 10** (0.727 → 0.726
+→ 0.569 → 0.520 → 0.387), ticking back up slightly at n_coord=20 (0.452) — not a clean
+monotonic curve, but the clear overall direction from n_coord=1 to the middle of the
+range is **downward**, not upward. This directly contradicts the premise in the original
+AB3 spec: *"GAT's unique contribution is spatial relational detection of coordinated
+attacks. n_coord is the variable that stresses exactly this"* — implying Δ should grow
+with n_coord. Instead, more coordinated ghosts appear to **dilute** the fusion decision
+rather than sharpen GAT's signal: Full-mode MCC itself declines from 0.667 (n_coord=1)
+down to 0.345 (n_coord=10) before a partial recovery at 20, while GAT-off stays
+persistently poor (-0.06 to -0.04) throughout, barely moving as n_coord changes at all.
+
+Two things worth noting, not necessarily flaws to fix — genuine findings to report:
+
+1. **Full-mode TTD is exactly 12.893s at every single n_coord** (not approximately —
+   identical to the millisecond across all 6 runs), and GAT-off's TTD sits at exactly
+   97.966-97.967s for n_coord≤5 then jumps to a different constant (118.12-118.23s) for
+   n_coord∈{10,20}. This looks like TTD is being driven by a small, discrete set of
+   always-first-detected vehicles/windows rather than varying continuously with the
+   attack's actual coordination level — worth understanding before citing TTD as a
+   n_coord-sensitive metric in the paper (MCC clearly IS n_coord-sensitive; TTD's
+   sensitivity here looks more like a step function tied to something else, possibly
+   which epoch/window boundary the calibrated θ_S first gets crossed at each n_coord
+   tier, rather than to n_coord itself).
+2. **Only single-seed (seed=1) results** — no mean±std over multiple seeds yet, per the
+   AB1/AB2/AB4 "deliverable" convention (§5 in AB4_HANDOFF.md: 3 seeds, error bars). The
+   shrinking-Δ trend is consistent enough across 5 points to look real rather than noise,
+   but before this goes in the paper it should get the same 3-seed treatment as the other
+   ablations.
+
+### Recommended interpretation for the writeup
+
+Don't force this into "GAT contribution grows with n_coord" — the data says otherwise.
+The more accurate and still-interesting claim: **GAT contributes substantially at every
+tested coordination level (Δ always positive, 0.39-0.73), but its relative advantage is
+largest when coordination is minimal (n_coord=1-2) and compresses as more ghosts are
+injected per interception** — plausibly because higher n_coord raises the raw ghost count
+enough that even the weak GAT-off path (psi+ae only) picks up a little more signal
+(GAT-off MCC creeps from -0.06 toward -0.04 as n_coord rises), while Full mode's
+advantage, though still large, has comparatively less room left to add on top.
+
 ## 9. Superseded — do not use for the real sweep
 
 §§1-7 (toy 16-vehicle/4-RSU topology work: model swap, `--lambda_gat` calibration,

@@ -1565,7 +1565,18 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
                 // coordinator always forges its own poison alone.
                 caught = (attack_number == 6);
             }
+            // AB6-off CDER coupling (sir 2026-07-27, same gap class as the PARR
+            // fix): the full-TRS forge branch books a wrong aggregate-plane
+            // control decision when TRS admits poison (line ~1750 below); that
+            // coupling lives ONLY inside send_aggregate_to_cloud(), which the
+            // !enable_trs path never calls — so AB6-off's CDER was silently stuck
+            // on baseline per-beacon decisions, flat in f for the same reason PARR
+            // was. Mirror it here: caught -> correct macro decision (booked as
+            // right); missed -> the ring's macro decision is wrong for all
+            // total_count vehicles it governs.
+            g_agg_ctrl_total += (uint64_t)total_count;
             if (caught) g_parr_rejected++;
+            else        g_agg_ctrl_wrong += (uint64_t)total_count;
         }
     } else {
     // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
@@ -2765,9 +2776,33 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 // trusted successor (no manual failover, p.75).
                                 const uint32_t controllerID = rsu_controller_ID[rsu_id];
 
+                                // E_c(t) = (ID_i, Φ_i(t), t, h(X_i(t)), σ) — Eq 3.62.
+                                // CP-DETECT derives flag^ctrl = 1[Φ_i > Φ_th] from
+                                // THIS submitted value (Eq 3.65) and scores the
+                                // directional conflict (1−flag^ctrl)·flag^rsu
+                                // (Eq 3.66). So a controller that suppresses must
+                                // suppress *here* too, not only on the downlink.
+                                //
+                                // Bug this fixes: the malicious combined-attack
+                                // controller was broadcasting CLEAN_ROUTING to
+                                // vehicles while still submitting its HONEST fusion
+                                // score on-chain (observed: CSUBM_VEH_36_E7 Φ=0.69,
+                                // Φ_th=0.5 ⇒ flag^ctrl=1 ⇒ conflict ≡ 0). It looked
+                                // truthful to the ledger while lying to the network,
+                                // so controller trust never decayed (τ stayed 1.0,
+                                // MeanConflict 0), SC-Trust never hit τ_min for
+                                // T_rev epochs, and no controller revocation /
+                                // RSU reassignment could ever occur — regardless of
+                                // how many suppression events the sim produced.
+                                double phi_submitted = (double)fs.phi;
+                                if (g_combined_attack && fs.anomalous) {
+                                    // Suppression: hide the anomaly the fusion
+                                    // layer actually found (report benign).
+                                    phi_submitted = 0.0;
+                                }
                                 CallSCControllerSubmitEvidence(
                                     vid_i, controllerID, ctrl_epoch,
-                                    (double)fs.phi, h_X);
+                                    phi_submitted, h_X);
 
                                 // ── Schedule Eq 3.66–3.69 CP-DETECT (TASK ①-M) ──
                                 // CPDetectCheck reads BOTH the just-written
@@ -2965,8 +3000,28 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
         uint32_t target_vid;
         bool     bcast;
 
-        if (malicious_ctrl) {
-            // Malicious controller (attacks 5/7): hardcoded WRONG_ROUTING, broadcast.
+        if (malicious_ctrl && g_combined_attack && detected) {
+            // Combined-attack SUPPRESSION variant (new): when the RSU/LW side has
+            // actually caught something (detected=true — from the concurrent
+            // data-plane attacks a1-a4/a6 that also run in combined mode), the
+            // malicious controller here HIDES it (ctrl_says=CLEAN) instead of the
+            // standard over-report. This is the case CPDetectCheck's on-chain
+            // directional rule (Eq 3.59/3.68: flag on ctrl=CLEAN vs rsu=ANOM,
+            // i.e. suppression) is actually designed to catch — the unconditional
+            // WRONG_ROUTING broadcast below only ever produces the OPPOSITE
+            // (over-report) direction, which Eq 3.68 explicitly does NOT
+            // penalize, so TCL_reassign was architecturally unreachable before
+            // this. Gated to g_combined_attack only — standalone attacks 5/7
+            // keep their original unconditional WRONG_ROUTING below unchanged
+            // (their RSU/data plane stays honest per the comment above, so
+            // `detected` is rarely/never true there anyway).
+            alert_type = 0;                                  // CLEAN_ROUTING (suppression)
+            spd_advice = s_max;
+            target_vid = vehicle_id;                         // unicast: mirrors honest path
+            bcast      = false;
+        } else if (malicious_ctrl) {
+            // Malicious controller (attacks 5/7, and combined-mode beacons the RSU
+            // didn't flag): hardcoded WRONG_ROUTING, broadcast.
             alert_type = 2;                                  // WRONG_ROUTING
             spd_advice = detected ? (s_max * 0.5) : s_max;
             target_vid = 0;                                  // 0 = all vehicles (broadcast)
