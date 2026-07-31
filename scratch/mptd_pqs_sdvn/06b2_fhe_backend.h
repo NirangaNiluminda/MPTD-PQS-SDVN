@@ -358,6 +358,13 @@ public:
             } catch (const std::exception &e) {
                 shares_ok_  = false;
                 last_error_ = std::string("ShareKeys: ") + e.what();
+                // init() still returns true on this soft-failure (all-present decrypt
+                // still works), so surface the reason here or it's silently lost —
+                // AB7 ring-size sweep (n>4) hit this and needed to know why.
+                std::cerr << "[CRYPTO/THFHE] WARNING: ShareKeys (with-aborts) failed at "
+                          << "n_parties=" << n_parties_ << " t=" << threshold_
+                          << " -- " << last_error_
+                          << " -- falling back to all-present decrypt only\n";
             }
 
             ring_dim_ = ctx_->GetRingDimension();

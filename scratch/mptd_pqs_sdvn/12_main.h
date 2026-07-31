@@ -161,7 +161,16 @@ int main(int argc, char *argv[])
     cmd.AddValue ("enable_trs", "AB6 toggle: 0=skip TRS sign/verify in crypto pipeline", enable_trs);
     cmd.AddValue ("trs_compromised_f", "AB6 f/n sweep: force F of n ring members compromised (0..n); -1=off", g_trs_compromised_f);
     cmd.AddValue ("enable_fhe", "AB7 toggle: 0=plaintext aggregates (TRS still signs)", enable_fhe);
+    cmd.AddValue ("ab7_ring_n", "AB7 x-axis: TRS/FHE signing-ring size n (BFT bound n>=4 at f=1; threshold t held fixed at 3); -1=off, default n=4", g_ab7_ring_n);
     cmd.AddValue ("enable_rsu_lifecycle", "AB8 toggle: 0=RSUs permanently trusted", enable_rsu_lifecycle);
+    cmd.AddValue ("rsu_malicious_fraction", "AB8 f/n sweep: malicious RSU fraction 0..1 (f/4 ring members ≈ f*16 RSUs), decoupled from attack_percentage; -1=off", g_rsu_malicious_frac);
+    cmd.AddValue ("lifecycle_gates_fusion", "AB8 option B: 1=a demoted RSU's psi is discounted in fusion (lets the lifecycle affect MCC/CDER_full); 0=off, default, all other sweeps unaffected", g_lifecycle_gates_fusion);
+    cmd.AddValue ("ctrl_compromise_onset", "AB9 x-axis: controller compromise onset as fraction of simTime (0=from first beacon/default, 1=never within run)", g_ctrl_compromise_onset);
+    cmd.AddValue ("rsu_trust_quorum", "AB8: override q_i quorum in SCRSUFinalizeEpoch (0=2f+1 default; 2=reachable at 30s, weakens BFT)", g_rsu_trust_quorum);
+    cmd.AddValue ("t_window", "AB8: override T_w SC-Revoke witness sliding window seconds (Eq 3.65); -1=off, chaincode keeps 30s default", g_t_window);
+    cmd.AddValue ("rsu_t_rev", "AB8: override T_rev consecutive low-trust epoch gate before permanent RSU demotion (default 3; races against T_w quorum-accumulation at short horizons)", g_rsu_t_rev);
+    cmd.AddValue ("rsu_trust_alpha", "AB8: override RSU trust EMA smoothing alpha (Eq eq:rsu_trust; default 0.3 -- THIS is the actual CLIENT-demotion gate, tau<tau_min=0.3; T_rev only gates the later revoke escalation)", g_rsu_trust_alpha);
+    cmd.AddValue ("demoted_psi_weight", "AB8 option B: multiplier on a demoted RSU's psi in fusion (0=silence, 1=no effect, default 0.5)", g_demoted_psi_weight);
     cmd.AddValue ("enable_ctrl_rotation", "AB9 toggle: 0=single fixed controller", enable_ctrl_rotation);
     cmd.AddValue ("use_lkh_tree", "AB11 toggle: 0=per-member unicast rekey instead of LKH tree", use_lkh_tree);
     cmd.AddValue ("enable_gat",
@@ -195,6 +204,13 @@ int main(int argc, char *argv[])
                   "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
                   g_mobility_source);
     cmd.Parse (argc, argv);
+    // AB7 ring-size sweep: n=3 violates the BFT bound n>=3f+1=4 at f=1 (paper
+    // §4.1.2 AB7). Fail fast rather than silently running an invalid ring.
+    if (g_ab7_ring_n != -1 && g_ab7_ring_n < 4) {
+        std::cerr << "[ABLATION] invalid --ab7_ring_n=" << g_ab7_ring_n
+                  << " (BFT bound requires n>=4 at f=1; -1=off)" << std::endl;
+        return 1;
+    }
     // Combined-attack mode: --attack_number=0 activates all attack types in one run
     // (sir's ablation/E1–E4 default). Vehicle attacks (a2/a4/a6) are assigned per-node
     // in declare_attackers(); RSU (a1/a3) + controller (a5/a7) layers activate alongside.
@@ -2391,9 +2407,11 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
     // 2f+1=3, matching the 3 endorsements register_one() actually collects.
     // Passing the true 64 would demand 2f+1=43 endorsements and break every
     // registration.
-    CallSCInitNetworkConfig(/*numRSUs=*/4, /*alpha=*/0.3,
+    CallSCInitNetworkConfig(/*numRSUs=*/4, /*alpha=*/g_rsu_trust_alpha,
                             /*tauWarn=*/0.5, /*tauMin=*/0.3,
-                            /*tRev=*/3, /*psiAnomalyTh=*/psi_th);
+                            /*tRev=*/(uint32_t)g_rsu_t_rev, /*psiAnomalyTh=*/psi_th,
+                            /*rsuTrustQuorum=*/g_rsu_trust_quorum,
+                            /*tWindowSec=*/(g_t_window > 0 ? g_t_window : 0.0));
 
     register_all_nodes();
   }

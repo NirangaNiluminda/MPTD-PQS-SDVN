@@ -224,10 +224,47 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
         }
     }
 
+    // ── LKH arm: broadcast one message per rotated path node (Eq.3.23) ───────
+    // g_lkh_node_rekey_msgs is non-empty only when use_lkh_tree=true. Each
+    // message carries K'_v wrapped under v's two child keys, so one transmission
+    // serves an entire subtree — this is what makes the rekey cost log2|V_j|
+    // rather than |V_j|. Survivors' leaf keys are unchanged, so there is nothing
+    // to unicast and the per-member loop above is empty in this arm.
+    //
+    // RekeyTag is reused as the carrier: target_vehicle_id = 0xFFFFFFFF marks a
+    // node message (vehicles filter it out — their K_i did not change), and
+    // new_nonce carries the heap node index.
+    for (const LkhNodeRekeyMsg &m : g_lkh_node_rekey_msgs) {
+        RekeyTag rk;
+        rk.SetTargetVehicleId(0xFFFFFFFFu);          // node-rekey broadcast marker
+        rk.SetNewLeafKey(m.has_ct_sib ? m.ct_sib : m.ct_path);
+        rk.SetNewNonce((uint32_t)m.node_idx);
+        rk.SetRsuId(rsu_id);
+        rk.SetTimestamp(sim_time);
+
+        Ptr<Packet> nk_pkt = Create<Packet>(0);
+        nk_pkt->AddPacketTag(rk);
+
+        int err = rekey_sock->SendTo(nk_pkt, 0,
+                      InetSocketAddress(Ipv4Address("3.255.255.255"), LKH_REKEY_PORT));
+        if (err >= 0) {
+            packets_sent++;
+            g_bwo_rekey_pkts++;                       // C8 BWO_scale
+            // Both wrapped copies ride in one packet when the node has two
+            // reachable children; the bottom node carries only the sibling copy.
+            g_bwo_rekey_bytes += rk.GetSerializedSize()
+                              + ((m.has_ct_path && m.has_ct_sib) ? LKH_KEY_BYTES : 0);
+        }
+        cout << "[LKH-REKEY-TX] RSU" << rsu_id
+             << " node=" << m.node_idx << " level=" << m.level
+             << " (broadcast, Eq.3.23 path-node rekey)" << endl;
+    }
+
     cout << "[LKH-REKEY] Revoked V" << (revoked_vehicle_id - 2)
          << ": rekeyed " << n_rekeyed << " tree nodes,"
          << " sent " << packets_sent << " rekey packets"
-         << " (Eq.3.23 N_rekey=log2|V_j|≈" << n_rekeyed << ")"
+         << (use_lkh_tree ? " (LKH: N_rekey=log2|V_j|="
+                          : " (unicast ablation: N_rekey=|V_j|=") << n_rekeyed << ")"
          << " t=" << sim_time << endl;
 }
 
@@ -791,7 +828,7 @@ uint32_t run_cp_detect(BsmBeaconTag &tag)
     //   cp_detected = (cp_flags != 0) && (attack_number == 7)
     // For attack 5 (TP-S3): detection relies on kinematic signatures (TP-S1..S5)
     // because only attack_pct% of beacons are actually modified at the control plane.
-    if (controller_malicious_assumption &&
+    if (ctrl_compromised_now() &&
         (attack_number == 5 || attack_number == 7 || g_combined_attack))
         return 1;
     return 0;
@@ -2130,7 +2167,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // partition so MCC (Eq. 4.1) is well-defined. CDER (Eq. 4.4) remains the primary
     // metric for MP-S4 since it is fundamentally a control-plane attack.
     if ((attack_number == 7 || (g_combined_attack && (vehicle_id % 2 == 0))) &&
-        controller_malicious_assumption &&
+        ctrl_compromised_now() &&
         GetBooleanWithProbability(attack_percentage, vehicle_id) &&
         !(g_combined_attack && tag.GetIsPoisoned()))   // combined: even veh → a7, honest beacons only
     {
@@ -2192,7 +2229,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // vehicle beacons and modifies position + speed before forwarding to other planes.
     // HandleBeaconReceived() runs at the management node → this IS the control plane.
     if ((attack_number == 5 || (g_combined_attack && (vehicle_id % 2 == 1))) &&
-        controller_malicious_assumption &&
+        ctrl_compromised_now() &&
         GetBooleanWithProbability(attack_percentage, vehicle_id) &&
         !(g_combined_attack && tag.GetIsPoisoned()))   // combined: odd veh → a5, honest beacons only
     {
@@ -2622,6 +2659,25 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
                                 if ((sm >> b) & 1u) s += w[b];
                             psi_fuse = s;
                         }
+                        // AB8 option B (opt-in via --lifecycle_gates_fusion=1):
+                        // a demoted/CLIENT RSU carries zero quorum weight on-chain
+                        // (§3.5.1); extend that to the AI plane so the detector
+                        // also stops trusting its rule verdict. Without this the
+                        // lifecycle cannot influence MCC/CDER at all — toggling
+                        // enable_rsu_lifecycle alone left both metrics BIT-IDENTICAL
+                        // (0.825 / 0.607, same seed), because fusion never reads RSU
+                        // trust state. With the lifecycle ABLATED (AB8 arm) nothing
+                        // is ever demoted, so poisoned rule verdicts keep feeding
+                        // fusion — which is precisely the loss AB8 aims to quantify.
+                        // g_demoted_psi_weight scales rather than silences: full
+                        // suppression (weight 0) threw away the demoted RSU's TRUE
+                        // positives too and, because demotion is noisy (4 of 9
+                        // demotes were honest RSUs), cost more signal than the
+                        // poison it blocked — MCC_full fell 0.825 -> 0.361.
+                        if (g_lifecycle_gates_fusion && enable_rsu_lifecycle &&
+                            rsu_id < MAX_RSUS && rsu_demoted[rsu_id]) {
+                            psi_fuse *= (float)g_demoted_psi_weight;
+                        }
                         const FusionScore fs = fuse_scores(
                             psi_fuse, gat_i, ae_err, theta_ae, k_hat_i);
                         // Standalone SOTA baselines (B2/B3): score the full-mode
@@ -2993,7 +3049,8 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // R2 fast-path for {2,3,4,6,clean}; controller-here for {1,5,7}.
     if (g_option_b_active && rsu_id < N_RSUs && g_mgmt_downlink_socket &&
         (attack_number == 1 || attack_number == 5 || attack_number == 7 || g_combined_attack)) {
-        bool malicious_ctrl = (attack_number == 5 || attack_number == 7 || g_combined_attack);
+        bool malicious_ctrl = (attack_number == 5 || attack_number == 7 || g_combined_attack)
+                              && ctrl_compromised_now();   // AB9 onset gate
 
         uint8_t  alert_type;
         double   spd_advice;

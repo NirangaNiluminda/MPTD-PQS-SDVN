@@ -141,6 +141,19 @@ type NetworkConfig struct {
 	TRev         int     `json:"TRev"`         // T_rev consecutive-epoch gate
 	PsiAnomalyTh float64 `json:"PsiAnomalyTh"` // ψ_th — anomaly cutoff
 	TWindowSec   float64 `json:"TWindowSec"`   // T_w — revocation-vote sliding window (Eq 3.65)
+	// RSUTrustQuorum overrides the q_i peer-agreement quorum used ONLY by
+	// SCRSUFinalizeEpoch (Eq 3.66 m_j baseline). 0 = derive as 2f+1, the paper
+	// default and the historical behaviour.
+	//
+	// Why an override exists: 2f+1=3 requires three DISTINCT RSUs to flag the
+	// same vehicle. Measured over a full 30 s window only 1 vehicle of 27 is
+	// ever seen by 3 RSUs — at 60 km/h a vehicle simply does not traverse three
+	// coverage zones that fast. q_i therefore stays 0, m_j collapses to ~1 for
+	// every RSU that reports an anomaly, and HONEST RSUs get demoted for
+	// correctly flagging attacks. Lowering the quorum makes the mechanism
+	// exercisable at short sim horizons; it WEAKENS the BFT guarantee, so it is
+	// opt-in and must be reported alongside any result produced with it.
+	RSUTrustQuorum int `json:"RSUTrustQuorum"`
 	UpdatedAt    string  `json:"UpdatedAt"`
 }
 
@@ -349,6 +362,33 @@ func (s *SmartContract) ResetLedger(ctx contractapi.TransactionContextInterface)
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+// epochWithinWindow reports whether submission epoch `sub` falls inside the
+// sliding window (cur - tWindowSec, cur] used to accumulate the Eq 3.65 peer
+// -agreement quorum q_i. Epoch labels are "E<seconds>" (1 s buckets, see
+// mptd_epoch_from_ts), so the comparison is numeric on the parsed suffix.
+//
+// tWindowSec <= 0 restores exact single-epoch matching, which is the historical
+// behaviour — kept so prior results remain reproducible. Unparsable labels fall
+// back to exact match rather than silently widening the window.
+func epochWithinWindow(sub, cur string, tWindowSec float64) bool {
+	if tWindowSec <= 0 {
+		return sub == cur
+	}
+	if sub == cur {
+		return true
+	}
+	if len(sub) < 2 || len(cur) < 2 || sub[0] != 'E' || cur[0] != 'E' {
+		return sub == cur
+	}
+	sN, err1 := strconv.Atoi(sub[1:])
+	cN, err2 := strconv.Atoi(cur[1:])
+	if err1 != nil || err2 != nil {
+		return sub == cur
+	}
+	// Past-only window: never let a future epoch's evidence influence q_i.
+	return sN <= cN && float64(cN-sN) < tWindowSec
+}
 
 // fByzantine returns f given the total RSU count under the Fabric n ≥ 3f+1
 // rule. Returns 0 when n < 4 so 2f+1 = 1 (degenerate single-RSU test setups).
@@ -908,9 +948,11 @@ func (s *SmartContract) countTrustedRSUs(ctx contractapi.TransactionContextInter
 // ─────────────────────────────────────────────────────────────────────────────
 
 // SCInitNetworkConfig — bootstrap or update channel-wide BFT parameters.
-// Args: numRSUs, alpha, tauWarn, tauMin, T_rev, psiAnomalyTh (all strings).
+// Args: numRSUs, alpha, tauWarn, tauMin, T_rev, psiAnomalyTh, rsuTrustQuorum,
+// tWindowSec (all strings).
 func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextInterface,
-	numRSUsStr, alphaStr, tauWarnStr, tauMinStr, tRevStr, psiThStr string) error {
+	numRSUsStr, alphaStr, tauWarnStr, tauMinStr, tRevStr, psiThStr,
+	rsuTrustQuorumStr, tWindowStr string) error {
 
 	numRSUs, err := strconv.Atoi(numRSUsStr)
 	if err != nil {
@@ -918,6 +960,21 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 	}
 	if numRSUs < 4 {
 		return fmt.Errorf("numRSUs=%d too small; BFT needs N ≥ 4 (so f ≥ 1)", numRSUs)
+	}
+	// 0 (or unparsable/negative) = derive 2f+1 as before.
+	rsuTrustQuorum, err := strconv.Atoi(rsuTrustQuorumStr)
+	if err != nil || rsuTrustQuorum < 0 {
+		rsuTrustQuorum = 0
+	}
+	// AB8 T_w override (Eq 3.65 sliding window): 0/unparsable/negative = keep
+	// defaultTWindowSec (30s, prior behaviour, every existing run stays
+	// bit-identical). Opt-in only — see the T_w quorum-unreachable finding in
+	// project-ab8-t-window-fix memory: at 30s a vehicle essentially never
+	// traverses 3 RSU zones inside a fixed 30s witness window, and simply
+	// extending --simTime doesn't help because this window never grew with it.
+	tWindow, err := strconv.ParseFloat(tWindowStr, 64)
+	if err != nil || tWindow <= 0 {
+		tWindow = defaultTWindowSec
 	}
 	alpha, err := strconv.ParseFloat(alphaStr, 64)
 	if err != nil {
@@ -951,7 +1008,8 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 		TauMin:       tauMin,
 		TRev:         tRev,
 		PsiAnomalyTh: psiTh,
-		TWindowSec:   defaultTWindowSec, // T_w (Eq 3.65); no init arg yet — tune via const
+		TWindowSec:   tWindow,           // T_w (Eq 3.65); AB8 opt-in override, default 30s
+		RSUTrustQuorum: rsuTrustQuorum,  // 0 = derive 2f+1 (paper default)
 		UpdatedAt:    txTimeStr(ctx),    // deterministic tx timestamp (GetTxTimestamp)
 	}
 	j, err := json.Marshal(cfg)
@@ -1914,7 +1972,14 @@ func (s *SmartContract) SCRSUFinalizeEpoch(ctx contractapi.TransactionContextInt
 	if err != nil {
 		return nil, fmt.Errorf("NetworkConfig: %v", err)
 	}
+	// q_i quorum: 2f+1 by default; RSUTrustQuorum > 0 overrides it (see the field
+	// comment — 2f+1 is unreachable at short sim horizons because a vehicle is
+	// rarely seen by 3 distinct RSUs, which demotes honest RSUs for correctly
+	// flagging). Override WEAKENS the BFT guarantee and must be reported.
 	quorum := 2*fByzantine(cfg.NumRSUs) + 1
+	if cfg.RSUTrustQuorum > 0 {
+		quorum = cfg.RSUTrustQuorum
+	}
 
 	// Single pass over all submissions, filtered to this epoch. Keys are
 	// SUBM_<veh>_<epoch>_<rsu> (vehicle-first), so the epoch is not a
@@ -1939,15 +2004,33 @@ func (s *SmartContract) SCRSUFinalizeEpoch(ctx contractapi.TransactionContextInt
 		if e := json.Unmarshal(qr.Value, &sub); e != nil {
 			return nil, e
 		}
-		if sub.Epoch != epoch {
+		// q_i is the 2f+1 peer-agreement baseline. Eq 3.65 defines it over the
+		// DISTINCT RSUs that flagged v_i within the temporal window T_w —
+		// explicitly NOT simultaneously, since "requiring 2f+1 simultaneous RSU
+		// observations of the same vehicle is geometrically infeasible under real
+		// mobility". Restricting it to ONE epoch made the quorum unreachable:
+		// measured co-observation is 1 witness for 95.9% of (vehicle,epoch) pairs
+		// and never exceeded 2, so len(flaggers) >= 3 was essentially never true,
+		// q_i was pinned at 0, and m_j collapsed to ~1.0 for EVERY RSU that
+		// reported an anomaly. Net effect: honest RSUs were demoted for correctly
+		// flagging attacks (measured 3-4 false of 8-9 demotes). Accumulating over
+		// T_w restores the paper's semantics and matches SCRevokeVote.
+		//
+		// Escape hatch: TWindowSec <= 0 reproduces the old single-epoch behaviour
+		// exactly, so earlier results stay reproducible.
+		if !epochWithinWindow(sub.Epoch, epoch, cfg.TWindowSec) {
 			continue
 		}
 		flagged := sub.Psi > cfg.PsiAnomalyTh
 
-		if rsuReports[sub.RSUID] == nil {
-			rsuReports[sub.RSUID] = make(map[string]bool)
+		// V_j(t) stays PER-EPOCH: m_j scores an RSU on what it reported in THIS
+		// epoch, even though the q_i baseline it is compared against spans T_w.
+		if sub.Epoch == epoch {
+			if rsuReports[sub.RSUID] == nil {
+				rsuReports[sub.RSUID] = make(map[string]bool)
+			}
+			rsuReports[sub.RSUID][sub.VehicleID] = true
 		}
-		rsuReports[sub.RSUID][sub.VehicleID] = true
 
 		if flagged && s.isTrustedRSU(ctx, sub.RSUID) {
 			if trustedFlaggers[sub.VehicleID] == nil {

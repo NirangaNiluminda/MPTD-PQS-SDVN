@@ -861,9 +861,14 @@ inline std::vector<uint32_t> mptd_query_trusted_controllers()
 // compute f+1). The chaincode falls back to safe defaults if this is never
 // called, but calling it explicitly is required to reproduce the paper's
 // evaluation tables.
+// tWindowSec: AB8 T_w override (Eq 3.65 sliding window), 0 = chaincode keeps
+// its default 30s (every prior run/sweep stays bit-identical). See the
+// project-ab8-t-window-fix memory: SC-Revoke's witness window was previously
+// hardcoded, capping quorum-reachability regardless of --simTime.
 inline void CallSCInitNetworkConfig(
     uint32_t numRSUs, double alpha, double tauWarn, double tauMin,
-    uint32_t tRev, double psiAnomalyTh)
+    uint32_t tRev, double psiAnomalyTh, uint32_t rsuTrustQuorum = 0,
+    double tWindowSec = 0.0)
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
@@ -872,13 +877,19 @@ inline void CallSCInitNetworkConfig(
         std::to_string(tauWarn),
         std::to_string(tauMin),
         std::to_string(tRev),
-        std::to_string(psiAnomalyTh)
+        std::to_string(psiAnomalyTh),
+        std::to_string(rsuTrustQuorum),  // 0 = chaincode derives 2f+1
+        std::to_string(tWindowSec)       // 0 = chaincode keeps default 30s
     };
     // Synchronous: init must commit before any evidence submission.
     std::string out = mptd_fabric_invoke_sync("invoke", "SCInitNetworkConfig", args);
     std::cout << "[SC-INIT] numRSUs=" << numRSUs
               << " α=" << alpha << " τ_warn=" << tauWarn << " τ_min=" << tauMin
               << " T_rev=" << tRev << " ψ_th=" << psiAnomalyTh
+              << " rsu_q=" << (rsuTrustQuorum ? std::to_string(rsuTrustQuorum)
+                                              : std::string("2f+1"))
+              << " t_window=" << (tWindowSec > 0 ? std::to_string(tWindowSec)
+                                                  : std::string("30(default)"))
               << " → " << out;
 }
 

@@ -176,10 +176,13 @@ void initialize_crypto_backends()
     // Full-mode default is the paper-correct PQ scheme Dilithium / ML-DSA-87,
     // Eq 3.49); --trs_classical=1 selects the classical Shamir-Schnorr-P256
     // signing-latency baseline for RQ5 (paper §3.5.4, behind ITrsBackend).
+    // AB7 ring-size sweep (--ab7_ring_n): n grows, t stays fixed at 3 (f=1
+    // held fixed by design — see g_ab7_ring_n comment in 02_config_globals.h).
+    const uint32_t ab7_ring_n = (g_ab7_ring_n >= 4) ? (uint32_t)g_ab7_ring_n : 4;
     const TrsScheme trs_scheme = g_trs_classical_baseline
                                ? TrsScheme::Classical : TrsScheme::Dilithium;
     const double coo_dkg_t0 = mptd_ms_now();   // C7 COO_dkg: TRS DKG + ThFHE keygen
-    if (init_trs_backend(/*n=*/4, /*t=*/3, trs_scheme)) {
+    if (init_trs_backend(/*n=*/ab7_ring_n, /*t=*/3, trs_scheme)) {
         std::cout << "[CRYPTO/TRS] " << g_trs_backend->scheme_name()
                   << " ready (n=" << g_trs_ring_n
                   << " t=" << g_trs_ring_t
@@ -191,8 +194,9 @@ void initialize_crypto_backends()
 
     // FHE: threshold (t, n+1) BFV-RNS — the paper-correct Full-mode scheme
     // (Eq 3.54 ThGen, multiparty key gen + Shamir ShareKeys "with aborts").
-    // n_rsus=4, threshold=3; Cloud is the mandatory (n+1)-th lead party.
-    if (init_threshold_fhe_backend(/*n_rsus=*/4, /*threshold=*/3,
+    // n_rsus=ab7_ring_n (default 4), threshold=3; Cloud is the mandatory
+    // (n+1)-th lead party. Shares the same ring size as the TRS backend above.
+    if (init_threshold_fhe_backend(/*n_rsus=*/ab7_ring_n, /*threshold=*/3,
                                    /*ptmod=*/FHE_PLAINTEXT_MODULUS, /*depth=*/1)) {
         std::cout << "[CRYPTO/THFHE] " << g_thfhe_backend->scheme_name()
                   << " ready (ring_dim=" << g_thfhe_backend->ring_dim()
@@ -690,6 +694,10 @@ static void refresh_endorsement_committee()
         for (const auto& v : views) {
             g_rsu_trust_cache[v.rsu_idx] = v.trust;
             if (v.trusted) g_rsu_trusted_set.insert(v.rsu_idx);
+            // AB8 option B: publish demotion state where the detection path can
+            // see it (04_state_globals.h) — 08_detection_engine.h is included
+            // before this header and cannot read g_rsu_trusted_set directly.
+            if (v.rsu_idx < MAX_RSUS) rsu_demoted[v.rsu_idx] = !v.trusted;
         }
         const uint32_t need = 2 * /*paper fixed f=*/1u + 1u;   // 2f+1 = 3
         g_endorsement_committee = select_endorsers_trust_ranked(

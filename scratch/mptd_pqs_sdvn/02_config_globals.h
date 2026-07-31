@@ -327,8 +327,128 @@ bool enable_trs             = true;   // AB6
 // PARR degrades along the BFT tolerance boundary. -1 = off (legacy behaviour:
 // f_actual emerges randomly from attack_percentage/rsu_seed). 0..n = controlled.
 int  g_trs_compromised_f    = -1;
+
+// AB8 f/n sweep: fraction of the 64 network RSUs that are ACTIVELY MALICIOUS
+// (injecting false evidence / misreporting verdicts), expressed as the malicious
+// share of a 4-member signing ring — f/n ∈ {0,0.25,0.5,0.75,1.0} ⇒ f ∈ {0..4}
+// ring members ⇒ ≈ f×16 network RSUs.
+//
+// Why this is separate from attack_percentage: attack_percentage drives BOTH the
+// vehicle attacking state (= ρ_a) AND n_comp in declare_compromised_rsus(). AB8
+// needs ρ_a pinned at 0.40 while f/n sweeps independently, which is impossible
+// while both read one variable. -1 = off ⇒ legacy behaviour (n_comp derived from
+// attack_percentage), so every existing sweep is bit-identical unless this is set.
+// Distinct from AB6's g_trs_compromised_f, which forges TRS signatures at the
+// crypto layer rather than making RSUs misbehave.
+double g_rsu_malicious_frac = -1.0;   // AB8
+
+// AB8 T_w override (Eq 3.65 SC-Revoke witness sliding window). The chaincode
+// previously hardcoded T_w=30s with NO init arg to change it, so quorum
+// witnesses older than the most recent 30 SIMULATED seconds were always
+// dropped regardless of --simTime -- a 300s run measured no better
+// FRR_demote than a 30s run because the extra 270s of history could never
+// count toward quorum. -1 = off (chaincode keeps its 30s default, every
+// prior run/sweep stays bit-identical). See project-ab8-t-window-fix memory.
+double g_t_window = -1.0;   // AB8
+
+// AB8 T_rev override (consecutive low-trust epoch gate before an RSU is
+// permanently demoted to CLIENT + SC-Revoked, SCRSUFinalizeEpoch). Was
+// hardcoded to 3 at the boot call site -- 3 CONSECUTIVE epochs is a race
+// against T_w quorum-accumulation: q_i is essentially always 0 in the first
+// few seconds of any run (quorum genuinely takes real wall-clock time to
+// build, independent of T_w's configured width), so T_rev=3 locks RSUs into
+// CLIENT before a wider T_w window ever gets a chance to help. Measured
+// 2026-07-31: widening T_w to 150s tripled raw 3+-distinct-RSU reachability
+// (3.7%->11.1%) but FRR_demote stayed bit-identical (0.344) because 9/22
+// demotions fired by epoch E39 -- before 150s of real history could exist.
+// Default 3 = prior hardcoded behaviour, every existing run stays identical.
+int g_rsu_t_rev = 3;   // AB8
+
+// AB8 alpha override (EMA smoothing factor, Eq eq:rsu_trust: tau(t) =
+// alpha*tau(t-1) + (1-alpha)*(1-m_j)). Was hardcoded to 0.3 at the boot call
+// site. This is the ACTUAL demotion gate (tau < tau_min=0.3 -> CLIENT,
+// immediately, no consecutive-epoch requirement -- T_rev only gates the
+// LATER escalation to terminal SC-Revoke, confirmed 2026-07-31 by a
+// --rsu_t_rev=60 run that still produced 9 demotes). At alpha=0.3, just 2
+// consecutive m_j=1 epochs (misbehaviour signal, which is ~always 1 whenever
+// quorum q_i is unreachable -- true for essentially every early epoch of any
+// run, honest or not) already drives tau to 0.09, well under tau_min. Higher
+// alpha gives more inertia against a few early "unconfirmed" epochs, at the
+// cost of also slowing detection of a TRULY misbehaving RSU (same formula,
+// symmetric effect) -- a real trade-off, not a free fix. Default 0.3 = prior
+// hardcoded behaviour, every existing run stays identical.
+double g_rsu_trust_alpha = 0.3;   // AB8
+
+// AB7 ring-size sweep: overrides the TRS/FHE signing-ring size n (both backends
+// share one physical ring). Threshold t is held FIXED at 3 (the value already
+// hardcoded at n=4, i.e. the 2f+1 BFT-quorum convention used elsewhere for RSU
+// endorsement) regardless of n — f=1 is meant to stay fixed while only ring
+// MEMBERSHIP grows, isolating how FHE/TRS computation scales with n (paper
+// §4.1.2 AB7). n=3 is invalid (BFT bound n>=3f+1=4 at f=1); -1 = off, default
+// n=4 (legacy behaviour, byte-identical to every prior full-mode/AB6 run).
+int g_ab7_ring_n = -1;
+
 bool enable_fhe             = true;   // AB7
 bool enable_rsu_lifecycle   = true;   // AB8
+
+// AB8 option-B extension: let the RSU lifecycle reach the DETECTION path, not
+// only on-chain quorum weight. When on, a beacon whose reporting RSU is in the
+// demoted/CLIENT state contributes psi_fuse = 0 to the fusion score — the
+// detector stops trusting a demoted RSU's rule verdict, mirroring "its
+// submissions carry zero quorum weight" (§3.5.1) on the AI plane.
+//
+// WHY THIS IS OFF BY DEFAULT: measured 2026-07-28, toggling enable_rsu_lifecycle
+// alone left MCC_full and CDER BIT-IDENTICAL (0.825 / 0.607 both arms, same
+// seed) because the fusion pipeline never consults RSU trust state — demotion
+// only changes endorser selection. AB8's premise ("MCC and CDER show what is
+// lost when compromised RSUs are never demoted") therefore could not hold.
+// This flag supplies the missing causal path, but it CHANGES DETECTION
+// SEMANTICS, so it must stay default-false: every existing sweep (AB1-AB11,
+// SOTA matrix, AB6/AB10 data) stays bit-identical unless explicitly enabled.
+bool g_lifecycle_gates_fusion = false;   // AB8 option B
+
+// AB8 option-B weight: what a DEMOTED RSU's psi is multiplied by in fusion.
+// 0.0 = silence it completely (the first attempt); 1.0 = no effect.
+//
+// Why this is tunable and no longer hardcoded to 0: zeroing measured WORSE than
+// not demoting at all — MCC_full 0.825 -> 0.361 and CDER_full 0.078 -> 0.414,
+// i.e. the lifecycle appeared HARMFUL, the opposite of AB8's premise. Cause:
+// zeroing discards a demoted RSU's psi for EVERY vehicle it reports, true
+// positives included, and demotion is itself noisy (4 of 9 demotes were honest
+// RSUs, FRR_demote 0.125). Silencing ~4 honest RSUs costs more signal than the
+// poison it blocks. A partial discount keeps some signal while still reducing a
+// suspect RSU's influence.
+double g_demoted_psi_weight = 0.5;       // AB8 option B
+
+// AB8: override the q_i peer-agreement quorum used by SCRSUFinalizeEpoch.
+// 0 = chaincode derives 2f+1 (paper default, historical behaviour). Measured
+// justification for allowing a lower value: over a full 30 s window only 1
+// vehicle of 27 is seen by >= 3 distinct RSUs, so 2f+1=3 is unreachable and
+// every flagging RSU is scored as misbehaving. WEAKENS the BFT guarantee —
+// opt-in, and must be reported alongside any result produced with it.
+uint32_t g_rsu_trust_quorum = 0;
+
+// AB9 x-axis: controller compromise ONSET as a fraction of simTime.
+// t_comp/T_sim in {0.00, 0.25, 0.50, 0.75, 1.00}:
+//   0.00 = compromised from the first beacon (worst case) — and the DEFAULT, so
+//          every existing sweep keeps its current behaviour bit-identically.
+//   1.00 = never compromised within the run (clean anchor; must reproduce the
+//          full-AEGIS result, which is what validates the ablation wiring).
+// Read through ctrl_compromised_now() so the gate is applied consistently at the
+// injection sites (a5/a7) and the CP-DETECT flag site.
+double g_ctrl_compromise_onset = 0.0;   // AB9
+
+// AB9: is the controller compromised YET at the current sim time? The controller
+// attack (a5/a7 and the combined-mode control plane) is gated on
+// t >= g_ctrl_compromise_onset * simTime so AB9 can sweep compromise ONSET.
+// Lives here rather than in 08_detection_engine.h because the earliest caller
+// sits above that file's CP-DETECT section. onset 0.0 == historical behaviour.
+static inline bool ctrl_compromised_now()
+{
+    if (!controller_malicious_assumption) return false;
+    if (g_ctrl_compromise_onset <= 0.0)   return true;
+    return ns3::Simulator::Now().GetSeconds() >= g_ctrl_compromise_onset * simTime;
+}
 bool enable_ctrl_rotation   = true;   // AB9
 bool use_lkh_tree           = true;   // AB11
 

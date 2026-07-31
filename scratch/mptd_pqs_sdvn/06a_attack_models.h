@@ -537,7 +537,16 @@ void declare_compromised_rsus()
     // How many RSUs to compromise
     int n_active = (int)N_RSUs;
     if (n_active > MAX_RSUS) n_active = MAX_RSUS;
-    int n_comp = (int)std::round((double)n_active * attack_percentage / 100.0);
+    // AB8: --rsu_malicious_fraction decouples the malicious RSU count from
+    // attack_percentage, so f/n can sweep while ρ_a stays pinned (the vehicle
+    // attacking state above still comes from attack_percentage). -1 = off.
+    int n_comp;
+    if (g_rsu_malicious_frac >= 0.0) {
+        double frac = (g_rsu_malicious_frac > 1.0) ? 1.0 : g_rsu_malicious_frac;
+        n_comp = (int)std::round((double)n_active * frac);
+    } else {
+        n_comp = (int)std::round((double)n_active * attack_percentage / 100.0);
+    }
     if (n_comp < 0) n_comp = 0;
     if (n_comp > n_active) n_comp = n_active;
 
@@ -566,8 +575,12 @@ void declare_compromised_rsus()
 
     // Report
     cout << "\n[RSU-SELECTION] attack=" << attack_number
-         << "  pct=" << attack_percentage << "%"
-         << "  compromising " << n_comp << "/" << n_active << " RSUs"
+         << "  pct=" << attack_percentage << "%";
+    if (g_rsu_malicious_frac >= 0.0)
+        cout << "  [AB8 f/n=" << g_rsu_malicious_frac
+             << " → ring f=" << (int)std::round(g_rsu_malicious_frac * 4.0)
+             << "/4, decoupled from pct]";
+    cout << "  compromising " << n_comp << "/" << n_active << " RSUs"
          << "  seed=" << actual_seed << endl;
     for (int r = 0; r < n_active; r++)
     {

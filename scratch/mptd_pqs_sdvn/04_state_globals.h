@@ -149,6 +149,15 @@ RsuIdentitySet rsu_id_set[total_size]; // indexed by RSU node id
 // compromised_rsu[i] = true means RSU i intercepts+modifies vehicle data.
 // Set by declare_compromised_rsus() in 11_blockchain_transmission.h.
 bool compromised_rsu[MAX_RSUS] = {};
+
+// AB8 option-B mirror: rsu_demoted[i] = RSU i is in the demoted/CLIENT lifecycle
+// state (trust < tau_min ⇒ zero quorum weight, cannot endorse). The authoritative
+// set is g_rsu_trusted_set in 11_blockchain_setup.h, but that header is included
+// AFTER 08_detection_engine.h, so the detector cannot reach it. This flat array
+// lives here (04_*) so refresh_endorsement_committee() can publish into it and the
+// fusion path can read it. Only consulted when g_lifecycle_gates_fusion is on;
+// stays all-false otherwise, so default runs are unaffected.
+bool rsu_demoted[MAX_RSUS] = {};
 // Combined-attack mode: per-RSU attack type for compromised RSUs (0=none/honest,
 // 1=TP-S1 drift, 3=MP-S1 ghost). Compromised RSUs are partitioned across a1/a3 so
 // no single RSU runs both. Set in declare_compromised_rsus() when attack_number==0.
