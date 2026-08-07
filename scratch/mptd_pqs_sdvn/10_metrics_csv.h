@@ -202,9 +202,15 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
     // TPE accumulator (08_detection_engine.h:2251) and socket layer (07:281) use.
     // (The earlier hardcoded `vid-2` was off by the true base → read an adjacent
     //  unrelated vehicle → ~800 m gt error.)
+    // Ghost identities (vid >= GHOST_VID_BASE=10000, see 08_detection_engine.h)
+    // have no backing ns-3 Node/MobilityModel, so v_idx would be a garbage
+    // index into the real-vehicle mobility provider. Skip the gt lookup for
+    // them and fall back to the reported (tag) pose — there is no separate
+    // "ground truth" for a fabricated identity; its reported position IS the
+    // only position that exists.
     const uint32_t v_idx = (vid >= g_first_vehicle_node_id) ? (vid - g_first_vehicle_node_id) : 0;
     double gt_x = tag.GetPosX(), gt_y = tag.GetPosY(), gt_spd = tag.GetSpeed();
-    if (g_mobility_provider) {
+    if (g_mobility_provider && vid < 10000) {
         Vector p = g_mobility_provider->get_gt_position(v_idx);
         Vector v = g_mobility_provider->get_gt_velocity(v_idx);
         gt_x   = p.x;
@@ -1001,6 +1007,9 @@ void print_mptd_metrics()
               << g_cp_detect_trs_fails << " TRS-fail) over "
               << g_cp_detect_epochs_evaluated << " audited epochs,"
               << " flag_c=" << (g_flag_c_active ? "1" : "0")
+              << " ctrl_evidence=" << g_ctrl_misbehave_evidence
+              << " ctrl_trust=" << std::fixed << std::setprecision(4) << g_ctrl_trust
+              << std::defaultfloat
               << " (paper §3.5.5 Algorithm 7, Eq 3.59)" << std::endl;
     // P6: SC-Register authorisation gate — dropped beacons (forensics only;
     // not in MCC/FPR/PARR/CDER). registered_vids = vehicles that have a
@@ -1141,14 +1150,20 @@ void write_mptd_results_csv()
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
     ensure_analytics_dir(NS3_ROOT "/analytics/results/sweep");
 
-    // Filename: metrics_a{attack}_p{pct}_s{speed}_m{ablation}.csv
-    // Each dimension is encoded so sweeps never overwrite each other.
+    // Filename: metrics_a{attack}_p{pct}_s{speed}_m{ablation}_seed{seed}.csv
+    // Each dimension is encoded so sweeps never overwrite each other. seed was
+    // missing until now: without it, re-running the same attack/speed/ablation
+    // config under a different --seed silently truncated and overwrote the
+    // previous seed's file (std::ios::trunc onto an identical path) — harmless
+    // in practice only because the actual sweep pipeline reads seed-tagged
+    // stdout logs instead of this CSV, never this file directly.
     std::ostringstream fname;
     fname << NS3_ROOT "/analytics/results/sweep/metrics_a"
           << attack_number << "_p" << attack_percentage
           << "_s" << maxspeed
           << "_m" << ablation_mode;
     if (ablation_ab != 0) fname << "_ab" << ablation_ab;   // C10: keep AB sweeps distinct
+    fname << "_seed" << run_seed;
     fname << ".csv";
 
     std::ofstream fout(fname.str(), std::ios::out | std::ios::trunc);
@@ -1162,7 +1177,8 @@ void write_mptd_results_csv()
     const int run_attacker_class = attacker_class_for((int)attack_number);
 
     // Header — note: TDEE=-1, TPE=-1 (SUMO required); CDER from ctrl-plane decisions
-    fout << "attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,ablation_ab,"
+    fout << "seed,"
+         << "attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,ablation_ab,"
          << "cm_TP,cm_FP,cm_TN,cm_FN,"
          << "MCC,FPR,"
          << "cm_full_TP,cm_full_FP,cm_full_TN,cm_full_FN,"
@@ -1180,7 +1196,8 @@ void write_mptd_results_csv()
          << "TCL_confirm,TCL_reassign\n";               // C9 (ms; −1 w/o Fabric)
 
     // Values
-    fout << attack_number              << ","
+    fout << run_seed                   << ","
+         << attack_number              << ","
          << run_attacker_class         << ","
          << attack_percentage          << ","
          << maxspeed                   << ","

@@ -1432,6 +1432,32 @@ func (s *SmartContract) activeControllerExcluding(ctx contractapi.TransactionCon
 	return best, nil
 }
 
+// countActiveControllers returns |C_trusted|: the number of controllers whose
+// registration is ACTIVE. Used by the Fix 3 floor guard below, mirroring
+// countTrustedRSUs() for the RSU lifecycle.
+func (s *SmartContract) countActiveControllers(ctx contractapi.TransactionContextInterface) (int, error) {
+	iter, err := ctx.GetStub().GetStateByRange("REG_", "REG_~")
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+	n := 0
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return 0, e
+		}
+		var r RegistrationRecord
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return 0, e
+		}
+		if r.Role == RoleController && r.Status == StatusActive {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // excludeAndReassignController flips a CP-DETECT-flagged controller to EXCLUDED
 // and records the C_trusted reassignment to its successor (Eq 3.64–3.67 /
 // invariant 2). Idempotent: a controller already EXCLUDED yields no new record.
@@ -1448,6 +1474,30 @@ func (s *SmartContract) excludeAndReassignController(ctx contractapi.Transaction
 	}
 	if reg.Status != StatusActive {
 		return nil, nil // already excluded/revoked — idempotent
+	}
+
+	// ── FIX 3: BFT floor for the controller set ──────────────────────────────
+	// Mirrors the RSU floor guard at :2144-2153, which the controller lifecycle
+	// never had. Without it the corrected Eq 3.69 quorum excluded ALL FOUR
+	// controllers inside epoch E7 and left C_trusted EMPTY — the run then logged
+	// "no active controller in C_trusted" 22 times and finished with no control
+	// plane at all.
+	//
+	// Floor is |C_trusted| >= 1: refuse an exclusion that would remove the last
+	// ACTIVE controller. The CFLAG record is still written by the caller, so the
+	// detection is preserved and auditable — only the exclusion is withheld.
+	// This is Option 1 as instructed; we did not choose the threshold ourselves.
+	const cTrustedFloor = 1
+	nActive, cErr := s.countActiveControllers(ctx)
+	if cErr != nil {
+		return nil, cErr
+	}
+	if nActive-1 < cTrustedFloor {
+		// Excluding would empty C_trusted — keep this controller and record no
+		// reassignment. Returning nil makes the caller emit CPDetectFlag rather
+		// than ControllerReassign, which is the correct signal: flagged but
+		// retained for lack of a successor.
+		return nil, nil
 	}
 
 	reg.Status = StatusExcluded
@@ -1612,7 +1662,30 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		implicitCleanVotes = 0
 	}
 
-	f := fByzantine(cfg.NumRSUs)
+	// Eq 3.69 quorum base = R^obs_ck: the TRUSTED RSUs that actually submitted
+	// evidence for THIS (vehicle, epoch), not the network-wide RSU count.
+	// Supervisor decision 2026-08-05: "R^obs_ck refers to the set of trusted
+	// RSUs that actively submitted evidence for the specific vehicle in that
+	// specific epoch — not the total network RSU count."
+	//
+	// Previously this used cfg.NumRSUs, which is written as a hardcoded 4
+	// regardless of the RSU count actually simulated — so the threshold was
+	// f+1 = 2 by accident rather than derivation, and setting cfg.NumRSUs to the
+	// real 64 would have made it 22 and unreachable. len(seenRSU) is complete at
+	// this point: the range scan above has finished and only trusted, deduped
+	// RSUs were inserted.
+	//
+	// CONSEQUENCE — FLAGGED, NOT HIDDEN: fByzantine(n) returns 0 for n < 4, so a
+	// (vehicle, epoch) witnessed by 1-3 trusted RSUs now carries a quorum of
+	// ONE. The measured witness distribution on this network is 179 pairs with a
+	// single witness against 4 with two, so in practice the threshold is 1 almost
+	// everywhere: one trusted RSU disagreeing with the controller now suffices to
+	// flag it and trigger exclusion + failover. That removes Byzantine tolerance
+	// precisely where malicious RSUs are known to exist (TP-S1 and MP-S1 are
+	// malicious-RSU attacks), so a compromised RSU not yet demoted could
+	// unilaterally exclude an honest controller. Implemented as instructed; the
+	// risk is reported with the result rather than absorbed silently.
+	f := fByzantine(len(seenRSU))
 	fP1 := f + 1
 	if conflict < fP1 {
 		return nil, nil

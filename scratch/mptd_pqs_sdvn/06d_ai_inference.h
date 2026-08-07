@@ -61,6 +61,10 @@
 #include <string>
 #include <vector>
 
+// TEMP DIAGNOSTIC (Critical Issue 3 calibration): ground truth for the
+// current score_gat() call's N nodes, set by the caller just before invoking.
+std::vector<uint8_t> g_diag_gt_scratch;
+
 struct FusionParams {
     static constexpr int K_ATTACK = 7;   // attack classes (Experiment 5 threat model)
 
@@ -100,6 +104,15 @@ struct FusionParams {
     // Change 2: GAT confidence gate. Commit to k̂'s weight sets only when
     // max_k ŷ^(k) ≥ theta_conf; else fall back to global w + average λ (k̂=-1).
     float theta_conf = 0.5f;
+
+    // Fix 4 (sir's review, 2026-08-04): per-head confidence gate override.
+    // DQ-A3-26 found the a3 head's 45.4% fallback rate is the primary a3
+    // routing bottleneck; sir asked to lower theta_conf specifically for a3
+    // (index 2, since attack=3 => k=attack-1=2) without touching the other
+    // 6 heads, which are working well at the global 0.8. Every entry defaults
+    // to the global theta_conf (set right after parsing, below) so a lookup
+    // at the call site never needs a sentinel check.
+    float theta_conf_k[K_ATTACK] = {0.5f,0.5f,0.5f,0.5f,0.5f,0.5f,0.5f};
 };
 
 inline FusionParams g_fusion = FusionParams{};
@@ -194,6 +207,43 @@ static inline bool load_fusion_weights_json(const std::string &path, FusionParam
 
     // sir Change 2: confidence gate θ_conf (optional; default keeps 0.5).
     { float tc; if (extract_float("theta_conf", tc)) out.theta_conf = tc; }
+
+    // Every head defaults to the (possibly just-overridden) global theta_conf
+    // before applying any sparse per-head overrides below.
+    for (int k = 0; k < FusionParams::K_ATTACK; ++k) out.theta_conf_k[k] = out.theta_conf;
+
+    // Fix 4: optional sparse per-attack override —
+    //   "theta_conf_per_attack": [ {"attack": 3, "theta_conf": 0.5}, ... ]
+    // Only listed attack classes are overridden; everything else stays at the
+    // global theta_conf set above. Mirrors the lambda_sets "attack" key
+    // convention (1-indexed attack number -> 0-indexed k = attack-1).
+    {
+        size_t pk_key = blob.find("\"theta_conf_per_attack\"");
+        if (pk_key != std::string::npos) {
+            size_t arr_beg = blob.find('[', pk_key);
+            size_t arr_end = (arr_beg != std::string::npos) ? blob.find(']', arr_beg)
+                                                             : std::string::npos;
+            if (arr_beg != std::string::npos && arr_end != std::string::npos) {
+                size_t cur = arr_beg;
+                while (cur < arr_end) {
+                    size_t obj_beg = blob.find('{', cur);
+                    if (obj_beg == std::string::npos || obj_beg >= arr_end) break;
+                    size_t obj_end = blob.find('}', obj_beg);
+                    if (obj_end == std::string::npos || obj_end > arr_end) break;
+                    float atk_f, tc_f;
+                    size_t c1 = obj_beg;
+                    bool got_atk = extract_float_after("attack", c1, obj_end, atk_f);
+                    size_t c2 = obj_beg;
+                    bool got_tc  = extract_float_after("theta_conf", c2, obj_end, tc_f);
+                    if (got_atk && got_tc) {
+                        int k = (int)atk_f - 1;
+                        if (k >= 0 && k < FusionParams::K_ATTACK) out.theta_conf_k[k] = tc_f;
+                    }
+                    cur = obj_end + 1;
+                }
+            }
+        }
+    }
 
     // sir Change 1: signature weight sets. "sig_weight_global": [w0..w8] and
     // "sig_weight_sets": [ {"attack":k, "w":[w0..w8]}, ...K ]. Parsed by walking
@@ -604,6 +654,37 @@ public:
         edge_index.insert(edge_index.end(), src.begin(), src.end());
         edge_index.insert(edge_index.end(), dst.begin(), dst.end());
 
+        // TEMP DIAGNOSTIC (Critical Issue 3): dump the exact raw tensor sent to
+        // ONNX Runtime, once, so it can be replayed byte-for-byte in Python.
+        {
+            static int call_ctr = 0;
+            call_ctr++;
+            if (call_ctr % 15 == 1) {   // sample across the run's timeline, not just the first call
+                float psi_min = 1e9f, psi_max = -1e9f, psi_sum = 0.0f;
+                uint32_t sig_nonzero = 0;
+                for (int i = 0; i < N; ++i) {
+                    float p = feats[i * mptd_ai::GAT_FEATURE_DIM + mptd_ai::KINEMATIC_DIM + 1];
+                    if (p < psi_min) psi_min = p;
+                    if (p > psi_max) psi_max = p;
+                    psi_sum += p;
+                    for (int b = 0; b < 9; ++b)
+                        if (feats[i * mptd_ai::GAT_FEATURE_DIM + mptd_ai::KINEMATIC_DIM + 2 + b] > 0.5f) sig_nonzero++;
+                }
+                std::cout << "[RAW-DUMP] call=" << call_ctr << " N=" << N
+                          << " psi_min=" << psi_min << " psi_max=" << psi_max
+                          << " psi_mean=" << (psi_sum / N) << " sig_nonzero_bits=" << sig_nonzero
+                          << std::endl;
+                std::cout << std::scientific << std::setprecision(9);
+                std::cout << "[RAW-DUMP] call=" << call_ctr << " x=[";
+                for (size_t k = 0; k < feats.size(); ++k) std::cout << feats[k] << (k+1<feats.size()?",":"");
+                std::cout << "]" << std::endl;
+                std::cout << "[RAW-DUMP] call=" << call_ctr << " E=" << E << " edge_index=[";
+                for (size_t k = 0; k < edge_index.size(); ++k) std::cout << edge_index[k] << (k+1<edge_index.size()?",":"");
+                std::cout << "]" << std::endl;
+                std::cout << std::defaultfloat;
+            }
+        }
+
         // 3. Run inference.
         try {
             Ort::MemoryInfo mem = Ort::MemoryInfo::CreateCpu(
@@ -640,6 +721,13 @@ public:
                 auto shp  = info.GetShape();
                 const int Kc = (shp.size() >= 2 && shp[1] > 0) ? (int)shp[1] : 1;
                 const float *ap = out[1].GetTensorData<float>();
+                {   // TEMP DIAGNOSTIC (Critical Issue 3): dump raw shape + first row
+                    std::cout << "[GAT-SHAPE] N=" << N << " shp=[";
+                    for (size_t si = 0; si < shp.size(); ++si) std::cout << shp[si] << (si+1<shp.size()?",":"");
+                    std::cout << "] Kc=" << Kc << " ap[0..min(Kc,7)]=";
+                    for (int k = 0; k < std::min(Kc, 7); ++k) std::cout << ap[k] << " ";
+                    std::cout << std::endl;
+                }
                 attack_types->resize(N);
                 for (int i = 0; i < N; ++i) {
                     int   best = 0;
@@ -657,10 +745,17 @@ public:
                     // Change 2 gate: require max-head confidence ≥ θ_conf (loaded
                     // from fusion_weights.json) to commit to k̂'s weight sets; else
                     // -1 → global w + average λ. Falls back to the legacy 0.5 head
-                    // threshold when θ_conf is unset.
+                    // threshold when θ_conf is unset. Fix 4: theta_conf_k[best]
+                    // lets a specific head (e.g. a3) use a lower gate than the
+                    // rest without touching heads that already work well.
                     (*attack_types)[i] =
-                        (bv >= std::max(mptd_ai::GAT_HEAD_DETECT_THRESH, g_fusion.theta_conf))
+                        (bv >= std::max(mptd_ai::GAT_HEAD_DETECT_THRESH, g_fusion.theta_conf_k[best]))
                         ? best : -1;
+                    {
+                        int gt = (i < (int)g_diag_gt_scratch.size()) ? (int)g_diag_gt_scratch[i] : -1;
+                        std::cout << "[GAT-CONF] bv=" << std::scientific << std::setprecision(8) << bv
+                                   << std::defaultfloat << " best=" << best << " gt=" << gt << std::endl; // TEMP DIAGNOSTIC (Critical Issue 3)
+                    }
                 }
             }
             return true;

@@ -58,7 +58,9 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	uint32_t    nearest_rsu_idx = 0; // used for log output below
 
 	uint32_t nid = node_source->GetId();
-	uint32_t vid = (nid >= 2) ? (nid - 2) : 0; // vehicle_state[] index
+	uint32_t vid = (nid >= 2) ? (nid - 2) : 0; // VS() index
+
+	g_diag_beacon_tx_count++;  // TEMP DIAGNOSTIC (Step 1 follow-up)
 
 	if (nid == 2)
 	{
@@ -67,14 +69,15 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	}
 
 	// ── Read NS-3 MobilityModel → compute beacon payload ───────────────────
-	// NOTE: we do NOT push to vehicle_state[] at send time.
-	// vehicle_state[nid] is populated ONLY by HandleBeaconReceived() on the
+	// NOTE: we do NOT push to VS() at send time.
+	// VS(nid) is populated ONLY by HandleBeaconReceived() on the
 	// RSU receive side. This avoids the send-vs-receive index collision
 	// (send side would use vid=nid-2, receive side uses nid directly).
 	double tx_px = 0.0, tx_py = 0.0, tx_spd = 0.0, tx_hdg = 0.0, tx_acc = 0.0;
 	double real_px = 0.0, real_py = 0.0;
 	double real_vx = 0.0, real_vy = 0.0;   // real velocity for LL-based RSU selection
 	bool   is_mal  = false;
+	bool   in_streak = true;  // E4 TL composite streak gate (--streak_sigma); declared here so it outlives the scoping block below
 	{
 		Ptr<MobilityModel> mob = node_source->GetObject<MobilityModel>();
 		double real_spd = 0.0, real_hdg = 0.0, real_acc = 0.0;
@@ -136,7 +139,21 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 			dest_port = 7777;
 		}
 
-		if (is_mal) {
+		// E4 TL composite: streak gate σ (--streak_sigma). Mirrors the
+		// vanish_counter pattern below — per-vehicle beacon counter cycling
+		// ON for σ beacons, OFF for σ beacons. -1 (default) = always on,
+		// byte-identical to every existing result. Gates BOTH the poisoning
+		// application below and the ground-truth IsPoisoned label, since a
+		// vehicle in its "honest" phase is genuinely transmitting real
+		// kinematics this beacon and must not be mislabeled as poisoned.
+		if (is_mal && g_streak_sigma > 0) {
+			static uint32_t streak_counter[MAX_NODES] = {};
+			uint32_t cycle_pos = streak_counter[vid] % (2u * (uint32_t)g_streak_sigma);
+			in_streak = cycle_pos < (uint32_t)g_streak_sigma;
+			streak_counter[vid]++;
+		}
+
+		if (is_mal && in_streak) {
 			// ── MP-S2 Vanishing: suppress beacon on alternate calls (50% drop) ──
 			// Vehicle appears to "vanish" from the network intermittently.
 			// Effect: poisoned beacons are never received → FN rate increases.
@@ -235,8 +252,15 @@ void send_lte_dataunicast_alone(Ptr<SimpleUdpApplication> udp_app,
 	tag.SetHeading(tx_hdg);
 	tag.SetAcceleration(tx_acc);
 	tag.SetTimestamp(Simulator::Now().GetSeconds());
-	tag.SetIsPoisoned(is_mal);
-	tag.SetAttackType(static_cast<uint32_t>(attack_number));
+	tag.SetIsPoisoned(is_mal && in_streak);
+	// Round 6 (DQ5/DQ-followup) fix: in combined mode the run-level attack_number
+	// is 0, so this previously stamped EVERY vehicle-level attack (a2/a4/a6) with
+	// type 0 — folding them into the "honest" bucket for any per-type breakdown
+	// and making class-balanced Phase 2 calibration impossible. veh_atk() returns
+	// this vehicle's actually-assigned type in combined mode (g_veh_attack[vid],
+	// set in declare_attackers()) and falls through to attack_number otherwise, so
+	// single-attack runs are byte-identical to before.
+	tag.SetAttackType(static_cast<uint32_t>(veh_atk(vid, attack_number)));
 	tag.SetSigViolated(0); // sig_violated set by detector (08_detection_engine.h)
 
 	// ── LKH HMAC beacon tag (Eq.3.37): MAC_i(t) = HMAC_{K_i}(b_i(t)‖t‖ID_i) ──

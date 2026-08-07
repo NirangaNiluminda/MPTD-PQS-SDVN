@@ -12,7 +12,9 @@
 #ifndef NS3_UDP_ARQ_APPLICATION_H
 #define NS3_UDP_ARQ_APPLICATION_H
 
+#include <cstring> // std::memset — FIX B per-RSU vehicle_state clear
 #include <set>     // SC-Register registered-vid cache (P6 detection gate)
+#include <unordered_map>  // ghost (Sybil) psi/sig_mask state, vid space beyond total_size
 
 // ── Network Performance Timing (kept from original) ───────────────────────
 double dsrc_utilization_time        = 0.0;
@@ -54,7 +56,39 @@ struct VehicleBeaconState {
     bool   is_malicious;            // ground truth for this vehicle
 };
 
-VehicleBeaconState vehicle_state[total_size];
+// ── FIX B (sir, 2026-08-06): per-RSU vehicle_state ───────────────────────────
+// ROOT CAUSE this addresses: a single shared array meant RSU 19 could write
+// forged kinematics for vid=98, and RSU 44 would later READ that entry when the
+// real vehicle arrived — producing a false positive on an honest beacon. The
+// contamination is cross-RSU, so per-RSU isolation makes it structurally
+// impossible.
+//
+// Implemented FLAG-GATED (--per_rsu_vehicle_state, default OFF) rather than as
+// an outright replacement, so that with the flag off every existing result stays
+// byte-identical and the fix is falsifiable by an A/B run.
+//
+// Sizing: MAX_RSUS(256) x total_size(256) x sizeof(VehicleBeaconState)(~984 B)
+// = ~64 MB in .bss. Verified affordable.
+//
+// Sufficiency of per-RSU history was MEASURED, not assumed, on a0_p40_m1 (292 s):
+// beacons per (rsu,vehicle) pair p50 = 475.5, and 88.0% of pairs exceed 50,
+// against BEACON_HISTORY = 20. Only 2.0% of pairs carry fewer than 5 beacons.
+VehicleBeaconState vehicle_state_shared[total_size];              // legacy, flag OFF
+VehicleBeaconState vehicle_state_per_rsu[MAX_RSUS][total_size];   // Fix B, flag ON
+
+// RSU context for the CURRENT beacon being processed. Set by
+// run_lw_detect_per_beacon() at entry; -1 means "no RSU context" (controller /
+// init paths), which falls back to the shared array.
+int  g_vs_cur_rsu = -1;
+
+// Accessor replacing every former direct-subscript site. Keeping one
+// indirection means the 60+ call sites are mechanical and the routing decision
+// lives in exactly one place.
+static inline VehicleBeaconState &VS(int vid) {
+    if (g_per_rsu_vehicle_state && g_vs_cur_rsu >= 0 && g_vs_cur_rsu < MAX_RSUS)
+        return vehicle_state_per_rsu[g_vs_cur_rsu][vid];
+    return vehicle_state_shared[vid];
+}
 
 // ── Pre-registered Sybil flags (Attack 3 enhanced mode) ──────────────────────
 // pre_registered_sybil[i] = true means vehicle i was designated as Sybil
@@ -74,21 +108,29 @@ double g_ttd_first_alert[total_size];
 
 // Initialise all vehicle beacon state buffers
 void init_vehicle_states() {
+    // FIX B: VS() resolves against g_vs_cur_rsu, which is -1 here, so the loop
+    // below only clears the SHARED array. The per-RSU array is a global and is
+    // therefore zero-initialised by static storage duration (head=0, count=0,
+    // drift_score=0.0, is_malicious=false — identical to what this loop writes),
+    // but clear it explicitly so the invariant does not depend on that.
+    if (g_per_rsu_vehicle_state)
+        std::memset(vehicle_state_per_rsu, 0, sizeof(vehicle_state_per_rsu));
+
     for (int i = 0; i < total_size; i++) {
-        vehicle_state[i].head  = 0;
-        vehicle_state[i].count = 0;
-        vehicle_state[i].drift_score  = 0.0;
-        vehicle_state[i].is_malicious = false;
+        VS(i).head  = 0;
+        VS(i).count = 0;
+        VS(i).drift_score  = 0.0;
+        VS(i).is_malicious = false;
         pre_registered_sybil[i]       = false;  // cleared; set by declare_pre_registered_sybils()
         g_ttd_first_poison[i]         = -1.0;   // C5 TTD sentinels
         g_ttd_first_alert[i]          = -1.0;
         for (int j = 0; j < BEACON_HISTORY; j++) {
-            vehicle_state[i].pos_x[j]     = 0.0;
-            vehicle_state[i].pos_y[j]     = 0.0;
-            vehicle_state[i].speed[j]     = 0.0;
-            vehicle_state[i].heading[j]   = 0.0;
-            vehicle_state[i].accel[j]     = 0.0;
-            vehicle_state[i].timestamp[j] = 0.0;
+            VS(i).pos_x[j]     = 0.0;
+            VS(i).pos_y[j]     = 0.0;
+            VS(i).speed[j]     = 0.0;
+            VS(i).heading[j]   = 0.0;
+            VS(i).accel[j]     = 0.0;
+            VS(i).timestamp[j] = 0.0;
         }
     }
 }
@@ -97,7 +139,7 @@ void init_vehicle_states() {
 void push_beacon(int vid, double px, double py, double sp,
                  double hd, double ac, double ts) {
     if (vid < 0 || vid >= total_size) return;
-    VehicleBeaconState &vs = vehicle_state[vid];
+    VehicleBeaconState &vs = VS(vid);
     vs.pos_x[vs.head]     = px;
     vs.pos_y[vs.head]     = py;
     vs.speed[vs.head]     = sp;
@@ -116,7 +158,7 @@ void push_beacon(int vid, double px, double py, double sp,
 // same logical slot — avoiding double-counting in TP-DETECT velocity/drift checks.
 void pop_last_beacon(int vid) {
     if (vid < 0 || vid >= total_size) return;
-    VehicleBeaconState &vs = vehicle_state[vid];
+    VehicleBeaconState &vs = VS(vid);
     if (vs.count == 0) return;
     // step head back one slot (wrap around)
     vs.head = (vs.head + BEACON_HISTORY - 1) % BEACON_HISTORY;
@@ -252,6 +294,25 @@ Ipv4Address g_cloud_csma_ip;
 Ptr<Socket> g_rsu0_send_socket;
 Ipv4Address g_rsu_dsrc_ip[MAX_RSUS];                // RSU DSRC IPs from dsrc_interfaces (3.x.x.x)
 Ipv4Address g_rsu_csma_ip[MAX_RSUS];               // RSU CSMA IPs for management → RSU downlink (10.1.1.x)
+
+// ── FIX 1 (identity binding before any vehicle_state write) ──────────────────
+// The TRUE owner of each vehicle ID, taken from the NS-3 node registry at
+// startup: dsrc_Nodes order is Vehicle_Nodes then RSU_Nodes, so vehicle v's DSRC
+// interface is dsrc_interfaces index v. Populated in 12_main.h.
+//
+// Deliberately NOT populated on first reception. The pre-existing
+// g_vehicle_dsrc_ip[] map (08:3521) is trust-on-first-use, and in the
+// impersonation attack the ATTACKER transmits first — measured: forged beacons
+// carrying vid 98 from t=72.809, the genuine vehicle not until t=193.546 — so a
+// first-use map records the attacker as the owner and would authorise exactly
+// the writes we need to block.
+Ipv4Address g_vehicle_owner_ip[total_size + 2];
+bool        g_vehicle_owner_ip_known[total_size + 2] = {};
+// DQ-FP4 instrumentation: identity checks performed and writes rejected.
+uint64_t    g_idbind_checked      = 0;
+uint64_t    g_idbind_rejected     = 0;
+uint64_t    g_idbind_rej_poisoned = 0;   // rejections whose beacon was is_poisoned=1 (correct block)
+uint64_t    g_idbind_rej_honest   = 0;   // rejections of HONEST beacons (false rejection)
 uint32_t    g_num_active_rsus   = 0;         // = N_RSUs when routing_test=true
 bool        g_option_b_active   = false;     // set true by 12_main.h when relay is ready
 Ptr<Socket>  g_mgmt_downlink_socket;         // management node's downlink send socket (set in StartApplication)
@@ -345,12 +406,53 @@ struct RsuBeaconWindow {
     bool     anomalous [IPFS_WINDOW_L]; // cached LW-DETECT result per beacon
     bool     is_poisoned[IPFS_WINDOW_L];// ground-truth poison label per beacon
                                         // (Eq 4.1/4.2 GT for full-mode MCC/FPR)
+    int      attack_type[IPFS_WINDOW_L];// ground-truth attack type 1-7 (0=honest),
+                                        // for per-attack-type MCC breakdown diagnostics
     uint32_t beacon_count;              // filled slots in current window
     double   window_start;              // first beacon time of current window
     uint32_t window_epoch;              // monotonic window counter
 };
 
 RsuBeaconWindow rsu_window[MAX_RSUS] = {};
+
+// ── RING-DETECT: deterministic Sybil-ring geometry test (--ring_detect) ──────
+// MEASURED motivation: ghosts are invisible to every existing channel —
+// sig_mask==0 for 100% of them (no rule signature ever fires), the LSTM-AE sees
+// ~0 dead-reckoning residual because each ghost tracks its victim at a fixed
+// offset, and the GAT's S is a per-graph z-score so a 4-of-5 ghost majority
+// DEFINES the mean and scores low. Measured ghost recall 0.3478 vs 0.9337 on
+// real vehicles, and ghosts are 74.2% of all false negatives.
+//
+// The ring geometry, by contrast, is exact and was measured directly:
+//   radius        135 m   (ghost_disp = R_max_comm * theta = 270 * 0.5)
+//   adjacent pair 190.9 m = 135*sqrt(2)      (p50)
+//   opposite pair 270.0 m = 2*135            (p95)
+//   |d heading|   0.0000 rad                 (median)
+//   timestamps    identical
+//
+// So a closed-form test beats any statistical detector here. Crucially it also
+// separates the ghosts from their VICTIM: with N symmetric ghosts around the
+// intercepted vehicle, the centroid of the group IS the victim's position, so
+// radii come out [R,R,R,R,0]. Ring members sit at radius R; the victim sits at
+// 0. That is the discrimination the GAT classification head could not make — it
+// flagged the victim 95% of the time.
+//
+// Independent of the IPFS window on purpose: that flushes on its own schedule
+// (and differently again under --ghost_batch), so the detector keeps its own
+// short per-RSU history and does not inherit that coupling.
+#define RINGBUF_N 32   // recent beacons retained per RSU for the geometry test
+
+struct RsuRingBuf {
+    uint32_t vid  [RINGBUF_N];
+    double   px   [RINGBUF_N];
+    double   py   [RINGBUF_N];
+    double   hd   [RINGBUF_N];
+    double   ts   [RINGBUF_N];
+    int      head;
+    int      count;
+};
+
+RsuRingBuf rsu_ringbuf[MAX_RSUS] = {};
 
 // ── R7e: Per-vehicle LSTM-AE ring buffer + ψ cache (paper §3.5.3 Eq 3.43–3.46) ─
 // Full-mode temporal anomaly detection runs LSTM-AE over a 20-beacon sliding
@@ -363,7 +465,7 @@ RsuBeaconWindow rsu_window[MAX_RSUS] = {};
 // the per-window GAT spatial score and the LSTM-AE temporal score.
 //
 // Indexed by vehicle id (vid = nid - 2, range [0..total_size)) to match the
-// pattern used by vehicle_state[] / pre_registered_sybil[] above.
+// pattern used by VS() / pre_registered_sybil[] above.
 #define LSTM_RING_SIZE 50    // physical ring capacity (max over scenarios; urban AE window=50, rural/highway=10)
 // Runtime AE window (≤ LSTM_RING_SIZE): set at AI init from the loaded lstm_ae ONNX
 // input shape [1, g_lstm_window, 6] so C++ feeds exactly what the model expects
@@ -381,9 +483,53 @@ struct VehicleLstmRing {
 };
 
 VehicleLstmRing vehicle_lstm_ring[total_size] = {};
+
+// ── GHOST LSTM-AE SUPPORT (--ghost_ae, default OFF) ─────────────────────────
+// Ghost IDs (vid >= 10000) fall outside every fixed total_size array here, so
+// ghosts received NO AE scoring at all: measured ae_norm == 0 for 100% of
+// 20 754 ghost beacons. That left the GAT as their only scorer and made MP-S1
+// ghosts 75.2% of ALL false negatives (7 321 of 9 911).
+//
+// Viability measured before implementing: only 44 distinct ghost IDs, mean 361
+// beacons each, 84.1% with >= 50 samples — so the L=50 window is satisfiable.
+// A small slot map is therefore sufficient; no per-vid array is needed.
+//
+// FPR SAFETY: no honest beacon carries vid >= 10000, so any change confined to
+// ghosts cannot create a false positive. This is a pure-recall lever.
+#define GHOST_LSTM_MAX 512
+static std::unordered_map<uint32_t,uint32_t> g_ghost_lstm_slot;
+static VehicleLstmRing g_ghost_lstm_ring[GHOST_LSTM_MAX] = {};
+static float g_ghost_prev_px [GHOST_LSTM_MAX] = {};
+static float g_ghost_prev_py [GHOST_LSTM_MAX] = {};
+static float g_ghost_prev_sp [GHOST_LSTM_MAX] = {};
+static float g_ghost_prev_hd [GHOST_LSTM_MAX] = {};
+static bool  g_ghost_prev_set[GHOST_LSTM_MAX] = {};
+static uint32_t g_ghost_lstm_next = 0;
+
+// Returns a stable slot for a ghost vid, or -1 when the table is full.
+static inline int ghost_lstm_slot(uint32_t vid) {
+    auto it = g_ghost_lstm_slot.find(vid);
+    if (it != g_ghost_lstm_slot.end()) return (int)it->second;
+    if (g_ghost_lstm_next >= GHOST_LSTM_MAX) return -1;
+    const uint32_t sl = g_ghost_lstm_next++;
+    g_ghost_lstm_slot[vid] = sl;
+    return (int)sl;
+}
+
 double          last_psi_per_vehicle[total_size] = {};   // H8: SUM of ψ per vehicle within the window
 uint32_t        psi_cnt_per_vehicle[total_size]  = {};   // H8: beacon count, for the per-window MEAN ψ
 uint32_t        last_sigmask_per_vehicle[total_size] = {}; // richer-feat: most-recent LW sig_mask (ψ sub-scores / which rule-checks fired) per vehicle, fed to the multi-task GAT for attack-type ID
+
+// Ghost (Sybil, MP-S1) identities use vid >= GHOST_VID_BASE (10000), far beyond
+// total_size (256) — the arrays above are fixed C arrays indexed directly by
+// vid, so ghosts were always guarded out (`if (v < total_size)`) to avoid an
+// out-of-bounds access, and silently fed psi=0/sig_mask=0 into GAT forever.
+// That guard is correct (removing it would corrupt memory); what was missing
+// is an equivalent, safely-bounded accumulator for the ghost range. A ghost
+// population per window is bounded (~n_coord per intercepted vehicle), so an
+// unordered_map is cheap and requires no bounds assumptions about ghost vids.
+struct GhostPsiState { double psi_sum = 0.0; uint32_t psi_cnt = 0; uint32_t sig_mask = 0; };
+std::unordered_map<uint32_t, GhostPsiState> g_ghost_psi_state;
 
 // ── R7e.4: Controller TPE predictor state (paper Eq 4.6) ──────────────────────
 // TPE = mean Euclidean displacement between controller's PREDICTED position
@@ -422,8 +568,16 @@ uint64_t tpe_disp_cnt  = 0;     // # comparisons accumulated
 static inline bool lstm_ring_push(uint32_t vid,
                                   float px, float py, float sp,
                                   float hd, float ac, float tau) {
-    if (vid >= (uint32_t)total_size) return false;
-    VehicleLstmRing &r = vehicle_lstm_ring[vid];
+    VehicleLstmRing *rp = nullptr;
+    if (vid >= (uint32_t)total_size) {
+        if (!g_ghost_ae || vid < 10000u) return false;   // non-ghost overflow: unchanged
+        const int sl = ghost_lstm_slot(vid);
+        if (sl < 0) return false;
+        rp = &g_ghost_lstm_ring[sl];
+    } else {
+        rp = &vehicle_lstm_ring[vid];
+    }
+    VehicleLstmRing &r = *rp;
     const uint32_t i = r.head;
     r.pos_x  [i] = px;
     r.pos_y  [i] = py;
@@ -463,23 +617,33 @@ static bool  lstm_prev_set[total_size] = {};
 static inline bool lstm_ring_push_resid(uint32_t vid,
                                         float px, float py, float sp,
                                         float hd, float ac, float tau) {
-    if (vid >= (uint32_t)total_size) return false;
+    int gsl = -1;
+    if (vid >= (uint32_t)total_size) {
+        if (!g_ghost_ae || vid < 10000u) return false;   // non-ghost overflow: unchanged
+        gsl = ghost_lstm_slot(vid);
+        if (gsl < 0) return false;
+    }
+    float *pv_px = (gsl >= 0) ? &g_ghost_prev_px [gsl] : &lstm_prev_px [vid];
+    float *pv_py = (gsl >= 0) ? &g_ghost_prev_py [gsl] : &lstm_prev_py [vid];
+    float *pv_sp = (gsl >= 0) ? &g_ghost_prev_sp [gsl] : &lstm_prev_sp [vid];
+    float *pv_hd = (gsl >= 0) ? &g_ghost_prev_hd [gsl] : &lstm_prev_hd [vid];
+    bool  *pv_st = (gsl >= 0) ? &g_ghost_prev_set[gsl] : &lstm_prev_set[vid];
     float rx = 0.0f, ry = 0.0f, dsp = 0.0f, dhd = 0.0f;
-    if (lstm_prev_set[vid]) {
-        const float dx = px - lstm_prev_px[vid];
-        const float dy = py - lstm_prev_py[vid];
+    if (*pv_st) {
+        const float dx = px - *pv_px;
+        const float dy = py - *pv_py;
         rx  = dx - sp * (float)T_b * std::cos(hd);
         ry  = dy - sp * (float)T_b * std::sin(hd);
-        dsp = sp - lstm_prev_sp[vid];
-        dhd = hd - lstm_prev_hd[vid];
+        dsp = sp - *pv_sp;
+        dhd = hd - *pv_hd;
         while (dhd >   (float)M_PI) dhd -= 2.0f * (float)M_PI;   // wrap to (-pi, pi]
         while (dhd <= -(float)M_PI) dhd += 2.0f * (float)M_PI;
     }
     // First beacon of a vehicle has no predecessor: residual stays 0, which is
     // on-manifold for the clean-trained model, and the ring needs L samples anyway.
-    lstm_prev_px [vid] = px;  lstm_prev_py [vid] = py;
-    lstm_prev_sp [vid] = sp;  lstm_prev_hd [vid] = hd;
-    lstm_prev_set[vid] = true;
+    *pv_px = px;  *pv_py = py;
+    *pv_sp = sp;  *pv_hd = hd;
+    *pv_st = true;
     return lstm_ring_push(vid, rx, ry, dsp, dhd, ac, tau);
 }
 
@@ -487,8 +651,16 @@ static inline bool lstm_ring_push_resid(uint32_t vid,
 // order so the LSTM-AE sees the oldest sample first (col 5 = tau_i, scaled
 // downstream by AiScaler). Returns false if ring is not yet full.
 static inline bool lstm_ring_dump(uint32_t vid, float *out_buf) {
-    if (vid >= (uint32_t)total_size) return false;
-    const VehicleLstmRing &r = vehicle_lstm_ring[vid];
+    const VehicleLstmRing *rp = nullptr;
+    if (vid >= (uint32_t)total_size) {
+        if (!g_ghost_ae || vid < 10000u) return false;
+        auto it = g_ghost_lstm_slot.find(vid);
+        if (it == g_ghost_lstm_slot.end()) return false;
+        rp = &g_ghost_lstm_ring[it->second];
+    } else {
+        rp = &vehicle_lstm_ring[vid];
+    }
+    const VehicleLstmRing &r = *rp;
     const uint32_t win = (uint32_t)g_lstm_window;
     if (r.count < win) return false;
     // Dump the last `win` samples in chronological order (oldest first). With a
@@ -558,7 +730,22 @@ void ipfs_push_and_maybe_flush(uint32_t rsu_id, uint32_t vid,
                                double px, double py, double sp,
                                double hd, double ac, double ts,
                                bool anomalous_flag,
-                               bool is_poisoned_flag = false) {
+                               bool is_poisoned_flag = false,
+                               bool force_flush = false,
+                               int  attack_type_flag = 0) {
+    // force_flush (Block 3 fix): evasive-mode Sybil ghosts are injected
+    // one-at-a-time via a direct call to this function (not through the
+    // normal per-beacon receive path), so their single entry would otherwise
+    // sit waiting for 9 more REAL beacons at that same RSU before the window
+    // ever reaches GAT — which may never happen in time, or at all, if that
+    // RSU sees little real traffic. Confirmed this was silently dropping every
+    // ghost from GAT/fusion scoring (0 ghost vids ever appeared in FUSION-RSU
+    // output across two full test runs, despite ghosts genuinely transmitting).
+    // force_flush lets the caller flush immediately with whatever's
+    // accumulated so far (including just the ghost alone), so the ghost's
+    // data reaches rsu_last_window on the very next controller cycle. Only
+    // used at the evasive-mode ghost call site; every other caller passes the
+    // default false and is byte-identical to before.
     if (rsu_id >= N_RSUs || rsu_id >= MAX_RSUS) return;
     RsuBeaconWindow &w = rsu_window[rsu_id];
     if (w.beacon_count == 0) w.window_start = ts;
@@ -573,9 +760,10 @@ void ipfs_push_and_maybe_flush(uint32_t rsu_id, uint32_t vid,
         w.timestamp[i]   = ts;
         w.anomalous[i]   = anomalous_flag;
         w.is_poisoned[i] = is_poisoned_flag;
+        w.attack_type[i] = attack_type_flag;
         w.beacon_count++;
     }
-    if (w.beacon_count >= IPFS_WINDOW_L) {
+    if (w.beacon_count >= IPFS_WINDOW_L || (force_flush && w.beacon_count > 0)) {
         std::string hash = ipfs_window_hash(w, rsu_id);
         uint32_t anomalous_in_win = 0;
         for (uint32_t i = 0; i < w.beacon_count; i++)

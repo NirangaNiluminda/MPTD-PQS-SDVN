@@ -33,6 +33,31 @@
 //   python3 waf --run "lda_attack --attack_number=1 --routing_algorithm=4
 //     --routing_test=true --attack_percentage=80 --simTime=15"
 // ============================================================
+// TEMP DIAGNOSTIC (Step 1, RSU coverage check + time-varying follow-up):
+// sample geometric coverage at multiple timestamps, not just once, to tell
+// whether a single snapshot is representative. Additive-only, no behavior change.
+void mptd_coverage_diag_check(double t_label)
+{
+    uint32_t within_range = 0;
+    std::vector<Vector> rsu_pos;
+    for (uint32_t r = 0; r < RSU_Nodes.GetN(); r++) {
+        rsu_pos.push_back(RSU_Nodes.Get(r)->GetObject<MobilityModel>()->GetPosition());
+    }
+    for (uint32_t v = 0; v < Vehicle_Nodes.GetN(); v++) {
+        Vector vp = Vehicle_Nodes.Get(v)->GetObject<MobilityModel>()->GetPosition();
+        double mind = 1e18;
+        for (auto &rp : rsu_pos) {
+            double dx = vp.x - rp.x, dy = vp.y - rp.y;
+            double d = std::sqrt(dx*dx + dy*dy);
+            if (d < mind) mind = d;
+        }
+        if (mind <= R_max_comm) within_range++;
+    }
+    std::cout << "[COVERAGE-DIAG] t=" << t_label << "s vehicles_within_" << R_max_comm << "m_of_any_RSU="
+              << within_range << "/" << Vehicle_Nodes.GetN()
+              << " (" << (100.0*within_range/Vehicle_Nodes.GetN()) << "%)" << std::endl;
+}
+
 int main(int argc, char *argv[])
 {
     CommandLine cmd;
@@ -102,6 +127,40 @@ int main(int argc, char *argv[])
                   "de-synced, relational-outlier heading, routed through GAT). Use with "
                   "--honest_mp_s1=1 to isolate GAT's contribution.",
                   g_sybil_gat_evasive);
+    cmd.AddValue ("ghost_batch",
+                  "Batch all ghosts of one interception into ONE RSU window so the GAT sees the ring (1=on, default 0)",
+                  g_ghost_batch);
+    cmd.AddValue ("ghost_ae",
+                  "Extend LSTM-AE temporal scoring to ghost IDs (vid>=10000) (1=on, default 0)",
+                  g_ghost_ae);
+    cmd.AddValue ("hmac_fail_closed",
+                  "Eq 3.37 fail-closed: reject beacons carrying NO HMAC (1=on, default 0)",
+                  g_hmac_fail_closed);
+    cmd.AddValue ("identity_binding",
+                  "FIX 1: reject vehicle_state writes whose transmitter does not own the claimed ID (1=on)",
+                  g_identity_binding);
+    cmd.AddValue ("gat_or_path_min_phi",
+                  "Minimum fusion phi before the GAT head OR-path may force a detection "
+                  "(0.0 = legacy no-floor; 0.5 suppresses the OR-only beacons)",
+                  g_gat_or_path_min_phi);
+    cmd.AddValue ("pop_anomalous_writes",
+                  "Remove a beacon from the vehicle kinematic history if the rule tier judged "
+                  "it anomalous, so a forged beacon cannot become the baseline for the victim's "
+                  "next honest beacon (1=on, default 0)",
+                  g_pop_anomalous_writes);
+    cmd.AddValue ("psi_cond_floor",
+                  "Floor the attack-conditioned psi at the global-weight psi so k_hat "
+                  "misrouting cannot erase rule evidence (1=on, default 0)",
+                  g_psi_cond_floor);
+    cmd.AddValue ("ring_detect",
+                  "Deterministic Sybil-ring geometry test: flag identities sitting on a "
+                  "consistent-radius ring about a common centroid, excluding the centroid "
+                  "(the victim). RULE-TIER — re-verify ablation ordering (1=on, default 0)",
+                  g_ring_detect);
+    cmd.AddValue ("per_rsu_vehicle_state",
+                  "FIX B: give each RSU its own vehicle_state history so one RSU's forged "
+                  "kinematics cannot be read back by another as a clean baseline (1=on, default 0)",
+                  g_per_rsu_vehicle_state);
     cmd.AddValue ("honest_mp_s1",
                   "AB3 Phase 1: 0=legacy MP-S1 (default; density OR ghost-ID marker, "
                   "gated on ground-truth poison label). 1=paper-faithful MP-S1 (Eq. mp_s1: "
@@ -117,6 +176,11 @@ int main(int argc, char *argv[])
                   "(paper Fig 3.4 N_ghost; default 4). Use with --attack_number=3 "
                   "(= sir's a4, Sybil-via-compromised-RSU).",
                   g_n_coord);
+    cmd.AddValue ("streak_sigma",
+                  "E4 TL composite: malicious vehicle injects for sigma consecutive "
+                  "beacons then goes honest for sigma beacons, repeating; -1=off "
+                  "(continuous injection, default, byte-identical to every prior run).",
+                  g_streak_sigma);
     cmd.AddValue ("eps_max",
                   "AB4 sweep: stealth drift bound epsilon_max in m per beacon "
                   "(Eq 3.5; default 0.5, must stay < the s_max*T_b = 3.33 m gate). "
@@ -163,6 +227,8 @@ int main(int argc, char *argv[])
     cmd.AddValue ("enable_fhe", "AB7 toggle: 0=plaintext aggregates (TRS still signs)", enable_fhe);
     cmd.AddValue ("ab7_ring_n", "AB7 x-axis: TRS/FHE signing-ring size n (BFT bound n>=4 at f=1; threshold t held fixed at 3); -1=off, default n=4", g_ab7_ring_n);
     cmd.AddValue ("enable_rsu_lifecycle", "AB8 toggle: 0=RSUs permanently trusted", enable_rsu_lifecycle);
+    cmd.AddValue ("enable_sc_trust", "R3 config5: 0=skip vehicle SC-Trust evidence submission/finalize (Eq 3.55/3.56) — vehicle trust never decays off its initial value", enable_sc_trust);
+    cmd.AddValue ("enable_sc_revoke", "R3 config5: 0=skip vehicle SC-Revoke vote (Eq 3.58/3.65) — vehicles are never revoked regardless of behaviour", enable_sc_revoke);
     cmd.AddValue ("rsu_malicious_fraction", "AB8 f/n sweep: malicious RSU fraction 0..1 (f/4 ring members ≈ f*16 RSUs), decoupled from attack_percentage; -1=off", g_rsu_malicious_frac);
     cmd.AddValue ("lifecycle_gates_fusion", "AB8 option B: 1=a demoted RSU's psi is discounted in fusion (lets the lifecycle affect MCC/CDER_full); 0=off, default, all other sweeps unaffected", g_lifecycle_gates_fusion);
     cmd.AddValue ("ctrl_compromise_onset", "AB9 x-axis: controller compromise onset as fraction of simTime (0=from first beacon/default, 1=never within run)", g_ctrl_compromise_onset);
@@ -179,6 +245,16 @@ int main(int argc, char *argv[])
     cmd.AddValue ("enable_lstm_ae",
                   "R7f: force LSTM-AE temporal detector on(1)/off(0); -1=follow ablation_mode",
                   g_enable_lstm_ae_cli);
+    cmd.AddValue ("cder_credit_cp_detect",
+                  "CP-1: credit CP-DETECT in CDER — once flag_c is raised, a malicious "
+                  "controller's decisions count as a DETECTED compromise interval rather "
+                  "than undetected control error. 0=legacy (default), 1=enabled",
+                  g_cder_credit_cp_detect);
+    cmd.AddValue ("gat_det_flag_heads",
+                  "flag_i^GAT (eq:gat_det_flag) head bitmask: bit k => head k's detection "
+                  "verdict is OR-ed into the fusion decision. 0=off (default, legacy). "
+                  "46 = heads 1,2,3,5 (excludes head 6, precision 0.52)",
+                  g_gat_det_flag_heads);
     cmd.AddValue ("trs_classical",
                   "TRS scheme: 0=PQ Dilithium/ML-DSA-87 (default, paper Eq 3.49, NIST L5), "
                   "1=classical Shamir-Schnorr-P256 ECDSA-class baseline for RQ5 PBPO",
@@ -266,6 +342,44 @@ int main(int argc, char *argv[])
         std::cout << "[ABLATION] Mode A5: Blockchain SC calls DISABLED" << std::endl;
     }
 
+    // ── GUARD: forcing an AI detector ON is incompatible with A1 scoring ─────
+    // ablation_mode defaults to 1 (A1 = lightweight), and A1 scores the
+    // confusion matrix from the LIGHTWEIGHT tier only. The R7f --enable_gat /
+    // --enable_lstm_ae overrides below act on the detector toggles
+    // INDEPENDENTLY of ablation_mode, so a run that forces the detectors on
+    // while leaving ablation_mode at its default computes a full-mode fusion
+    // verdict for every beacon and then never scores it: the printed MCC/FPR
+    // come out lightweight-only and IDENTICAL across arms, and CDER_full is
+    // -1 (0/0 decisions).
+    //
+    // The D1/D4/D6 300 s runs of 2026-08-05 were produced exactly this way.
+    // Their per-beacon [FUSION-RSU] verdicts did differ by arm (MP-S1 recall
+    // 0.19/0.35/0.35), so the ablation ordering was real — but it had to be
+    // recomputed by hand from the logs because the simulator's own scored
+    // output could not show it. That is a silent failure, and this guard exists
+    // so it cannot recur.
+    //
+    // Promote to A0 (full) and say so loudly. Only A1 is promoted: mode 6 (B1)
+    // is a deliberately AI-free baseline, so it warns instead of being
+    // rewritten, which would destroy the baseline's meaning.
+    if (ablation_mode == 1 &&
+        (g_enable_gat_cli > 0 || g_enable_lstm_ae_cli > 0)) {
+        std::cout << "[ABLATION][GUARD] --enable_gat/--enable_lstm_ae forced ON "
+                     "but ablation_mode=A1 scores the LIGHTWEIGHT tier only "
+                     "(MCC/FPR would be LW-only and identical across arms, "
+                     "CDER_full=-1). PROMOTING ablation_mode A1 -> A0 (full) so "
+                     "the fusion verdict is actually scored."
+                  << std::endl;
+        ablation_mode = 0;
+    } else if (ablation_mode == 6 &&
+               (g_enable_gat_cli > 0 || g_enable_lstm_ae_cli > 0)) {
+        std::cout << "[ABLATION][GUARD][WARN] ablation_mode=A6 (B1 baseline) is "
+                     "AI-free by design, but --enable_gat/--enable_lstm_ae was "
+                     "forced ON. NOT promoting: the scored matrix stays "
+                     "lightweight. This combination is almost certainly a "
+                     "mistake." << std::endl;
+    }
+
     // ── R7f: derive AI-component toggles from ablation_mode (paper §4.1.1) ───
     // Default (CLI not set, cli == -1) follows the ablation table:
     //   A1 → no AI (lightweight only)
@@ -350,16 +464,21 @@ int main(int argc, char *argv[])
         const std::string scaler_path  = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/scaler.json";
         const std::string theta_path   = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/theta_ae.txt";
         const std::string weights_path = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/fusion_weights.json";
-        // 2026-07-27 fix: scaler.json (shared with the LSTM-AE) was overwritten by the
+        // 2026-07-27 fix (urban_a3), extended 2026-08-03 to the shared urban
+        // model: scaler.json (shared with the LSTM-AE) was overwritten by the
         // AB4 dead-reckoning-residual fix — incompatible with GAT's absolute-position
         // inputs (measured |z| in the thousands, saturating GAT for clean and poisoned
-        // beacons alike). urban_a3/gat_scaler.json holds the original absolute-position
-        // stats (mean/scale ~ pos_x 1755±545 etc., matching this scenario's real map
-        // scale) dedicated to GAT only; the LSTM-AE keeps using scaler_path unaffected.
-        // Scoped to urban_a3 only — every other scenario passes "" and is byte-identical.
+        // beacons alike). <scenario>/gat_scaler.json, where present, holds the original
+        // absolute-position stats (mean/scale ~ pos_x 1755±545 etc.) dedicated to GAT
+        // only; the LSTM-AE keeps using scaler_path unaffected. Confirmed live: the
+        // shared urban model (a1/a2/a4/a5/a6/a7) showed mean_S~250,000 for BOTH clean
+        // and malicious populations before this fix (θ_S=8.305) — same bug as urban_a3
+        // had, never previously fixed for the other six attack types. Generalized to
+        // check any scenario_sub's own gat_scaler.json; scenarios without one (rural,
+        // highway, urban_combined) pass "" and are byte-identical to before.
         std::string gat_scaler_path;
-        if (scenario_sub == "urban_a3") {
-            std::string gspath = NS3_ROOT "/analytics/ml/models/urban_a3/gat_scaler.json";
+        {
+            std::string gspath = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/gat_scaler.json";
             std::ifstream gstest(gspath);
             if (gstest.good()) gat_scaler_path = gspath;
         }
@@ -1717,6 +1836,59 @@ int main(int argc, char *argv[])
       g_option_b_active = true;  // all Option B globals are now set
       cout << "[OPT-B] DSRC-RSU relay ACTIVE (routing_test=" << routing_test << ")" << endl;
   }
+
+  // ── FIX 1: bind each vehicle ID to its TRUE physical DSRC address ───────────
+  // Same container order as above: vehicle v's DSRC interface is index v. This
+  // is the registry-derived ground truth used by handle_readone to reject
+  // vehicle_state writes from a transmitter that does not own the claimed ID.
+  // Keyed by NS-3 NODE ID, which is exactly what a vehicle writes into the beacon
+  // (09_vehicle_beacon_tx.h:249, tag.SetVehicleId(nid) with nid = node->GetId()).
+  // Do NOT key this by any assumed offset: an earlier revision indexed via
+  // lkh_veh_idx() and was systematically 3 entries off, which rejected GENUINE
+  // beacons — every rejection showed owner == claimed + 3, a constant that no
+  // attack could produce (victim selection is a per-attacker std::shuffle).
+  //
+  // CORRECTED LOOKUP. Two earlier revisions inferred the DSRC interface index
+  // from the node ID (`GetAddress(v)` with v from container order, and via
+  // lkh_veh_idx()). Both were wrong: instrumentation showed checked=3912
+  // rejected=3912 — EVERY beacon failed, honest ones included — because the
+  // observed source address is 3.0.0.(vid-8) while those maps produced
+  // 3.0.0.(vid-5). The index inference does not hold.
+  //
+  // We therefore read each vehicle's address from its OWN node object and take
+  // whichever interface carries the DSRC subnet (3.x). No offset arithmetic, so
+  // no assumption to get wrong.
+  {
+      uint32_t bound = 0, skipped = 0;
+      for (uint32_t v = 0; v < Vehicle_Nodes.GetN(); v++) {
+          Ptr<Node> nd = Vehicle_Nodes.Get(v);
+          uint32_t node_id = nd->GetId();
+          if (node_id >= (uint32_t)(total_size + 2)) { skipped++; continue; }
+          Ptr<Ipv4> ip4 = nd->GetObject<Ipv4>();
+          if (!ip4) { skipped++; continue; }
+          bool found = false;
+          for (uint32_t ifc = 0; ifc < ip4->GetNInterfaces() && !found; ifc++) {
+              for (uint32_t ad = 0; ad < ip4->GetNAddresses(ifc) && !found; ad++) {
+                  Ipv4Address a = ip4->GetAddress(ifc, ad).GetLocal();
+                  // DSRC subnet is 3.0.0.0/8 (address_dsrc.SetBase above).
+                  if ((a.Get() >> 24) == 3u) {
+                      g_vehicle_owner_ip[node_id]       = a;
+                      g_vehicle_owner_ip_known[node_id] = true;
+                      bound++; found = true;
+                  }
+              }
+          }
+          if (!found) skipped++;
+      }
+      cout << "[FIX1-IDBIND] bound " << bound << " vehicle node-IDs from their OWN Ipv4 objects"
+           << " (skipped=" << skipped << ")";
+      if (Vehicle_Nodes.GetN()) {
+          uint32_t n0 = Vehicle_Nodes.Get(0)->GetId();
+          cout << "  node" << n0 << " -> "
+               << (g_vehicle_owner_ip_known[n0] ? g_vehicle_owner_ip[n0] : Ipv4Address());
+      }
+      cout << endl;
+  }
   address_dsrc_172.SetBase ("4.0.0.0", "255.0.0.0");
   dsrc_interfaces_172 = address_dsrc_172.Assign (wifidevices_172);
   address_dsrc_174.SetBase ("5.0.0.0", "255.0.0.0");
@@ -2435,8 +2607,26 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
       g_ttd_first_alert[i]  = -1.0;
   }
 
+  // TEMP DIAGNOSTIC (Step 1 follow-up): sample coverage at multiple timestamps
+  // via a named free function (mptd_coverage_diag_check, declared above main).
+  for (double t = 2.0; t < simTime; t += 2.0) {
+      Simulator::Schedule(Seconds(t), &mptd_coverage_diag_check, t);
+  }
+
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
+
+  // TEMP DIAGNOSTIC (Step 1 follow-up): raw TX vs RX beacon counts, to localize
+  // the beacon-count gap. Compare against the confusion matrix total printed
+  // separately (cm_TP+cm_FP+cm_TN+cm_FN).
+  std::cout << "[COVERAGE-DIAG] beacon TX attempts=" << g_diag_beacon_tx_count
+            << "  RX at RSU (HandleBeaconReceived calls)=" << g_diag_beacon_rx_count
+            << "  RX/TX=" << (g_diag_beacon_tx_count > 0 ? (100.0*g_diag_beacon_rx_count/g_diag_beacon_tx_count) : 0.0)
+            << "%" << std::endl;
+  std::cout << "[COVERAGE-DIAG] confusion-matrix update() calls=" << g_diag_cm_update_count
+            << "  CM/RX=" << (g_diag_beacon_rx_count > 0 ? (100.0*g_diag_cm_update_count/g_diag_beacon_rx_count) : 0.0)
+            << "%  (Block 2: gap between RX and CM update means a filter exists between them)"
+            << std::endl;
 
   // ── Tier-3 batched-commit: flush trailing partial batches + summary ──────
   // (paper §3.5.5) The time-flush only fires on a subsequent same-RSU push, so
@@ -2475,6 +2665,18 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   if (total_trajectories_received > 0) {
       double poison_rate = 100.0 * total_trajectories_poisoned / total_trajectories_received;
       std::cout << "  Actual poison rate   : " << poison_rate << "%" << std::endl;
+      // FIX 1 (identity binding) — DQ-FP4 answer + validation of the check itself.
+      if (g_hmac_fail_closed)
+          std::cout << "  [HMAC-FAILCLOSED] beacons rejected for missing MAC: "
+                    << g_hmac_missing_rejected << std::endl;
+      std::cout << "  [FIX1] idbind checked=" << g_idbind_checked
+                << " rejected=" << g_idbind_rejected
+                << "  of which poisoned=" << g_idbind_rej_poisoned
+                << " HONEST=" << g_idbind_rej_honest;
+      if (g_idbind_rejected)
+          std::cout << "  (precision=" 
+                    << (100.0 * g_idbind_rej_poisoned / g_idbind_rejected) << "%)";
+      std::cout << std::endl;
   }
   std::cout << "========================================" << std::endl;
   // ─────────────────────────────────────────────────────────────────────────

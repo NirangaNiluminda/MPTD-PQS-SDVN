@@ -55,6 +55,43 @@ using namespace std::chrono;
 // over actual RSUs bounds on N_RSUs (NOT the literal 4 or MAX_RSUS).
 #define MAX_RSUS 256
 
+// FIX B (sir, 2026-08-06): route vehicle_state through a per-RSU array so one
+// RSU's forged kinematics cannot be read back by another RSU as a clean
+// vehicle's history. Default OFF => byte-identical to all prior results.
+bool g_per_rsu_vehicle_state = false;
+
+// RING-DETECT: deterministic Sybil-ring geometry test. Ghosts are 74.2% of all
+// false negatives (recall 0.3478 vs 0.9337 on real vehicles) because no
+// statistical channel sees them; the ring geometry is exact, so a closed-form
+// test does. Default OFF -- it is RULE-TIER, so it fires in D1/D4/D6 alike and
+// the ablation ordering must be re-verified before it is enabled.
+// Minimum fusion score phi before the GAT head OR-path may force a detection.
+// 0.0 = previous behaviour (no floor). See 08_detection_engine.h for the measured
+// FP/TP exchange that motivates a non-zero value.
+double g_gat_or_path_min_phi = 0.0;
+
+// Do not let a beacon that was JUST judged anomalous remain in the vehicle's
+// kinematic history as the baseline for judging the next beacon. push_beacon()
+// runs as step 1, BEFORE detection, so a forged beacon poisons the history it is
+// then compared against — which is why impersonation victims (vids 196/191/202)
+// carry FPR 0.53-0.59 on their own honest beacons. Measured: 6 vehicles produce
+// 77.7% of all false positives. Default OFF.
+bool   g_pop_anomalous_writes = false;
+
+// Floor the attack-conditioned psi at the global-weight psi, so k_hat misrouting
+// cannot erase rule evidence. Only GAT-bearing arms derive k_hat, so without this
+// enabling the GAT can LOSE detections D1 keeps (measured: 158 TPs, 155 of them
+// routed to the k_hat=4 misrouting sink). Default OFF = byte-identical.
+bool   g_psi_cond_floor    = false;
+
+bool   g_ring_detect       = false;
+double g_ring_tol_t        = 0.05;   // s     max timestamp spread within a ring
+double g_ring_tol_hd       = 0.05;   // rad   max heading spread within a ring
+double g_ring_r_min        = 60.0;   // m     min plausible ring radius
+double g_ring_r_max        = 250.0;  // m     max plausible ring radius
+double g_ring_r_cv         = 0.25;   // -     max radius coeff. of variation
+int    g_ring_min_members  = 3;      // min ring members to declare a ring
+
 const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
 uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban 8×8 grid=64)
 uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
@@ -281,6 +318,14 @@ bool g_per_pid_results      = false;
 // so every already-collected result is byte-identical.
 int  g_n_coord              = 4;
 
+// E4 Threat Level (TL) composite: streak parameter σ — the number of
+// consecutive beacons a malicious vehicle injects poisoned data for before
+// going honest for σ beacons, repeating (paper TL variable, second half
+// alongside n_coord). Default -1 = off, continuous injection for the entire
+// run, byte-identical to every existing result. When > 0, the vehicle's
+// per-beacon injection state cycles ON for σ beacons, OFF for σ beacons.
+int  g_streak_sigma         = -1;
+
 // AB5 / E2 uniform-speed traces (--uniform_speed_trace). The default traces use
 // REALISTIC per-road OSM speed limits, so a vehicle's actual speed is set by map
 // topology, not by --maxspeed (measured: mobility_urban_60.tcl has 2234 distinct
@@ -322,6 +367,41 @@ double g_mp_s1_density_k    = 2.3;
 // anomaly) — the configuration that isolates GAT's contribution. Requires
 // --honest_mp_s1=1 to be meaningful. Default false: legacy a3 is byte-identical.
 bool g_sybil_gat_evasive    = false;
+// FIX 1 (identity binding before vehicle_state writes).
+//
+// DEFAULT OFF pending redesign. The concept is sound and the guard site is
+// correct, but the owner-address lookup is not: it derives the DSRC interface
+// index from the vehicle node ID, and that inference is wrong. Measured with
+// instrumentation: checked=3912 rejected=3912 — EVERY beacon failed the check,
+// including honest ones, because the observed source address is 3.0.0.(vid-8)
+// while the map computes 3.0.0.(vid-5).
+//
+// The correct implementation reads each vehicle's address from its own node
+// object (Ipv4 interface) rather than assuming a container-index offset. Until
+// that lands this must stay off: with it on, no beacon can ever write
+// vehicle_state, which suppresses detection and cost 0.12 recall in measurement.
+bool g_identity_binding     = false;
+
+// FAIL-CLOSED HMAC gate (Eq 3.37). DEFAULT OFF — see 08_detection_engine.h for
+// why. When on, a beacon carrying no MAC is rejected rather than silently
+// accepted. Flag-gated so it can be measured and reverted without a rebuild.
+bool     g_hmac_fail_closed      = false;
+
+// GHOST LSTM-AE (--ghost_ae). DEFAULT OFF. Extends AE temporal scoring to ghost
+// IDs (vid >= 10000), which currently receive none (measured ae_norm == 0 for
+// 100% of ghost beacons). Ghosts are 75.2% of all false negatives. FPR-safe by
+// construction: no honest beacon carries vid >= 10000.
+bool g_ghost_ae = false;
+
+// GHOST GRAPH BATCHING (--ghost_batch). DEFAULT OFF.
+// Ghosts are force-flushed one at a time, so each is scored ALONE: measured
+// 74.8% of ghost windows contain exactly 1 beacon and 98.3% contain <=2, against
+// 100% of normal windows containing 10. The GAT therefore sees a single-node
+// graph and cannot perform relational detection — the ring of N_ghost fabricated
+// identities is dismantled before it reaches the model. When on, all ghosts from
+// one interception are accumulated and flushed together so the ring is visible.
+bool g_ghost_batch = false;
+uint64_t g_hmac_missing_rejected = 0;
 bool enable_trs             = true;   // AB6
 // AB6 f/n sweep: force exactly F of the n signing-ring members compromised so
 // PARR degrades along the BFT tolerance boundary. -1 = off (legacy behaviour:
@@ -391,6 +471,14 @@ int g_ab7_ring_n = -1;
 bool enable_fhe             = true;   // AB7
 bool enable_rsu_lifecycle   = true;   // AB8
 
+// R3 config5: vehicle-side SC-Trust / SC-Revoke ablation — analogous to
+// enable_rsu_lifecycle (AB8) but for the VEHICLE trust-decay (Eq 3.55/3.56,
+// CallSCTrustSubmitEvidence/FinalizeEpoch) and vehicle revocation-vote
+// (Eq 3.58/3.65, CallSCRevokeVote) mechanisms specifically. Default true =
+// current behaviour, byte-identical to every prior run.
+bool enable_sc_trust        = true;
+bool enable_sc_revoke       = true;
+
 // AB8 option-B extension: let the RSU lifecycle reach the DETECTION path, not
 // only on-chain quorum weight. When on, a beacon whose reporting RSU is in the
 // demoted/CLIENT state contributes psi_fuse = 0 to the fusion score — the
@@ -406,6 +494,30 @@ bool enable_rsu_lifecycle   = true;   // AB8
 // SEMANTICS, so it must stay default-false: every existing sweep (AB1-AB11,
 // SOTA matrix, AB6/AB10 data) stays bit-identical unless explicitly enabled.
 bool g_lifecycle_gates_fusion = false;   // AB8 option B
+
+// ── flag_i^GAT (paper revised eq:gat_det_flag) — 2026-08-05 ────────────────
+// The paper specifies that the GAT detects an attack iff ANY per-attack head
+// fires (max_k y^(k) > 0.5), and that this verdict is OR-ed into the fusion
+// decision. The C++ computed that verdict (encoded in k_hat_i >= 0) and even
+// logged it as `gatflag=`, but NEVER OR-ed it into full_flag — k_hat was used
+// only to select the lambda weight set. So the detection half of the equation
+// was unimplemented.
+//
+// Measured impact of implementing it (combined attack, rho_a=0.60, 3 seeds):
+//     OR heads {1,2,3,5}: MCC 0.4241 -> 0.5210, a3 recall 0.199 -> 0.541
+// Head participation is a bitmask because per-head precision varies sharply
+// when the flag is used as a DETECTOR (measured, same runs):
+//     head 1: 1.0000   head 2: 1.0000   head 5: 1.0000   head 3: 0.9744
+//     head 0: 0.9138   head 6: 0.5166  <-- head 6 is a coin flip, exclude it
+// Bit k set => head k participates.
+//
+// DEFAULT CHANGED 2026-08-05 (Action 1): 0 -> 46 (= bits 1,2,3,5). Leaving this
+// off by default meant any run launched without --gat_det_flag_heads=46 would
+// silently revert to the pre-fix wiring error (eq:gat_det_flag computed, logged
+// as `gatflag=`, then discarded) and produce MCC ~0.4241 instead of ~0.5121.
+// Final experiments must not depend on remembering a CLI argument. Pass
+// --gat_det_flag_heads=0 to explicitly reproduce the legacy behaviour.
+uint32_t g_gat_det_flag_heads = 46;
 
 // AB8 option-B weight: what a DEMOTED RSU's psi is multiplied by in fusion.
 // 0.0 = silence it completely (the first attempt); 1.0 = no effect.
@@ -731,6 +843,31 @@ uint32_t g_cp_detect_conflict_fires    = 0;  // Eq 3.59 conflict-gate firings
 uint32_t g_cp_detect_epochs_evaluated  = 0;  // number of controller decisions audited
 bool     g_flag_c_active               = false;  // RSU fallback mode currently active
 
+// ── CP-1 (2026-08-05): credit CP-DETECT in CDER ──────────────────────────────
+// CP-DETECT (Algorithm 7, Eq 3.59) fires and sets g_flag_c_active, but until now
+// that verdict was consumed by NOTHING — its only reader was a printf in
+// 10_metrics_csv.h:1009. Measured: 93,079 firings in a 300 s run, zero effect on
+// any metric. CDER therefore never measured controller-compromise DETECTION at
+// all; a malicious controller's decision was scored `wrong = true` unconditionally,
+// whether or not the system had caught it.
+//
+// With this enabled, once CP-DETECT has flagged the controller, its subsequent
+// bad decisions are treated as a DETECTED compromise interval rather than as
+// undetected control error — which is what CDER (Eq 4.4) is meant to measure.
+//
+// Default false = legacy behaviour, so every previously reported CDER stays
+// reproducible. Enable with --cder_credit_cp_detect=1 to obtain the paired
+// before/after comparison.
+bool     g_cder_credit_cp_detect       = false;
+
+// CP-2 (2026-08-05): controller misbehaviour evidence counter, the controller-side
+// analogue of the RSU trust chain (eq:rsu_trust / eq:ctrl_trust). Incremented on
+// every CP-DETECT firing so controller compromise accumulates evidence instead of
+// being discarded. Reported in the metrics line; feeds the SC-Revoke decision path.
+uint64_t g_ctrl_misbehave_evidence     = 0;
+double   g_ctrl_trust                  = 1.0;   // tau_c(t), EMA-decayed on evidence
+double   g_ctrl_trust_alpha            = 0.3;   // mirrors g_rsu_trust_alpha
+
 // ── Send-side speed/time history — separate from receive-side vehicle_state ──
 // Used only in send_LTE_metadata_uplink_alone() to compute accel at send time.
 // Indexed by vid = nid - 2 (0..N_Vehicles-1), never written by receive side.
@@ -916,6 +1053,15 @@ double HELLO_initial_timestamp      = 0.0;
 double LLDP_final_timestamp         = 0.0;
 double packet_final_timestamp[total_size + 2];
 double flow_initiation_time         = 0.0;
+
+// TEMP DIAGNOSTIC (Step 1 follow-up): raw TX-attempt vs RX-received beacon
+// counters, independent of confusion-matrix scoring or any software gate.
+// Compares against cm_TP+cm_FP+cm_TN+cm_FN to localize where the beacon-count
+// gap actually happens (TX vs RX = physical/MAC loss; RX vs scored = software
+// gate). Additive-only, no behavior change.
+uint64_t g_diag_beacon_tx_count = 0;
+uint64_t g_diag_beacon_rx_count = 0;
+uint64_t g_diag_cm_update_count = 0;  // TEMP DIAGNOSTIC (Block 2): update_confusion_matrix() call count
 
 bool sybil_mitm_nodes[total_size]                  = {}; // MP-S2: identity theft / MP-S3: MitM relay
 
