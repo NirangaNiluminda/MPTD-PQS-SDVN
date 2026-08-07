@@ -1,0 +1,453 @@
+{
+  "_README": [
+    "Human knowledge that cannot be derived from source: WHY each flag is or is not",
+    "used, and when it SHOULD be used. Flag names and defaults are NOT stored here --",
+    "they are parsed from scratch/mptd_pqs_sdvn/ by tools/dump_run_config.py so they",
+    "cannot drift. Add an entry for every new flag; the generator reports gaps.",
+    "status: used | unused | broken | sweep"
+  ],
+  "canonical_run": {
+    "_verified": "Read back from /proc/<pid>/cmdline of the completed 300 s run on 2026-08-07 (PIDs 2262814/816/818). This is the exact configuration behind D1 0.763 / D4 0.758 / D6 0.766.",
+    "command": "export LD_LIBRARY_PATH=$NS3/build/lib\ncd $NS3\n$BIN --mobility_source=1 --mobility_scenario=0 --maxspeed=60 \\\n     --N_Vehicles=200 --N_RSUs=64 \\\n     --attack_number=0 --attack_percentage=40 --simTime=300 \\\n     --ablation_mode=0 --routing_test=false \\\n     --skip_blockchain=true --per_pid_results=1 \\\n     --enable_gat=1 --enable_lstm_ae=1 --seed=1 \\\n     --per_rsu_vehicle_state=1 --ring_detect=1 \\\n     --gat_det_flag_heads=0 --psi_cond_floor=1 \\\n     > $SCRATCH/<dir>/<arm>.log 2>&1 &",
+    "arms": {
+      "D1 (no ML)": "--enable_gat=0 --enable_lstm_ae=0",
+      "D4 (GAT only)": "--enable_gat=1 --enable_lstm_ae=0",
+      "D6 (GAT + LSTM-AE)": "--enable_gat=1 --enable_lstm_ae=1"
+    },
+    "preflight": "# 1. deployed model must be the ORIGINAL (the Fix-A model is a known dead end)\ncd $NS3/analytics/ml/models/urban_combined\nreadlink gat_model.onnx     # EXPECT: ../urban/gat_model.onnx\ncat theta_s.txt             # EXPECT: 19.74\ncat theta_ae.txt            # EXPECT: 33.693885\n\n# 2. binary is current\ncd $NS3 && ./waf build --targets=mptd_pqs_sdvn\n\n# 3. after launching, confirm the flags that ACTUALLY reached the process\nfor p in <pids>; do tr '\\0' ' ' < /proc/$p/cmdline; echo; done"
+  },
+  "traps": [
+    {
+      "trap": "`routing_test` defaults **true**",
+      "detail": "Declared in `07_socket_layer.h:16`, not in any config header -- which is why it stayed invisible. Always pass `--routing_test=false`."
+    },
+    {
+      "trap": "`ablation_mode` defaults **1**",
+      "detail": "Mode 1 = AB1, not full mode. Always pass `--ablation_mode=0`."
+    },
+    {
+      "trap": "`gat_det_flag_heads` defaults **46**, not 0",
+      "detail": "The OR-path is ON unless you explicitly pass `--gat_det_flag_heads=0`. Reported runs pass 0."
+    },
+    {
+      "trap": "ns-3 CLI booleans",
+      "detail": "Need `=0`/`=1`, not bare flags. A bare `--ring_detect` does not enable it."
+    },
+    {
+      "trap": "`LD_LIBRARY_PATH`",
+      "detail": "Must be `build/lib` or the ONNX sessions fail to load."
+    },
+    {
+      "trap": "log case sensitivity",
+      "detail": "`full_anom=YES` / `full_anom=no` -- case differs between the two outcomes."
+    },
+    {
+      "trap": "`pgrep -f` / `pkill -f` self-match",
+      "detail": "The pattern matches your own shell. Use explicit PIDs."
+    },
+    {
+      "trap": "dict-keyed log parsing",
+      "detail": "Keying on `(rsu,t,vid)` silently dedups and has twice produced results contradicting the simulator. Add an occurrence index and validate the parsed confusion matrix against the simulator's printed `MCC_full` before trusting any analysis."
+    },
+    {
+      "trap": "theta_S must come from **in-sim** clean p95",
+      "detail": "Never the offline corpus. Offline 3.709 vs in-sim 41.46; using the offline value collapsed MCC to 0.20."
+    },
+    {
+      "trap": "`rsu_window.anomalous[]` has ZERO readers",
+      "detail": "Writing to it does nothing. Fusion reads `psi`, so flags must be set BEFORE psi is computed (~`08_detection_engine.h:2288`), not after."
+    },
+    {
+      "trap": "`--per_pid_results=1` when running arms concurrently",
+      "detail": "Isolates each run's `analytics/results_pid<PID>/`. Without it, per-beacon logs collide -- `a4_p40_m0` was once found to contain all of `a3_p40_m0`."
+    },
+    {
+      "trap": "`stealthy_control_plane` defaults **true**",
+      "detail": "Declared `02_config_globals.h:221`. Never passed on any reported run, so TP-S3/MP-S4 were in STEALTH mode throughout. Not a bug, but it is an unstated experimental condition."
+    }
+  ],
+  "flags": {
+    "mobility_source": {
+      "status": "used",
+      "value": "1",
+      "why": "Drive mobility from the SUMO trace rather than an ns-3 mobility model."
+    },
+    "mobility_scenario": {
+      "status": "used",
+      "value": "0",
+      "why": "0 = urban (Shinjuku). 1 = rural, 2 = highway."
+    },
+    "maxspeed": {
+      "status": "used",
+      "value": "60",
+      "why": "Urban regime speed. Distinct from `--s_max_kmh`, which is the DETECTOR bound."
+    },
+    "N_Vehicles": {
+      "status": "used",
+      "value": "200",
+      "why": "Fleet size for the reported scenario; matches `tab:set-network`."
+    },
+    "N_RSUs": {
+      "status": "used",
+      "value": "64",
+      "why": "8x8 grid at 250 m spacing; matches `tab:set-network`."
+    },
+    "attack_number": {
+      "status": "used",
+      "value": "0",
+      "why": "0 = COMBINED mode, all seven variants active at once. Any other value runs a single variant."
+    },
+    "attack_percentage": {
+      "status": "used",
+      "value": "40",
+      "why": "rho_a = 0.40, the default high-stress point. Measured beacon-level poisoning at this setting is 79.16%, not the 89.6% quoted in paper item P3."
+    },
+    "simTime": {
+      "status": "used",
+      "value": "300",
+      "why": "Full duration. NOTE: ordering D1<D4<D6 holds at a 90 s cutoff but NOT over the full 300 s -- see the audit."
+    },
+    "ablation_mode": {
+      "status": "used",
+      "value": "0",
+      "why": "Full scoring. Ablation is done by zeroing COMPONENTS (`--enable_gat/--enable_lstm_ae`), never by switching the simulator to a lightweight mode. This is the distinction between a valid ablation and a broken pipeline."
+    },
+    "routing_test": {
+      "status": "used",
+      "value": "false",
+      "why": "Must be forced off; the default is true and silently invalidates results."
+    },
+    "skip_blockchain": {
+      "status": "used",
+      "value": "true",
+      "why": "Detection runs do not need the Fabric round-trip. Turn OFF for the RQ5/RQ6 crypto-latency runs."
+    },
+    "per_pid_results": {
+      "status": "used",
+      "value": "1",
+      "why": "Isolates each concurrent arm's results directory. Essential when D1/D4/D6 run in parallel."
+    },
+    "enable_gat": {
+      "status": "used",
+      "value": "0 or 1",
+      "why": "Selects the arm. GAT off => S_i = 0, k_hat = -1, OR-flag off, and lambda_gat is dropped from the fusion sum and the survivors renormalised."
+    },
+    "enable_lstm_ae": {
+      "status": "used",
+      "value": "0 or 1",
+      "why": "Selects the arm. AE off => eps_i = 0 and lambda_ae dropped + renormalised, identically to the GAT path."
+    },
+    "seed": {
+      "status": "used",
+      "value": "1",
+      "why": "Unified ns-3 RngRun + attack randomness. Vary for mean+/-std across seeds."
+    },
+    "per_rsu_vehicle_state": {
+      "status": "used",
+      "value": "1",
+      "why": "Fix B. Binds every vehicle_state access to the receiving RSU so an impersonator cannot contaminate the victim's kinematic history at a different RSU. Measured: vid98 FPR 1.0000 -> 0.0691, MCC +0.032."
+    },
+    "ring_detect": {
+      "status": "used",
+      "value": "1",
+      "why": "Deterministic Sybil-ring geometry test. Ghost recall 0.49 -> 0.99 at zero FP cost, MCC +0.19. Fires through the MP-S1 signature bit, so it lifts ALL arms equally -- which is why it compresses the ablation ordering."
+    },
+    "gat_det_flag_heads": {
+      "status": "used",
+      "value": "0",
+      "why": "DISABLES the GAT head OR-path entirely. Default is 46 (on). Beacons flagged only via this path were 54-55% of D4/D6 false positives for 285/306 true positives -- a poor exchange. Note this means paper item G4's Phi floor had nothing to act on."
+    },
+    "psi_cond_floor": {
+      "status": "used",
+      "value": "1",
+      "why": "Floors attack-conditioned psi at the global-weight psi: psi_fuse = max(s, s_global). Prevents k_hat misrouting from ERASING rule evidence. Measured effect: D4's true-positive losses vs D1 went from 158 to ZERO. D1 is provably unaffected (k_hat < 0 there, so the floor is a no-op)."
+    },
+    "ghost_batch": {
+      "status": "unused",
+      "why": "Built and never used in any reported run. Batches a ghost ring into ONE GAT window (N=4-5) instead of the standard window.",
+      "when": "Required if paper item S3 is to be published as written -- S3 currently describes behaviour that was OFF. Enable and re-run, or reword S3."
+    },
+    "ghost_ae": {
+      "status": "unused",
+      "why": "Extends LSTM-AE temporal scoring to ghost identities. Deliberately off: ghosts have no genuine kinematic history to reconstruct against.",
+      "when": "Only if ghost temporal modelling is added as a contribution."
+    },
+    "gat_or_path_min_phi": {
+      "status": "unused",
+      "why": "Phi floor before the GAT head OR-path may force a detection. Left at 0.0 because the OR-path itself is disabled via `--gat_det_flag_heads=0`, so there is nothing to floor.",
+      "when": "Only meaningful together with `--gat_det_flag_heads=46`. Paper item G4 proposes 0.60; that pairing has NOT been run."
+    },
+    "cder_credit_cp_detect": {
+      "status": "unused",
+      "why": "Credits CP-DETECT's flag_c to CDER so a caught controller compromise stops counting as UNDETECTED control error. Off by default to keep legacy CDER reproducible.",
+      "when": "Required if paper item C1 is to be published -- C1 describes behaviour that was OFF in every reported run."
+    },
+    "lifecycle_gates_fusion": {
+      "status": "unused",
+      "why": "AB8 option B: discounts a demoted RSU's psi in fusion. Without it the RSU lifecycle cannot influence MCC/CDER at all (toggling `enable_rsu_lifecycle` alone left both metrics bit-identical).",
+      "when": "AB8 only, paired with `--demoted_psi_weight`. Full suppression (weight 0) cost more signal than the poison it blocked: MCC 0.825 -> 0.361."
+    },
+    "identity_binding": {
+      "status": "broken",
+      "why": "Fix 1. Rejects beacon writes when the transmitter does not own the claimed ID. Measured -0.124 MCC with 40% of rejections falling on honest vehicles. Superseded by `--per_rsu_vehicle_state`, which solves the same contamination geometrically.",
+      "when": "Never. Use `--per_rsu_vehicle_state=1` instead."
+    },
+    "pop_anomalous_writes": {
+      "status": "broken",
+      "why": "Drops the anomalous beacon from kinematic history. Starves the history and drives FPR to 0.535.",
+      "when": "Never. Leave at 0."
+    },
+    "verbose_tx": {
+      "status": "unused",
+      "why": "Per-beacon [DSRC-TX]/[LL-SEL] stdout. Off because it bloats long runs -- the 300 s logs are already ~600 MB per arm without it.",
+      "when": "Short debug runs only."
+    },
+    "stealthy_control_plane": {
+      "status": "used",
+      "value": "true (DEFAULT \u2014 never passed on the command line)",
+      "why": "Active in every reported run by default. TP-S3/MP-S4 inject small plausible controller falsification that the beacon detectors cannot see; only CP-DETECT catches them. Pass `=false` for the legacy LOUD variant. The paper must state which mode produced its results."
+    },
+    "hmac_fail_closed": {
+      "status": "unused",
+      "why": "Changes HMAC failure from scoring to hard rejection.",
+      "when": "AB2 / MitM experiments."
+    },
+    "sybil_gat_evasive": {
+      "status": "unused",
+      "why": "Scatters ghosts onto distinct spread-out RSU cells to evade density detection, instead of the clustered ring.",
+      "when": "Adversarial-robustness testing of ring_detect -- the geometry test assumes a co-located ring, so this is its natural stressor and has NOT been run against it."
+    },
+    "enable_rule_signatures": {
+      "status": "sweep",
+      "why": "AB1 -- removes the psi FUSION term. NOTE: sig_mask and psi still feed the GAT input even under AB1, because the GAT consumes 16 features including psi and all nine signature bits."
+    },
+    "enable_hmac_gate": {
+      "status": "sweep",
+      "why": "AB2 -- HMAC + nonce beacon gate."
+    },
+    "lambda_gat": {
+      "status": "sweep",
+      "why": "AB3 -- rescales the GLOBAL lambda triple only, keeping the psi:ae ratio. JSON on disk untouched."
+    },
+    "lambda_ae": {
+      "status": "sweep",
+      "why": "AB4 -- rescales the GLOBAL lambda triple only, keeping the psi:gat ratio. Needed because k_hat is -1 on most decisions, so the per-attack sets never apply and the global lambda_ae=0.3071 alone caps the AE's vote below Phi_th."
+    },
+    "enable_trs": {
+      "status": "sweep",
+      "why": "AB6 -- TRS threshold signing gate."
+    },
+    "trs_compromised_f": {
+      "status": "sweep",
+      "why": "AB6 f/n sweep -- forces F of n ring members compromised."
+    },
+    "enable_fhe": {
+      "status": "sweep",
+      "why": "AB7 -- plaintext aggregates, TRS still signs."
+    },
+    "ab7_ring_n": {
+      "status": "sweep",
+      "why": "AB7 x-axis, TRS/FHE ring size n. Added but NOT yet built or smoke-tested."
+    },
+    "fhe_ring_dim": {
+      "status": "sweep",
+      "why": "AB7 -- FHE ring dimension N (32768 vs 65536)."
+    },
+    "enable_rsu_lifecycle": {
+      "status": "sweep",
+      "why": "AB8 -- RSU three-state trust lifecycle."
+    },
+    "rsu_malicious_fraction": {
+      "status": "sweep",
+      "why": "AB8 f/n sweep, decoupled from attack_percentage."
+    },
+    "rsu_trust_quorum": {
+      "status": "sweep",
+      "why": "AB8 -- overrides q_i quorum; 2 is reachable at 30 s but weakens BFT."
+    },
+    "t_window": {
+      "status": "sweep",
+      "why": "AB8 -- overrides SC-Revoke's T_w witness window, which was otherwise hardcoded at 30 s regardless of simTime. That hardcoding is why the 300 s AB8 test showed nothing."
+    },
+    "rsu_t_rev": {
+      "status": "sweep",
+      "why": "AB8 -- T_rev consecutive low-trust epochs before permanent demotion."
+    },
+    "rsu_trust_alpha": {
+      "status": "sweep",
+      "why": "AB8 -- RSU trust EMA alpha. THIS is the actual client-demotion gate (tau < tau_min = 0.3); T_rev only gates the later revoke escalation."
+    },
+    "demoted_psi_weight": {
+      "status": "sweep",
+      "why": "AB8 option B -- multiplier on a demoted RSU's psi. 0.5 default; 0 (full silence) measured worse than leaving the poison in."
+    },
+    "enable_ctrl_rotation": {
+      "status": "sweep",
+      "why": "AB9 -- single fixed controller vs the trusted-controller set."
+    },
+    "ctrl_compromise_onset": {
+      "status": "sweep",
+      "why": "AB9 x-axis -- controller compromise onset as a fraction of simTime."
+    },
+    "use_lkh_tree": {
+      "status": "sweep",
+      "why": "AB11 -- LKH tree vs per-member unicast rekey."
+    },
+    "enable_sc_trust": {
+      "status": "sweep",
+      "why": "R3 config 5 -- skips vehicle SC-Trust evidence submission; vehicle trust never decays."
+    },
+    "enable_sc_revoke": {
+      "status": "sweep",
+      "why": "R3 config 5 -- skips vehicle SC-Revoke vote; vehicles are never revoked."
+    },
+    "n_coord": {
+      "status": "sweep",
+      "why": "Experiment 4 / AB3 -- coordinating attacker count."
+    },
+    "streak_sigma": {
+      "status": "sweep",
+      "why": "Experiment 4 -- poisoning streak length."
+    },
+    "eps_max": {
+      "status": "sweep",
+      "why": "AB4 / Experiment 4 -- stealth drift cap per beacon."
+    },
+    "stealth_fraction": {
+      "status": "sweep",
+      "why": "Experiment 1 secondary axis -- stealth vs abrupt proportion (gamma)."
+    },
+    "psi_th": {
+      "status": "sweep",
+      "why": "Composite alert threshold. WARNING: dual role -- it is both the LW alert threshold (`06d_ai_inference.h:1102`) AND the fusion normaliser (`:908`). Sweeping it moves the full-mode decision boundary too. Code default 0.09; the paper's sweep table selects 0.05."
+    },
+    "kappa_th": {
+      "status": "sweep",
+      "why": "MP-S3 KL-divergence threshold."
+    },
+    "delta_th": {
+      "status": "sweep",
+      "why": "TP-S5 drift threshold. Reads vehicle_state, so its calibration is affected by `--per_rsu_vehicle_state`."
+    },
+    "drift_window_k": {
+      "status": "sweep",
+      "why": "TP-S5 drift observation window, in beacons. Same per-RSU-state coupling as delta_th."
+    },
+    "k_sybil": {
+      "status": "sweep",
+      "why": "MP-S1 Sybil density factor. NOTE: ring_detect now also fires the MP-S1 bit, so this no longer sweeps a single mechanism."
+    },
+    "s_max_kmh": {
+      "status": "sweep",
+      "why": "TP-S1/MP-S4 DETECTION speed bound, decoupled from --maxspeed and the trace. Also forces a full-mode detection via the hard speed-bound override."
+    },
+    "phi_max": {
+      "status": "sweep",
+      "why": "GAT graph heading-divergence bound. Code constant PHI_MAX_GRAPH is pi/2; `tab:fullmode-selected` claims 45 degrees for urban."
+    },
+    "ablation_ab": {
+      "status": "sweep",
+      "why": "Selects the AB1-AB11 variant by name."
+    },
+    "trs_classical": {
+      "status": "sweep",
+      "why": "AB7 -- ECDSA-class baseline instead of ML-DSA-87, for the signing-latency comparison."
+    },
+    "tiered_commit": {
+      "status": "sweep",
+      "why": "Blockchain tiered commit strategy on/off."
+    },
+    "t_batch": {
+      "status": "sweep",
+      "why": "Tier-3 batch commit interval, seconds. Constraint: T_batch << T_w."
+    },
+    "n_commit": {
+      "status": "sweep",
+      "why": "Tier-3 batch commit threshold, evidence entries."
+    },
+    "sybil_registration_pct": {
+      "status": "used",
+      "value": "0 (DEFAULT \u2014 never passed)",
+      "why": "\u26a0\ufe0f 0 selects the ORIGINAL Sybil mode, where ghost IDs sit OUTSIDE the registered pool. The code's own comment (02_config_globals.h:155-163) says detection is then \"trivial\" and \"metrics are flat at 1.0 regardless of attack_percentage\", and recommends 30-50 for meaningful variation. MP-S1/MP-S2 results and the ring_detect ghost-recall figure were all obtained in this easy mode."
+    },
+    "faithful_mitm": {
+      "status": "used",
+      "value": "false (DEFAULT \u2014 never passed)",
+      "why": "MP-S3 (attack 6) ran in the default MitM mode, not the faithful variant added in commit dad4bc6."
+    },
+    "mitm_stealth": {
+      "status": "used",
+      "value": "false (DEFAULT \u2014 never passed)",
+      "why": "MP-S3 ran non-stealth. Paired with --faithful_mitm as the a6 MitM variants."
+    },
+    "honest_mp_s1": {
+      "status": "used",
+      "value": "false (DEFAULT \u2014 never passed)",
+      "why": "MP-S1 ghost injection behaves adversarially, not honestly. Diagnostic control for isolating MP-S1's FP contribution."
+    },
+    "uniform_speed_trace": {
+      "status": "used",
+      "value": "false (DEFAULT \u2014 never passed)",
+      "why": "Trace keeps its natural SUMO speed distribution. Set true for Experiment 2, where every vehicle must travel at exactly the target speed."
+    },
+    "rsu_seed": {
+      "status": "used",
+      "value": "0 (DEFAULT \u2014 never passed)",
+      "why": "0 does NOT mean non-reproducible here: when --seed>0 the RSU compromise RNG is derived as run_seed*2654435761+12345 (06a_attack_models.h:558), so the compromised-RSU set is deterministic at --seed=1. It only falls back to the system clock if --seed is also unset. Pass --rsu_seed=N to pin the RSU set independently of the run seed."
+    },
+    "N_Controllers": {
+      "status": "used",
+      "value": "4 (DEFAULT \u2014 never passed)",
+      "why": "Size of the registered controller set C. Relevant to the Eq 3.69 controller-quorum work: the SC-Revoke floor refuses an exclusion that would empty C_trusted, and with 4 controllers all four were once excluded in epoch E7 before that floor existed."
+    },
+    "data_transmission_frequency": {
+      "status": "used",
+      "value": "10.0 (DEFAULT)",
+      "why": "Beacon rate in Hz \u2014 10 Hz = the 100 ms interval T_b assumed throughout the paper. Changing it invalidates every per-beacon threshold and the N_b/detection-feasibility derivation."
+    },
+    "link_lifetime_threshold": {
+      "status": "used",
+      "value": "0.400 (DEFAULT)",
+      "why": "Routing link-lifetime cutoff, calibrated for the 270 m DSRC range. Affects the routing plane only, not detection."
+    },
+    "architecture": {
+      "status": "used",
+      "value": "0 (DEFAULT)",
+      "why": "Network architecture variant selector. 0 is the standard three-plane SDVN layout used for all reported results."
+    },
+    "lambda": {
+      "status": "used",
+      "value": "10 (DEFAULT)",
+      "why": "Routing/link parameter. NOT the fusion weights lambda_1..3 \u2014 those come from fusion_weights.json and are set via --lambda_gat/--lambda_ae. Name collision; do not confuse them."
+    },
+    "experiment_number": {
+      "status": "used",
+      "value": "0 (DEFAULT)",
+      "why": "Experiment selector for the Exp1-Exp5 harness; 0 = plain run, which is what the reported detection results use."
+    },
+    "routing_algorithm": {
+      "status": "used",
+      "value": "0 (DEFAULT)",
+      "why": "Routing protocol selector. Inert for detection runs \u2014 meaningful only when --routing_test=true."
+    },
+    "qf": {
+      "status": "used",
+      "value": "0 (DEFAULT)",
+      "why": "Queue/flow parameter for the routing plane. Inert for detection runs."
+    },
+    "delta_hmac": {
+      "status": "used",
+      "value": "0.5 (DEFAULT)",
+      "why": "H5 Delta_HMAC beacon freshness window, seconds. A beacon whose timestamp is staler than this is rejected by LW-DETECT before signature scoring."
+    },
+    "delta_trs": {
+      "status": "used",
+      "value": "2.0 (DEFAULT)",
+      "why": "H6 Delta_TRS freshness window for sigma_TRS verification (Eq 3.53). Inert while --skip_blockchain=true."
+    },
+    "poison_theta": {
+      "status": "sweep",
+      "why": "AB4 sweep: attack deviation scale theta in [0,1], default 0.5. Scales max_position_deviation / max_velocity_deviation in PoisonTrajectoryByType(). LOWER = stealthier, so the psi rules and the spatial GAT stop saturating and the LSTM-AE becomes the discriminating tier. Left at its default in the reported runs."
+    }
+  }
+}

@@ -1,0 +1,29 @@
+#!/bin/sh
+# Blocks a commit if RUN_CONFIG.md is stale or a CLI flag has no rationale.
+# Enabled by:  git config core.hooksPath tools/hooks
+# Bypass once: git commit --no-verify
+
+ROOT=$(git rev-parse --show-toplevel) || exit 0
+[ -f "$ROOT/tools/dump_run_config.py" ] || exit 0
+
+if ! python3 "$ROOT/tools/dump_run_config.py" --check; then
+    cat >&2 <<'MSG'
+
+────────────────────────────────────────────────────────────────
+COMMIT BLOCKED — simulator flags and RUN_CONFIG.md are out of sync.
+
+A CLI flag with no documented rationale is how a run gets silently
+misconfigured. Two defaults have already cost this project days:
+  routing_test          (true,  declared in 07_socket_layer.h)
+  stealthy_control_plane(true,  active in every reported run)
+
+Fix:
+  1. add an entry to tools/flag_rationale.json
+  2. python3 tools/dump_run_config.py
+  3. git add RUN_CONFIG.md tools/flag_rationale.json
+
+Bypass (only if you know why): git commit --no-verify
+────────────────────────────────────────────────────────────────
+MSG
+    exit 1
+fi
