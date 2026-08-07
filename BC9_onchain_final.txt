@@ -1,0 +1,150 @@
+--- GetAllControllerFlags: 14 ---
+[
+ {
+  "ID": "CFLAG_CTRL_0_VEH_129_E7",
+  "ControllerID": "CTRL_0",
+  "VehicleID": "VEH_129",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-05T18:36:22Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_1_VEH_108_E7",
+  "ControllerID": "CTRL_1",
+  "VehicleID": "VEH_108",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-05T18:36:22Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_1_VEH_38_E7",
+  "ControllerID": "CTRL_1",
+  "VehicleID": "VEH_38",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-05T18:36:18Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_2_VEH_191_E7",
+  "ControllerID": "CTRL_2",
+  "VehicleID": "VEH_191",
+  "Epoch": "E7",
+  "ConflictCount": 2,
+  "NumRSUs": 2,
+  "ImplicitCleanVotes": 2,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-05T18:36:31Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_2_VEH_23_E7",
+  "ControllerID": "CTRL_2",
+  "VehicleID": "VEH_23",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-05T18:36:31Z"
+ },
+ {
+  "ID": "CFLAG
+--- GetControllerReassignments: 4 ---
+[
+ {
+  "ID": "CTRLREASSIGN_CTRL_0_E7",
+  "ExcludedController": "CTRL_0",
+  "SuccessorController": "CTRL_2",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "ThresholdFP1": 1,
+  "At": "2026-08-05T18:36:22Z"
+ },
+ {
+  "ID": "CTRLREASSIGN_CTRL_1_E7",
+  "ExcludedController": "CTRL_1",
+  "SuccessorController": "CTRL_0",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "ThresholdFP1": 1,
+  "At": "2026-08-05T18:36:18Z"
+ },
+ {
+  "ID": "CTRLREASSIGN_CTRL_2_E7",
+  "ExcludedController": "CTRL_2",
+  "SuccessorController": "CTRL_3",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "ThresholdFP1": 1,
+  "At": "2026-08-05T18:36:25Z"
+ },
+ {
+  "ID": "CTRLREASSIGN_CTRL_3_E8",
+  "ExcludedController": "CTRL_3",
+  "SuccessorController": "",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E8",
+  "ConflictCount": 1,
+  "ThresholdFP1": 1,
+  "At": "2026-08-05T18:44:39Z"
+ }
+]
+--- GetAllControllerTrustScores: 4 ---
+[
+ {
+  "ID": "CTRUST_CTRL_0",
+  "ControllerID": "CTRL_0",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-05T18:27:28Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_1",
+  "ControllerID": "CTRL_1",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-05T18:27:40Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_2",
+  "ControllerID": "CTRL_2",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-05T18:27:44Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_3",
+  "ControllerID": "CTRL_3",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-05T18:27:51Z"
+ }
+]
+--- GetActiveController --- EMPTY {"ok": false, "error": "evaluate GetActiveController: rpc error: code = Unknown desc = evaluate call to endorser returned error: chaincode response 500, no active controller in C_trusted"}

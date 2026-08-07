@@ -68,8 +68,11 @@ def load_scenario_assets(scenario: str):
     Load GAT (shared, 6-dim) + the deployed scenario-specific 6-dim LSTM-AE,
     its 6-dim scaler, per-scenario theta_ae, and window length.
     """
-    # GAT model (shared)
-    gat = GATDetector(in_dim=6).to(DEVICE)
+    # GAT model (shared) -- in_dim must match FEATURE_DIM (16), not the stale
+    # 6-dim assumption this had; recalibrate_gat_per_scenario.py already uses
+    # the correct default. Fixes a load crash for every scenario, not just
+    # rural (2026-07-31).
+    gat = GATDetector().to(DEVICE)
     gat_path = os.path.join(MODEL_DIR, "shared", "gat_model.pt")
     if not os.path.exists(gat_path):
         gat_path = os.path.join(MODEL_DIR, "gat_model.pt")

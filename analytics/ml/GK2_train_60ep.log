@@ -1,0 +1,48 @@
+[gk2] corpus rows=546646 ghosts=25424 runs=81
+    bucket k=-1: available= 34244 taken= 1500
+    bucket k= 0: available=  1196 taken= 1196
+    bucket k= 1: available=  1066 taken= 1066
+    bucket k= 2: available=  3751 taken= 1500
+    bucket k= 3: available=  4245 taken= 1500
+    bucket k= 4: available=   460 taken=  460
+    bucket k= 5: available=  1886 taken= 1500
+    bucket k= 6: available=  4099 taken= 1500
+[gk2] windows: ghost-bearing=6356 non-ghost(stratified)=10222 total=16578
+[gk2] graphs built: 16578  (dropped 0 edgeless)
+[gk2] graph size: min=4 p50=10 max=10
+[gk2] valid class rows=99066 pos/class=[9470, 7507, 32399, 11714, 2632, 10942, 11302]
+[gk2] w_pos=[5.23, 6.6, 1.53, 4.23, 18.82, 4.53, 4.38]
+[gk2] training 60 epochs on 13262 graphs (val 3316) …
+  epoch   1  train=4.8981  val=5.1191  best=5.1191
+  epoch   5  train=11.1770  val=14.7998  best=5.1191
+  epoch  10  train=12.1155  val=11.9629  best=5.1191
+  epoch  15  train=2.7883  val=3.3808  best=3.3808
+  epoch  20  train=2.5776  val=3.3471  best=3.0316
+  epoch  25  train=2.4255  val=2.9503  best=2.8558
+  epoch  30  train=2.3135  val=2.5488  best=2.5222
+  epoch  35  train=2.2737  val=2.7232  best=2.5222
+  epoch  40  train=2.2529  val=2.5567  best=2.4977
+  epoch  45  train=2.1612  val=2.5118  best=2.3997
+  epoch  50  train=2.1976  val=2.3977  best=2.3977
+  epoch  55  train=2.1553  val=2.3947  best=2.3852
+  epoch  60  train=2.1252  val=2.4045  best=2.3540
+[gk2] restored best-val checkpoint (2.3540)
+/home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35/analytics/ml/train_gat_ghost_k2.py:227: DeprecationWarning: You are using the legacy TorchScript-based ONNX export. Starting in PyTorch 2.9, the new torch.export-based ONNX exporter has become the default. Learn more about the new export logic: https://docs.pytorch.org/docs/stable/onnx_export.html. For exporting control flow: https://pytorch.org/tutorials/beginner/onnx/export_control_flow_model_to_onnx_tutorial.html
+  torch.onnx.export(raw, (torch.randn(n, 16), torch.tensor([list(range(n)), list(range(n))], dtype=torch.long)),
+/home/sdvn_mobility_flooding/.local/lib/python3.12/site-packages/torch/onnx/_internal/torchscript_exporter/symbolic_opset9.py:5296: UserWarning: Exporting aten::index operator with indices of type Byte. Only 1-D indices are supported. In any other case, this will produce an incorrect ONNX graph.
+  indices = [try_mask_to_index(idx) for idx in indices]
+
+======================================================================
+[gk2] WITHIN-WINDOW SEPARATION on held-out ghost windows
+======================================================================
+  ghost windows evaluated : 1090   S degenerate(all-equal): 238 (21.8%)
+  S      AUC  mean=0.4151 p50=0.5000   (deployed model: 0.512)
+  bv[k2] AUC  mean=0.5363 p50=0.5000   (deployed model: 0.503)
+
+  theta_S (clean p95) = 3.606
+  S  ghost p50=0.119  clean p50=0.484
+  k2 head  ghost mean=0.9991 p50=0.9999 | clean mean=0.2585 p95=0.9986
+    ghost bv_k2>=0.5: 100.0%   clean bv_k2>=0.5:  23.0%
+    ghost bv_k2>=0.8: 100.0%   clean bv_k2>=0.8:  13.5%
+
+[gk2] saved to /home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35/analytics/ml/models/urban_ghostk2_test (ISOLATED — nothing deployed reads this)

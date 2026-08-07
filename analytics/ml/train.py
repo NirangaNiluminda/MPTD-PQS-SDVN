@@ -176,13 +176,41 @@ def build_gat_dataset(df: pd.DataFrame):
     """
     feat_cols = ["pos_x", "pos_y", "speed", "heading", "accel"]
     T_B = 0.1  # beacon interval (s) — paper §3.3, Eq. 3.21
-    # Bucket to nearest beacon tick. Use floor so a beacon arriving at 7.005s
-    # and another at 7.095s both land in bucket 7.0 (start of that tick).
     df = df.copy()
-    df["_tick"] = (df["sim_time"] / T_B).round().astype(int)
-    group_keys = ["run_id", "_tick"] if "run_id" in df.columns else ["_tick"]
+
+    # ── STEP 3 / Fix B (2026-08-04) — graph grouping must match the runtime ──
+    # PREVIOUSLY: grouped by (run_id, tick), i.e. EVERY vehicle across the whole
+    # map at one timestep. But the C++ runtime scores ONE RSU's accumulated
+    # ~10-beacon window (ipfs_push_and_maybe_flush -> run_gat_fusion_for_rsu).
+    # Because S_i is a snapshot-RELATIVE z-score norm (Eq. 3.42: z is computed
+    # over the snapshot's own nodes), these two groupings produce completely
+    # different score distributions from IDENTICAL weights — the model was
+    # being trained on a different task than it is served on. Measured with the
+    # unmodified deployed weights on the same corpus:
+    #     map-wide (run_id, tick) : AUC = 0.4416  (no separation)
+    #     per-RSU 10-beacon window: AUC = 0.7439  (real separation)
+    # Now grouped per-RSU and chunked into consecutive RSU_WINDOW-beacon windows
+    # ordered by sim_time, mirroring the RSU's accumulate-then-flush behaviour.
+    RSU_WINDOW = int(os.environ.get("MPTD_GAT_RSU_WINDOW", "10"))
     graphs = []
-    for _key, grp in df.groupby(group_keys):
+    if "rsu_id" in df.columns:
+        group_keys = ["run_id", "rsu_id"] if "run_id" in df.columns else ["rsu_id"]
+        chunks = []
+        for _key, g in df.groupby(group_keys):
+            g = g.sort_values("sim_time")
+            for start in range(0, len(g) - RSU_WINDOW + 1, RSU_WINDOW):
+                chunks.append(g.iloc[start:start + RSU_WINDOW])
+        grouped = enumerate(chunks)
+    else:
+        # Legacy fallback when rsu_id is absent (e.g. synthetic data): keep the
+        # old per-tick behaviour so those paths still run.
+        print("[train] WARNING: no rsu_id column — falling back to per-tick grouping "
+              "(will not match runtime scoring; see Fix B)")
+        df["_tick"] = (df["sim_time"] / T_B).round().astype(int)
+        gk = ["run_id", "_tick"] if "run_id" in df.columns else ["_tick"]
+        grouped = df.groupby(gk)
+
+    for _key, grp in grouped:
         if len(grp) < 2:
             # Snapshot-level z-score in GATDetector forward needs N≥2 for
             # std() to be defined. Single-vehicle snapshots are rare; skip
@@ -269,6 +297,9 @@ def train_gat(df: pd.DataFrame) -> GATDetector:
     # gradient scale, so a plain last-epoch save can land on a worse model.
     import copy
     GRAD_CLIP = float(os.environ.get("MPTD_GAT_GRAD_CLIP", "5.0"))
+    # Opt-in extra weight on the classification-head loss (Critical Issue 3 fix
+    # attempt): default 1.0 leaves every existing caller byte-identical.
+    _loss_k_weight = float(os.environ.get("MPTD_GAT_LOSS_K_WEIGHT", "1.0"))
     best_val   = float("inf")
     best_state = copy.deepcopy(model.state_dict())
 
@@ -301,7 +332,7 @@ def train_gat(df: pd.DataFrame) -> GATDetector:
             # Summed per-head class-weighted BCE (revised eq:gat_loss).
             w = ym * w_pos_t + (1.0 - ym) * w_neg_t        # (N,K) per-element weight
             loss_k = nn.functional.binary_cross_entropy(atk, ym, weight=w, reduction="mean") * ATTACK_CLASSES
-            loss = loss_s + loss_k
+            loss = loss_s + _loss_k_weight * loss_k
             loss.backward()
             if GRAD_CLIP > 0:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
@@ -423,6 +454,40 @@ def train_lstm_ae(df: pd.DataFrame):
 # Main
 # ---------------------------------------------------------------------------
 
+class _GatExportRawScore(nn.Module):
+    """
+    STEP 3 / Fix A (2026-08-04) — ONNX export contract.
+
+    The DEPLOYED gat_model.onnx emits the RAW spatial anomaly score s_i (its
+    `scores` output node is ReduceL2 — verified by inspecting the ONNX graph),
+    and θ_S is calibrated against that raw scale (θ_S = 19.74, observed S ≈ 7.7).
+    But GATDetector.forward() returns sigmoid(score_scale·s_i + score_bias),
+    which is bounded to [0,1]. Exporting forward() directly therefore ships a
+    model whose scores are ~0.52, so the runtime computes S/θ_S ≈ 0.52/19.74
+    ≈ 0.026 — a constant, for every beacon and every attack type. This was
+    measured as the cause of three failed GAT retrains.
+
+    This wrapper re-emits s_i BEFORE the affine+sigmoid, restoring the deployed
+    contract. Training is unaffected: the sigmoid head still shapes the
+    embedding via BCE (which needs [0,1]); only the exported graph changes.
+
+    NOTE: θ_S must be recalibrated whenever the model is retrained, since s_i's
+    scale is not fixed across training runs.
+    """
+    def __init__(self, model: GATDetector):
+        super().__init__()
+        self.m = model
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        emb = self.m.act(self.m.conv1(x, edge_index))
+        emb = self.m.act(self.m.conv2(emb, edge_index))
+        mu  = emb.mean(dim=0, keepdim=True)
+        sig = emb.std(dim=0, keepdim=True) + 1e-6
+        s_i = ((emb - mu) / sig).norm(dim=1, keepdim=True)   # raw s_i (Eq. 3.42)
+        atk = torch.sigmoid(self.m.cls_heads(emb))
+        return s_i, atk
+
+
 def export_gat_onnx(model: GATDetector, path: str, n_nodes: int = 16):
     """
     Export GAT to ONNX via the legacy TorchScript exporter (dynamo=False).
@@ -439,12 +504,14 @@ def export_gat_onnx(model: GATDetector, path: str, n_nodes: int = 16):
                             (argmax_k → predicted attack type k̂_i)
     """
     model.eval()
+    # Fix A: export the raw-s_i wrapper, not model.forward() (see _GatExportRawScore).
+    export_model = _GatExportRawScore(model).eval()
     dummy_x  = torch.randn(n_nodes, FEATURE_DIM, dtype=torch.float32)
     # Self-loop edges so the trace always has at least one edge per node.
     dummy_ei = torch.tensor([[i for i in range(n_nodes)],
                              [i for i in range(n_nodes)]], dtype=torch.long)
     torch.onnx.export(
-        model,
+        export_model,
         (dummy_x, dummy_ei),
         path,
         input_names  = ["x", "edge_index"],

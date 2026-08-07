@@ -1,0 +1,83 @@
+BC7 — on-chain final state  (30s, rho_a=0.40, combined attack, ablation_mode=0,
+routing_test=false, skip_blockchain=false, routing_algorithm=4,
+cder_credit_cp_detect=1, --tiered_commit=0, seed=1)
+
+Run completed 2026-08-05 ~21:00 (sim reached t=29.0004).
+Log: BC7_30s_tiered0.log
+
+PROVENANCE NOTE: transcribed verbatim from the live gateway queries executed at
+21:01 and 21:05 on 2026-08-05, i.e. after the run completed and before the
+subsequent BC8 run's ResetLedger wiped the ledger at ~21:07. These are recorded
+measurements, not re-queried values — the ledger no longer holds them. Re-obtain
+by re-running BC7's command if independent confirmation is required.
+
+=== GetAllControllerFlags : 1 record ===
+{
+ "ID": "CFLAG_CTRL_2_VEH_191_E7",
+ "ControllerID": "CTRL_2",
+ "VehicleID": "VEH_191",
+ "Epoch": "E7",
+ "ConflictCount": 2,
+ "NumRSUs": 2,
+ "ImplicitCleanVotes": 2,
+ "ThresholdFP1": 2,
+ "FlaggedAt": "2026-08-05T15:03:12Z"
+}
+
+=== GetControllerReassignments : 1 record ===
+{
+ "ID": "CTRLREASSIGN_CTRL_2_E7",
+ "ExcludedController": "CTRL_2",
+ "SuccessorController": "CTRL_0",
+ "Reason": "cp_detect_conflict",
+ "Epoch": "E7",
+ "ConflictCount": 2,
+ "ThresholdFP1": 2,
+ "At": "2026-08-05T15:03:12Z"
+}
+
+=== GetActiveController ===
+CTRL_0
+
+=== GetAllControllerTrustScores : 4 records (FINAL, epoch E26) ===
+CTRUST_CTRL_0  TrustScore=0.9999925045065217  MeanConflict=0
+               NumRSUsLastEpoch=42  ConsecutiveLowEpochs=0  UpdateCount=10
+CTRUST_CTRL_1  TrustScore=1                   MeanConflict=0
+               NumRSUsLastEpoch=3   ConsecutiveLowEpochs=0  UpdateCount=10
+CTRUST_CTRL_2  TrustScore=1                   MeanConflict=0
+               NumRSUsLastEpoch=0   ConsecutiveLowEpochs=0  UpdateCount=0
+               (EXCLUDED — no further updates after exclusion)
+CTRUST_CTRL_3  TrustScore=0.9998979399999999  MeanConflict=0
+               NumRSUsLastEpoch=4   ConsecutiveLowEpochs=0  UpdateCount=7
+
+=== INTERIM trust state, sampled mid-run at epoch E9 (t ~ 14s) ===
+CTRUST_CTRL_0  TrustScore=0.9364814814814815  MeanConflict=0.07407407407407407
+CTRUST_CTRL_3  TrustScore=0.8599999999999999  MeanConflict=0.2
+Recorded to show the decay-then-recover behaviour: the Eq 3.55 EMA
+tau <- alpha*tau + (1-alpha)*(1-meanConflict) pulls trust back toward 1.0 once
+conflicts stop. On-chain conflicts occurred only in epochs E7-E9 of 27.
+
+=== In-sim metrics (same run) ===
+MCC       = 0.3834   (lightweight)
+MCC_full  = 0.4224   (fusion)
+CDER      = 0.0991   (775/7824 wrong)
+CDER_full = 0.3337   (2311/6926 wrong)
+CP-DETECT = 3887 alerts over 3912 audited epochs, flag_c=1,
+            ctrl_evidence=3887, local ctrl_trust=0.0000
+Actual poison rate = 88.14%
+
+=== INTERPRETATION ===
+FIRST run in which the on-chain CP-DETECT chain fires end-to-end:
+CFLAG written -> controller excluded from C_trusted -> successor activated.
+Prior runs (BC5/BC6, batched) had CFLAG=0, MeanConflict=0, no reassignment.
+
+NOT demonstrated: sustained trust decay. tau never stays below tau_min for T_rev
+consecutive epochs because on-chain conflict events are rare (1 honest RSU
+witness per vehicle-epoch in 97.8% of pairs vs a threshold of f+1=2).
+
+CAVEAT: this run used --tiered_commit=0, which disables the paper's Tier-3
+batched commit (Sec 3.5.5) and therefore forfeits the PBPO transaction-count
+claim. It is a DIAGNOSTIC isolating the commit-timing race, not a shippable
+configuration. The shipped fix is the targeted flush
+(tier3_flush_for_vid_epoch, 08_detection_engine.h) verified by run BC8 with
+batching left ON.

@@ -1,0 +1,8 @@
+=== pairs with >=2 distinct RSU witnesses ===
+VEH_191 E7: Phi=0 cAnom=False rsus=[('RSU_35', 0.85), ('RSU_43', 0.15)] -> conflict=2 fP1=2 FIRES=True
+VEH_191 E8: Phi=0.45 cAnom=True rsus=[('RSU_35', 0.85), ('RSU_43', 0.2)] -> conflict=0 fP1=2 FIRES=False
+VEH_191 E9: Phi=0 cAnom=False rsus=[('RSU_35', 0.85), ('RSU_43', 0.2)] -> conflict=2 fP1=2 FIRES=True
+VEH_191 E10: Phi=0.300425 cAnom=True rsus=[('RSU_35', 0.85), ('RSU_43', 0.1)] -> conflict=0 fP1=2 FIRES=False
+
+pairs with BOTH SUBM+CSUBM: 178/183
+pairs showing suppression asymmetry (Phi<=th, some psi>th): 122

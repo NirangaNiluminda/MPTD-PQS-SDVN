@@ -36,8 +36,8 @@ import numpy as np
 D = "/tmp/claude-1001/-home-sdvn-mobility-flooding-Niranga-MPTD-PQS-SDVN/6472eadc-2635-44cc-8573-bb1807cc26d5/scratchpad"
 PHI_TH = 0.5
 L_PSI, L_GAT, L_AE = 0.5071, 0.1857, 0.3071   # deployed global set (fusion_weights.json)
-RX = re.compile(r'psi=([0-9.]+) S=([0-9.eE+-]+) ae_norm=([0-9.]+) ae_raw=([0-9.eE+-]+)'
-                r'.*?gt_pois=(\d) phi=([0-9.eE+-]+).*?full_anom=(YES|no)')
+RX = re.compile(r'psi=([0-9.]+).*?S=([0-9.eE+-]+).*?ae_norm=([0-9.]+).*?ae_raw=([0-9.eE+-]+)'
+                r'.*?gt_pois=(\d).*?phi=([0-9.eE+-]+).*?full_anom=(YES|no)')
 
 
 def load(seed):
