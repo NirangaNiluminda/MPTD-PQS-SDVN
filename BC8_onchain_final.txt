@@ -1,0 +1,75 @@
+--- GetAllControllerFlags: 1 ---
+[
+ {
+  "ID": "CFLAG_CTRL_2_VEH_191_E7",
+  "ControllerID": "CTRL_2",
+  "VehicleID": "VEH_191",
+  "Epoch": "E7",
+  "ConflictCount": 2,
+  "NumRSUs": 2,
+  "ImplicitCleanVotes": 2,
+  "ThresholdFP1": 2,
+  "FlaggedAt": "2026-08-05T15:56:17Z"
+ }
+]
+--- GetControllerReassignments: 1 ---
+[
+ {
+  "ID": "CTRLREASSIGN_CTRL_2_E7",
+  "ExcludedController": "CTRL_2",
+  "SuccessorController": "CTRL_0",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E7",
+  "ConflictCount": 2,
+  "ThresholdFP1": 2,
+  "At": "2026-08-05T15:56:17Z"
+ }
+]
+--- GetAllControllerTrustScores: 4 ---
+[
+ {
+  "ID": "CTRUST_CTRL_0",
+  "ControllerID": "CTRL_0",
+  "TrustScore": 0.9999999999385045,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 42,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "E26",
+  "UpdateCount": 18,
+  "UpdatedAt": "2026-08-05T16:11:23Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_1",
+  "ControllerID": "CTRL_1",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 3,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "E26",
+  "UpdateCount": 18,
+  "UpdatedAt": "2026-08-05T16:11:23Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_2",
+  "ControllerID": "CTRL_2",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-05T15:50:42Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_3",
+  "ControllerID": "CTRL_3",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 4,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "E26",
+  "UpdateCount": 14,
+  "UpdatedAt": "2026-08-05T16:11:23Z"
+ }
+]
+--- GetActiveController --- CTRL_0

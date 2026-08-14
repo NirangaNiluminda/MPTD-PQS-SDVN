@@ -19,10 +19,16 @@ def load_beacon_csv(path: str) -> pd.DataFrame:
         df = df.rename(columns=rename_map)
 
     if "run_id" not in df.columns:
-        BOUNDARY_DROP = 2.0
-        prev = df["sim_time"].shift(1)
-        new_run = (prev.notna() & ((prev - df["sim_time"]) > BOUNDARY_DROP))
-        df["run_id"] = new_run.cumsum().astype(int)
+        if "source_run" in df.columns:
+            # Prefer the explicit run label written by combine_data.py over
+            # guessing from time gaps -- exact and can't be fooled by unusual
+            # sim_time patterns within a real run.
+            df["run_id"] = df["source_run"].astype("category").cat.codes
+        else:
+            BOUNDARY_DROP = 2.0
+            prev = df["sim_time"].shift(1)
+            new_run = (prev.notna() & ((prev - df["sim_time"]) > BOUNDARY_DROP))
+            df["run_id"] = new_run.cumsum().astype(int)
     return df
 
 def filter_clean_only(df: pd.DataFrame) -> pd.DataFrame:
@@ -71,14 +77,14 @@ def build_windows(beacon_df, vehicle_id: int, window: int = WINDOW_SIZE) -> np.n
     windows = np.stack([feats_6[i:i+window] for i in range(len(feats_6) - window + 1)])
     return windows
 
-def build_all_windows(df: pd.DataFrame) -> np.ndarray:
+def build_all_windows(df: pd.DataFrame, window: int = WINDOW_SIZE) -> np.ndarray:
     group_keys = ["run_id", "vehicle_id"] if "run_id" in df.columns else ["vehicle_id"]
     all_windows = []
     for _key, vdf in df.groupby(group_keys):
         vdf = vdf.sort_values("sim_time").reset_index(drop=True)
-        wins = build_windows(vdf, vehicle_id=vdf["vehicle_id"].iloc[0])
+        wins = build_windows(vdf, vehicle_id=vdf["vehicle_id"].iloc[0], window=window)
         if len(wins) > 0:
             all_windows.append(wins)
     if not all_windows:
-        return np.empty((0, WINDOW_SIZE, FEATURE_DIM), dtype=np.float32)
+        return np.empty((0, window, FEATURE_DIM), dtype=np.float32)
     return np.concatenate(all_windows, axis=0).astype(np.float32)

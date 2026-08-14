@@ -79,6 +79,16 @@ uint32_t cm_full_FN = 0;
 //
 // Reset implicitly per process — first sim run starts with empty set.
 std::unordered_set<uint32_t> g_ctrl_seen_vids;
+// C3: per-RSU-cell accepted-vehicle sets for spatial TDEE (ρ̂_cell, Eq 4.5).
+// A vehicle is attributed to the Voronoi cell of its REPORTED position, so a
+// poisoned position lands the vehicle in the wrong cell → spatial density
+// distortion, which TDEE must expose.
+std::unordered_set<uint32_t> g_ctrl_seen_cell[MAX_RSUS];
+// C3: ground-truth counterpart (ρ_gt_cell) — vehicles attributed to the cell
+// of their SUMO true position, sampled at the SAME beacon instants as ρ̂.
+// Sampled during the sim because ns-3 mobility models assert if queried after
+// Simulator::Destroy() (metrics-print time).
+std::unordered_set<uint32_t> g_gt_seen_cell[MAX_RSUS];
 
 // ── Helper: create directory (no-op if exists) ────────────────────────────────
 static void ensure_analytics_dir(const char *path)
@@ -135,8 +145,16 @@ static inline const char* mptd_scenario_name() {
         default: return "urban";
     }
 }
+// Scenario tag for the live-results dir, optionally suffixed with the PID so
+// concurrent runs don't share beacon_log.csv (see g_per_pid_results). export_run_dataset
+// MUST use this same tag so it copies from the process's own live dir.
+static inline std::string mptd_scenario_tag() {
+    std::string t = mptd_scenario_name();
+    if (g_per_pid_results) t += "_pid" + std::to_string((long)getpid());
+    return t;
+}
 static inline std::string mptd_results_dir() {
-    return std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_name() + "/";
+    return std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_tag() + "/";
 }
 
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
@@ -175,10 +193,26 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
 
     // R7b: read ground-truth pose from mobility provider (== ns-3 MobilityModel).
     // Falls back to reported pose if provider is absent (shouldn't happen post-R7a).
+    //
+    // INDEX FIX (2026-07-20): `vid` here is the beacon tag's vehicle_id = ns-3 NodeID
+    // (`tag.SetVehicleId(nid)` in 09_vehicle_beacon_tx.h). get_gt_position() indexes
+    // Vehicle_Nodes by the 0-based LOCAL vehicle index. Vehicles are created AFTER the
+    // RSUs/controllers/mgmt/cloud nodes, so the first vehicle's NodeID is
+    // g_first_vehicle_node_id (NOT 2). Convert with that base — same conversion the
+    // TPE accumulator (08_detection_engine.h:2251) and socket layer (07:281) use.
+    // (The earlier hardcoded `vid-2` was off by the true base → read an adjacent
+    //  unrelated vehicle → ~800 m gt error.)
+    // Ghost identities (vid >= GHOST_VID_BASE=10000, see 08_detection_engine.h)
+    // have no backing ns-3 Node/MobilityModel, so v_idx would be a garbage
+    // index into the real-vehicle mobility provider. Skip the gt lookup for
+    // them and fall back to the reported (tag) pose — there is no separate
+    // "ground truth" for a fabricated identity; its reported position IS the
+    // only position that exists.
+    const uint32_t v_idx = (vid >= g_first_vehicle_node_id) ? (vid - g_first_vehicle_node_id) : 0;
     double gt_x = tag.GetPosX(), gt_y = tag.GetPosY(), gt_spd = tag.GetSpeed();
-    if (g_mobility_provider) {
-        Vector p = g_mobility_provider->get_gt_position(vid);
-        Vector v = g_mobility_provider->get_gt_velocity(vid);
+    if (g_mobility_provider && vid < 10000) {
+        Vector p = g_mobility_provider->get_gt_position(v_idx);
+        Vector v = g_mobility_provider->get_gt_velocity(v_idx);
         gt_x   = p.x;
         gt_y   = p.y;
         gt_spd = std::sqrt(v.x*v.x + v.y*v.y + v.z*v.z);
@@ -223,7 +257,26 @@ void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
 
     // R7a: feed TDEE estimator. A beacon that PASSES detection (detected==false)
     // reaches the controller and contributes to its density estimate ρ̂(t).
-    if (!detected) g_ctrl_seen_vids.insert(vid);
+    if (!detected)
+    {
+        g_ctrl_seen_vids.insert(vid);
+        // C3: attribute the vehicle to the Voronoi cell of its REPORTED
+        // position — a poisoned position places it in the wrong cell, which
+        // is exactly the spatial distortion TDEE (Eq 4.5) must expose.
+        uint32_t cell = nearest_rsu_for_position((double)tag.GetPosX(),
+                                                 (double)tag.GetPosY());
+        if (cell < MAX_RSUS) g_ctrl_seen_cell[cell].insert(vid);
+    }
+    // C3: ρ_gt_cell sample — the vehicle's TRUE cell at this instant. Booked
+    // for every beacon (detected or not: the vehicle physically exists either
+    // way). Sybil-forged vids ≥ N_Vehicles are excluded (no real vehicle).
+    if (v_idx < N_Vehicles && g_mobility_provider
+        && g_mobility_provider->is_sumo_derived())
+    {
+        const Vector gt = g_mobility_provider->get_gt_position(v_idx);   // container index, not NodeID
+        uint32_t gcell = nearest_rsu_for_position(gt.x, gt.y);
+        if (gcell < MAX_RSUS) g_gt_seen_cell[gcell].insert(v_idx);
+    }
 }
 
 // ── TP-S1 Before/After Poison Log ─────────────────────────────────────────────
@@ -615,9 +668,13 @@ void log_controller_poison(double sim_t,
 double compute_MCC()
 {
     double tp = cm_TP, fp = cm_FP, tn = cm_TN, fn = cm_FN;
-    double denom = std::sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn));
-    if (denom < 1e-9) return 0.0;
-    return (tp*tn - fp*fn) / denom;
+    // Eq 4.1: ε-smoothed MCC — removes the undefined 0/0 when a class is absent
+    // (e.g. ρ_a=0 → no attackers → TP=FN=0). ε=1e-12 is negligible for any
+    // non-degenerate confusion matrix, so real MCC values are unchanged.
+    const double e = 1e-12;
+    double num   = (tp+e)*(tn+e) - (fp+e)*(fn+e);
+    double denom = std::sqrt((tp+fp+e)*(tp+fn+e)*(tn+fp+e)*(tn+fn+e));
+    return num / denom;
 }
 
 // FPR: False Positive Rate  —  FP / (FP + TN)
@@ -634,9 +691,11 @@ double compute_FPR()
 double compute_MCC_full()
 {
     double tp = cm_full_TP, fp = cm_full_FP, tn = cm_full_TN, fn = cm_full_FN;
-    double denom = std::sqrt((tp+fp)*(tp+fn)*(tn+fp)*(tn+fn));
-    if (denom < 1e-9) return 0.0;
-    return (tp*tn - fp*fn) / denom;
+    // Eq 4.1: ε-smoothed MCC (see compute_MCC) — defined at class absence.
+    const double e = 1e-12;
+    double num   = (tp+e)*(tn+e) - (fp+e)*(fn+e);
+    double denom = std::sqrt((tp+fp+e)*(tp+fn+e)*(tn+fp+e)*(tn+fn+e));
+    return num / denom;
 }
 
 double compute_FPR_full()
@@ -647,16 +706,20 @@ double compute_FPR_full()
 }
 
 // PARR: Poisoning Attack Rejection Rate (Eq. 4.3)
-// Fraction of poisoned blockchain submissions correctly rejected by the TRS layer.
-// A "TRS rejection" is counted per poisoned beacon flagged by the RSU lightweight
-// detector (flag=1, Eq 3.67). This is the per-beacon witness signal that feeds the
-// BFT revocation quorum (2f+1 distinct trusted RSUs within window T_w, Eq 3.65).
-// Unlike DR = TP/(TP+FN) (overall per-beacon detection rate), PARR is scoped to the
-// poisoned-beacon population and reflects the TRS-layer rejection outcome.
+// Paper definition: TRS-rejected poisoned aggregates / total poisoned aggregates
+// INJECTED. C4b wires a natural injector — a compromised ring coordinator that
+// tampers its signed aggregate post-signing (08_detection_engine.h) — so the
+// numerator g_parr_rejected and denominator g_parr_injected are booked only when
+// such an attacker is actually present and closing the ring. Returns -1 (N/A)
+// when no poisoned aggregate was injected (honest ring, or coordinator not
+// compromised), consistent with the other C5–C9 metrics. Full mode → ~1.0
+// (every tampered aggregate rejected at the TRS gate); AB6 (TRS off) → 0.0 (no
+// gate, injections pass). The raw crypto-gate tally g_trs_verified_count /
+// g_trs_rejected_count is still emitted separately for reference.
 double compute_PARR()
 {
-    if (parr_poisoned_total == 0) return 0.0;
-    return (double)parr_trs_rejected / (double)parr_poisoned_total;
+    if (g_parr_injected == 0) return -1.0;
+    return (double)g_parr_rejected / (double)g_parr_injected;
 }
 
 // CDER: Control Decision Error Rate (paper §4.1.2, Eq. 4.4)
@@ -669,12 +732,27 @@ double compute_PARR()
 // Fallback (Option B inactive / no downlink decisions): beacon-level (FP+FN)/total.
 double compute_CDER()
 {
-    if (ctrl_decisions_total > 0)
-        return (double)ctrl_decisions_wrong / (double)ctrl_decisions_total;
+    // AB6: fold in aggregate-plane (ring macro) control decisions so CDER degrades
+    // as TRS admits more poison at high f. g_agg_* are 0 outside AB6 sweep mode
+    // (g_trs_compromised_f<0), so this is identity for every other experiment.
+    const uint64_t w = (uint64_t)ctrl_decisions_wrong + g_agg_ctrl_wrong;
+    const uint64_t t = (uint64_t)ctrl_decisions_total + g_agg_ctrl_total;
+    if (t > 0)
+        return (double)w / (double)t;
     // Fallback: beacon-level confusion matrix (FP+FN)/total
     double total = (double)(cm_TP + cm_FP + cm_TN + cm_FN);
     if (total < 1e-9) return 0.0;
     return (double)(cm_FP + cm_FN) / total;
+}
+
+// CDER_full — control-plane decision error scored against the FUSION verdict
+// (GAT+AE), so it responds to the AI layer (unlike compute_CDER() which is the
+// RSU's immediate lightweight decision, LW-only by architecture). Returns -1 in
+// lightweight modes (1/6) where no fusion runs — callers then use compute_CDER().
+double compute_CDER_full()
+{
+    if (ctrl_full_total == 0) return -1.0;
+    return (double)ctrl_full_wrong / (double)ctrl_full_total;
 }
 
 // TDEE: Traffic Density Estimation Error (Eq. 4.5, dimensionless)
@@ -683,10 +761,16 @@ double compute_CDER()
 //   ρ̂(t)    = controller's estimated density from accepted beacons
 //             (g_ctrl_seen_vids tracked in log_beacon_to_csv())
 //
-// R7a implementation:
-//   ρ_gt = N_Vehicles (count of real vehicles — provider gives the same value
-//          since the mobility model IS the source of truth for vehicle count)
-//   ρ̂    = |g_ctrl_seen_vids| (distinct vids whose beacons passed detection)
+// C3 implementation (per-cell spatial density, Voronoi RSU cells):
+//   ρ̂_cell    = |g_ctrl_seen_cell[r]| — distinct accepted vids attributed to
+//               cell r by the nearest-RSU of their REPORTED position
+//               (log_beacon_to_csv). Poisoned positions land in wrong cells.
+//   ρ_gt_cell = |g_gt_seen_cell[r]| — distinct REAL vehicles attributed to
+//               cell r by the nearest-RSU of their SUMO true position, sampled
+//               at the same beacon instants (booked in log_beacon_to_csv;
+//               post-Destroy get_gt_position calls assert in ns-3).
+//   TDEE      = mean over cells with ρ_gt_cell > 0 of
+//               |ρ̂_cell − ρ_gt_cell| / ρ_gt_cell
 //
 // Returns -1 only if the active mobility provider is NOT SUMO-derived
 // (paper §4.1.3 requires SUMO ground truth). For sumo_trace runs the value is
@@ -694,16 +778,28 @@ double compute_CDER()
 // misinterpretation of non-conformant values.
 //
 // Applicable metric for MP attacks {3,4,6,7} per paper §4.1.2 — Sybil attacks
-// inflate ρ̂ above N_Vehicles; TP attacks generally leave ρ̂ ≈ N_Vehicles.
+// inflate ρ̂_cell; TP position-poisoning shifts vehicles across cell borders.
+static uint32_t g_tdee_cells_scored = 0;  // for the print line
+
 double compute_TDEE()
 {
     if (!g_mobility_provider || !g_mobility_provider->is_sumo_derived()) {
         return -1.0;  // not paper-conformant under hardcoded mobility
     }
-    const double rho_gt = (double)N_Vehicles;
-    if (rho_gt < 1e-9) return 0.0;
-    const double rho_hat = (double)g_ctrl_seen_vids.size();
-    return std::fabs(rho_hat - rho_gt) / rho_gt;
+    const uint32_t active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? N_RSUs : MAX_RSUS;
+
+    double err_sum = 0.0;
+    uint32_t scored = 0;
+    for (uint32_t r = 0; r < active; ++r) {
+        if (g_gt_seen_cell[r].empty()) continue;  // empty cell: no GT density to compare
+        const double rho_gt  = (double)g_gt_seen_cell[r].size();
+        const double rho_hat = (double)g_ctrl_seen_cell[r].size();
+        err_sum += std::fabs(rho_hat - rho_gt) / rho_gt;
+        scored++;
+    }
+    g_tdee_cells_scored = scored;
+    if (scored == 0) return 0.0;
+    return err_sum / (double)scored;
 }
 
 // TPE: Trajectory Poisoning Exposure (Eq. 4.6)
@@ -749,6 +845,71 @@ double compute_PBPO_LW()
     return pbpo_lw_time_sum_ms / (double)pbpo_lw_cnt;
 }
 
+// ── C5–C9: paper §4.2 metric additions (TTD/FRR/COO/BWO/TCL) ──────────────────
+// All emit −1 when the producing mechanism never ran in this configuration
+// (e.g. TCL without live Fabric, COO in LW-only ablation).
+
+// C5 TTD (s): mean over detected attackers of (first alert ≥ onset) − onset.
+// Same semantics as analytics/compute_ttd.py; undetected attackers excluded.
+double compute_TTD()
+{
+    double sum = 0.0; int cnt = 0;
+    for (int i = 0; i < total_size; i++)
+        if (g_ttd_first_poison[i] >= 0 && g_ttd_first_alert[i] >= 0) {
+            sum += g_ttd_first_alert[i] - g_ttd_first_poison[i];
+            cnt++;
+        }
+    return cnt > 0 ? sum / cnt : -1.0;
+}
+
+// C6 FRR_revoke: honest vehicles falsely revoked / honest vehicle population.
+double compute_FRR_revoke()
+{
+    uint32_t honest = 0;
+    for (uint32_t i = 0; i < N_Vehicles && i < (uint32_t)total_size; i++)
+        if (!mptd_vehicle_is_malicious_gt((int)i)) honest++;
+    return honest > 0 ? (double)g_frr_false_revokes / (double)honest : -1.0;
+}
+
+// C6 FRR_demote: honest RSUs falsely demoted from TRUSTED / honest RSU count.
+double compute_FRR_demote()
+{
+    if (!g_frr_demote_data) return -1.0;   // no on-chain lifecycle reads (skip_blockchain)
+    uint32_t honest = 0;
+    for (uint32_t j = 0; j < N_RSUs && j < MAX_RSUS; j++)
+        if (!compromised_rsu[j]) honest++;
+    return honest > 0 ? (double)g_frr_false_demotes / (double)honest : -1.0;
+}
+
+// C7 COO: mean per-epoch crypto wall-clock (ms), plus the Δt_TRS/Δt_FHE split.
+double compute_COO_epoch()
+{
+    return g_coo_epochs > 0
+         ? (g_coo_trs_ms_sum + g_coo_fhe_ms_sum) / (double)g_coo_epochs : -1.0;
+}
+double compute_COO_trs()
+{ return g_coo_epochs > 0 ? g_coo_trs_ms_sum / (double)g_coo_epochs : -1.0; }
+double compute_COO_fhe()
+{ return g_coo_epochs > 0 ? g_coo_fhe_ms_sum / (double)g_coo_epochs : -1.0; }
+
+// C8 BWO_ratio: security bytes (HMAC + FHE ct + σ_TRS + LKH rekey) over plain
+// BSM payload bytes. BWO_scale = LKH rekey messages sent this run (the
+// N_rekey-vs-|V_j| scaling curve comes from sweeping runs).
+double compute_BWO_ratio()
+{
+    if (g_bwo_base_bytes == 0) return -1.0;
+    const uint64_t sec = g_bwo_hmac_bytes + g_bwo_fhe_bytes
+                       + g_bwo_trs_bytes  + g_bwo_rekey_bytes;
+    return (double)sec / (double)g_bwo_base_bytes;
+}
+
+// C9 TCL (ms): mean Fabric sync-invoke submit→commit-ack; mean post-revocation
+// c_assigned reassignment commit.
+double compute_TCL_confirm()
+{ return g_tcl_confirm_cnt  > 0 ? g_tcl_confirm_ms_sum  / (double)g_tcl_confirm_cnt  : -1.0; }
+double compute_TCL_reassign()
+{ return g_tcl_reassign_cnt > 0 ? g_tcl_reassign_ms_sum / (double)g_tcl_reassign_cnt : -1.0; }
+
 // ── Print all metrics to stdout ────────────────────────────────────────────────
 void print_mptd_metrics()
 {
@@ -777,7 +938,16 @@ void print_mptd_metrics()
                   << "  (Fusion, Eq 4.2)" << std::endl;
     }
     std::cout << "  PARR = " << compute_PARR()
-              << "  (TRS blockchain rejection; "
+              << "  (Eq 4.3, poisoned-rejected/injected; "
+              << g_parr_rejected << "/" << g_parr_injected
+              << " poisoned aggregates rejected; -1 = none injected)"
+              << "  [TRS-gate tally " << g_trs_rejected_count << " rej / "
+              << g_trs_verified_count << " ok]" << std::endl;
+    // Separate (non-PARR) revocation-rate signal: poisoned beacons revoked via the
+    // lightweight detection path (Eq 3.67). Kept for reference — NOT the crypto PARR.
+    std::cout << "  RevRate = "
+              << (parr_poisoned_total ? (double)parr_trs_rejected / (double)parr_poisoned_total : 0.0)
+              << "  (LW detection-revoke; "
               << parr_trs_rejected << "/" << parr_poisoned_total << " poisoned revoked)" << std::endl;
     // R8.4: per-beacon TRS verify outcomes (Paper §3.5.4 Algorithm 6).
     // Distinct from PARR (per-flagged-poisoned-beacon, Eq 3.67 / 4.3).
@@ -795,15 +965,23 @@ void print_mptd_metrics()
     else
         std::cout << "  CDER = " << compute_CDER()
                   << "  (beacon-level (FP+FN)/total fallback, Eq.4.4, lower=better)" << std::endl;
+    // CDER_full: control error against the FUSION verdict (responds to the AI layer).
+    // -1 in lightweight modes (no fusion) — there compute_CDER() above is the metric.
+    std::cout << "  CDER_full = " << compute_CDER_full()
+              << "  (fusion-verdict control error: " << ctrl_full_wrong
+              << "/" << ctrl_full_total
+              << " wrong, AI-layer-sensitive, lower=better; -1=lightweight/no fusion)"
+              << std::endl;
     // TDEE: live when --mobility_source=sumo_trace; otherwise -1 per paper conformance.
     // TPE:  live dead-reckoning predictor (08_detection_engine.h) vs SUMO ground truth.
     {
         const double tdee = compute_TDEE();
         const bool   sumo = g_mobility_provider && g_mobility_provider->is_sumo_derived();
         std::cout << "  TDEE = " << tdee << "  ("
-                  << (sumo ? "SUMO-derived, |ρ̂−ρ_gt|/ρ_gt" : "not sumo_derived → -1")
-                  << ", Eq.4.5; ρ̂=" << g_ctrl_seen_vids.size()
-                  << " ρ_gt=" << N_Vehicles << ")" << std::endl;
+                  << (sumo ? "SUMO-derived, per-cell mean |ρ̂−ρ_gt|/ρ_gt" : "not sumo_derived → -1")
+                  << ", Eq.4.5; cells scored=" << g_tdee_cells_scored
+                  << "/" << N_RSUs
+                  << " distinct ρ̂ vids=" << g_ctrl_seen_vids.size() << ")" << std::endl;
     }
     {
         const double tpe  = compute_TPE();
@@ -829,6 +1007,9 @@ void print_mptd_metrics()
               << g_cp_detect_trs_fails << " TRS-fail) over "
               << g_cp_detect_epochs_evaluated << " audited epochs,"
               << " flag_c=" << (g_flag_c_active ? "1" : "0")
+              << " ctrl_evidence=" << g_ctrl_misbehave_evidence
+              << " ctrl_trust=" << std::fixed << std::setprecision(4) << g_ctrl_trust
+              << std::defaultfloat
               << " (paper §3.5.5 Algorithm 7, Eq 3.59)" << std::endl;
     // P6: SC-Register authorisation gate — dropped beacons (forensics only;
     // not in MCC/FPR/PARR/CDER). registered_vids = vehicles that have a
@@ -837,6 +1018,29 @@ void print_mptd_metrics()
               << " beacons rejected (unregistered vid), "
               << g_registered_vids.size() << "/" << N_Vehicles
               << " vehicles on-chain (paper §3.5.5 Algorithm 7)" << std::endl;
+    // C5–C9 (paper §4.2 additions): −1 = mechanism did not run in this config
+    std::cout << "  TTD       = " << compute_TTD() << " s (first alert − onset,"
+              << " per detected attacker mean)" << std::endl;
+    std::cout << "  FRR       = revoke " << compute_FRR_revoke()
+              << " (" << g_frr_false_revokes << " false / "
+              << g_frr_revoked_total << " total revokes),"
+              << " demote " << compute_FRR_demote()
+              << " (" << g_frr_false_demotes << " false / "
+              << g_frr_demoted_total << " total demotes)" << std::endl;
+    std::cout << "  COO       = epoch " << compute_COO_epoch()
+              << " ms (TRS " << compute_COO_trs()
+              << " + FHE " << compute_COO_fhe()
+              << " over " << g_coo_epochs << " epochs),"
+              << " DKG " << g_coo_dkg_ms << " ms" << std::endl;
+    std::cout << "  BWO       = ratio " << compute_BWO_ratio()
+              << " (hmac=" << g_bwo_hmac_bytes << "B fhe=" << g_bwo_fhe_bytes
+              << "B trs=" << g_bwo_trs_bytes << "B rekey=" << g_bwo_rekey_bytes
+              << "B / base=" << g_bwo_base_bytes << "B),"
+              << " scale=" << g_bwo_rekey_pkts << " rekey msgs" << std::endl;
+    std::cout << "  TCL       = confirm " << compute_TCL_confirm()
+              << " ms (" << g_tcl_confirm_cnt << " invokes),"
+              << " reassign " << compute_TCL_reassign()
+              << " ms (" << g_tcl_reassign_cnt << " rollovers)" << std::endl;
     std::cout << "──────────────────────────────────────────────────────" << std::endl;
 }
 
@@ -884,12 +1088,21 @@ static void export_run_dataset(const std::string &metrics_src)
     }
 
     // per-scenario folder (option A); no trailing slash so the existing
-    // `results + "/..."` joins below stay correct.
-    const std::string results = std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_name();
+    // `results + "/..."` joins below stay correct. Uses mptd_scenario_tag() so a
+    // --per_pid_results run copies from ITS OWN live dir, not the shared one.
+    const std::string results = std::string(NS3_ROOT "/analytics/results/") + mptd_scenario_tag();
 
+    // NOTE: the folder key includes _m{ablation_mode}. Without it, two ablation
+    // variants at the same scenario/attack/pct (e.g. AB5 lightweight vs full mode)
+    // would archive into the SAME aN_pP folder and silently overwrite each other's
+    // beacon_log.csv / metrics.csv. Keeping the mode in the path lets an AB1–AB11
+    // sweep coexist on disk.
     std::ostringstream dir;
     dir << DATASET_ROOT "/analytics/datasets/" << mptd_scenario_name() << "/a"
-        << attack_number << "_p" << attack_percentage;
+        << attack_number << "_p" << attack_percentage << "_m" << ablation_mode;
+    // C10: AB variants run with ablation_mode=0 internally, so without the _ab
+    // suffix an AB sweep would overwrite the true full-mode folder.
+    if (ablation_ab != 0) dir << "_ab" << ablation_ab;
     const std::string dest = dir.str();
 
     std::error_code ec;
@@ -937,13 +1150,21 @@ void write_mptd_results_csv()
     ensure_analytics_dir(NS3_ROOT "/analytics/results");
     ensure_analytics_dir(NS3_ROOT "/analytics/results/sweep");
 
-    // Filename: metrics_a{attack}_p{pct}_s{speed}_m{ablation}.csv
-    // Each dimension is encoded so sweeps never overwrite each other.
+    // Filename: metrics_a{attack}_p{pct}_s{speed}_m{ablation}_seed{seed}.csv
+    // Each dimension is encoded so sweeps never overwrite each other. seed was
+    // missing until now: without it, re-running the same attack/speed/ablation
+    // config under a different --seed silently truncated and overwrote the
+    // previous seed's file (std::ios::trunc onto an identical path) — harmless
+    // in practice only because the actual sweep pipeline reads seed-tagged
+    // stdout logs instead of this CSV, never this file directly.
     std::ostringstream fname;
     fname << NS3_ROOT "/analytics/results/sweep/metrics_a"
           << attack_number << "_p" << attack_percentage
           << "_s" << maxspeed
-          << "_m" << ablation_mode << ".csv";
+          << "_m" << ablation_mode;
+    if (ablation_ab != 0) fname << "_ab" << ablation_ab;   // C10: keep AB sweeps distinct
+    fname << "_seed" << run_seed;
+    fname << ".csv";
 
     std::ofstream fout(fname.str(), std::ios::out | std::ios::trunc);
 
@@ -956,7 +1177,8 @@ void write_mptd_results_csv()
     const int run_attacker_class = attacker_class_for((int)attack_number);
 
     // Header — note: TDEE=-1, TPE=-1 (SUMO required); CDER from ctrl-plane decisions
-    fout << "attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,"
+    fout << "seed,"
+         << "attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,ablation_ab,"
          << "cm_TP,cm_FP,cm_TN,cm_FN,"
          << "MCC,FPR,"
          << "cm_full_TP,cm_full_FP,cm_full_TN,cm_full_FN,"
@@ -967,14 +1189,20 @@ void write_mptd_results_csv()
          << "PBPO_LW_ms,PBPO_Full_ms,"
          << "total_received,total_poisoned,total_stored,"
          << "trs_verified_count,trs_rejected_count,"   // R8.4: per-beacon σ_j outcomes
-         << "sc_register_rejects,sc_register_active\n"; // P6: SC-Register gate outcomes
+         << "sc_register_rejects,sc_register_active,"  // P6: SC-Register gate outcomes
+         << "TTD,FRR_revoke,FRR_demote,"                // C5/C6 (paper §4.2)
+         << "COO_epoch,COO_trs,COO_fhe,COO_dkg,"        // C7 (ms)
+         << "BWO_ratio,BWO_scale,"                      // C8
+         << "TCL_confirm,TCL_reassign\n";               // C9 (ms; −1 w/o Fabric)
 
     // Values
-    fout << attack_number              << ","
+    fout << run_seed                   << ","
+         << attack_number              << ","
          << run_attacker_class         << ","
          << attack_percentage          << ","
          << maxspeed                   << ","
          << ablation_mode              << ","
+         << ablation_ab                << ","
          << cm_TP                      << ","
          << cm_FP                      << ","
          << cm_TN                      << ","
@@ -1001,7 +1229,18 @@ void write_mptd_results_csv()
          << g_trs_verified_count                 << ","   // R8.4
          << g_trs_rejected_count                 << ","   // R8.4
          << unregistered_beacon_reject_count     << ","   // P6
-         << g_registered_vids.size()             << "\n"; // P6
+         << g_registered_vids.size()             << ","   // P6
+         << compute_TTD()                        << ","   // C5
+         << compute_FRR_revoke()                 << ","   // C6
+         << compute_FRR_demote()                 << ","   // C6
+         << compute_COO_epoch()                  << ","   // C7
+         << compute_COO_trs()                    << ","   // C7
+         << compute_COO_fhe()                    << ","   // C7
+         << g_coo_dkg_ms                         << ","   // C7
+         << compute_BWO_ratio()                  << ","   // C8
+         << g_bwo_rekey_pkts                     << ","   // C8 BWO_scale
+         << compute_TCL_confirm()                << ","   // C9
+         << compute_TCL_reassign()               << "\n"; // C9
     fout.close();
 
     // Also print to stdout and note the file written

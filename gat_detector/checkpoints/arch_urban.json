@@ -1,0 +1,11 @@
+{
+  "scenario": "urban",
+  "selected_candidate": "G3",
+  "heads": 8,
+  "hidden_dim": 64,
+  "emb_dim": 32,
+  "dropout": 0.3,
+  "val_mcc_mean": 0.3989003840969456,
+  "val_fpr_mean": 0.38931262423149815,
+  "best_seed": 0
+}

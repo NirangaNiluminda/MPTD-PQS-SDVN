@@ -66,10 +66,11 @@ def compute_metrics(tp, fp, tn, fn, attack_pct=20, speed_kmh=50,
     """
     total          = tp + fp + tn + fn
     total_poisoned = tp + fn
-    denom_mcc      = (tp + fp) * (tp + fn) * (tn + fp) * (tn + fn)
 
-    # Eq. 4.1 — MCC
-    mcc = (tp * tn - fp * fn) / (denom_mcc ** 0.5 + 1e-9) if denom_mcc else 0.0
+    # Eq. 4.1 — ε-smoothed MCC (defined when a class is absent, e.g. ρ_a=0)
+    e   = 1e-12
+    mcc = ((tp + e) * (tn + e) - (fp + e) * (fn + e)) / \
+          (((tp + fp + e) * (tp + fn + e) * (tn + fp + e) * (tn + fn + e)) ** 0.5)
 
     # Eq. 4.2 — FPR
     fpr = _safe(fp, fp + tn)

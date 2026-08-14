@@ -24,7 +24,7 @@ not from vehicle *i*'s own normal behaviour.
    They are never recomputed or updated during evaluation.
 
 At inference, `score.py` looks up each node's own `x̄'_i`, `σ'_i` by vehicle id and
-computes `S_i(t) = ||(x'_i(t) − x̄'_i) / σ'_i||²`. A pooled global mean/std is also
+computes `S_i(t) = ||(x'_i(t) − x̄'_i) / σ'_i||_2`. A pooled global mean/std is also
 stored as a fallback for any vehicle id that appears at test time but was never
 seen during clean calibration (pseudonym rotation, different seeds).
 
@@ -38,10 +38,11 @@ seen during clean calibration (pseudonym rotation, different seeds).
 
 ## Sanity check (built in)
 
-For correctly z-scored embeddings the clean `S_i` mean should equal the embedding
-dimension. The calibration run reports exactly this per scenario (urban 32,
-suburban 16, highway 8), confirming the per-node normalisation is right. `score.py`
-also prints how many nodes used their own stats vs the global fallback.
+For correctly z-scored embeddings the clean `S_i` (an L2 norm, Eq. gat_score) mean
+should be about the square root of the embedding dimension. The calibration run
+reports this per scenario (urban ≈√32≈5.66, suburban ≈√16=4, highway ≈√8≈2.83),
+confirming the per-node normalisation is right. `score.py` also prints how many
+nodes used their own stats vs the global fallback.
 
 Unchanged: the three-separate-models structure, Phase 1a training, and the open
 z-score-vs-head question remain as before.

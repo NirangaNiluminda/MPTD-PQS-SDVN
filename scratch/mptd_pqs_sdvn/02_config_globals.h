@@ -22,12 +22,12 @@
 // CHANGE THESE TWO LINES when moving to a different machine.
 // Usage in code: NS3_ROOT "/analytics/data/file.csv"
 //                FAB_ROOT "/test-network/..."
-#define NS3_ROOT "/home/vboxuser/ns-allinone-3.35/ns-3.35"
-#define FAB_ROOT "/home/vboxuser/fabric-samples"
+#define NS3_ROOT "/home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35"
+#define FAB_ROOT "/home/sdvn_mobility_flooding/fabric-samples"
 // DATASET_ROOT = the git repo working tree (committable). The additive
 // per-attack/per-percentage dataset export (export_run_dataset() in
 // 10_metrics_csv.h) writes here, separate from NS3_ROOT analytics output.
-#define DATASET_ROOT "/home/vboxuser/Desktop/MPTD-PQS-SDVN"
+#define DATASET_ROOT "/home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN"
 // ───────────────────────────────────────────────────────────────────────────
 
 using namespace std::chrono;
@@ -46,16 +46,56 @@ using namespace std::chrono;
 // Most per-vehicle loops self-guard (skip vehicle_state[i].count==0), so they
 // stay correct at this larger capacity; the non-self-guarding consortium split
 // in 11_blockchain_setup.h uses N_Vehicles explicitly.
-#define MAX_NODES 320
+// Bumped 320->600 (2026-08-09) for the E3 scalability sweep's N_Vehicles=500
+// point; see total_size below for the matching vehicle-array bump.
+#define MAX_NODES 600
 
 // MAX_RSUS = per-RSU array CAPACITY (compile-time). The ACTIVE RSU count is the
 // runtime global N_RSUs below. Test net uses N_RSUs=4; SUMO urban uses an 8×8 =
 // 64-RSU uniform grid (rsu_positions_urban.csv; supervisor-mandated 2026-06-12,
 // 250 m spacing). All per-RSU arrays are sized [MAX_RSUS]; every loop / gate
 // over actual RSUs bounds on N_RSUs (NOT the literal 4 or MAX_RSUS).
-#define MAX_RSUS 64
+#define MAX_RSUS 256
 
-const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
+// FIX B (sir, 2026-08-06): route vehicle_state through a per-RSU array so one
+// RSU's forged kinematics cannot be read back by another RSU as a clean
+// vehicle's history. Default OFF => byte-identical to all prior results.
+bool g_per_rsu_vehicle_state = false;
+
+// RING-DETECT: deterministic Sybil-ring geometry test. Ghosts are 74.2% of all
+// false negatives (recall 0.3478 vs 0.9337 on real vehicles) because no
+// statistical channel sees them; the ring geometry is exact, so a closed-form
+// test does. Default OFF -- it is RULE-TIER, so it fires in D1/D4/D6 alike and
+// the ablation ordering must be re-verified before it is enabled.
+// Minimum fusion score phi before the GAT head OR-path may force a detection.
+// 0.0 = previous behaviour (no floor). See 08_detection_engine.h for the measured
+// FP/TP exchange that motivates a non-zero value.
+double g_gat_or_path_min_phi = 0.0;
+
+// Do not let a beacon that was JUST judged anomalous remain in the vehicle's
+// kinematic history as the baseline for judging the next beacon. push_beacon()
+// runs as step 1, BEFORE detection, so a forged beacon poisons the history it is
+// then compared against — which is why impersonation victims (vids 196/191/202)
+// carry FPR 0.53-0.59 on their own honest beacons. Measured: 6 vehicles produce
+// 77.7% of all false positives. Default OFF.
+bool   g_pop_anomalous_writes = false;
+
+// Floor the attack-conditioned psi at the global-weight psi, so k_hat misrouting
+// cannot erase rule evidence. Only GAT-bearing arms derive k_hat, so without this
+// enabling the GAT can LOSE detections D1 keeps (measured: 158 TPs, 155 of them
+// routed to the k_hat=4 misrouting sink). Default OFF = byte-identical.
+bool   g_psi_cond_floor    = false;
+
+bool   g_ring_detect       = false;
+double g_ring_tol_t        = 0.05;   // s     max timestamp spread within a ring
+double g_ring_tol_hd       = 0.05;   // rad   max heading spread within a ring
+double g_ring_r_min        = 60.0;   // m     min plausible ring radius
+double g_ring_r_max        = 250.0;  // m     max plausible ring radius
+double g_ring_r_cv         = 0.25;   // -     max radius coeff. of variation
+int    g_ring_min_members  = 3;      // min ring members to declare a ring
+
+const int total_size = 550;  // vehicle-array CAPACITY (was 16, then 256 for SUMO 200-veh runs;
+                              // bumped 2026-08-09 for the E3 scalability sweep's N_Vehicles=500 point)
 uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban 8×8 grid=64)
 uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
 uint32_t N_Controllers = 4;
@@ -79,11 +119,40 @@ int    maxspeed             = 60;  // km/h max vehicle speed
 // See 09b_mobility_provider.h for the IMobilityProvider abstraction.
 int g_mobility_source = 0;  // MOBILITY_SRC_HARDCODED
 
+// ── RSU placement CSV override (--rsu_positions_csv_override) ─────────────
+// Empty by default -> default_rsu_positions_path(scenario) picks the
+// supervisor-mandated per-scenario file (e.g. rsu_positions_urban.csv, fixed
+// at 64 RSUs) exactly as before. Set only when a sweep needs an RSU count
+// that file doesn't cover (E3 scalability: N_RSUs=96/128/160), so those runs
+// point at their own place_rsus.py-generated CSV instead of silently falling
+// back to the broken legacy hardcoded grid. Never touches the default file.
+std::string g_rsu_positions_csv_override = "";
+
+// ── Mobility trace override (--mobility_trace_csv_override) ───────────────
+// Empty by default -> default_sumo_trace_path(scenario, speed) picks the
+// standard mobility_<tag>_<speed>.tcl exactly as before. The standard urban
+// trace only has 200 vehicle trajectories (build_sumo_trace.sh's committed
+// output); N_Vehicles beyond that silently leaves extra nodes with no
+// MobilityModel, which aborts inside LteHelper::InstallUeDevice(). Set only
+// for sweeps needing more vehicles than the default trace covers (E3
+// scalability: N_Vehicles=300/400/500), pointing at a separately generated
+// mobility_urban{300,400,500}_60.tcl. Never touches the default trace file.
+std::string g_mobility_trace_csv_override = "";
+
 // ── RSU Compromise Seed (TP-S1 / MP-S1 random selection) ──────────────────
 // 0 = different random RSUs each run  (uses system clock)
 // N = fixed seed N → same RSUs compromised every run (reproducible)
 // Example: --rsu_seed=42 --attack_percentage=40 → always same 2 RSUs
 uint32_t rsu_seed = 0;
+
+// Unified multi-seed control (2026-07-20). --seed=N sets run_seed=N, which:
+//   (1) seeds the ns-3 RNG via RngSeedManager::SetRun(N) in 12_main.h, and
+//   (2) is mixed into the attack randomness (attacker selection, stealth drift,
+//       RSU-compromise shuffle) so that different --seed values produce genuinely
+//       different runs (mean±std over ≥3 seeds). Default 1 = reproducible baseline.
+// Without this, the attack seeds were fixed per-vehicle (12345*vid) → every run
+// identical → multi-seed std≈0.
+uint32_t run_seed = 1;
 
 // Paper §3.4.4 IEEE 802.11p BSM rate: 10 Hz → T_b = 100 ms (Eq 3.9).
 // Detection gate s_max·T_b = 3.33 m is keyed to this; do not change without
@@ -91,6 +160,7 @@ uint32_t rsu_seed = 0;
 double data_transmission_frequency = 10.0;
 double data_transmission_period    = 1.0 / data_transmission_frequency;
 double link_lifetime_threshold     = 0.400;
+
 
 // ── Attack Scenario Selection (maps to paper §3.4) ─────────────────────────
 //   1 = TP-S1 : Malicious RSU trajectory poisoning          (Fig 3.1)
@@ -116,7 +186,7 @@ int attack_percentage = 40;  // % of nodes that are malicious (0-100, avoid 100)
 int sybil_registration_pct = 0;
 
 const char* attack_scenario_name[] = {
-    "",                                                    // 0 unused
+    "COMBINED:All7AttackTypes",                            // 0 combined-attack mode
     "TP-S1:MaliciousRSU-TrajectoryPoisoning",             // 1
     "TP-S2:MaliciousVehicle-TrajectoryPoisoning",         // 2
     "MP-S1:Sybil-CompromisedRSU",                        // 3
@@ -156,6 +226,28 @@ inline int attacker_class_for(int attack_num)
 }
 
 bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
+// STEALTHY control-plane mode (a5 = TP-S3, a7 = MP-S4) — DEFAULT.
+//   The malicious controller leaves the vehicle→RSU beacon PLAUSIBLE (unchanged):
+//   the attack lives entirely in its control-plane WRONG_ROUTING decisions.
+//   → Beacon-level detectors (ψ, Ercan, Sharma) are BLIND by construction
+//     (poisoned beacons are feature-identical to honest).
+//   → Only CP-DETECT (controller-vs-RSU consensus, Algorithm 7) catches it,
+//     because the compromised controller keeps issuing WRONG_ROUTING that the
+//     honest RSUs disagree with.
+//   This is the realistic control-plane threat and the intended default.
+//
+//   Set --stealthy_control_plane=false for the legacy "LOUD" variant, where the
+//   controller injects a large per-beacon drift (a5: ~16 m position; a7: +25-50%
+//   speed) that leaks into the beacon so ANY beacon detector catches the symptom
+//   (used only to show the contrast — beacon baselines then also "detect" a5/a7).
+//   NOTE: only affects attack_number 5 and 7; other attacks are unchanged.
+bool stealthy_control_plane = true;
+
+// Verbose per-beacon stdout ([DSRC-TX], [LL-SEL]) — OFF by default. These fire
+// once per vehicle per beacon interval; at 200 vehicles over a 300 s run they
+// balloon the log to ~280 MB and make the run I/O-bound (~2.3 h). Gated so long
+// sweeps stay fast/small; set --verbose_tx=true to re-enable for debugging.
+bool g_verbose_tx = false;
 
 // ── R4.b: backup-controller flag removed (paper has no backup controller) ──
 // The paper specifies CP-DETECT (Algorithm 7, §3.5.5) — when ≥f+1 RSUs disagree
@@ -173,8 +265,327 @@ bool controller_malicious_assumption = true; // used by TP-S3 and MP-S4
 //   4 = A4  Full, no PQ      : Rules + HMAC + GAT + AE, TRS/FHE disabled (use_pq_crypto=false)
 //   5 = A5  Full, no BC      : Rules + HMAC + GAT + AE, blockchain SC calls skipped
 //   6 = B1  Ghaleb (2014)    : LTT baseline — speed plausibility + cross-RSU reachability only
+//   7 = B2  Standalone GAT   : SOTA GAT baseline — decision purely S_i > θ_S, NO ψ tier
+//   8 = B3  Standalone AE    : SOTA LSTM-AE baseline — decision purely ε_i > θ_ae, NO ψ tier
 //   0 = Full (no ablation)   : every component active
+// NOTE: modes 2/3 keep the ψ composite tier active inside fuse_scores() (lp always
+// on), so "A2 GAT-only"/"A3 AE-only" are really ψ+GAT / ψ+AE ablations. Modes 7/8
+// are the GENUINE standalone SOTA baselines: the scored full-mode confusion matrix
+// is driven by the single detector's native threshold alone (08_detection_engine.h),
+// with no ψ contamination — the correct control for a "superior to SOTA" claim.
 int ablation_mode = 1;
+
+// ── C10: paper ablation variants AB1–AB11 (§4.1.2) ─────────────────────────
+// The paper's 11-way ablation removes ONE mechanism at a time from FULL mode.
+// --ablation_ab=N (1..11) selects the variant; 0 (default) = selector off,
+// legacy --ablation_mode governs alone. Dispatch in 12_main.h after Parse():
+//   AB1  rule signatures off (ψ TP-S1..MP-S4 zeroed)   → enable_rule_signatures=false
+//   AB2  HMAC+nonce beacon gate off                     → enable_hmac_gate=false
+//   AB3  GAT off                                        → g_enable_gat_cli=0
+//   AB4  LSTM-AE off                                    → g_enable_lstm_ae_cli=0
+//   AB5  full AI off (lightweight only)                 ≡ legacy ablation_mode=1
+//   AB6  TRS gate off (FHE stays on)                    → enable_trs=false
+//   AB7  FHE off (TRS signs plaintext aggregates)       → enable_fhe=false
+//   AB8  RSU 3-state lifecycle off (always trusted)     → enable_rsu_lifecycle=false
+//   AB9  multi-controller off (single fixed controller) → enable_ctrl_rotation=false
+//   AB10 blockchain off                                 ≡ legacy ablation_mode=5 + skip_blockchain
+//   AB11 LKH tree off (per-member unicast rekey)        → use_lkh_tree=false
+// All AB modes except AB5/AB10 force ablation_mode=0 (full baseline minus one).
+// Each toggle is also individually CLI-exposed for combined ablations.
+int  ablation_ab            = 0;
+bool enable_rule_signatures = true;   // AB1
+bool enable_hmac_gate       = true;   // AB2
+
+// ── a6 (MP-S3) faithful in-transit modification ──────────────────────────────
+// Default false = legacy a6 behaviour (fabricate a fresh unauthenticated beacon
+// addressed to the ATTACKER's RSU). That model never reaches the HMAC gate: the
+// RSU geographic filter (08_detection_engine.h) drops it because the claimed
+// victim position belongs to another RSU zone, so HMAC is never consulted.
+//
+// When true, a6 models a real man-in-the-middle per the paper threat model:
+//   (1) the relayed beacon is addressed to the RSU serving the CLAIMED position,
+//       so it survives the geographic filter, and
+//   (2) it carries the victim's HMAC computed over the victim's ORIGINAL
+//       kinematics, then the payload is modified → MAC no longer matches →
+//       lkh_verify_beacon_hmac() fails (in-transit modification detected).
+// The attacker never obtains K_i, so it cannot mint a fresh valid MAC; it only
+// replays the original MAC over altered content — exactly a real MitM's power.
+//
+// Kept OFF by default so combined-attack runs (AB1, E1–E5) are byte-identical
+// to previously collected results. Enable per-run with --faithful_mitm=1.
+bool g_faithful_mitm        = false;
+
+// a6 stealth regime (paper gamma=1.0, Eq 3.5). Default false = abrupt/blatant
+// forgery, which trips the psi speed bound on 100% of beacons and makes the HMAC
+// gate redundant. When true the forged kinematics stay INSIDE the feasibility
+// envelope (speed <= 0.9*s_max, position step <= epsilon_max_stealth = 0.5 m <
+// the 3.33 m gate), so psi cannot fire and HMAC is the only instant detector.
+// Requires --faithful_mitm=1 to be meaningful (the stale MAC is what HMAC catches).
+bool g_mitm_stealth         = false;
+
+// Per-run isolation of the shared live-results dir (analytics/results/<scenario>/).
+// The per-beacon logs (beacon_log.csv, ghost_identity_log.csv, …) are written to
+// that ONE dir and only copied to the per-attack dataset folder at run end, so two
+// CONCURRENT sims of different attacks clobber each other's beacon_log (MCC is safe
+// — it comes from in-memory counters — but beacon-level analysis is corrupted).
+// With --per_pid_results=1 the live dir becomes <scenario>_pid<PID>/, isolating each
+// process so its beacon_log is clean even under parallel sweeps. Default OFF so the
+// running sweep's paths are byte-identical. (2026-07-25)
+bool g_per_pid_results      = false;
+
+// AB3 sweep variable: n_coord — the number of COORDINATED Sybil identities a
+// compromised RSU fabricates per intercepted vehicle (paper Fig 3.4 Steps 4-5,
+// previously the hardcoded N_ghost=4 in 08_detection_engine.h). GAT's unique
+// contribution is spatial relational detection of coordinated attacks, so this
+// is the variable that stresses it. Default 4 = the previous hardcoded value,
+// so every already-collected result is byte-identical.
+int  g_n_coord              = 4;
+
+// E4 Threat Level (TL) composite: streak parameter σ — the number of
+// consecutive beacons a malicious vehicle injects poisoned data for before
+// going honest for σ beacons, repeating (paper TL variable, second half
+// alongside n_coord). Default -1 = off, continuous injection for the entire
+// run, byte-identical to every existing result. When > 0, the vehicle's
+// per-beacon injection state cycles ON for σ beacons, OFF for σ beacons.
+int  g_streak_sigma         = -1;
+
+// AB5 / E2 uniform-speed traces (--uniform_speed_trace). The default traces use
+// REALISTIC per-road OSM speed limits, so a vehicle's actual speed is set by map
+// topology, not by --maxspeed (measured: mobility_urban_60.tcl has 2234 distinct
+// speeds, max 29.98 m/s). That is correct for E1/E5/AB1-AB4, but it confounds a
+// SPEED sweep: v would not be a clean experimental variable.
+// build_sumo_trace.sh UNIFORM_SPEED_MS=<m/s> emits a companion trace where every
+// vType maxSpeed, speedFactor=1, speedDev=0 AND every road edge speed is pinned to
+// the target. Those live under the "<tag>_uniform" tag so they sit BESIDE the
+// realistic ones — mobility_urban_60.tcl (used by the completed AB1 + running AB2
+// sweeps) is never overwritten. RSU layout is speed-independent and keeps the base
+// tag. Default false = existing behaviour for every other experiment.
+bool g_uniform_speed_trace  = false;
+
+// AB3 Phase 1: paper-faithful MP-S1 identity-density signature (--honest_mp_s1).
+// The legacy MP-S1 (08_detection_engine.h) ANDs the density check with two
+// non-paper shortcuts: (a) ghost_seen_flag — fires on the synthetic ghost ID
+// marker vid>=10000, and (b) tag.GetIsPoisoned() — the GROUND-TRUTH poison label.
+// Together these make MP-S1 a label-assisted oracle: FP=0 by construction and every
+// ghost trivially caught, so GAT can never contribute (AB3 anti-informative). When
+// true, MP-S1 implements ONLY paper Eq. mp_s1 — the identity-density check on
+// OBSERVABLE beacon data (count > threshold) — with no synthetic-ID flag and no
+// ground-truth gate. Default false so all existing single/combined results are
+// byte-identical; enable for AB3 and the paper-faithful redo.
+bool g_honest_mp_s1         = false;
+// Honest-MP-S1 density threshold multiplier: threshold = ceil((N_v/N_r) * k). The
+// naive k=1 (mean density) flags ~48% of clean urban traffic; k≈2.3 lifts the
+// threshold to the clean 95th-pct (~7) so honest clustering doesn't false-positive.
+double g_mp_s1_density_k    = 2.3;
+
+// AB3 Phase 2: GAT-evasive distributed Sybil (--sybil_gat_evasive). The legacy a3
+// clusters n_coord ghosts at ONE RSU (density spike → MP-S1 trivially fires) and never
+// routes them through the GAT scoring path (0 fusion entries), so GAT cannot contribute.
+// When true, each ghost is instead: (1) placed near a DISTINCT RSU so per-RSU density
+// stays ≤1 (evades even paper-faithful MP-S1), (2) given plausible kinematics — speed
+// ≤ s_max, constant heading so no TP-S1/S2/S3 fire — but a heading INCONSISTENT with
+// local flow (spatial-relational outlier), (3) de-synced in time (evades MP-S2), and
+// (4) ROUTED through ipfs_push_and_maybe_flush() so the GAT actually scores it. Goal:
+// rules can no longer catch the Sybils (FN>0 in lightweight) but GAT can (spatial
+// anomaly) — the configuration that isolates GAT's contribution. Requires
+// --honest_mp_s1=1 to be meaningful. Default false: legacy a3 is byte-identical.
+bool g_sybil_gat_evasive    = false;
+// FIX 1 (identity binding before vehicle_state writes).
+//
+// DEFAULT OFF pending redesign. The concept is sound and the guard site is
+// correct, but the owner-address lookup is not: it derives the DSRC interface
+// index from the vehicle node ID, and that inference is wrong. Measured with
+// instrumentation: checked=3912 rejected=3912 — EVERY beacon failed the check,
+// including honest ones, because the observed source address is 3.0.0.(vid-8)
+// while the map computes 3.0.0.(vid-5).
+//
+// The correct implementation reads each vehicle's address from its own node
+// object (Ipv4 interface) rather than assuming a container-index offset. Until
+// that lands this must stay off: with it on, no beacon can ever write
+// vehicle_state, which suppresses detection and cost 0.12 recall in measurement.
+bool g_identity_binding     = false;
+
+// FAIL-CLOSED HMAC gate (Eq 3.37). DEFAULT OFF — see 08_detection_engine.h for
+// why. When on, a beacon carrying no MAC is rejected rather than silently
+// accepted. Flag-gated so it can be measured and reverted without a rebuild.
+bool     g_hmac_fail_closed      = false;
+
+// GHOST LSTM-AE (--ghost_ae). DEFAULT OFF. Extends AE temporal scoring to ghost
+// IDs (vid >= 10000), which currently receive none (measured ae_norm == 0 for
+// 100% of ghost beacons). Ghosts are 75.2% of all false negatives. FPR-safe by
+// construction: no honest beacon carries vid >= 10000.
+bool g_ghost_ae = false;
+
+// GHOST GRAPH BATCHING (--ghost_batch). DEFAULT OFF.
+// Ghosts are force-flushed one at a time, so each is scored ALONE: measured
+// 74.8% of ghost windows contain exactly 1 beacon and 98.3% contain <=2, against
+// 100% of normal windows containing 10. The GAT therefore sees a single-node
+// graph and cannot perform relational detection — the ring of N_ghost fabricated
+// identities is dismantled before it reaches the model. When on, all ghosts from
+// one interception are accumulated and flushed together so the ring is visible.
+bool g_ghost_batch = false;
+uint64_t g_hmac_missing_rejected = 0;
+bool enable_trs             = true;   // AB6
+// AB6 f/n sweep: force exactly F of the n signing-ring members compromised so
+// PARR degrades along the BFT tolerance boundary. -1 = off (legacy behaviour:
+// f_actual emerges randomly from attack_percentage/rsu_seed). 0..n = controlled.
+int  g_trs_compromised_f    = -1;
+
+// AB8 f/n sweep: fraction of the 64 network RSUs that are ACTIVELY MALICIOUS
+// (injecting false evidence / misreporting verdicts), expressed as the malicious
+// share of a 4-member signing ring — f/n ∈ {0,0.25,0.5,0.75,1.0} ⇒ f ∈ {0..4}
+// ring members ⇒ ≈ f×16 network RSUs.
+//
+// Why this is separate from attack_percentage: attack_percentage drives BOTH the
+// vehicle attacking state (= ρ_a) AND n_comp in declare_compromised_rsus(). AB8
+// needs ρ_a pinned at 0.40 while f/n sweeps independently, which is impossible
+// while both read one variable. -1 = off ⇒ legacy behaviour (n_comp derived from
+// attack_percentage), so every existing sweep is bit-identical unless this is set.
+// Distinct from AB6's g_trs_compromised_f, which forges TRS signatures at the
+// crypto layer rather than making RSUs misbehave.
+double g_rsu_malicious_frac = -1.0;   // AB8
+
+// AB8 T_w override (Eq 3.65 SC-Revoke witness sliding window). The chaincode
+// previously hardcoded T_w=30s with NO init arg to change it, so quorum
+// witnesses older than the most recent 30 SIMULATED seconds were always
+// dropped regardless of --simTime -- a 300s run measured no better
+// FRR_demote than a 30s run because the extra 270s of history could never
+// count toward quorum. -1 = off (chaincode keeps its 30s default, every
+// prior run/sweep stays bit-identical). See project-ab8-t-window-fix memory.
+double g_t_window = -1.0;   // AB8
+
+// AB8 T_rev override (consecutive low-trust epoch gate before an RSU is
+// permanently demoted to CLIENT + SC-Revoked, SCRSUFinalizeEpoch). Was
+// hardcoded to 3 at the boot call site -- 3 CONSECUTIVE epochs is a race
+// against T_w quorum-accumulation: q_i is essentially always 0 in the first
+// few seconds of any run (quorum genuinely takes real wall-clock time to
+// build, independent of T_w's configured width), so T_rev=3 locks RSUs into
+// CLIENT before a wider T_w window ever gets a chance to help. Measured
+// 2026-07-31: widening T_w to 150s tripled raw 3+-distinct-RSU reachability
+// (3.7%->11.1%) but FRR_demote stayed bit-identical (0.344) because 9/22
+// demotions fired by epoch E39 -- before 150s of real history could exist.
+// Default 3 = prior hardcoded behaviour, every existing run stays identical.
+int g_rsu_t_rev = 3;   // AB8
+
+// AB8 alpha override (EMA smoothing factor, Eq eq:rsu_trust: tau(t) =
+// alpha*tau(t-1) + (1-alpha)*(1-m_j)). Was hardcoded to 0.3 at the boot call
+// site. This is the ACTUAL demotion gate (tau < tau_min=0.3 -> CLIENT,
+// immediately, no consecutive-epoch requirement -- T_rev only gates the
+// LATER escalation to terminal SC-Revoke, confirmed 2026-07-31 by a
+// --rsu_t_rev=60 run that still produced 9 demotes). At alpha=0.3, just 2
+// consecutive m_j=1 epochs (misbehaviour signal, which is ~always 1 whenever
+// quorum q_i is unreachable -- true for essentially every early epoch of any
+// run, honest or not) already drives tau to 0.09, well under tau_min. Higher
+// alpha gives more inertia against a few early "unconfirmed" epochs, at the
+// cost of also slowing detection of a TRULY misbehaving RSU (same formula,
+// symmetric effect) -- a real trade-off, not a free fix. Default 0.3 = prior
+// hardcoded behaviour, every existing run stays identical.
+double g_rsu_trust_alpha = 0.3;   // AB8
+
+// AB7 ring-size sweep: overrides the TRS/FHE signing-ring size n (both backends
+// share one physical ring). Threshold t is held FIXED at 3 (the value already
+// hardcoded at n=4, i.e. the 2f+1 BFT-quorum convention used elsewhere for RSU
+// endorsement) regardless of n — f=1 is meant to stay fixed while only ring
+// MEMBERSHIP grows, isolating how FHE/TRS computation scales with n (paper
+// §4.1.2 AB7). n=3 is invalid (BFT bound n>=3f+1=4 at f=1); -1 = off, default
+// n=4 (legacy behaviour, byte-identical to every prior full-mode/AB6 run).
+int g_ab7_ring_n = -1;
+
+bool enable_fhe             = true;   // AB7
+bool enable_rsu_lifecycle   = true;   // AB8
+
+// R3 config5: vehicle-side SC-Trust / SC-Revoke ablation — analogous to
+// enable_rsu_lifecycle (AB8) but for the VEHICLE trust-decay (Eq 3.55/3.56,
+// CallSCTrustSubmitEvidence/FinalizeEpoch) and vehicle revocation-vote
+// (Eq 3.58/3.65, CallSCRevokeVote) mechanisms specifically. Default true =
+// current behaviour, byte-identical to every prior run.
+bool enable_sc_trust        = true;
+bool enable_sc_revoke       = true;
+
+// AB8 option-B extension: let the RSU lifecycle reach the DETECTION path, not
+// only on-chain quorum weight. When on, a beacon whose reporting RSU is in the
+// demoted/CLIENT state contributes psi_fuse = 0 to the fusion score — the
+// detector stops trusting a demoted RSU's rule verdict, mirroring "its
+// submissions carry zero quorum weight" (§3.5.1) on the AI plane.
+//
+// WHY THIS IS OFF BY DEFAULT: measured 2026-07-28, toggling enable_rsu_lifecycle
+// alone left MCC_full and CDER BIT-IDENTICAL (0.825 / 0.607 both arms, same
+// seed) because the fusion pipeline never consults RSU trust state — demotion
+// only changes endorser selection. AB8's premise ("MCC and CDER show what is
+// lost when compromised RSUs are never demoted") therefore could not hold.
+// This flag supplies the missing causal path, but it CHANGES DETECTION
+// SEMANTICS, so it must stay default-false: every existing sweep (AB1-AB11,
+// SOTA matrix, AB6/AB10 data) stays bit-identical unless explicitly enabled.
+bool g_lifecycle_gates_fusion = false;   // AB8 option B
+
+// ── flag_i^GAT (paper revised eq:gat_det_flag) — 2026-08-05 ────────────────
+// The paper specifies that the GAT detects an attack iff ANY per-attack head
+// fires (max_k y^(k) > 0.5), and that this verdict is OR-ed into the fusion
+// decision. The C++ computed that verdict (encoded in k_hat_i >= 0) and even
+// logged it as `gatflag=`, but NEVER OR-ed it into full_flag — k_hat was used
+// only to select the lambda weight set. So the detection half of the equation
+// was unimplemented.
+//
+// Measured impact of implementing it (combined attack, rho_a=0.60, 3 seeds):
+//     OR heads {1,2,3,5}: MCC 0.4241 -> 0.5210, a3 recall 0.199 -> 0.541
+// Head participation is a bitmask because per-head precision varies sharply
+// when the flag is used as a DETECTOR (measured, same runs):
+//     head 1: 1.0000   head 2: 1.0000   head 5: 1.0000   head 3: 0.9744
+//     head 0: 0.9138   head 6: 0.5166  <-- head 6 is a coin flip, exclude it
+// Bit k set => head k participates.
+//
+// DEFAULT CHANGED 2026-08-05 (Action 1): 0 -> 46 (= bits 1,2,3,5). Leaving this
+// off by default meant any run launched without --gat_det_flag_heads=46 would
+// silently revert to the pre-fix wiring error (eq:gat_det_flag computed, logged
+// as `gatflag=`, then discarded) and produce MCC ~0.4241 instead of ~0.5121.
+// Final experiments must not depend on remembering a CLI argument. Pass
+// --gat_det_flag_heads=0 to explicitly reproduce the legacy behaviour.
+uint32_t g_gat_det_flag_heads = 46;
+
+// AB8 option-B weight: what a DEMOTED RSU's psi is multiplied by in fusion.
+// 0.0 = silence it completely (the first attempt); 1.0 = no effect.
+//
+// Why this is tunable and no longer hardcoded to 0: zeroing measured WORSE than
+// not demoting at all — MCC_full 0.825 -> 0.361 and CDER_full 0.078 -> 0.414,
+// i.e. the lifecycle appeared HARMFUL, the opposite of AB8's premise. Cause:
+// zeroing discards a demoted RSU's psi for EVERY vehicle it reports, true
+// positives included, and demotion is itself noisy (4 of 9 demotes were honest
+// RSUs, FRR_demote 0.125). Silencing ~4 honest RSUs costs more signal than the
+// poison it blocks. A partial discount keeps some signal while still reducing a
+// suspect RSU's influence.
+double g_demoted_psi_weight = 0.5;       // AB8 option B
+
+// AB8: override the q_i peer-agreement quorum used by SCRSUFinalizeEpoch.
+// 0 = chaincode derives 2f+1 (paper default, historical behaviour). Measured
+// justification for allowing a lower value: over a full 30 s window only 1
+// vehicle of 27 is seen by >= 3 distinct RSUs, so 2f+1=3 is unreachable and
+// every flagging RSU is scored as misbehaving. WEAKENS the BFT guarantee —
+// opt-in, and must be reported alongside any result produced with it.
+uint32_t g_rsu_trust_quorum = 0;
+
+// AB9 x-axis: controller compromise ONSET as a fraction of simTime.
+// t_comp/T_sim in {0.00, 0.25, 0.50, 0.75, 1.00}:
+//   0.00 = compromised from the first beacon (worst case) — and the DEFAULT, so
+//          every existing sweep keeps its current behaviour bit-identically.
+//   1.00 = never compromised within the run (clean anchor; must reproduce the
+//          full-AEGIS result, which is what validates the ablation wiring).
+// Read through ctrl_compromised_now() so the gate is applied consistently at the
+// injection sites (a5/a7) and the CP-DETECT flag site.
+double g_ctrl_compromise_onset = 0.0;   // AB9
+
+// AB9: is the controller compromised YET at the current sim time? The controller
+// attack (a5/a7 and the combined-mode control plane) is gated on
+// t >= g_ctrl_compromise_onset * simTime so AB9 can sweep compromise ONSET.
+// Lives here rather than in 08_detection_engine.h because the earliest caller
+// sits above that file's CP-DETECT section. onset 0.0 == historical behaviour.
+static inline bool ctrl_compromised_now()
+{
+    if (!controller_malicious_assumption) return false;
+    if (g_ctrl_compromise_onset <= 0.0)   return true;
+    return ns3::Simulator::Now().GetSeconds() >= g_ctrl_compromise_onset * simTime;
+}
+bool enable_ctrl_rotation   = true;   // AB9
+bool use_lkh_tree           = true;   // AB11
 
 // ── R7f: AI component toggles (paper §4.1.1 A2/A3 ablation) ────────────────
 // Independently enable the GAT spatial detector and the LSTM-AE temporal detector.
@@ -189,6 +600,26 @@ int g_enable_gat_cli      = -1;   // -1 = follow ablation_mode, 0/1 = explicit
 int g_enable_lstm_ae_cli  = -1;   // -1 = follow ablation_mode, 0/1 = explicit
 bool g_enable_gat         = true; // effective value after dispatch (R7f)
 bool g_enable_lstm_ae     = true; // effective value after dispatch (R7f)
+// AB4: per-run override of the GLOBAL fusion lambda_ae (--lambda_ae). -1 = off,
+// i.e. use fusion_weights.json as-is. Rescales psi/gat to 1-lambda_ae keeping
+// their ratio. Exists because the deployed lambda_ae=0.3071 caps the AE's vote
+// below phi_th=0.5, so on stealth drift it cannot move any decision; the
+// per-attack lambda_sets can't be used instead because k_hat is -1 on every
+// decision. Per-run so AB4 needs no change to the shared JSON.
+double g_lambda_ae_cli    = -1.0;
+
+// AB3: per-run override of the GLOBAL fusion lambda_gat (--lambda_gat). -1 = off.
+// Mirrors --lambda_ae above (rescales psi/ae to 1-lambda_gat keeping their ratio).
+// Exists because the deployed lambda_gat=0.1857 (and every per-attack k-set, max
+// 0.3) caps GAT's vote below phi_th=0.5. The AB3 evasive Sybil (--sybil_gat_evasive)
+// is deliberately engineered so psi and the LSTM-AE stay ~0 (plausible kinematics,
+// no temporal signature) — GAT is meant to be the SOLE discriminator (see
+// g_sybil_gat_evasive comment above) — but with the deployed weights, a perfectly
+// discriminative GAT (S >> theta_S) still can't cross Phi_th alone: verified
+// 2026-07-27, GAT-on vs GAT-off gave BYTE-IDENTICAL fused confusion matrices
+// (TP=0/FN=79 both ways) even after fixing GAT's stale calibration. Same
+// k_hat=-1 caveat as lambda_ae — the per-attack sets are dead at deploy.
+double g_lambda_gat_cli   = -1.0;
 
 // ── Stage 7: Post-Quantum Crypto flag ──────────────────────────────────────
 // Forced false automatically when ablation_mode == 4 (set in 12_main.h after cmd.Parse).
@@ -212,6 +643,7 @@ double R_max_comm = 270.0;  // Max V2V/V2I communication range (m); 41 dBm DSRC 
 // ── Trajectory Poisoning Detection Thresholds (§3.4.4) ────────────────────
 // TP-S1: Kinematic position feasibility
 double s_max = 33.33;       // Max road speed ~120 km/h (m/s)
+double g_s_max_cli_kmh = -1.0;  // --s_max_kmh override (km/h); -1 = keep default s_max. Decoupled from --maxspeed (which drives the SUMO trace file).
 
 // TP-S2: Heading rate deviation
 double omega_max = 0.5236;  // Max angular velocity (rad/s) = 30 deg/s
@@ -220,9 +652,14 @@ double omega_max = 0.5236;  // Max angular velocity (rad/s) = 30 deg/s
 double a_max = 4.0;         // Max vehicle acceleration (m/s²)
 
 // TP-S4/TP-S5: Dead-reckoning and drift
-double delta_th = 10.0;     // Dead-reckoning residual threshold (m)
-// Calibration: delta_th=10.0m accommodates honest direction changes in the random-waypoint
-// mobility model (90° turn at 50 km/h gives residual ~9.8m; must stay below delta_th).
+double delta_th = 5.0;      // Dead-reckoning residual threshold (m)
+// Calibration (2026-07-20, sir Step 5): swept δ_th∈{5,7.5,10,12.5,15} offline on the
+// G50 SUMO drift attack (our a2). δ_th=5.0 is the max-MCC value with FPR≤0.05: it lifts
+// the drift-signature recall on poisoned beacons hugely (TP-S5 0.18→0.96) at ZERO honest
+// FP cost — SUMO honest trajectories are smooth (0.1s beacons), so honest dead-reckoning
+// residual ≈0 even at highway speed (verified urban/rural/highway: honest fire 0/15077).
+// Old value 10.0 was tuned for the random-waypoint model (large honest turn residuals);
+// under SUMO it was needlessly high and missed the stealth drift. a2 MCC 0.945→0.948.
 static bool g_save_restore_context = false;  // unused placeholder
 int    drift_window_k = 10; // Window size k for cumulative drift score
 
@@ -236,6 +673,12 @@ double rho_v   = 0.01;      // Vehicle density (vehicles/m²)
 // Beacons are staggered T_b/N apart in 12_main.h (≈6.25ms for 16 vehicles).
 // tau_sync=1ms < 6.25ms stagger → honest vehicles are NOT flagged.
 // Attacker colluders who send within 1ms of each other ARE flagged.
+// Calibration (2026-07-20, sir Step 6): swept τ_sync∈{1,2,5,10}ms × ρ_sync∈{0.6..0.9}
+// on the G50 impersonation attack (our a4). KEPT τ_sync=1ms — widening is
+// COUNTERPRODUCTIVE: with 200 SUMO vehicles at 0.1s beacons, honest beacons routinely
+// coincide within a few ms, so honest MP-S2 fire explodes 0.00→0.09→0.40→0.67 at
+// τ=1→2→5→10ms. τ=1ms already gives clean separation (0.21/0.00). a4 is caught by
+// MP-S1 (0.96/0.00) regardless, so τ_sync has ~zero leverage on a4's overall MCC.
 double tau_sync  = 0.001;   // 1ms synchronization detection window (s)
 double rho_sync  = 0.8;     // Co-occurrence rate threshold
 
@@ -263,6 +706,22 @@ double kappa_th              = 0.1;   // KL divergence detection threshold (Eq. 
 // Previous value 0.30 was set for a fully-trained GAT+LSTM-AE system (not yet
 // implemented); 0.09 is calibrated to the rule-based branch's weight distribution.
 double psi_th    = 0.09;    // Lightweight mode isolation threshold (rule-based branch)
+float  g_theta_s = 8.560697f;  // Option A (Eq 3.46): GAT spatial calibration θ_S (95th pctl of clean S_i). Overridden from models/shared/theta_s.txt at AI init.
+double g_phi_max_graph = 1.5707963267948966;  // π/2 — GAT edge heading-divergence bound φmax (#9 sensitivity; runtime override of mptd_ai::PHI_MAX_GRAPH, set via --phi_max)
+uint32_t g_fhe_ring_dim = 0;  // #12 sensitivity: 0=auto (OpenFHE picks N for L5); >0 forces params.SetRingDim(N), e.g. 32768/65536. Set via --fhe_ring_dim.
+
+// ── H5: HMAC replay protection (paper HMAC gate: freshness Δ_HMAC + cluster nonce cache) ──
+// Δ_HMAC: max age of an authentic beacon at the RSU. Beacons are sent every
+// T_b=100 ms with ~sub-ms propagation, so 0.5 s accepts all honest traffic with
+// wide margin while bounding the replay window to 5 beacon periods. The paper
+// leaves Δ_HMAC symbolic; value is CLI-overridable (--delta_hmac).
+double delta_hmac = 0.5;    // Δ_HMAC freshness window (s)
+
+// ── H6: TRS message freshness (paper trs_message/trs_fresh: ring nonce ν_S + Δ_TRS) ──
+// Δ_TRS: max age of a σ_TRS bundle at the cloud verify gate. The pipeline runs
+// once per IPFS window (L=10 beacons × T_b=100 ms = 1 s), so 2 s covers honest
+// sign→verify latency with margin. Paper leaves Δ_TRS symbolic; CLI-overridable.
+double delta_trs = 2.0;     // Δ_TRS freshness window (s)
 
 // ── MRTPA Attack Injection Parameters ─────────────────────────────────────
 double poisoning_intensity_theta  = 0.5;   // θ ∈ [0,1] deviation magnitude
@@ -301,7 +760,7 @@ double max_acceleration_deviation = 5.0;   // Max acceleration offset (m/s²)
 //                                    TP-S1 single-beacon + extra via TP-S4/S5 cumulative
 //     k_max                = 50    → accumulator reset every 50 beacons (~5 s at 10 Hz),
 //                                    approximating handover stitch (Eq 3.4 W_s).
-double epsilon_max_stealth           = 0.5;   // m per beacon (Eq 3.5 stealth bound, < gate)
+double epsilon_max_stealth           = 0.5;   // AB4 sweep variable (--eps_max)   // m per beacon (Eq 3.5 stealth bound, < gate)
 double epsilon_min_abrupt            = 7.0;   // m per beacon (above gate at theta=0.5)
 double epsilon_max_abrupt            = 12.0;  // m per beacon (abrupt ceiling)
 double stealth_fraction_theta_s      = 0.7;   // fraction of beacons drawn from stealth
@@ -340,11 +799,13 @@ uint32_t total_trajectories_stored_blockchain = 0;
 uint32_t tdee_gt_count [MAX_RSUS] = {};
 uint32_t tdee_est_count[MAX_RSUS] = {};
 
-// ── PARR: TRS blockchain rejection accumulators (paper Eq. 4.3) ─────────────
-// parr_trs_rejected  = poisoned beacons flagged by the RSU lightweight detector
-//                      (flag=1, Eq 3.67 → counted as a TRS-layer rejection)
+// ── Lightweight detection-revoke accumulators (NOT PARR) ────────────────────
+// These count the LW detection-revoke path, reported as "RevRate". PARR (Eq 4.3)
+// is the CRYPTOGRAPHIC TRS-verify rejection rate and uses g_trs_rejected_count /
+// (g_trs_verified_count + g_trs_rejected_count) in compute_PARR() instead.
+// parr_trs_rejected   = poisoned beacons revoked by the RSU lightweight detector
+//                       (flag=1, Eq 3.67)
 // parr_poisoned_total = total poisoned beacons submitted to the blockchain ledger
-// PARR = parr_trs_rejected / parr_poisoned_total   (distinct from DR = TP/(TP+FN))
 uint32_t parr_trs_rejected   = 0;
 uint32_t parr_poisoned_total = 0;
 
@@ -360,6 +821,25 @@ uint32_t pbpo_cnt         = 0;
 // WRONG_ROUTING always wrong; CLEAN for poisoned = FN; ATTACK_DETECTED for clean = FP.
 uint32_t ctrl_decisions_total = 0;
 uint32_t ctrl_decisions_wrong = 0;
+// CDER_full (additive, AB4/AB5): the per-beacon RSU CDER above is LIGHTWEIGHT by
+// architecture — the RSU emits its control decision immediately, before the
+// window-close fusion verdict exists, so ctrl_decisions_* can never reflect the
+// AI layer and comes out identical for FULL vs an ML-tier ablation. CDER_full
+// scores the controller's RETROSPECTIVE fusion verdict (full_flag) against ground
+// truth at the fusion site, so the control-plane error responds to GAT+AE. Stays
+// 0 in lightweight modes (1/6) where no fusion runs → compute_CDER_full()
+// returns -1 there, and the lightweight run's own ctrl_decisions_* (LW) is used.
+uint32_t ctrl_full_total = 0;
+uint32_t ctrl_full_wrong = 0;
+// AB6 f/n sweep: aggregate-plane control decisions. The controller issues one
+// ring-level (macro) control decision per TRS epoch from the verified aggregate;
+// when TRS ADMITS a poisoned aggregate (forge), that decision — affecting the
+// ring's total_count vehicles — is wrong. Folded into compute_CDER() so CDER
+// degrades as f rises (CDER_agg ≈ 1−PARR). Only booked when g_trs_compromised_f>=0,
+// so zero effect on non-AB6 runs. Vehicle-weighted (total_count) for visibility
+// against the per-beacon CDER denominator.
+uint64_t g_agg_ctrl_total = 0;
+uint64_t g_agg_ctrl_wrong = 0;
 // PBPO_LW: RSU-side lightweight HMAC gate processing time (Eq.4.7, lightweight mode)
 // Separate from PBPO_Full (controller-side full detection pipeline).
 double   pbpo_lw_time_sum_ms = 0.0;
@@ -385,6 +865,31 @@ uint32_t g_cp_detect_trs_fails         = 0;  // TRS-verify gate failures (R8-act
 uint32_t g_cp_detect_conflict_fires    = 0;  // Eq 3.59 conflict-gate firings
 uint32_t g_cp_detect_epochs_evaluated  = 0;  // number of controller decisions audited
 bool     g_flag_c_active               = false;  // RSU fallback mode currently active
+
+// ── CP-1 (2026-08-05): credit CP-DETECT in CDER ──────────────────────────────
+// CP-DETECT (Algorithm 7, Eq 3.59) fires and sets g_flag_c_active, but until now
+// that verdict was consumed by NOTHING — its only reader was a printf in
+// 10_metrics_csv.h:1009. Measured: 93,079 firings in a 300 s run, zero effect on
+// any metric. CDER therefore never measured controller-compromise DETECTION at
+// all; a malicious controller's decision was scored `wrong = true` unconditionally,
+// whether or not the system had caught it.
+//
+// With this enabled, once CP-DETECT has flagged the controller, its subsequent
+// bad decisions are treated as a DETECTED compromise interval rather than as
+// undetected control error — which is what CDER (Eq 4.4) is meant to measure.
+//
+// Default false = legacy behaviour, so every previously reported CDER stays
+// reproducible. Enable with --cder_credit_cp_detect=1 to obtain the paired
+// before/after comparison.
+bool     g_cder_credit_cp_detect       = false;
+
+// CP-2 (2026-08-05): controller misbehaviour evidence counter, the controller-side
+// analogue of the RSU trust chain (eq:rsu_trust / eq:ctrl_trust). Incremented on
+// every CP-DETECT firing so controller compromise accumulates evidence instead of
+// being discarded. Reported in the metrics line; feeds the SC-Revoke decision path.
+uint64_t g_ctrl_misbehave_evidence     = 0;
+double   g_ctrl_trust                  = 1.0;   // tau_c(t), EMA-decayed on evidence
+double   g_ctrl_trust_alpha            = 0.3;   // mirrors g_rsu_trust_alpha
 
 // ── Send-side speed/time history — separate from receive-side vehicle_state ──
 // Used only in send_LTE_metadata_uplink_alone() to compute accel at send time.
@@ -459,6 +964,23 @@ int routing_algorithm = 0;
 // the master training CSV can be built without a working Fabric environment.
 // Defaults to false (production behaviour preserved).
 bool skip_blockchain                           = false;
+
+// ── Tiered blockchain commit strategy (paper §3.5.5, tab:set-blockchain) ──────
+// Per-beacon SYNCHRONOUS Fabric commits are impractical at the 100 ms beacon
+// rate (each consensus round-trip blocks the RSU pipeline). Four tiers:
+//   T1 immediate  — revocation / controller reassignment (kept synchronous)
+//   T2 per-epoch  — trust threshold crossings, TRS sigs, RSU lifecycle
+//   T3 batched    — ordinary anomaly evidence E_j(t): buffered per-RSU, flushed
+//                   as ONE batched tx every g_t_batch s OR g_n_commit entries
+//   T4 off-chain  — raw beacon windows + per-beacon scores → IPFS, hash only
+// Security invariant preserved: BFT revocation (eq:bft_revoke_rsu) counts
+// distinct RSU submissions within T_w; g_t_batch << T_w so all batches land
+// inside the window. Values chosen: T_batch=10 s (≪ T_w≈60 s, 6 batches/window,
+// 10× fewer commits than per-second), N_commit=50 (flushes before T_batch under
+// high-penetration bursts → no buffer overflow; T_batch dominates at low load).
+bool   g_tiered_commit = true;   // enable Tier-3 batched evidence commit
+double g_t_batch       = 10.0;   // Tier-3 batch interval (s)  {5,10,20,30}, ≪ T_w
+int    g_n_commit      = 50;     // Tier-3 batch size (entries) {10,25,50,100}
 bool beacon_suppression_nodes[total_size]     = {};  // reserved: beacon vanishing/drop attack
 bool heading_spoof_nodes[total_size]          = {};  // TP-S2: heading/velocity exaggeration
 bool rsu_fabrication_nodes[total_size]        = {};  // reserved: RSU fabrication
@@ -526,6 +1048,20 @@ double   AIFS        = 0.0;
 // ── Malicious node flags for location-based attacks (11_routing) ──────────
 bool tp_vehicle_nodes[total_size]         = {};  // TP-S2: malicious vehicle trajectory poisoning
 
+// ── Combined-attack mode (--attack_number=0): all 7 attack types active in ONE
+// run, the "combined attack" default sir specifies for the ablation and E1–E4.
+// g_veh_attack[i] = the attack type assigned to malicious vehicle i (0 = honest;
+// else 2/4/6 for the vehicle-level TP-S2/MP-S2/MP-S3). The RSU-level (a1,a3) and
+// controller-level (a5,a7) attacks are activated globally alongside. This lets a
+// single run yield every metric (TPE from TP attacks, TDEE from MP attacks,
+// CP-DETECT from the controller attacks). Set after cmd.Parse() in 12_main.h.
+bool g_combined_attack = false;
+int  g_veh_attack[total_size] = {};
+// Effective attack type for a vehicle: per-node in combined mode, else the global.
+inline int veh_atk(uint32_t vid, int global_atk) {
+    return (g_combined_attack && vid < (uint32_t)total_size) ? g_veh_attack[vid] : global_atk;
+}
+
 NS_LOG_COMPONENT_DEFINE ("mptd_pqs_sdvn");
 
 // ── Additional timing globals (11_routing_blockchain_transmission.h) ───────
@@ -540,6 +1076,15 @@ double HELLO_initial_timestamp      = 0.0;
 double LLDP_final_timestamp         = 0.0;
 double packet_final_timestamp[total_size + 2];
 double flow_initiation_time         = 0.0;
+
+// TEMP DIAGNOSTIC (Step 1 follow-up): raw TX-attempt vs RX-received beacon
+// counters, independent of confusion-matrix scoring or any software gate.
+// Compares against cm_TP+cm_FP+cm_TN+cm_FN to localize where the beacon-count
+// gap actually happens (TX vs RX = physical/MAC loss; RX vs scored = software
+// gate). Additive-only, no behavior change.
+uint64_t g_diag_beacon_tx_count = 0;
+uint64_t g_diag_beacon_rx_count = 0;
+uint64_t g_diag_cm_update_count = 0;  // TEMP DIAGNOSTIC (Block 2): update_confusion_matrix() call count
 
 bool sybil_mitm_nodes[total_size]                  = {}; // MP-S2: identity theft / MP-S3: MitM relay
 

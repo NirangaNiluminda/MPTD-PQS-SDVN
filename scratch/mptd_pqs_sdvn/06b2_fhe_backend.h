@@ -42,6 +42,19 @@
 #include <string>
 #include <unordered_map>
 
+// ── FHE plaintext modulus (Option A, 2026-07-04) ─────────────────────────────
+// BFV packs each aggregate slot [Σspeed, Σpos_x, Σpos_y, N] as a signed integer
+// that MUST stay in (−p/2, p/2). Positions are scaled ×POS_SCALE(=1000)→mm, so a
+// single km-scale SUMO coordinate (~5000 m → 5e6 mm) already dwarfs the old
+// p=65537, and the per-window Σpos over up to ~200 vehicles (≲1e9) more so —
+// this is why crypto-on Full mode (A0) aborted with "Cannot encode integer …
+// > plaintext modulus 65537". We use the 32-bit NTT-friendly prime
+// 0xFFF00001 = 4293918721 (≡1 mod 2^20, so BFV batching holds for any ring dim
+// ≤ 2^19). p/2 ≈ 2.147e9 gives ~2× headroom over worst-case Σpos on a 5 km map.
+// Raising p enlarges the ring dimension → the reported FHE latency/security
+// figures shift; that tradeoff is expected and accepted under Option A.
+static constexpr uint32_t FHE_PLAINTEXT_MODULUS = 4293918721u; // 0xFFF00001
+
 // NIST Level 5 enforcement (opt-in via -DMPTD_REQUIRE_LEVEL5): OpenFHE is
 // required; without "openfhe.h" this header compiles the Mock backend below,
 // which performs NO real encryption.
@@ -66,7 +79,8 @@
 // BfvBackend — concrete OpenFHE BFV-RNS backend for MPTD-PQS Full-mode FHE.
 //
 // Single-context model: one CryptoContext + one KeyPair for the whole sim.
-// Plaintext modulus 65537 (Fermat prime, widely tested for BFV packing).
+// Plaintext modulus FHE_PLAINTEXT_MODULUS (0xFFF00001, see top of file — sized
+// to hold km-scale Σpos aggregates that overflowed the former 65537).
 // Multiplicative depth 1 (we only do EvalAdd for averaging; no multiplies).
 // Stays well inside [13]'s 5-second latency envelope.
 //
@@ -87,7 +101,7 @@ public:
     static constexpr int64_t POS_SCALE   = 1000;   // m   → mm
 
     // One-time setup. Returns false on failure.
-    bool init(uint32_t plaintext_modulus = 65537,
+    bool init(uint32_t plaintext_modulus = FHE_PLAINTEXT_MODULUS,
               uint32_t mult_depth        = 1)
     {
         try {
@@ -97,6 +111,7 @@ public:
             // NIST Level 5 (supervisor requirement 2026-06): 256-bit
             // post-quantum security, consistent with the threshold backend.
             params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
+            if (g_fhe_ring_dim > 0) params.SetRingDim(g_fhe_ring_dim);  // #12 sensitivity override
 
             ctx_ = lbcrypto::GenCryptoContext(params);
             ctx_->Enable(lbcrypto::PKE);
@@ -236,7 +251,7 @@ private:
 // ────────────────────────────────────────────────────────────────────────────
 static std::unique_ptr<BfvBackend> g_fhe_backend;
 
-static bool init_fhe_backend(uint32_t plaintext_modulus = 65537,
+static bool init_fhe_backend(uint32_t plaintext_modulus = FHE_PLAINTEXT_MODULUS,
                              uint32_t mult_depth        = 1)
 {
     if (g_fhe_backend && g_fhe_backend->ready()) return true;
@@ -283,7 +298,7 @@ public:
 
     // Eq 3.54: ThGen(1^λ, n+1, t). n_rsus RSUs + 1 Cloud; threshold t.
     bool init(uint32_t n_rsus, uint32_t threshold,
-              uint32_t plaintext_modulus = 65537, uint32_t mult_depth = 1)
+              uint32_t plaintext_modulus = FHE_PLAINTEXT_MODULUS, uint32_t mult_depth = 1)
     {
         try {
             if (threshold == 0 || threshold > n_rsus + 1) {
@@ -302,10 +317,12 @@ public:
             params.SetMultipartyMode(lbcrypto::NOISE_FLOODING_MULTIPARTY);
             params.SetThresholdNumOfParties(n_parties_);
             params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
+            if (g_fhe_ring_dim > 0) params.SetRingDim(g_fhe_ring_dim);  // #12 sensitivity override
             // NIST Level 5 (supervisor requirement 2026-06): 256-bit
             // post-quantum security. Paper Table 3.13. OpenFHE auto-selects
             // a ring dimension large enough to meet HEStd_256_quantum.
             params.SetSecurityLevel(lbcrypto::HEStd_256_quantum);
+            if (g_fhe_ring_dim > 0) params.SetRingDim(g_fhe_ring_dim);  // #12 sensitivity override
 
             ctx_ = lbcrypto::GenCryptoContext(params);
             ctx_->Enable(lbcrypto::PKE);
@@ -341,6 +358,13 @@ public:
             } catch (const std::exception &e) {
                 shares_ok_  = false;
                 last_error_ = std::string("ShareKeys: ") + e.what();
+                // init() still returns true on this soft-failure (all-present decrypt
+                // still works), so surface the reason here or it's silently lost —
+                // AB7 ring-size sweep (n>4) hit this and needed to know why.
+                std::cerr << "[CRYPTO/THFHE] WARNING: ShareKeys (with-aborts) failed at "
+                          << "n_parties=" << n_parties_ << " t=" << threshold_
+                          << " -- " << last_error_
+                          << " -- falling back to all-present decrypt only\n";
             }
 
             ring_dim_ = ctx_->GetRingDimension();
@@ -377,6 +401,14 @@ public:
         lbcrypto::Serial::Serialize(ct, oss, lbcrypto::SerType::BINARY);
         const std::string &s = oss.str();
         return std::vector<uint8_t>(s.begin(), s.end());
+    }
+    // R9: inverse of serialize_ciphertext — cloud rebuilds Enc(A_ring) from bytes.
+    Ciphertext deserialize_ciphertext(const std::vector<uint8_t> &bytes) const {
+        std::string s(bytes.begin(), bytes.end());
+        std::istringstream iss(s, std::ios::binary);
+        Ciphertext ct;
+        lbcrypto::Serial::Deserialize(ct, iss, lbcrypto::SerType::BINARY);
+        return ct;
     }
 
     // ── Homomorphic addition — no secret key (Eq 3.47 ring, Eq 3.52 cloud) ───
@@ -483,7 +515,7 @@ private:
 static std::unique_ptr<ThresholdBfvBackend> g_thfhe_backend;
 
 static bool init_threshold_fhe_backend(uint32_t n_rsus = 4, uint32_t threshold = 3,
-                                       uint32_t plaintext_modulus = 65537,
+                                       uint32_t plaintext_modulus = FHE_PLAINTEXT_MODULUS,
                                        uint32_t mult_depth = 1)
 {
     if (g_thfhe_backend && g_thfhe_backend->ready()) return true;
@@ -507,7 +539,7 @@ public:
     static constexpr int64_t SPEED_SCALE = 100;
     static constexpr int64_t POS_SCALE   = 1000;
 
-    bool init(uint32_t plaintext_modulus = 65537, uint32_t mult_depth = 1) {
+    bool init(uint32_t plaintext_modulus = FHE_PLAINTEXT_MODULUS, uint32_t mult_depth = 1) {
         ready_ = true;
         pt_mod_ = plaintext_modulus;
         return true;
@@ -598,7 +630,7 @@ private:
 };
 
 static std::unique_ptr<BfvBackend> g_fhe_backend;
-static inline bool init_fhe_backend(uint32_t pt_mod = 65537, uint32_t depth = 1) {
+static inline bool init_fhe_backend(uint32_t pt_mod = FHE_PLAINTEXT_MODULUS, uint32_t depth = 1) {
     g_fhe_backend = std::unique_ptr<BfvBackend>(new BfvBackend());
     return g_fhe_backend->init(pt_mod, depth);
 }
@@ -619,7 +651,7 @@ public:
     static constexpr int64_t POS_SCALE   = 1000;
 
     bool init(uint32_t n_rsus, uint32_t threshold,
-              uint32_t plaintext_modulus = 65537, uint32_t mult_depth = 1) {
+              uint32_t plaintext_modulus = FHE_PLAINTEXT_MODULUS, uint32_t mult_depth = 1) {
         n_parties_ = n_rsus + 1;
         threshold_ = threshold;
         ready_ = true;
@@ -649,6 +681,12 @@ public:
 
     std::vector<uint8_t> serialize_ciphertext(const Ciphertext& ct) const {
         return ct.data;
+    }
+    // R9: inverse for the no-OpenFHE stub — bytes are just the packed int64 slots.
+    Ciphertext deserialize_ciphertext(const std::vector<uint8_t>& bytes) const {
+        Ciphertext ct;
+        ct.data = bytes;
+        return ct;
     }
 
     Ciphertext add(const Ciphertext& a, const Ciphertext& b) const {
@@ -724,7 +762,7 @@ private:
 static std::unique_ptr<ThresholdBfvBackend> g_thfhe_backend;
 
 static bool init_threshold_fhe_backend(uint32_t n_rsus = 4, uint32_t threshold = 3,
-                                       uint32_t plaintext_modulus = 65537,
+                                       uint32_t plaintext_modulus = FHE_PLAINTEXT_MODULUS,
                                        uint32_t mult_depth = 1)
 {
     if (g_thfhe_backend && g_thfhe_backend->ready()) return true;

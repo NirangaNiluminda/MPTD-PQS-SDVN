@@ -1,11 +1,18 @@
 # Paper ↔ Code Alignment — HPC Punch List
 
-**Date:** 2026-07-03. **Branch:** `feature/metrics-11`.
+**Date:** 2026-07-03 (reconciled against the latest paper draft). **Branch:** `ml-review-fixes`.
 **Trigger:** paper Chapter 4 was rewritten into **5 formal Experiments** (`sec:exp1`–`sec:exp5`)
 with a fixed default config, **11 ablation variants AB1–AB11** (`sec:ablation`), and **11
 metrics**, all evaluating the **full mode** against baselines **B1/B2/B3**. The code is still on
 the older A1–A5 + B1 scheme and the lightweight path. This file maps every experiment / AB
 variant / metric to the exact code knob so the HPC edits target the right things.
+
+**What the latest draft changed vs this punch list:** (a) `tab:set-scenarios` now fixes
+s_max=**60/90/150** and Log-distance (n=3.0) for BOTH rural and highway — matching the shipped
+code and the urban/rural/highway@200 datasets; three other tables/prose remain stale (see §0).
+(b) Full-mode component selection is now DONE offline — real GAT/LSTM-AE selection tables exist
+(GAT MCC urban 0.4056 / rural 0.1400 / highway 0.7942); only the integrated `ablation_mode=0`
+ns-3 run is still outstanding. (c) Results now report real AB5 (lightweight) MCC/PARR/CDER.
 
 Legend: ✅ aligned · ⚠️ partial (reachable but not labelled / needs a split) · ❌ gap (new code)
 
@@ -13,18 +20,27 @@ Legend: ✅ aligned · ⚠️ partial (reachable but not labelled / needs a spli
 
 ## 0. Resolve in the paper FIRST (else the code targets the wrong number)
 
-- [ ] **`s_max` per scenario is specified three incompatible ways** — `tab:set-lw`
-  `TBD{100,120,130,140}`; `tab:smax-sensitivity` grid (urban 80/100/120, rural 100/120/140,
-  highway 120/130/140); `tab:set-scenarios` concrete **60/90/150**. The code reads ONE
-  `s_max` per scenario. Pick one set before configuring.
-- [ ] **Highway propagation model contradicts itself** — §4.3 prose says **two-ray ground**,
-  `tab:set-scenarios` says **Log-distance (n=3.0)**. Configure the NS-3 channel to whichever
-  you keep.
+Status note (2026-07-03): the current paper draft **partially resolves** these, but the
+resolutions are inconsistent *across tables/prose within the same draft* — the code is
+already built to the `tab:set-scenarios` values (60/90/150, Log-distance both rural+highway),
+so the remaining action is to fix the paper's OTHER tables/prose to match, not to re-config code.
+
+- [ ] **`s_max` — `tab:set-scenarios` now concrete 60/90/150** (matches code + shipped
+  datasets), BUT still contradicted by three other places: `tab:set-lw` `TBD{100,120,130,140}`,
+  `tab:smax-sensitivity` grid (urban 80/100/120, rural 100/120/140, highway 120/130/140),
+  and `sec:param-rationale` prose. **Code is correct at 60/90/150** — fix the three stale
+  tables/prose in the paper to match, do NOT re-config.
+- [ ] **Highway propagation — `tab:set-scenarios` now says Log-distance (n=3.0)** for BOTH
+  rural AND highway, matching the shipped code (12_main.h scenario 2 = LogDistance, committed
+  5b6cd92). BUT `sec:mobility-scenarios` **prose still says highway uses "two-ray
+  ground-reflection model"** — stale, contradicts the table. Fix the prose → Log-distance.
 - [ ] **`\ref{eq:fpr}` still dangling** in the full-mode model-selection prose
   ("FPR, Eq.~\ref{eq:fpr}") — restore a one-line FPR def or drop the ref.
 - [ ] **Results/PARR prose** still says "gap between **A1** and B1" → **AB5/AB6**.
 - [ ] **Map area** — tables say ≈4 km²; the density sentence in `sec:param-rationale` says
-  "2 km²". Pick one (affects the 100 veh/km² claim).
+  "2 km²". Pick one (affects the 100 veh/km² claim). Note: rural map caps at ~138–151
+  full-window vehicles (sparse ~2 km² Hohenwart net), so the 200-veh/scenario fairness claim
+  cannot hold for rural without enlarging the map — document the rural cap or match by density.
 
 ---
 
@@ -34,16 +50,22 @@ Default config (`tab:default-config`): ρ_a=0.40, γ=0.70, v=60 km/h, N_v=200, T
 **full mode**. Every experiment's "proposed method" is **full mode vs B1/B2/B3**, so the two
 cross-cutting blockers below hit ALL five experiments:
 
-- ❌ **Full mode not exercised** — default run is `routing_test=true` + `ablation_mode=1`
-  (=AB5, lightweight). Full mode (GAT+LSTM ONNX, TRS/FHE, Fabric) is compiled-in but unrun.
+- ⚠️ **Full mode partially exercised (offline component selection done, end-to-end sim not)** —
+  the paper now carries REAL full-mode model-selection tables: `tab:gat-selection` (GAT chosen,
+  per-scenario MCC **urban 0.4056 / rural 0.1400 / highway 0.7942** at FPR 0), `tab:lstmae-selection`,
+  and `tab:fullmode-selected` (GAT finalised; LSTM-AE β still TBD). So the AI components ARE
+  trained/selected offline. What is STILL unrun is the **integrated ns-3 full-mode run**
+  (`ablation_mode=0`): default sweep is still `routing_test=true` + `ablation_mode=1` (=AB5,
+  lightweight). Bring up `ablation_mode=0` (GAT+LSTM ONNX inference, TRS/FHE, Fabric) end-to-end.
 - ❌ **B2, B3 missing** — only B1 (Ghaleb) is coded. B2 (Fed-LSTM-AE) / B3 (hTDC-AE) are
-  **ML baselines → coordinate with the ML member**, do not silently own.
+  **ML baselines → coordinate with the ML member**, do not silently own. (Reminder: B2/B3 must
+  each be ONE global model with held-out vehicles, not per-(attack×pct) models.)
 
 | Exp | Independent var | Code knob | Y-metrics | Status / extra blocker |
 |---|---|---|---|---|
 | **1** `sec:exp1` | ρ_a × γ (6×3) | `--attack_percentage`, `stealth_fraction_theta_s` (02_config_globals.h:307) | MCC,TTD,CDER,TDEE,TPE,PBPO | ⚠️ confirm γ has a CLI binding for {0,0.7,1.0}; needs SUMO (TDEE/TPE) + full mode + B2/B3 |
 | **2** `sec:exp2` | speed {10,60,100,140} | `--maxspeed` (02_config_globals.h:71) + per-speed SUMO trace `mobility_<scen>_<spd>.tcl` | same 6 | ⚠️ trace file must exist for each speed×scenario; + full mode + B2/B3 |
-| **3** `sec:exp3` | N_v {100,200,300,400}, RSU scaled | `routing_test=false` + N via CLI | MCC,TTD,CDER,PBPO,**COO,BWO_ratio** | ❌ **deferred scale-up** (16/4 test vs ~200/25 SUMO); ❌ COO/BWO absent |
+| **3** `sec:exp3` | N_v {100,200,300,400}, RSU scaled | `routing_test=false` + N via CLI | MCC,TTD,CDER,PBPO,**COO,BWO_ratio** | ❌ **deferred scale-up** (16/4 test vs ~200/25 SUMO); ✅ COO/BWO emitted since 2026-07-06 (C5–C9) |
 | **4** `sec:exp4` | Threat Level 1–5 (σ×n_coord) | **none** | same 6 | ❌ no `threat_level`/`n_coord` knob (only attack 7 "coordinated" type) |
 | **5** `sec:exp5` | 7 attack variants, isolated | `--attack_number=1..7` | MCC,TTD,CDER,TDEE/TPE,PBPO | ✅ knob exists; needs full mode + B2/B3 + SUMO |
 
@@ -53,23 +75,28 @@ cross-cutting blockers below hit ALL five experiments:
 
 Code today (02_config_globals.h:167): `0=Full, 1=A1(LW-only), 2=A2, 3=A3, 4=A4(no PQ crypto),
 5=A5(no-BC), 6=B1(Ghaleb LTT)`. AI sub-toggles: `--enable_gat`, `--enable_lstm_ae`
-(02_config_globals.h:188). The paper's 11-way split does NOT map 1:1 — extend the selector:
+(02_config_globals.h:188).
 
-| AB | Removed | Code today | Edit |
-|---|---|---|---|
-| **AB1** | rule signatures (ψ) | ❌ | new mode: disable TP-S1..MP-S4 scoring |
-| **AB2** | HMAC + nonce | ❌ | new mode: disable HMAC gate |
-| **AB3** | GAT | ⚠️ `--enable_gat=0` | wire as AB3 label |
-| **AB4** | LSTM-AE | ⚠️ `--enable_lstm_ae=0` | wire as AB4 label |
-| **AB5** | full AI (LW only) | ✅ mode 1 (A1) | rename A1→AB5 |
-| **AB6** | TRS gate | ⚠️ half of mode 4 | split `use_pq_crypto`: TRS-off only |
-| **AB7** | FHE pre-coord | ⚠️ half of mode 4 | split `use_pq_crypto`: FHE-off only |
-| **AB8** | RSU 3-state lifecycle | ❌ | new mode: RSUs permanently trusted |
-| **AB9** | multi-controller | ❌ | new mode: single fixed controller |
-| **AB10** | blockchain (SC-Trust/Revoke) | ✅ mode 5 (A5) (04_state_globals.h:157) | rename A5→AB10 |
-| **AB11** | LKH→unicast rekey | ❌ | new mode: unicast rekey path |
+**RESOLVED (C10, 2026-07-06):** new `--ablation_ab=0..11` selector (02_config_globals.h,
+dispatch in 12_main.h) maps every AB onto fine-grained toggles; legacy `ablation_mode`
+enum untouched. Outputs get an `_ab{N}` suffix + `ablation_ab` CSV column.
 
-Net: **AB5, AB10 aligned; AB3, AB4, AB6, AB7 partial; AB1, AB2, AB8, AB9, AB11 are new.**
+| AB | Removed | Wiring |
+|---|---|---|
+| **AB1** | rule signatures (ψ) | ✅ `enable_rule_signatures=false` — TP/MP flags zeroed, detectors still warm state, CP-DETECT stays |
+| **AB2** | HMAC + nonce | ✅ `enable_hmac_gate=false` — Δ_HMAC gate bypassed |
+| **AB3** | GAT | ✅ `g_enable_gat_cli=0` |
+| **AB4** | LSTM-AE | ✅ `g_enable_lstm_ae_cli=0` |
+| **AB5** | full AI (LW only) | ✅ ≡ `ablation_mode=1` |
+| **AB6** | TRS gate | ✅ `enable_trs=false` — unsigned aggregate; poisoned aggregates still injected but never rejected → PARR=0.0 vs full-mode 1.0 (C4b contrast) |
+| **AB7** | FHE pre-coord | ✅ `enable_fhe=false` — plaintext ring sums, TRS still binds payload, H7 envelope intact |
+| **AB8** | RSU 3-state lifecycle | ✅ `enable_rsu_lifecycle=false` — uniform-random endorsers over ALL RSUs |
+| **AB9** | multi-controller | ✅ `enable_ctrl_rotation=false` — controller 0 pinned |
+| **AB10** | blockchain (SC-Trust/Revoke) | ✅ ≡ `ablation_mode=5` + `skip_blockchain=true` |
+| **AB11** | LKH→unicast rekey | ✅ `use_lkh_tree=false` — flat group keying, N_rekey=\|V_j\| |
+
+Net: **all 11 variants wired.** Smoke-tested AB2/AB6/AB7/AB11 + legacy-full regression
+(simTime=30, a1/p30) — see DESIGN_FLAWS_AUDIT.md §6.2 C10 resolution note.
 
 ---
 
@@ -77,28 +104,42 @@ Net: **AB5, AB10 aligned; AB3, AB4, AB6, AB7 partial; AB1, AB2, AB8, AB9, AB11 a
 
 CSV header: 10_metrics_csv.h:959. TTD helper: analytics/compute_ttd.py.
 
+> **RESOLVED (C5–C9, 2026-07-06):** all five missing families now emitted natively — 11 new CSV
+> columns after `sc_register_active`: `TTD, FRR_revoke, FRR_demote, COO_epoch, COO_trs, COO_fhe,
+> COO_dkg, BWO_ratio, BWO_scale, TCL_confirm, TCL_reassign` (−1 when the mechanism never ran).
+> Smoke (a1/p30/s30, skip_blockchain): full mode TTD=0.000 s (per-beacon detection fires on the
+> poisoned beacon itself), FRR_revoke=0.0625, COO epoch 193.99 ms (TRS 22.47 + FHE 171.53),
+> DKG 224.16 ms, BWO_ratio 148.17; AB7 cross-check COO_fhe=0.000 / epoch 0.49 ms / ratio 1.079.
+> Post-R9 re-verification (2026-07-08), through the networked RSU→Cloud path after the chunked-
+> transport fix: 19/19 epochs round-trip, COO epoch 236.01 ms (TRS 22.49 + FHE 213.53 — the Δ is
+> the cloud-side deserialize of the ~2 MB ciphertext); AB7 epoch 0.53 ms / ratio 1.079. Pass
+> `--rsu_seed` for reproducible smoke numbers (default 0 clock-seeds the compromised-RSU pick).
+
 | Metric | Scope | Producer today | Gap / stage |
 |---|---|---|---|
 | MCC | all-baseline | ✅ CSV `MCC` | — |
-| TTD | all-baseline | ⚠️ analytics/compute_ttd.py (from beacon_log) | ok; optionally add CSV col |
+| TTD | all-baseline | ✅ CSV `TTD` (matches analytics/compute_ttd.py semantics) | — |
 | CDER | all-baseline | ✅ CSV `CDER` | — |
 | TDEE | all-baseline | ✅ CSV `TDEE` (−1 w/o SUMO) | run `--mobility_source=1` |
 | TPE | all-baseline | ✅ CSV `TPE` (−1 w/o SUMO) | run with SUMO |
 | PBPO | all-baseline | ✅ CSV `PBPO_LW/Full` | — |
-| PARR | ablation | ✅ CSV `PARR` | — |
-| FRR (revoke+demote) | ablation | ❌ | Stage 3 — live Fabric |
-| COO | ablation | ❌ | Stage 2 — full-mode crypto timers |
-| BWO (ratio+scale) | ablation | ❌ | Stage 1–2 — byte counters + LKH sweep |
-| TCL (confirm+reassign) | ablation | ❌ | Stage 3 — Fabric latencies |
+| PARR | ablation | ✅ CSV `PARR` (Eq 4.3, C4b) | f/n sweep: 1.0 at f=1 → **0.0 at f≥t_sign=2** (sub-threshold forgery boundary); MitM (attack 6) always 1.0; AB6=0.0; −1 when honest |
+| FRR (revoke+demote) | ablation | ✅ CSV `FRR_revoke`/`FRR_demote` | demote = −1 w/o Fabric; live validation Stage 3 |
+| COO | ablation | ✅ CSV `COO_epoch/trs/fhe/dkg` | — |
+| BWO (ratio+scale) | ablation | ✅ CSV `BWO_ratio`/`BWO_scale` | scaling *sweep* = batch-run/analytics task |
+| TCL (confirm+reassign) | ablation | ✅ CSV `TCL_confirm`/`TCL_reassign` | −1 w/o Fabric; live validation Stage 3 |
 | ~~FPR~~ | demoted | ✅ CSV `FPR` (keep for calibration) | drop from primary plots only |
 
 ---
 
 ## 4. Recommended HPC edit order
 
-1. **Paper-first fixes (§0)** — 10 min, unblocks correct config.
+1. **Paper-first fixes (§0)** — now mostly editorial: the CODE is already correct at
+   60/90/150 + Log-distance; the remaining work is fixing the paper's three stale s_max tables
+   and the `sec:mobility-scenarios` two-ray prose to match `tab:set-scenarios`. ~10 min in LaTeX.
 2. **Full mode up + B1**, on SUMO → produces Exp1/Exp2/Exp5 for the proposed method
-   (the 6 all-baseline metrics already exist).
+   (the 6 all-baseline metrics already exist). AI components already selected offline
+   (GAT/LSTM-AE tables) — this step is the integrated `ablation_mode=0` ns-3 run.
 3. **Ablation selector 7→11** (§2) — biggest single edit; unlocks AB1–AB11.
 4. **Exp4 `threat_level` knob** (σ×n_coord), then **Exp3 scale-up** + **COO/BWO** (Stage 2).
 5. **B2/B3** with the ML member; **FRR/TCL** with Fabric (Stage 3).

@@ -120,7 +120,7 @@ type RegistrationRecord struct {
 	// R^obs_ck(t) = {r_j ∈ R_trusted(t) : c_assigned(r_j)=c_k} that SCControllerFinalizeEpoch
 	// averages the directional conflict over (Eq 3.60). Set by SCSetRSUController at
 	// setup and rewritten on every CP-DETECT/EMA controller reassignment (p.75).
-	AssignedController string `json:"AssignedController,omitempty"`
+	AssignedController string `json:"AssignedController,omitempty" metadata:"AssignedController,optional"`
 	TReg         string  `json:"TReg"`               // caller-supplied registration timestamp
 	RegisteredAt string  `json:"RegisteredAt"`       // server-side commit time (RFC3339)
 }
@@ -141,6 +141,19 @@ type NetworkConfig struct {
 	TRev         int     `json:"TRev"`         // T_rev consecutive-epoch gate
 	PsiAnomalyTh float64 `json:"PsiAnomalyTh"` // ψ_th — anomaly cutoff
 	TWindowSec   float64 `json:"TWindowSec"`   // T_w — revocation-vote sliding window (Eq 3.65)
+	// RSUTrustQuorum overrides the q_i peer-agreement quorum used ONLY by
+	// SCRSUFinalizeEpoch (Eq 3.66 m_j baseline). 0 = derive as 2f+1, the paper
+	// default and the historical behaviour.
+	//
+	// Why an override exists: 2f+1=3 requires three DISTINCT RSUs to flag the
+	// same vehicle. Measured over a full 30 s window only 1 vehicle of 27 is
+	// ever seen by 3 RSUs — at 60 km/h a vehicle simply does not traverse three
+	// coverage zones that fast. q_i therefore stays 0, m_j collapses to ~1 for
+	// every RSU that reports an anomaly, and HONEST RSUs get demoted for
+	// correctly flagging attacks. Lowering the quorum makes the mechanism
+	// exercisable at short sim horizons; it WEAKENS the BFT guarantee, so it is
+	// opt-in and must be reported alongside any result produced with it.
+	RSUTrustQuorum int `json:"RSUTrustQuorum"`
 	UpdatedAt    string  `json:"UpdatedAt"`
 }
 
@@ -153,7 +166,7 @@ type SCTrustScore struct {
 	MeanPsi              float64 `json:"MeanPsi"`              // (1/|R|)·Σ ψ_j^{(i)}(t) from last finalised epoch
 	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R| of last finalised epoch
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for T_rev gate (τ < τ_min)
-	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_i < τ_warn — reduced routing priority (paper §3.5.1)
+	Probationary         bool    `json:"Probationary,omitempty" metadata:"Probationary,optional"` // τ_min ≤ τ_i < τ_warn — reduced routing priority (paper §3.5.1)
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
 	UpdatedAt            string  `json:"UpdatedAt"`
@@ -173,8 +186,8 @@ type RSUTrustScore struct {
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate (τ < τ_min)
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
-	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_{r_j} < τ_warn — still TRUSTED/endorsing but under watch (paper §3.5.1)
-	FloorHeld            bool    `json:"FloorHeld,omitempty"`    // τ < τ_min but held TRUSTED by the BFT 3f+1 floor guard
+	Probationary         bool    `json:"Probationary,omitempty" metadata:"Probationary,optional"` // τ_min ≤ τ_{r_j} < τ_warn — still TRUSTED/endorsing but under watch (paper §3.5.1)
+	FloorHeld            bool    `json:"FloorHeld,omitempty" metadata:"FloorHeld,optional"`    // τ < τ_min but held TRUSTED by the BFT 3f+1 floor guard
 	UpdatedAt            string  `json:"UpdatedAt"`
 }
 
@@ -191,7 +204,7 @@ type ControllerTrustScore struct {
 	MeanConflict         float64 `json:"MeanConflict"`         // (1/|R^obs_ck|)·Σ conflict_j(t) from last finalised epoch (Eq 3.60)
 	NumRSUsLastEpoch     int     `json:"NumRSUsLastEpoch"`     // |R^obs_ck(t)| of last finalised epoch
 	ConsecutiveLowEpochs int     `json:"ConsecutiveLowEpochs"` // running counter for the T_rev revocation gate (τ < τ_min)
-	Probationary         bool    `json:"Probationary,omitempty"` // τ_min ≤ τ_ck < τ_warn — under watch, still in C_trusted
+	Probationary         bool    `json:"Probationary,omitempty" metadata:"Probationary,optional"` // τ_min ≤ τ_ck < τ_warn — under watch, still in C_trusted
 	LastEpochTimestamp   string  `json:"LastEpochTimestamp"`
 	UpdateCount          int     `json:"UpdateCount"`
 	UpdatedAt            string  `json:"UpdatedAt"`
@@ -304,9 +317,125 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 	return nil
 }
 
+// ResetLedger wipes all per-run world state so each simulation starts from a
+// clean ledger. Fabric blocks are append-only, so this clears the CURRENT-state
+// keys the detection logic reads (registrations, trust scores, revocations,
+// evidence submissions, revoke votes, controller flags/reassignments, active
+// controller, and network config) — not the immutable block history. The sim
+// re-seeds config + RSU/vehicle/controller registrations at the start of every
+// run (CallSCInitNetworkConfig + register_all_nodes), so wiping every namespace
+// is safe. Returns the number of keys deleted.
+// resetLedgerPrefixes is the canonical prefix list -- single source of truth
+// shared by ResetLedger (legacy, whole-ledger) and ResetLedgerPrefix (one
+// prefix per call, see below).
+var resetLedgerPrefixes = []string{
+	"REG_", "SCTRUST_", "RSUTRUST_", "CTRUST_",
+	"SCREVOKE_", "SUBM_", "CSUBM_", "CFLAG_",
+	"CTRLREASSIGN_", "CTRL_", "VOTE_", "NETCFG",
+}
+
+func resetLedgerOnePrefix(ctx contractapi.TransactionContextInterface, p string) (int, error) {
+	iter, err := ctx.GetStub().GetStateByRange(p, p+"~")
+	if err != nil {
+		return 0, fmt.Errorf("ResetLedger: range %s: %w", p, err)
+	}
+	// Collect keys first; deleting while the range iterator is open is not
+	// guaranteed safe across state DBs.
+	var keys []string
+	for iter.HasNext() {
+		kv, err := iter.Next()
+		if err != nil {
+			iter.Close()
+			return 0, fmt.Errorf("ResetLedger: iter %s: %w", p, err)
+		}
+		keys = append(keys, kv.Key)
+	}
+	iter.Close()
+	deleted := 0
+	for _, k := range keys {
+		if err := ctx.GetStub().DelState(k); err != nil {
+			return deleted, fmt.Errorf("ResetLedger: del %s: %w", k, err)
+		}
+		deleted++
+	}
+	return deleted, nil
+}
+
+// ResetLedger — legacy whole-ledger wipe, ALL 12 prefixes in ONE transaction.
+// KEPT for any caller not yet updated to ResetLedgerPrefix, but do not use
+// this for a campaign that runs many simulations back to back: as state
+// accumulates (a full 200-vehicle/64-RSU/300s run leaves far more live keys
+// than the ~91 an empty-ledger run sees), the single-transaction read+write
+// set grows every call, and was observed (2026-08-10, AB8 sweep) to both
+// blow the client commit deadline (DeadlineExceeded) AND trigger Fabric's
+// MVCC phantom-read-conflict check (PHANTOM_READ_CONFLICT) -- the wipe
+// silently fails, the NEXT run's registrations then get rejected as
+// duplicates against the stale, un-wiped state, and the ledger only gets
+// dirtier from there. Use ResetLedgerPrefix in a loop instead (see
+// CallSCResetLedger in 06c_blockchain_api.h).
+func (s *SmartContract) ResetLedger(ctx contractapi.TransactionContextInterface) (int, error) {
+	deleted := 0
+	for _, p := range resetLedgerPrefixes {
+		n, err := resetLedgerOnePrefix(ctx, p)
+		deleted += n
+		if err != nil {
+			return deleted, err
+		}
+	}
+	return deleted, nil
+}
+
+// ResetLedgerPrefix — wipes ONE key prefix per call (one Fabric transaction,
+// one commit). Caller loops over all 12 prefixes (see resetLedgerPrefixes),
+// making 12 small commits instead of ResetLedger's one large one. Fixes the
+// growing-transaction-size failure mode documented above: each call's
+// read/write set is bounded by that single prefix's current key count, not
+// the whole ledger's, so per-call latency and MVCC conflict risk stay flat
+// across a long campaign instead of growing with accumulated state.
+func (s *SmartContract) ResetLedgerPrefix(ctx contractapi.TransactionContextInterface, prefix string) (int, error) {
+	valid := false
+	for _, p := range resetLedgerPrefixes {
+		if p == prefix {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return 0, fmt.Errorf("ResetLedgerPrefix: unknown prefix %q", prefix)
+	}
+	return resetLedgerOnePrefix(ctx, prefix)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Helpers
 // ─────────────────────────────────────────────────────────────────────────────
+
+// epochWithinWindow reports whether submission epoch `sub` falls inside the
+// sliding window (cur - tWindowSec, cur] used to accumulate the Eq 3.65 peer
+// -agreement quorum q_i. Epoch labels are "E<seconds>" (1 s buckets, see
+// mptd_epoch_from_ts), so the comparison is numeric on the parsed suffix.
+//
+// tWindowSec <= 0 restores exact single-epoch matching, which is the historical
+// behaviour — kept so prior results remain reproducible. Unparsable labels fall
+// back to exact match rather than silently widening the window.
+func epochWithinWindow(sub, cur string, tWindowSec float64) bool {
+	if tWindowSec <= 0 {
+		return sub == cur
+	}
+	if sub == cur {
+		return true
+	}
+	if len(sub) < 2 || len(cur) < 2 || sub[0] != 'E' || cur[0] != 'E' {
+		return sub == cur
+	}
+	sN, err1 := strconv.Atoi(sub[1:])
+	cN, err2 := strconv.Atoi(cur[1:])
+	if err1 != nil || err2 != nil {
+		return sub == cur
+	}
+	// Past-only window: never let a future epoch's evidence influence q_i.
+	return sN <= cN && float64(cN-sN) < tWindowSec
+}
 
 // fByzantine returns f given the total RSU count under the Fabric n ≥ 3f+1
 // rule. Returns 0 when n < 4 so 2f+1 = 1 (degenerate single-RSU test setups).
@@ -866,9 +995,11 @@ func (s *SmartContract) countTrustedRSUs(ctx contractapi.TransactionContextInter
 // ─────────────────────────────────────────────────────────────────────────────
 
 // SCInitNetworkConfig — bootstrap or update channel-wide BFT parameters.
-// Args: numRSUs, alpha, tauWarn, tauMin, T_rev, psiAnomalyTh (all strings).
+// Args: numRSUs, alpha, tauWarn, tauMin, T_rev, psiAnomalyTh, rsuTrustQuorum,
+// tWindowSec (all strings).
 func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextInterface,
-	numRSUsStr, alphaStr, tauWarnStr, tauMinStr, tRevStr, psiThStr string) error {
+	numRSUsStr, alphaStr, tauWarnStr, tauMinStr, tRevStr, psiThStr,
+	rsuTrustQuorumStr, tWindowStr string) error {
 
 	numRSUs, err := strconv.Atoi(numRSUsStr)
 	if err != nil {
@@ -876,6 +1007,21 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 	}
 	if numRSUs < 4 {
 		return fmt.Errorf("numRSUs=%d too small; BFT needs N ≥ 4 (so f ≥ 1)", numRSUs)
+	}
+	// 0 (or unparsable/negative) = derive 2f+1 as before.
+	rsuTrustQuorum, err := strconv.Atoi(rsuTrustQuorumStr)
+	if err != nil || rsuTrustQuorum < 0 {
+		rsuTrustQuorum = 0
+	}
+	// AB8 T_w override (Eq 3.65 sliding window): 0/unparsable/negative = keep
+	// defaultTWindowSec (30s, prior behaviour, every existing run stays
+	// bit-identical). Opt-in only — see the T_w quorum-unreachable finding in
+	// project-ab8-t-window-fix memory: at 30s a vehicle essentially never
+	// traverses 3 RSU zones inside a fixed 30s witness window, and simply
+	// extending --simTime doesn't help because this window never grew with it.
+	tWindow, err := strconv.ParseFloat(tWindowStr, 64)
+	if err != nil || tWindow <= 0 {
+		tWindow = defaultTWindowSec
 	}
 	alpha, err := strconv.ParseFloat(alphaStr, 64)
 	if err != nil {
@@ -909,7 +1055,8 @@ func (s *SmartContract) SCInitNetworkConfig(ctx contractapi.TransactionContextIn
 		TauMin:       tauMin,
 		TRev:         tRev,
 		PsiAnomalyTh: psiTh,
-		TWindowSec:   defaultTWindowSec, // T_w (Eq 3.65); no init arg yet — tune via const
+		TWindowSec:   tWindow,           // T_w (Eq 3.65); AB8 opt-in override, default 30s
+		RSUTrustQuorum: rsuTrustQuorum,  // 0 = derive 2f+1 (paper default)
 		UpdatedAt:    txTimeStr(ctx),    // deterministic tx timestamp (GetTxTimestamp)
 	}
 	j, err := json.Marshal(cfg)
@@ -1332,6 +1479,32 @@ func (s *SmartContract) activeControllerExcluding(ctx contractapi.TransactionCon
 	return best, nil
 }
 
+// countActiveControllers returns |C_trusted|: the number of controllers whose
+// registration is ACTIVE. Used by the Fix 3 floor guard below, mirroring
+// countTrustedRSUs() for the RSU lifecycle.
+func (s *SmartContract) countActiveControllers(ctx contractapi.TransactionContextInterface) (int, error) {
+	iter, err := ctx.GetStub().GetStateByRange("REG_", "REG_~")
+	if err != nil {
+		return 0, err
+	}
+	defer iter.Close()
+	n := 0
+	for iter.HasNext() {
+		qr, e := iter.Next()
+		if e != nil {
+			return 0, e
+		}
+		var r RegistrationRecord
+		if e := json.Unmarshal(qr.Value, &r); e != nil {
+			return 0, e
+		}
+		if r.Role == RoleController && r.Status == StatusActive {
+			n++
+		}
+	}
+	return n, nil
+}
+
 // excludeAndReassignController flips a CP-DETECT-flagged controller to EXCLUDED
 // and records the C_trusted reassignment to its successor (Eq 3.64–3.67 /
 // invariant 2). Idempotent: a controller already EXCLUDED yields no new record.
@@ -1348,6 +1521,30 @@ func (s *SmartContract) excludeAndReassignController(ctx contractapi.Transaction
 	}
 	if reg.Status != StatusActive {
 		return nil, nil // already excluded/revoked — idempotent
+	}
+
+	// ── FIX 3: BFT floor for the controller set ──────────────────────────────
+	// Mirrors the RSU floor guard at :2144-2153, which the controller lifecycle
+	// never had. Without it the corrected Eq 3.69 quorum excluded ALL FOUR
+	// controllers inside epoch E7 and left C_trusted EMPTY — the run then logged
+	// "no active controller in C_trusted" 22 times and finished with no control
+	// plane at all.
+	//
+	// Floor is |C_trusted| >= 1: refuse an exclusion that would remove the last
+	// ACTIVE controller. The CFLAG record is still written by the caller, so the
+	// detection is preserved and auditable — only the exclusion is withheld.
+	// This is Option 1 as instructed; we did not choose the threshold ourselves.
+	const cTrustedFloor = 1
+	nActive, cErr := s.countActiveControllers(ctx)
+	if cErr != nil {
+		return nil, cErr
+	}
+	if nActive-1 < cTrustedFloor {
+		// Excluding would empty C_trusted — keep this controller and record no
+		// reassignment. Returning nil makes the caller emit CPDetectFlag rather
+		// than ControllerReassign, which is the correct signal: flagged but
+		// retained for lack of a successor.
+		return nil, nil
 	}
 
 	reg.Status = StatusExcluded
@@ -1512,7 +1709,30 @@ func (s *SmartContract) CPDetectCheck(ctx contractapi.TransactionContextInterfac
 		implicitCleanVotes = 0
 	}
 
-	f := fByzantine(cfg.NumRSUs)
+	// Eq 3.69 quorum base = R^obs_ck: the TRUSTED RSUs that actually submitted
+	// evidence for THIS (vehicle, epoch), not the network-wide RSU count.
+	// Supervisor decision 2026-08-05: "R^obs_ck refers to the set of trusted
+	// RSUs that actively submitted evidence for the specific vehicle in that
+	// specific epoch — not the total network RSU count."
+	//
+	// Previously this used cfg.NumRSUs, which is written as a hardcoded 4
+	// regardless of the RSU count actually simulated — so the threshold was
+	// f+1 = 2 by accident rather than derivation, and setting cfg.NumRSUs to the
+	// real 64 would have made it 22 and unreachable. len(seenRSU) is complete at
+	// this point: the range scan above has finished and only trusted, deduped
+	// RSUs were inserted.
+	//
+	// CONSEQUENCE — FLAGGED, NOT HIDDEN: fByzantine(n) returns 0 for n < 4, so a
+	// (vehicle, epoch) witnessed by 1-3 trusted RSUs now carries a quorum of
+	// ONE. The measured witness distribution on this network is 179 pairs with a
+	// single witness against 4 with two, so in practice the threshold is 1 almost
+	// everywhere: one trusted RSU disagreeing with the controller now suffices to
+	// flag it and trigger exclusion + failover. That removes Byzantine tolerance
+	// precisely where malicious RSUs are known to exist (TP-S1 and MP-S1 are
+	// malicious-RSU attacks), so a compromised RSU not yet demoted could
+	// unilaterally exclude an honest controller. Implemented as instructed; the
+	// risk is reported with the result rather than absorbed silently.
+	f := fByzantine(len(seenRSU))
 	fP1 := f + 1
 	if conflict < fP1 {
 		return nil, nil
@@ -1872,7 +2092,14 @@ func (s *SmartContract) SCRSUFinalizeEpoch(ctx contractapi.TransactionContextInt
 	if err != nil {
 		return nil, fmt.Errorf("NetworkConfig: %v", err)
 	}
+	// q_i quorum: 2f+1 by default; RSUTrustQuorum > 0 overrides it (see the field
+	// comment — 2f+1 is unreachable at short sim horizons because a vehicle is
+	// rarely seen by 3 distinct RSUs, which demotes honest RSUs for correctly
+	// flagging). Override WEAKENS the BFT guarantee and must be reported.
 	quorum := 2*fByzantine(cfg.NumRSUs) + 1
+	if cfg.RSUTrustQuorum > 0 {
+		quorum = cfg.RSUTrustQuorum
+	}
 
 	// Single pass over all submissions, filtered to this epoch. Keys are
 	// SUBM_<veh>_<epoch>_<rsu> (vehicle-first), so the epoch is not a
@@ -1897,15 +2124,33 @@ func (s *SmartContract) SCRSUFinalizeEpoch(ctx contractapi.TransactionContextInt
 		if e := json.Unmarshal(qr.Value, &sub); e != nil {
 			return nil, e
 		}
-		if sub.Epoch != epoch {
+		// q_i is the 2f+1 peer-agreement baseline. Eq 3.65 defines it over the
+		// DISTINCT RSUs that flagged v_i within the temporal window T_w —
+		// explicitly NOT simultaneously, since "requiring 2f+1 simultaneous RSU
+		// observations of the same vehicle is geometrically infeasible under real
+		// mobility". Restricting it to ONE epoch made the quorum unreachable:
+		// measured co-observation is 1 witness for 95.9% of (vehicle,epoch) pairs
+		// and never exceeded 2, so len(flaggers) >= 3 was essentially never true,
+		// q_i was pinned at 0, and m_j collapsed to ~1.0 for EVERY RSU that
+		// reported an anomaly. Net effect: honest RSUs were demoted for correctly
+		// flagging attacks (measured 3-4 false of 8-9 demotes). Accumulating over
+		// T_w restores the paper's semantics and matches SCRevokeVote.
+		//
+		// Escape hatch: TWindowSec <= 0 reproduces the old single-epoch behaviour
+		// exactly, so earlier results stay reproducible.
+		if !epochWithinWindow(sub.Epoch, epoch, cfg.TWindowSec) {
 			continue
 		}
 		flagged := sub.Psi > cfg.PsiAnomalyTh
 
-		if rsuReports[sub.RSUID] == nil {
-			rsuReports[sub.RSUID] = make(map[string]bool)
+		// V_j(t) stays PER-EPOCH: m_j scores an RSU on what it reported in THIS
+		// epoch, even though the q_i baseline it is compared against spans T_w.
+		if sub.Epoch == epoch {
+			if rsuReports[sub.RSUID] == nil {
+				rsuReports[sub.RSUID] = make(map[string]bool)
+			}
+			rsuReports[sub.RSUID][sub.VehicleID] = true
 		}
-		rsuReports[sub.RSUID][sub.VehicleID] = true
 
 		if flagged && s.isTrustedRSU(ctx, sub.RSUID) {
 			if trustedFlaggers[sub.VehicleID] == nil {

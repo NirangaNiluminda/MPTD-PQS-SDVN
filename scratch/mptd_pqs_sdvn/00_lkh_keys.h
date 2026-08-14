@@ -126,6 +126,14 @@ static uint32_t g_vehicle_nonce   [LKH_MAX_VEH];
 static ns3::Ipv4Address g_vehicle_dsrc_ip[LKH_MAX_VEH];
 static bool             g_vehicle_ip_known[LKH_MAX_VEH];
 
+// H5 cluster replay cache: last beacon timestamp accepted through the full HMAC
+// gate, per vehicle, shared by ALL RSUs of the cluster (single sim process ⇒ one
+// table = the paper's RSU-cluster nonce cache). A beacon whose timestamp is not
+// strictly greater than this is a replay — same MAC would verify, so the MAC
+// alone cannot catch it. Updated ONLY on a full gate pass so forged/stale
+// beacons cannot poison the cache. 0.0 = nothing seen yet (beacons start >0).
+static double g_hmac_last_seen_t[LKH_MAX_VEH];
+
 // RSU ring-leaf keys — one per RSU. Used as the SC-Register leaf commitment
 // h(K_{u_j}); the TRS signing shares now come from the Joint-Feldman DKG in
 // 06b1 (Eq 3.25 dkg_trs), NOT from this array.
@@ -403,16 +411,110 @@ static void lkh_zone_regen_node(LkhZone &z, int node_idx, double sim_time)
     std::memcpy(z.nodes[node_idx].key, nk, LKH_KEY_BYTES);
 }
 
+// ── LKH path-node rekey messages (Eq.3.23 N_rekey = log₂|V_j|) ───────────────
+// One message per rotated path node, carrying K'_v wrapped under each of v's two
+// child keys. This is what makes LKH logarithmic: a single message serves an
+// ENTIRE sibling subtree, instead of one unicast per surviving member.
+//
+// Delivery, bottom-up along the revoked leaf's path. At path node v with an
+// on-path child c_path (already rotated this round) and an off-path sibling
+// c_sib (untouched):
+//   • members under c_sib  decrypt K'_v with their unchanged subtree key K_{c_sib}
+//   • members under c_path decrypt K'_v with K'_{c_path}, which they obtained
+//     from the message emitted one level below
+// At the bottom level c_path IS the revoked leaf, so that ciphertext is omitted —
+// this is precisely the forward-secrecy cut that excludes the revoked vehicle.
+//
+// A survivor's OWN leaf key K_{u_i} is never rotated by someone else's
+// revocation, so K_i = KDF(K_{u_i}, η_i, ID_i) is unchanged and no per-member
+// unicast is required. The flat/unicast ablation arm (use_lkh_tree=false) is the
+// opposite: no shared path keys exist to amortise, so every leaf must rotate.
+struct LkhNodeRekeyMsg {
+    int      node_idx = -1;              // heap index of the rotated path node
+    int      level    = 0;               // 0 = revoked leaf's parent, up to root
+    uint8_t  ct_path[LKH_KEY_BYTES];     // K'_v wrapped under K'_{on-path child}
+    uint8_t  ct_sib [LKH_KEY_BYTES];     // K'_v wrapped under K_{sibling child}
+    bool     has_ct_path = false;        // false at the bottom (child = revoked leaf)
+    bool     has_ct_sib  = false;        // false only if the sibling index is invalid
+};
+// Filled by lkh_zone_rekey_path_ex(); consumed by send_lkh_rekey_to_vehicles().
+static std::vector<LkhNodeRekeyMsg> g_lkh_node_rekey_msgs;
+
+// Key wrap: ct = key XOR KDF(kek, node_idx‖t, "kek"). The keystream is bound to
+// both the node and the rekey instant, so it is never reused across rounds.
+static void lkh_wrap_key(const uint8_t *kek, const uint8_t *key,
+                         int node_idx, double sim_time,
+                         uint8_t out[LKH_KEY_BYTES])
+{
+    uint8_t info[12];
+    uint32_t ni = (uint32_t)node_idx;
+    for (int b = 0; b < 4; b++) info[b] = (uint8_t)((ni >> (b*8)) & 0xFF);
+    uint64_t ti = (uint64_t)(sim_time * 1e6);
+    for (int b = 0; b < 8; b++) info[4+b] = (uint8_t)((ti >> (b*8)) & 0xFF);
+
+    uint8_t stream[LKH_KEY_BYTES];
+    lkh_kdf(kek, LKH_KEY_BYTES, info, 12, (const uint8_t*)"kek", 3, stream);
+    for (int i = 0; i < LKH_KEY_BYTES; i++) out[i] = key[i] ^ stream[i];
+}
+
 // Rekey the root path of leaf `slot` (forward secrecy of the zone group key).
-// Returns the number of internal nodes rekeyed = tree depth.
-static int lkh_zone_rekey_path(LkhZone &z, int slot, double sim_time)
+// Returns the number of internal nodes rekeyed = tree depth. When `emit_msgs`,
+// also fills g_lkh_node_rekey_msgs with one message per rotated node.
+static int lkh_zone_rekey_path_ex(LkhZone &z, int slot, double sim_time,
+                                  bool emit_msgs)
 {
     int depth = 0; for (int c = z.cap; c > 1; c >>= 1) depth++;
+    if (emit_msgs) g_lkh_node_rekey_msgs.clear();
     if (slot < 0 || slot >= z.cap) return depth;
-    int cur = z.first_leaf + slot;
-    lkh_zone_regen_node(z, cur, sim_time + 0.001);           // dead leaf
-    while (cur > 0) { cur = (cur - 1) / 2; lkh_zone_regen_node(z, cur, sim_time); }
+
+    int child = z.first_leaf + slot;
+    lkh_zone_regen_node(z, child, sim_time + 0.001);   // dead leaf — delivered to nobody
+    bool child_is_revoked_leaf = true;
+    int  level = 0;
+
+    while (child > 0) {
+        int parent = (child - 1) / 2;
+        // heap layout: children of p are 2p+1 (left) and 2p+2 (right)
+        int sib = (child % 2 == 1) ? child + 1 : child - 1;
+
+        // Snapshot the sibling key BEFORE rotating the parent — the sibling is
+        // NOT rotated, and its members still hold this key.
+        uint8_t sib_key[LKH_KEY_BYTES];
+        bool sib_ok = (sib > 0 && sib < (int)z.nodes.size());
+        if (sib_ok) std::memcpy(sib_key, z.nodes[sib].key, LKH_KEY_BYTES);
+
+        // The on-path child was rotated earlier in this loop (or is the dead leaf).
+        uint8_t child_new[LKH_KEY_BYTES];
+        std::memcpy(child_new, z.nodes[child].key, LKH_KEY_BYTES);
+
+        lkh_zone_regen_node(z, parent, sim_time);      // K'_parent
+
+        if (emit_msgs) {
+            LkhNodeRekeyMsg m;
+            m.node_idx = parent;
+            m.level    = level;
+            if (sib_ok) {
+                lkh_wrap_key(sib_key, z.nodes[parent].key, parent, sim_time, m.ct_sib);
+                m.has_ct_sib = true;
+            }
+            if (!child_is_revoked_leaf) {
+                lkh_wrap_key(child_new, z.nodes[parent].key, parent, sim_time, m.ct_path);
+                m.has_ct_path = true;
+            }
+            g_lkh_node_rekey_msgs.push_back(m);
+        }
+
+        child_is_revoked_leaf = false;
+        child = parent;
+        level++;
+    }
     return depth;
+}
+
+// Back-compat wrapper: rotate the path without emitting messages (benign handoff).
+static int lkh_zone_rekey_path(LkhZone &z, int slot, double sim_time)
+{
+    return lkh_zone_rekey_path_ex(z, slot, sim_time, /*emit_msgs=*/false);
 }
 
 // Forward declaration (defined after lkh_compute_session_key).
@@ -717,6 +819,7 @@ static int lkh_zone_population(int rsu)
 static int lkh_rekey_on_revoke(int veh_idx, double sim_time)
 {
     g_lkh_affected_members.clear();
+    g_lkh_node_rekey_msgs.clear();
     if (veh_idx < 0 || veh_idx >= LKH_MAX_VEH) return 0;
     int rsu = g_vehicle_zone[veh_idx];
     if (rsu < 0 || rsu >= (int)g_lkh_zone.size()) {
@@ -732,16 +835,38 @@ static int lkh_rekey_on_revoke(int veh_idx, double sim_time)
     }
     g_vehicle_zone[veh_idx] = -1; g_vehicle_slot[veh_idx] = -1;
 
-    lkh_zone_rekey_path(z, slot, sim_time);             // forward secrecy
+    int n_rekey;
+    const int vj = z.n_members;                         // survivors |V_j|
+    if (use_lkh_tree) {
+        // Rotate the revoked leaf's path and emit ONE message per rotated node.
+        // Survivors keep their leaf keys K_{u_i} (and hence K_i) — that is the
+        // whole point of the hierarchy, so g_lkh_affected_members stays EMPTY
+        // and no per-member unicast is generated.
+        lkh_zone_rekey_path_ex(z, slot, sim_time, /*emit_msgs=*/true);
 
-    for (int s = 0; s < z.cap; s++)
-        if (z.slot_owner[s] >= 0) g_lkh_affected_members.push_back(z.slot_owner[s]);
-
-    int vj = z.n_members;                               // survivors |V_j|
-    int n_rekey = 0; for (int c = (vj > 0 ? vj : 1); c > 1; c >>= 1) n_rekey++;
-    printf("[LKH] Revoke veh_idx=%d from zone %d: %zu surviving zone members to "
-           "rekey (Eq.3.23 N_rekey=log2|V_j|=log2(%d)≈%d)\n",
-           veh_idx, rsu, g_lkh_affected_members.size(), vj, n_rekey);
+        n_rekey = (int)g_lkh_node_rekey_msgs.size();    // = tree depth = log2|V_j|
+        printf("[LKH] Revoke veh_idx=%d from zone %d: %d path-node rekey msgs for "
+               "%d survivors (Eq.3.23 N_rekey=log2|V_j|=log2(%d)=%d)\n",
+               veh_idx, rsu, n_rekey, vj, vj, n_rekey);
+    } else {
+        // AB11 (C10): key TREE removed — flat group keying. Every survivor's
+        // key is rotated INDIVIDUALLY (no shared path nodes amortise the
+        // rotation), so the rekey cost is linear, N_rekey = |V_j|, the classic
+        // pre-LKH unicast baseline the paper ablates against (vs log₂|V_j|).
+        lkh_zone_regen_node(z, z.first_leaf + slot, sim_time + 0.001);  // dead leaf
+        for (int s = 0; s < z.cap; s++) {
+            int v = z.slot_owner[s];
+            if (v < 0) continue;
+            lkh_zone_regen_node(z, z.first_leaf + s, sim_time);
+            std::memcpy(g_vehicle_leaf_key[v],
+                        z.nodes[z.first_leaf + s].key, LKH_KEY_BYTES);
+            g_lkh_affected_members.push_back(v);
+        }
+        n_rekey = vj;
+        printf("[LKH] Revoke veh_idx=%d from zone %d: %zu survivors rekeyed "
+               "FLAT/unicast (AB11: N_rekey=|V_j|=%d)\n",
+               veh_idx, rsu, g_lkh_affected_members.size(), n_rekey);
+    }
     return n_rekey;
 }
 

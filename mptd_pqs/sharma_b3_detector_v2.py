@@ -296,6 +296,28 @@ def load_scenario(scenario_dir: str) -> Optional[pd.DataFrame]:
     return extract_features(aug)
 
 
+def paper_rule_predict(feat_df: pd.DataFrame) -> np.ndarray:
+    """Sharma 2021 plausibility decision — NO TRAINING, NO OUR-DATA FITTING.
+
+    Implements the paper's rule-based Location- and Movement-Plausibility
+    checks (Section IV.2) directly:
+
+      • Location Plausibility (LP): a beacon whose declared position falls
+        OUTSIDE the 99% acceleration-CI of its predicted position scores 2 on
+        an axis (Eqs 1-4).  We flag if lp_total >= 2, i.e. the declared motion
+        is implausible on at least one axis at the 99% level (or borderline on
+        both).
+      • Movement Plausibility (MP): a vehicle that claims to move but has ~zero
+        net displacement (constant-position attacker) → mp_flag == 1.
+
+    A message is misbehaving if EITHER plausibility check fires. Thresholds come
+    from the paper's kinematic CIs (A_95/A_99), never from our labels.
+    """
+    lp_total = feat_df["lp_total"].values
+    mp_flag  = feat_df["mp_flag"].values
+    return ((lp_total >= 2) | (mp_flag >= 1)).astype(int)
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 #  CLASSIFIERS (Section V of Sharma 2021)
 # ─────────────────────────────────────────────────────────────────────────────
@@ -360,13 +382,16 @@ def compute_metrics(y_true: np.ndarray,
     Return MCC, FPR, PARR, CDER, TDEE, TPE, PBPO for one test fold.
     Same definitions as the Ercan B2 detector.
     """
-    if len(np.unique(y_true)) < 2 or len(np.unique(y_pred)) < 2:
-        mcc = 0.0
-    else:
-        mcc = matthews_corrcoef(y_true, y_pred)
-
     cm = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel() if cm.size == 4 else (0, 0, 0, 0)
+
+    # ε-smoothed MCC (Eq 4.1) — matches the C++ MPTD-PQS pipeline (ε=1e-12) so the
+    # baseline MCC is comparable in degenerate / class-imbalance cases (raw
+    # sklearn matthews_corrcoef returns 0 there, diverging from MPTD-PQS).
+    _e   = 1e-12
+    _num = (tp + _e) * (tn + _e) - (fp + _e) * (fn + _e)
+    _den = ((tp + fp + _e) * (tp + fn + _e) * (tn + fp + _e) * (tn + fn + _e)) ** 0.5
+    mcc  = float(_num / _den)
 
     fpr  = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     parr = tp / n_total if n_total > 0 else 0.0

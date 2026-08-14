@@ -24,14 +24,14 @@ from sklearn.model_selection import train_test_split
 
 # --- path setup so we can import sibling modules
 sys.path.insert(0, os.path.dirname(__file__))
-from gat_detector   import GATDetector, snapshot_to_graph
+from gat_detector   import GATDetector, snapshot_to_graph, ATTACK_CLASSES, SIG_BITS, FEATURE_DIM
 from lstm_ae        import LSTMAEDetector, build_windows, calibrate_threshold, WINDOW_SIZE
 
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
 ML_DIR        = os.path.dirname(__file__)
-MODEL_DIR     = os.path.join(ML_DIR, "models")
+MODEL_DIR     = os.environ.get("MPTD_MODEL_DIR", os.path.join(ML_DIR, "models"))
 # R7c: prefer the sweep-built master training file when present; fall back to
 # the per-run beacon_log.csv (overwritten by the sim) so single-run debug works.
 MASTER_CSV    = os.path.normpath(os.path.join(ML_DIR, "data", "beacon_train_master.csv"))
@@ -39,10 +39,11 @@ PER_RUN_CSV   = os.path.normpath(os.path.join(ML_DIR, "..", "results", "beacon_l
 BEACON_CSV    = MASTER_CSV if os.path.exists(MASTER_CSV) else PER_RUN_CSV
 
 DEVICE      = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-EPOCHS_GAT  = 30
+EPOCHS_GAT  = int(os.environ.get("MPTD_GAT_EPOCHS", "30"))
 EPOCHS_AE   = 40
 BATCH_SIZE  = 32
-LR          = 1e-3
+LR          = float(os.environ.get("MPTD_GAT_LR", "1e-3"))          # #16 sensitivity
+WEIGHT_DECAY = float(os.environ.get("MPTD_GAT_WD", "0.0"))          # #17 (paper 5e-4, was unapplied)
 
 # ---------------------------------------------------------------------------
 # Synthetic data generator (when beacon_log.csv is absent)
@@ -175,13 +176,41 @@ def build_gat_dataset(df: pd.DataFrame):
     """
     feat_cols = ["pos_x", "pos_y", "speed", "heading", "accel"]
     T_B = 0.1  # beacon interval (s) — paper §3.3, Eq. 3.21
-    # Bucket to nearest beacon tick. Use floor so a beacon arriving at 7.005s
-    # and another at 7.095s both land in bucket 7.0 (start of that tick).
     df = df.copy()
-    df["_tick"] = (df["sim_time"] / T_B).round().astype(int)
-    group_keys = ["run_id", "_tick"] if "run_id" in df.columns else ["_tick"]
+
+    # ── STEP 3 / Fix B (2026-08-04) — graph grouping must match the runtime ──
+    # PREVIOUSLY: grouped by (run_id, tick), i.e. EVERY vehicle across the whole
+    # map at one timestep. But the C++ runtime scores ONE RSU's accumulated
+    # ~10-beacon window (ipfs_push_and_maybe_flush -> run_gat_fusion_for_rsu).
+    # Because S_i is a snapshot-RELATIVE z-score norm (Eq. 3.42: z is computed
+    # over the snapshot's own nodes), these two groupings produce completely
+    # different score distributions from IDENTICAL weights — the model was
+    # being trained on a different task than it is served on. Measured with the
+    # unmodified deployed weights on the same corpus:
+    #     map-wide (run_id, tick) : AUC = 0.4416  (no separation)
+    #     per-RSU 10-beacon window: AUC = 0.7439  (real separation)
+    # Now grouped per-RSU and chunked into consecutive RSU_WINDOW-beacon windows
+    # ordered by sim_time, mirroring the RSU's accumulate-then-flush behaviour.
+    RSU_WINDOW = int(os.environ.get("MPTD_GAT_RSU_WINDOW", "10"))
     graphs = []
-    for _key, grp in df.groupby(group_keys):
+    if "rsu_id" in df.columns:
+        group_keys = ["run_id", "rsu_id"] if "run_id" in df.columns else ["rsu_id"]
+        chunks = []
+        for _key, g in df.groupby(group_keys):
+            g = g.sort_values("sim_time")
+            for start in range(0, len(g) - RSU_WINDOW + 1, RSU_WINDOW):
+                chunks.append(g.iloc[start:start + RSU_WINDOW])
+        grouped = enumerate(chunks)
+    else:
+        # Legacy fallback when rsu_id is absent (e.g. synthetic data): keep the
+        # old per-tick behaviour so those paths still run.
+        print("[train] WARNING: no rsu_id column — falling back to per-tick grouping "
+              "(will not match runtime scoring; see Fix B)")
+        df["_tick"] = (df["sim_time"] / T_B).round().astype(int)
+        gk = ["run_id", "_tick"] if "run_id" in df.columns else ["_tick"]
+        grouped = df.groupby(gk)
+
+    for _key, grp in grouped:
         if len(grp) < 2:
             # Snapshot-level z-score in GATDetector forward needs N≥2 for
             # std() to be defined. Single-vehicle snapshots are rare; skip
@@ -190,22 +219,103 @@ def build_gat_dataset(df: pd.DataFrame):
         feats_5  = grp[feat_cols].values.astype(np.float32)
         # Append tau_i column: default 1.0 (fully trusted) — Eq. 3.21
         tau_col  = np.ones((len(feats_5), 1), dtype=np.float32)
-        feats_6  = np.hstack([feats_5, tau_col])   # (N, 6)
+        # Richer identity features (raw, unscaled): composite ψ + 9 sig_mask bits
+        # (the ψ sub-scores = which LW rule-checks fired). These carry the
+        # per-attack signature the kinematics lack. Absent (legacy CSV) → zeros.
+        n = len(feats_5)
+        psi_col = (grp["psi_score"].fillna(0).values.astype(np.float32).reshape(-1, 1)
+                   if "psi_score" in grp.columns else np.zeros((n, 1), np.float32))
+        if "sig_mask" in grp.columns:
+            sm = grp["sig_mask"].fillna(0).values.astype(np.int64)
+            sig_bits = np.stack([((sm >> b) & 1) for b in range(SIG_BITS)],
+                                axis=1).astype(np.float32)          # (N, SIG_BITS)
+        else:
+            sig_bits = np.zeros((n, SIG_BITS), np.float32)
+        feats_6  = np.hstack([feats_5, tau_col, psi_col, sig_bits]) # (N, FEATURE_DIM)
         labels   = grp["is_poisoned"].values.astype(np.float32)
         data     = snapshot_to_graph(feats_6)
         data.y   = torch.tensor(labels, dtype=torch.float)
+
+        # Multi-task per-attack labels y_i^(k) (revised eq:gat_loss): one-hot on
+        # the attacking class. y_i^(k)=1 iff vehicle i is poisoned AND executing
+        # attack type k (attack_number = k+1, k∈[0,K-1]); clean vehicles are all
+        # zeros. attack_number is the ground-truth NS-3 attack config.
+        y_multi = np.zeros((len(grp), ATTACK_CLASSES), dtype=np.float32)
+        if "attack_number" in grp.columns:
+            atk_num = grp["attack_number"].fillna(0).values.astype(int)
+            is_pois = labels.astype(int)
+            for r in range(len(grp)):
+                k = atk_num[r] - 1
+                if is_pois[r] == 1 and 0 <= k < ATTACK_CLASSES:
+                    y_multi[r, k] = 1.0
+        data.y_multi = torch.tensor(y_multi, dtype=torch.float)
         graphs.append(data)
     return graphs
 
 
 def train_gat(df: pd.DataFrame) -> GATDetector:
     print("[train] Training GAT detector …")
+    # Deterministic init + training so hyperparameter sweeps isolate the knob
+    # (not random-init noise). Fixed seed → 1 run per value is a fair comparison.
+    _seed = int(os.environ.get("MPTD_SEED", "42"))
+    torch.manual_seed(_seed); np.random.seed(_seed)
     graphs = build_gat_dataset(df)
     train_g, val_g = train_test_split(graphs, test_size=0.2, random_state=42)
 
     model = GATDetector().to(DEVICE)
-    opt   = torch.optim.Adam(model.parameters(), lr=LR)
+    opt   = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)  # #17
     loss_fn = nn.BCELoss()
+
+    # Per-class inverse-frequency weights (revised eq:gat_loss):
+    #   w_k^+ = |V_train| / (2|V_k^+|),  w_k^- = |V_train| / (2|V_k^-|)
+    # computed once over the whole training set so rare attack classes are not
+    # dominated by frequent ones. Guard divide-by-zero for empty classes.
+    tot = 0
+    pos = np.zeros(ATTACK_CLASSES, dtype=np.float64)
+    for data in train_g:
+        ym = data.y_multi.numpy()
+        tot += ym.shape[0]
+        pos += ym.sum(axis=0)
+    neg = np.maximum(tot - pos, 0.0)
+    w_pos = np.where(pos > 0, tot / (2.0 * np.maximum(pos, 1.0)), 1.0)
+    w_neg = np.where(neg > 0, tot / (2.0 * np.maximum(neg, 1.0)), 1.0)
+    # Cap the positive-class weight: uncapped inverse-frequency (up to ~14×)
+    # heavily over-weights positives → the head sigmoids saturate high even on
+    # CLEAN nodes, so max_k ŷ^(k) stops being a valid detection score (it was
+    # inverted for control-plane attacks). A modest cap keeps the probabilities
+    # calibrated so the head-detection fusion tier is discriminative, while still
+    # up-weighting rare classes for routing. (MPTD_GAT_WPOS_CAP; default uncapped.)
+    _wpos_cap = float(os.environ.get("MPTD_GAT_WPOS_CAP", "1e9"))
+    w_pos = np.minimum(w_pos, _wpos_cap)
+    w_pos_t = torch.tensor(w_pos, dtype=torch.float, device=DEVICE)   # (K,)
+    w_neg_t = torch.tensor(w_neg, dtype=torch.float, device=DEVICE)   # (K,)
+    print(f"[train] GAT multi-task: K={ATTACK_CLASSES} heads, "
+          f"pos/class={pos.astype(int).tolist()}, w_pos={np.round(w_pos,2).tolist()}")
+
+    # Gradient clipping + best-checkpoint (early-stopping) guard against the
+    # multi-task loss diverging: the summed 7-head class-weighted BCE has a large
+    # gradient scale, so a plain last-epoch save can land on a worse model.
+    import copy
+    GRAD_CLIP = float(os.environ.get("MPTD_GAT_GRAD_CLIP", "5.0"))
+    # Opt-in extra weight on the classification-head loss (Critical Issue 3 fix
+    # attempt): default 1.0 leaves every existing caller byte-identical.
+    _loss_k_weight = float(os.environ.get("MPTD_GAT_LOSS_K_WEIGHT", "1.0"))
+    best_val   = float("inf")
+    best_state = copy.deepcopy(model.state_dict())
+
+    def _val_loss():
+        model.eval()
+        vl = 0.0
+        with torch.no_grad():
+            for data in val_g:
+                data = data.to(DEVICE)
+                score, atk = model(data.x, data.edge_index)
+                score = score.squeeze(-1)
+                ym = data.y_multi
+                w = ym * w_pos_t + (1.0 - ym) * w_neg_t
+                vl += (loss_fn(score, data.y).item() +
+                       nn.functional.binary_cross_entropy(atk, ym, weight=w).item() * ATTACK_CLASSES)
+        return vl / max(1, len(val_g))
 
     for epoch in range(EPOCHS_GAT):
         model.train()
@@ -213,23 +323,33 @@ def train_gat(df: pd.DataFrame) -> GATDetector:
         for data in train_g:
             data = data.to(DEVICE)
             opt.zero_grad()
-            pred = model(data.x, data.edge_index).squeeze(-1)
-            loss = loss_fn(pred, data.y)
+            score, atk = model(data.x, data.edge_index)   # (N,1), (N,K)
+            score = score.squeeze(-1)
+            ym = data.y_multi                              # (N,K)
+            # Spatial-score BCE keeps S_i (fusion GAT term) calibrated on the
+            # binary is_poisoned label, exactly as before the multi-task patch.
+            loss_s = loss_fn(score, data.y)
+            # Summed per-head class-weighted BCE (revised eq:gat_loss).
+            w = ym * w_pos_t + (1.0 - ym) * w_neg_t        # (N,K) per-element weight
+            loss_k = nn.functional.binary_cross_entropy(atk, ym, weight=w, reduction="mean") * ATTACK_CLASSES
+            loss = loss_s + _loss_k_weight * loss_k
             loss.backward()
+            if GRAD_CLIP > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), GRAD_CLIP)
             opt.step()
             total_loss += loss.item()
 
-        if (epoch + 1) % 10 == 0:
-            model.eval()
-            val_loss = 0.0
-            with torch.no_grad():
-                for data in val_g:
-                    data = data.to(DEVICE)
-                    pred = model(data.x, data.edge_index).squeeze(-1)
-                    val_loss += loss_fn(pred, data.y).item()
+        vl = _val_loss()
+        if vl < best_val:
+            best_val   = vl
+            best_state = copy.deepcopy(model.state_dict())
+        if (epoch + 1) % 5 == 0 or epoch == 0:
             print(f"  Epoch {epoch+1:3d}  train_loss={total_loss/len(train_g):.4f}"
-                  f"  val_loss={val_loss/len(val_g):.4f}")
+                  f"  val_loss={vl:.4f}  best_val={best_val:.4f}")
 
+    # Restore the best-validation checkpoint (not the possibly-diverged last one).
+    model.load_state_dict(best_state)
+    print(f"[train] GAT restored best-val checkpoint (val_loss={best_val:.4f})")
     return model
 
 
@@ -334,6 +454,40 @@ def train_lstm_ae(df: pd.DataFrame):
 # Main
 # ---------------------------------------------------------------------------
 
+class _GatExportRawScore(nn.Module):
+    """
+    STEP 3 / Fix A (2026-08-04) — ONNX export contract.
+
+    The DEPLOYED gat_model.onnx emits the RAW spatial anomaly score s_i (its
+    `scores` output node is ReduceL2 — verified by inspecting the ONNX graph),
+    and θ_S is calibrated against that raw scale (θ_S = 19.74, observed S ≈ 7.7).
+    But GATDetector.forward() returns sigmoid(score_scale·s_i + score_bias),
+    which is bounded to [0,1]. Exporting forward() directly therefore ships a
+    model whose scores are ~0.52, so the runtime computes S/θ_S ≈ 0.52/19.74
+    ≈ 0.026 — a constant, for every beacon and every attack type. This was
+    measured as the cause of three failed GAT retrains.
+
+    This wrapper re-emits s_i BEFORE the affine+sigmoid, restoring the deployed
+    contract. Training is unaffected: the sigmoid head still shapes the
+    embedding via BCE (which needs [0,1]); only the exported graph changes.
+
+    NOTE: θ_S must be recalibrated whenever the model is retrained, since s_i's
+    scale is not fixed across training runs.
+    """
+    def __init__(self, model: GATDetector):
+        super().__init__()
+        self.m = model
+
+    def forward(self, x: torch.Tensor, edge_index: torch.Tensor):
+        emb = self.m.act(self.m.conv1(x, edge_index))
+        emb = self.m.act(self.m.conv2(emb, edge_index))
+        mu  = emb.mean(dim=0, keepdim=True)
+        sig = emb.std(dim=0, keepdim=True) + 1e-6
+        s_i = ((emb - mu) / sig).norm(dim=1, keepdim=True)   # raw s_i (Eq. 3.42)
+        atk = torch.sigmoid(self.m.cls_heads(emb))
+        return s_i, atk
+
+
 def export_gat_onnx(model: GATDetector, path: str, n_nodes: int = 16):
     """
     Export GAT to ONNX via the legacy TorchScript exporter (dynamo=False).
@@ -344,29 +498,34 @@ def export_gat_onnx(model: GATDetector, path: str, n_nodes: int = 16):
     Inputs:
       x          (N, 6)  float32 node features
       edge_index (2, E)  int64   COO edges
-    Output:
-      scores     (N, 1)  float32 spatial anomaly S_i ∈ [0,1]
+    Outputs:
+      scores        (N, 1)  float32 spatial anomaly S_i ∈ [0,1]
+      attack_probs  (N, K)  float32 per-attack detection probs ŷ_i^(k)
+                            (argmax_k → predicted attack type k̂_i)
     """
     model.eval()
-    dummy_x  = torch.randn(n_nodes, 6, dtype=torch.float32)
+    # Fix A: export the raw-s_i wrapper, not model.forward() (see _GatExportRawScore).
+    export_model = _GatExportRawScore(model).eval()
+    dummy_x  = torch.randn(n_nodes, FEATURE_DIM, dtype=torch.float32)
     # Self-loop edges so the trace always has at least one edge per node.
     dummy_ei = torch.tensor([[i for i in range(n_nodes)],
                              [i for i in range(n_nodes)]], dtype=torch.long)
     torch.onnx.export(
-        model,
+        export_model,
         (dummy_x, dummy_ei),
         path,
         input_names  = ["x", "edge_index"],
-        output_names = ["scores"],
+        output_names = ["scores", "attack_probs"],
         dynamic_axes = {
-            "x":          {0: "N"},
-            "edge_index": {1: "E"},
-            "scores":     {0: "N"},
+            "x":            {0: "N"},
+            "edge_index":   {1: "E"},
+            "scores":       {0: "N"},
+            "attack_probs": {0: "N"},
         },
         opset_version = 16,
         dynamo        = False,   # legacy tracer; required for PyG GATConv
     )
-    print(f"[train] GAT ONNX exported → {path}")
+    print(f"[train] GAT ONNX exported → {path} (2 outputs: scores, attack_probs[K={ATTACK_CLASSES}])")
 
 
 def export_lstm_ae_onnx(model: LSTMAEDetector, path: str,

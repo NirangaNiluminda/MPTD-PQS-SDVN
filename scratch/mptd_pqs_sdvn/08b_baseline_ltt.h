@@ -84,21 +84,32 @@ bool run_ltt_detect(uint32_t vehicle_id, uint32_t rsu_id, BsmBeaconTag &tag)
     double curr_py = tag.GetPosY();
     double curr_t  = tag.GetTimestamp();
 
+    // ── Check 0: Reported-speed plausibility (no history needed) ─────────────
+    // Ghaleb's speed-plausibility principle applies to the beacon's OWN reported
+    // speed, not only to position-derived speed: a vehicle CLAIMING a speed above
+    // the physical road bound s_max is implausible regardless of prior state.
+    // The position-delta check (Check 1) alone misses velocity-field exaggeration
+    // that keeps reported positions kinematically consistent — e.g. MP-S3 (attack 6)
+    // and MP-S4 (attack 7) transmit ~66 m/s unclamped (EnforceRealism skipped in
+    // 09_vehicle_beacon_tx.h). Stealthy attacks clamped to s_max (e.g. TP-S2) stay
+    // below this bound and remain — correctly — outside LTT's kinematic scope.
+    bool speed_implausible = (tag.GetSpeed() > s_max);
+
     LttEntry &entry = g_ltt[vehicle_id];
 
-    // First beacon from this vehicle — populate LTT, no detection yet
+    // First beacon from this vehicle — populate LTT; only Check 0 can fire yet
     if (entry.timestamp < 0.0) {
         entry.pos_x     = curr_px;
         entry.pos_y     = curr_py;
         entry.timestamp = curr_t;
         entry.rsu_id    = rsu_id;
-        return false;
+        return speed_implausible;
     }
 
     double dt = curr_t - entry.timestamp;
     if (dt <= 0.0) dt = T_b;  // guard against same-timestamp beacons
 
-    bool flagged = false;
+    bool flagged = speed_implausible;  // Check 0 (reported-speed plausibility)
 
     // ── Check 1: Speed Plausibility (Alg.1 Eq.1) ─────────────────────────────
     // dist(p_curr, p_prev) / dt > s_max → physically impossible movement

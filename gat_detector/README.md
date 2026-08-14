@@ -1,4 +1,4 @@
-# GAT Spatial Anomaly Detector — implementation guide
+<!-- # GAT Spatial Anomaly Detector — implementation guide
 
 This is the **GAT component** of the MPTD-PQS framework (the spatial anomaly
 detector, report §3.5.3 / Eqs. 3.26–3.29, 3.38). It is built to the supervised
@@ -204,3 +204,94 @@ Remove-Item outputs\*     -Force -ErrorAction SilentlyContinue
 Remove-Item data\*.csv    -Force -ErrorAction SilentlyContinue
 
 Then repeat from 4.
+
+
+1.  -->
+
+
+# GAT Spatial Detector — three per-scenario models (real NS-3 data)
+
+Trains and selects **three separate GAT spatial anomaly detectors**, one per
+mobility scenario (**urban / rural / highway**), directly from the real NS-3
+beacon logs. There is **no synthetic data generation** and **no LLM** — the only
+learned model here is the GAT (the LSTM-AE is a separate component).
+(`suburban` has been renamed to `rural` everywhere.)
+
+## Data layout (read directly, no conversion)
+
+    data/<scenario>/a<N>_p<pct>/beacon_log.csv
+
+      <scenario> = urban | rural | highway
+      a<N>       = attack type (a1..a7)
+      p<pct>     = penetration (p0, p20, p40, p60, p80, p100)
+
+`p0` runs (attack_pct == 0) are the **clean** data (calibration); `p>0` runs are
+the **attack** data (label = is_poisoned). beacon_log.csv raw columns used:
+`sim_time, vehicle_id, pos_x, pos_y, speed, heading, accel, is_poisoned,
+attack_number, attack_pct` (mapped internally — see DATA_FORMAT.md).
+
+## Install (Linux)
+
+    python3 -m venv .venv
+    source .venv/bin/activate
+    pip install --upgrade pip
+    pip install torch
+    pip install torch_geometric scikit-learn pandas numpy matplotlib
+
+## The three models (selected — report Table 4.18)
+
+| scenario | heads | hidden | emb | dropout | phi_max | r_max |
+|----------|-------|--------|-----|---------|---------|-------|
+| urban    | 8     | 64     | 32  | 0.20    | 45 deg  | 270 m |
+| rural    | 4     | 32     | 16  | 0.10    | 30 deg  | 270 m |
+| highway  | 2     | 16     | 8   | 0.05    | 15 deg  | 270 m |
+
+    python models_summary.py        # print the three models + checkpoint status
+
+## 1) Model selection (reproduces report Table 4.16)
+
+Trains all 3 candidate architectures per scenario over >=3 seeds, temporal split,
+records val MCC (mean +/- std) and FPR, picks the best. Writes
+`outputs/<scenario>_model_selection.csv` and prints the Table 4.16.
+
+    python select_models.py --scenario urban   --data_root data --seeds 3
+    python select_models.py --scenario rural   --data_root data --seeds 3
+    python select_models.py --scenario highway --data_root data --seeds 3
+    python select_models.py --scenario all     --data_root data --seeds 3
+
+## 2) Train the selected model (Phase 1a)
+
+    python train.py --scenario urban   --data_root data
+    python train.py --scenario rural   --data_root data
+    python train.py --scenario highway --data_root data
+    # -> checkpoints/<scenario>_encoder.pt
+
+## 3) Calibrate on clean data (Phase 1b)
+
+    python calibrate.py --scenario urban --data_root data
+    python calibrate.py --scenario rural --data_root data
+    # -> checkpoints/<scenario>_stats.npz  (per-node x_bar'_i, sigma'_i, locked theta_S)
+
+## 4) Score the attack data (Eq. 3.41 spatial score S_i)
+
+    python score.py --scenario urban --data_root data
+    python score.py --scenario rural --data_root data
+    python score.py --scenario highway --data_root data
+    # -> outputs/<scenario>_scores.csv
+
+## Run all three at once
+
+    for s in urban rural highway; do python train.py --scenario $s --data_root data; done
+    for s in urban rural;         do python calibrate.py --scenario $s --data_root data; done
+    for s in urban rural;         do python score.py    --scenario $s --data_root data; done
+
+
+## Pipeline summary
+
+1. `dataset.py` reads raw beacon logs, buckets `sim_time` into 100 ms graphs
+   (Tb), builds Eq. 3.27 edges, Eq. 3.28 z-score features.
+2. `train.py` (Phase 1a): class-weighted BCE (Eq. 3.32), temporal split,
+   best-val-MCC checkpoint; saves the encoder (head discarded).
+3. `calibrate.py` (Phase 1b): per-node clean stats + locked theta_S.
+4. `score.py`: S_i = || (x'_i - x_bar'_i)/sigma'_i ||_2 (Eq. 3.41), flag vs theta_S.
+5. `select_models.py`: candidate sweep -> Table 4.16.

@@ -46,6 +46,20 @@ fallbacks** that must be ruled out on the HPC.
   **baseline** backend only (RQ5); the default paper path is Dilithium, which is
   non-linear and unaffected.
 
+## 2b. Known conformance bug — TRS signing threshold (M9, OPEN 2026-07-08)
+
+- **`t_sign` is set to `t_decrypt` (3-of-4 instead of the paper's 2-of-4).**
+  `init_trs_backend(n=4, t=3)` ([11:182](scratch/mptd_pqs_sdvn/11_blockchain_setup.h#L182))
+  makes the single global `g_trs_ring_t=3` serve both roles, so the honest ring
+  signs **3-of-4** where the paper's `t_sign = f+1 = 2`. The FHE decrypt
+  present-set ([08:~1495, ~1671](scratch/mptd_pqs_sdvn/08_detection_engine.h#L1495))
+  also sizes from `g_trs_ring_t`, correct **only by coincidence** (`3==t_decrypt`).
+  Unlike §2's items this is a genuine **bug** (wrong value), not a benign design
+  limitation. Reported metrics are unaffected — the C4b PARR forgery boundary
+  derives `t_sign=f+1` from `n` independently — so it is masked, but the honest
+  signing path deviates from the paper. Full detail + fix plan in
+  **DESIGN_FLAWS_AUDIT.md §7.5 (M9)**.
+
 ## 3. Simulated / abstracted (transport, not the math)
 
 - **DKG runs in-process.** One NS-3 process plays all `n` ring members. The

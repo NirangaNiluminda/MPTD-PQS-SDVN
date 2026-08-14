@@ -47,6 +47,8 @@ import os
 import numpy as np
 import pandas as pd
 import scipy.stats as stats
+import xml.etree.ElementTree as ET
+from scipy.spatial import cKDTree
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from sklearn.metrics import confusion_matrix, matthews_corrcoef
@@ -67,6 +69,63 @@ MIN_VEH_SEP     = 2.0          # m   minimum legal vehicle separation (Module 2c
 
 CDER_THRESHOLD  = 10.0         # metres — for CDER metric
 N_SPLITS        = 5            # StratifiedKFold splits
+
+# ───────────────────────────────────────────────────────────────────
+#  MAP GEOMETRY LOADERS (real road network + RSU grid)
+#  Ghaleb's Module 2a (road-boundary) and 2b (transmission range) are
+#  MAP-DEPENDENT. The legacy single-centreline / hardcoded-RSU defaults are
+#  a straight-highway model and are invalid on the urban SUMO grid (they flag
+#  100% of honest vehicles). These loaders give the detector the ACTUAL urban
+#  road network (sumo/urban/urban.net.xml) and RSU grid
+#  (mobility/rsu_positions_urban.csv), which share the beacon-log coordinate
+#  frame (SUMO-local metres — verified: net/RSU/beacon extents overlap).
+# ───────────────────────────────────────────────────────────────────
+_ROAD_CACHE: Dict[str, Optional[cKDTree]] = {}
+
+
+def load_road_index(net_xml_path: str, step: float = 4.0) -> Optional[cKDTree]:
+    """Parse SUMO lane geometry → cKDTree of densely-sampled road points.
+
+    Every <lane shape="x0,y0 x1,y1 …"> polyline is resampled every `step`
+    metres; a beacon is 'on road' if its nearest sampled road point is within
+    the detector's road tolerance. Cached per file. Returns None if unreadable.
+    """
+    if net_xml_path in _ROAD_CACHE:
+        return _ROAD_CACHE[net_xml_path]
+    pts: List[Tuple[float, float]] = []
+    try:
+        root = ET.parse(net_xml_path).getroot()
+        for lane in root.iter("lane"):
+            shp = lane.get("shape")
+            if not shp:
+                continue
+            coords = []
+            for p in shp.split():
+                v = p.split(",")
+                coords.append((float(v[0]), float(v[1])))   # drop z if present
+            for (x0, y0), (x1, y1) in zip(coords[:-1], coords[1:]):
+                seglen = math.hypot(x1 - x0, y1 - y0)
+                n = max(1, int(seglen / step))
+                for k in range(n + 1):
+                    t = k / n
+                    pts.append((x0 + (x1 - x0) * t, y0 + (y1 - y0) * t))
+    except Exception:
+        _ROAD_CACHE[net_xml_path] = None
+        return None
+    tree = cKDTree(np.asarray(pts)) if pts else None
+    _ROAD_CACHE[net_xml_path] = tree
+    return tree
+
+
+def load_rsu_positions(csv_path: str) -> Optional[Dict[int, Tuple[float, float]]]:
+    """Read RSU (x,y) keyed by rsu_id from a 'rsu_id,x,y' CSV."""
+    try:
+        df = pd.read_csv(csv_path)
+        return {int(r["rsu_id"]): (float(r["x"]), float(r["y"]))
+                for _, r in df.iterrows()}
+    except Exception:
+        return None
+
 
 # RSU positions matching ercan_b2_detector_new.py
 RSU_POS: Dict[int, Tuple[float, float]] = {
@@ -175,7 +234,12 @@ def compute_metrics(y_true: np.ndarray,
     cm             = confusion_matrix(y_true, y_pred, labels=[0, 1])
     tn, fp, fn, tp = cm.ravel()
 
-    mcc  = float(matthews_corrcoef(y_true, y_pred))
+    # ε-smoothed MCC (Eq 4.1) — matches the C++ MPTD-PQS pipeline (ε=1e-12) so the
+    # baseline MCC is comparable in degenerate / class-imbalance cases.
+    _e   = 1e-12
+    _num = (tp + _e) * (tn + _e) - (fp + _e) * (fn + _e)
+    _den = ((tp + fp + _e) * (tp + fn + _e) * (tn + fp + _e) * (tn + fn + _e)) ** 0.5
+    mcc  = float(_num / _den)
     fpr  = fp / (fp + tn) if (fp + tn) > 0 else 0.0
     parr = tp / (tp + fn) if (tp + fn) > 0 else 0.0
 
@@ -242,7 +306,10 @@ class GhalebB1Detector:
                  wave_range:    float = WAVE_RANGE_M,
                  min_veh_sep:   float = MIN_VEH_SEP,
                  area_diff_th:  float = AREA_DIFF_TH,
-                 ltt_window:    int   = LTT_WINDOW):
+                 ltt_window:    int   = LTT_WINDOW,
+                 road_tree:     Optional[cKDTree] = None,
+                 road_tol:      float = 25.0,
+                 rsu_pos:       Optional[Dict[int, Tuple[float, float]]] = None):
         self.speed_max    = speed_max_ms
         self.speed_min    = speed_min_ms
         self.road_centre  = road_centre_y
@@ -251,6 +318,12 @@ class GhalebB1Detector:
         self.min_veh_sep  = min_veh_sep
         self.area_diff_th = area_diff_th
         self.ltt_window   = ltt_window
+        # Map geometry: when provided, Module 2a uses a true on-road check
+        # (nearest road point > road_tol ⇒ off-road) and run() uses the real
+        # RSU grid. When None, falls back to the legacy single-centreline model.
+        self.road_tree    = road_tree
+        self.road_tol     = road_tol
+        self.rsu_pos      = rsu_pos
         self._state: Dict[str, _VehicleState] = {}
 
     # ── helpers ─────────────────────────────────────────────────
@@ -316,7 +389,13 @@ class GhalebB1Detector:
         flags["m1"] = 0
 
         # Module 2a — Road-Map Boundary
-        if abs(y - self.road_centre) > self.road_half_w:
+        if self.road_tree is not None:
+            # True on-road plausibility: flag if declared position is farther
+            # than road_tol from ANY lane of the real road network.
+            d_road, _ = self.road_tree.query([x, y])
+            if d_road > self.road_tol:
+                flags["m2a"] = 1
+        elif abs(y - self.road_centre) > self.road_half_w:
             flags["m2a"] = 1
 
         # Module 2b — Transmission Range (declared pos must be near RSU)
@@ -393,7 +472,8 @@ class GhalebB1Detector:
 
             # Use first RSU seen for this vehicle
             rsu_id = int(grp["rsu_id"].iloc[0])
-            rsu_xy = RSU_POS.get(rsu_id, (0.0, ROAD_CENTRE_Y))
+            _rsu_src = self.rsu_pos if self.rsu_pos is not None else RSU_POS
+            rsu_xy = _rsu_src.get(rsu_id, (0.0, ROAD_CENTRE_Y))
 
             for _, row in grp.iterrows():
                 r   = row.to_dict()

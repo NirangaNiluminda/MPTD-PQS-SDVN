@@ -41,6 +41,8 @@
 #include <cstdio>      // snprintf for \uXXXX JSON escape
 #include <mutex>       // once-flag for libcurl global init + warn-once
 #include <atomic>      // ipfs_disabled latch
+#include <thread>      // std::this_thread::sleep_for — CallSCResetLedger retry backoff
+#include <chrono>      // std::chrono::seconds — CallSCResetLedger retry backoff
 #if __has_include(<curl/curl.h>)
 #include <curl/curl.h> // TASK ①-E: kubo HTTP API client for h(b_i(t)) CID
 #endif
@@ -220,6 +222,7 @@ static inline bool mptd_fabric_call_socket(
     const std::string& identity = "")
 {
     payload_out.clear();
+    const double tcl_t0 = mptd_ms_now();   // C9 TCL_confirm
 
     int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return false;
@@ -243,10 +246,22 @@ static inline bool mptd_fabric_call_socket(
         return false;
     }
 
-    // 30 s budget covers worst-case Fabric commit (~1–2 s in practice) plus
-    // headroom for endorsement retries. Matches the daemon's per-conn deadline.
+    // Socket timeout. Deliberately very large: it is the LAST ceiling above the
+    // daemon's per-conn deadline and the gateway's endorse/submit/commit
+    // budget. On a contended 64-peer cluster, boot-time registration submits
+    // can legitimately take minutes; expiring early does NOT fail fast, it
+    // leaves the RSU/vehicle unregistered and silently corrupts the run (and
+    // in the worst case the client blocks in unix_stream_data_wait with no
+    // error at all, because the daemon still answers — just later than the
+    // client stopped listening). Prefer "slow but complete" over "fast but
+    // half-registered"; override with MPTD_FABRIC_SOCK_TIMEOUT_SEC.
     struct timeval tv;
-    tv.tv_sec  = 30;
+    {
+        const char* e = std::getenv("MPTD_FABRIC_SOCK_TIMEOUT_SEC");
+        long secs = (e && *e) ? std::strtol(e, nullptr, 10) : 800;
+        if (secs < 1) secs = 800;
+        tv.tv_sec = secs;
+    }
     tv.tv_usec = 0;
     ::setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     ::setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
@@ -295,6 +310,13 @@ static inline bool mptd_fabric_call_socket(
     }
     // Payload is optional (FNF and many invokes return empty)
     mptd_decode_payload_field(resp, "payload", payload_out);
+    // C9 TCL_confirm: synchronous invoke wall-clock = submit → gateway commit
+    // ack (the daemon replies after Fabric SubmitTransaction returns, i.e.
+    // after ordering+commit). Queries and fire-and-forget sends are excluded.
+    if (action == "invoke" && !fire_and_forget) {
+        g_tcl_confirm_ms_sum += mptd_ms_now() - tcl_t0;
+        g_tcl_confirm_cnt++;
+    }
     return true;
 }
 
@@ -777,7 +799,9 @@ static uint32_t g_active_controller_idx = 0;
 // per-beacon hot path.
 inline void mptd_refresh_active_controller()
 {
-    if (skip_blockchain) return;
+    // AB9 (C10): multi-controller removed — the initial controller stays
+    // pinned for the whole run, no CP-DETECT/EMA rollover.
+    if (skip_blockchain || !enable_ctrl_rotation) return;
     std::string out = mptd_fabric_invoke_sync("query", "GetActiveController", {});
     // Payload is the raw chaincode string (possibly JSON-quoted). Pull the
     // integer suffix after the LAST "CTRL_".
@@ -839,9 +863,14 @@ inline std::vector<uint32_t> mptd_query_trusted_controllers()
 // compute f+1). The chaincode falls back to safe defaults if this is never
 // called, but calling it explicitly is required to reproduce the paper's
 // evaluation tables.
+// tWindowSec: AB8 T_w override (Eq 3.65 sliding window), 0 = chaincode keeps
+// its default 30s (every prior run/sweep stays bit-identical). See the
+// project-ab8-t-window-fix memory: SC-Revoke's witness window was previously
+// hardcoded, capping quorum-reachability regardless of --simTime.
 inline void CallSCInitNetworkConfig(
     uint32_t numRSUs, double alpha, double tauWarn, double tauMin,
-    uint32_t tRev, double psiAnomalyTh)
+    uint32_t tRev, double psiAnomalyTh, uint32_t rsuTrustQuorum = 0,
+    double tWindowSec = 0.0)
 {
     MPTD_BLOCKCHAIN_GUARD();
     std::vector<std::string> args = {
@@ -850,14 +879,86 @@ inline void CallSCInitNetworkConfig(
         std::to_string(tauWarn),
         std::to_string(tauMin),
         std::to_string(tRev),
-        std::to_string(psiAnomalyTh)
+        std::to_string(psiAnomalyTh),
+        std::to_string(rsuTrustQuorum),  // 0 = chaincode derives 2f+1
+        std::to_string(tWindowSec)       // 0 = chaincode keeps default 30s
     };
     // Synchronous: init must commit before any evidence submission.
     std::string out = mptd_fabric_invoke_sync("invoke", "SCInitNetworkConfig", args);
     std::cout << "[SC-INIT] numRSUs=" << numRSUs
               << " α=" << alpha << " τ_warn=" << tauWarn << " τ_min=" << tauMin
               << " T_rev=" << tRev << " ψ_th=" << psiAnomalyTh
+              << " rsu_q=" << (rsuTrustQuorum ? std::to_string(rsuTrustQuorum)
+                                              : std::string("2f+1"))
+              << " t_window=" << (tWindowSec > 0 ? std::to_string(tWindowSec)
+                                                  : std::string("30(default)"))
               << " → " << out;
+}
+
+// ── CallSCResetLedger — wipe per-run world state before re-seeding ────────────
+// Deletes all dynamic world-state keys (registrations, trust scores, revocations,
+// evidence/votes, controller flags/reassignments, active controller, config) so
+// each simulation starts from a clean ledger. Fabric blocks are append-only, so
+// only current state is cleared, not block history. Synchronous: the wipe must
+// commit before register_all_nodes() re-registers nodes for this run. No-op when
+// skip_blockchain is set (training-sweep mode).
+//
+// One ResetLedgerPrefix call per prefix (12 small commits), NOT the legacy
+// single-transaction ResetLedger — found 2026-08-10 (AB8 sweep, seed 2 of a
+// back-to-back campaign): once a prior run has left a full 200-vehicle/64-RSU
+// ledger behind, one giant delete-everything transaction is big enough to
+// blow the client commit deadline (DeadlineExceeded) or trip Fabric's MVCC
+// phantom-read-conflict check -- and CRITICALLY, the old code treated that
+// failure as non-fatal, printed the error, and carried on straight into
+// registration against the STILL-DIRTY ledger. Every RSU/vehicle bootstrap
+// then failed as "duplicate identity", and every downstream metric silently
+// came back 0/-1 for the rest of that run (and the run after, since the
+// ledger just got dirtier). Per-prefix calls keep each transaction's
+// read/write set bounded by that prefix's own key count rather than the
+// whole ledger, so latency/conflict risk stay flat across a long campaign.
+// Retries transient failures; a prefix that still won't commit after retries
+// aborts the whole run rather than silently proceeding on a dirty ledger --
+// a genuine measurement is not possible at that point, so failing loud here
+// is strictly better than another N hours producing unusable output.
+inline void CallSCResetLedger()
+{
+    MPTD_BLOCKCHAIN_GUARD();
+    // Must match resetLedgerPrefixes in chaincode/chaincode/smartcontract.go.
+    static const char* kPrefixes[] = {
+        "REG_", "SCTRUST_", "RSUTRUST_", "CTRUST_",
+        "SCREVOKE_", "SUBM_", "CSUBM_", "CFLAG_",
+        "CTRLREASSIGN_", "CTRL_", "VOTE_", "NETCFG",
+    };
+    constexpr int kMaxAttempts = 4;
+    int total_deleted = 0;
+    std::cout << "[SC-RESET] per-run ledger wipe (per-prefix)";
+    for (const char* prefix : kPrefixes) {
+        bool ok = false;
+        std::string payload;
+        for (int attempt = 0; attempt < kMaxAttempts && !ok; attempt++) {
+            if (attempt > 0) {
+                std::cerr << "[SC-RESET] retry " << attempt << " for prefix "
+                          << prefix << " after: " << payload << '\n';
+                std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
+            }
+            ok = mptd_fabric_call_socket("invoke", "ResetLedgerPrefix",
+                                          {prefix}, /*fire_and_forget=*/false,
+                                          payload);
+        }
+        if (!ok) {
+            std::cerr << "\n[SC-RESET] FATAL: prefix " << prefix
+                       << " never committed after " << kMaxAttempts
+                       << " attempts (" << payload << "). Refusing to run "
+                       << "registration against a possibly-dirty ledger -- "
+                       << "aborting run.\n";
+            std::exit(1);
+        }
+        if (!payload.empty()) {
+            try { total_deleted += std::stoi(payload); } catch (...) {}
+        }
+    }
+    std::cout << " → " << total_deleted << " keys deleted across "
+              << (sizeof(kPrefixes) / sizeof(kPrefixes[0])) << " prefixes\n";
 }
 
 // SCResult — registration-call outcome (ok flag + error/payload string).
@@ -973,6 +1074,25 @@ inline void CallSCTrustSubmitEvidence(
     mptd_fabric_invoke_async("SCTrustSubmitEvidence", args);
 }
 
+// P4 identity-pool guard, local copy: 06c is included BEFORE 11_blockchain_setup.h
+// (mptd_scregister::ca_identity_enabled lives there), so it can't be called from
+// here directly — this mirrors that function's exact body so the two stay in
+// sync without an include-order dependency. Bug this fixes: CallSCControllerSubmitEvidence
+// / CallCPDetectCheck / CallCPDetectCheckAsync used to stamp "ctrl<N>"
+// UNCONDITIONALLY, ignoring MPTD_CA_IDENTITY=0; when the per-controller wallet
+// slot isn't enrolled, every one of those calls fails at identity load, so a
+// controller conflict can never be observed on-chain and
+// excludeAndReassignController never fires — TCL_reassign stays -1 forever
+// regardless of attack intensity.
+static inline bool mptd_06c_ca_identity_enabled()
+{
+    static bool on = []() {
+        const char* e = std::getenv("MPTD_CA_IDENTITY");
+        return !(e && e[0] == '0');
+    }();
+    return on;
+}
+
 // ── CallSCControllerSubmitEvidence — Eq 3.57 controller evidence tuple ───────
 // E_c(t) = (vehicleID, Φ_i(t), epoch, h(X_i(t)), σ_c^sub)
 // Written by the SDN controller (peer #2 in the Fabric organization mapping)
@@ -997,7 +1117,14 @@ inline void CallSCControllerSubmitEvidence(
     std::vector<std::string> args = {
         vehId, ctrlId, epoch, phiStr, beaconHash, sig
     };
-    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args, "ctrl" + std::to_string(controllerID));
+    // P4 guard (same fix as CallCPDetectCheck above): without this, an
+    // unenrolled "ctrl<N>" wallet slot makes EVERY CSUBM write fail at
+    // identity load — CPDetectCheck then has no controller evidence to
+    // compare against even once ITS identity is fixed, so the conflict can
+    // never be observed regardless of attack intensity.
+    std::string submit_id = mptd_06c_ca_identity_enabled()
+                                ? ("ctrl" + std::to_string(controllerID)) : "";
+    mptd_fabric_invoke_async("SCControllerSubmitEvidence", args, submit_id);
 }
 
 // ── CallSCTrustFinalizeEpoch — Eq 3.55 EMA + T_rev gate ──────────────────────
@@ -1053,7 +1180,9 @@ inline std::string CallCPDetectCheck(
     std::vector<std::string> args = {
         MakeVehId(vehicleID), epoch
     };
-    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args, "ctrl" + std::to_string(controllerID));
+    std::string submit_id = mptd_06c_ca_identity_enabled()
+                                ? ("ctrl" + std::to_string(controllerID)) : "";
+    return mptd_fabric_invoke_sync("invoke", "CPDetectCheck", args, submit_id);
 }
 
 // ── CallCPDetectCheckAsync — fire-and-forget variant ─────────────────────────
@@ -1075,7 +1204,9 @@ inline void CallCPDetectCheckAsync(
     };
     // controllerID = c_assigned(r_j) of the window's RSU (matches CSUBM
     // submitter; follows reassignment via rsu_controller_ID[]).
-    mptd_fabric_invoke_async("CPDetectCheck", args, "ctrl" + std::to_string(controllerID));
+    std::string submit_id = mptd_06c_ca_identity_enabled()
+                                ? ("ctrl" + std::to_string(controllerID)) : "";
+    mptd_fabric_invoke_async("CPDetectCheck", args, submit_id);
 }
 
 // ── CallSCRSUFinalizeEpoch — RSU SC-Trust EMA (Eq rsu_trust / rsu_misbehave) ──
@@ -1222,6 +1353,23 @@ inline std::vector<RsuTrustView> CallSCGetAllRSUTrustScores()
         v.trusted = (mptd_json_str_after(js, "\"State\":", idAnchor) == "TRUSTED");
         out.push_back(v);
         pos = idAnchor + 12;   // advance past this anchor
+    }
+    // C6 FRR_demote: count TRUSTED→(non-TRUSTED) lifecycle transitions; a
+    // false demote is one hitting an RSU outside the compromised_rsu[] GT.
+    // First sighting of each RSU only seeds the baseline state.
+    for (const auto& v : out) {
+        if (v.rsu_idx >= MAX_RSUS) continue;
+        g_frr_demote_data = true;
+        if (!g_frr_lifecycle_seen[v.rsu_idx]) {
+            g_frr_lifecycle_seen[v.rsu_idx]  = true;
+            g_frr_rsu_was_trusted[v.rsu_idx] = v.trusted;
+            continue;
+        }
+        if (g_frr_rsu_was_trusted[v.rsu_idx] && !v.trusted) {
+            g_frr_demoted_total++;
+            if (!compromised_rsu[v.rsu_idx]) g_frr_false_demotes++;
+        }
+        g_frr_rsu_was_trusted[v.rsu_idx] = v.trusted;
     }
     return out;
 }

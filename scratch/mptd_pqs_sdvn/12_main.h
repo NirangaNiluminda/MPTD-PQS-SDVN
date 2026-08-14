@@ -33,6 +33,31 @@
 //   python3 waf --run "lda_attack --attack_number=1 --routing_algorithm=4
 //     --routing_test=true --attack_percentage=80 --simTime=15"
 // ============================================================
+// TEMP DIAGNOSTIC (Step 1, RSU coverage check + time-varying follow-up):
+// sample geometric coverage at multiple timestamps, not just once, to tell
+// whether a single snapshot is representative. Additive-only, no behavior change.
+void mptd_coverage_diag_check(double t_label)
+{
+    uint32_t within_range = 0;
+    std::vector<Vector> rsu_pos;
+    for (uint32_t r = 0; r < RSU_Nodes.GetN(); r++) {
+        rsu_pos.push_back(RSU_Nodes.Get(r)->GetObject<MobilityModel>()->GetPosition());
+    }
+    for (uint32_t v = 0; v < Vehicle_Nodes.GetN(); v++) {
+        Vector vp = Vehicle_Nodes.Get(v)->GetObject<MobilityModel>()->GetPosition();
+        double mind = 1e18;
+        for (auto &rp : rsu_pos) {
+            double dx = vp.x - rp.x, dy = vp.y - rp.y;
+            double d = std::sqrt(dx*dx + dy*dy);
+            if (d < mind) mind = d;
+        }
+        if (mind <= R_max_comm) within_range++;
+    }
+    std::cout << "[COVERAGE-DIAG] t=" << t_label << "s vehicles_within_" << R_max_comm << "m_of_any_RSU="
+              << within_range << "/" << Vehicle_Nodes.GetN()
+              << " (" << (100.0*within_range/Vehicle_Nodes.GetN()) << "%)" << std::endl;
+}
+
 int main(int argc, char *argv[])
 {
     CommandLine cmd;
@@ -45,14 +70,41 @@ int main(int argc, char *argv[])
     cmd.AddValue ("mobility_scenario", "mobility_scenario", mobility_scenario);
     cmd.AddValue ("architecture", "architecture", architecture);
     cmd.AddValue ("maxspeed", "maxspeed", maxspeed);
+    // Sensitivity-analysis knobs (paper §4.3.4 grid-search tables). Each maps to
+    // the LW-detector global it calibrates; swept one-at-a-time by run_sensitivity.sh.
+    cmd.AddValue ("psi_th",         "composite alert threshold psi_th (Eq 3.21)",        psi_th);
+    cmd.AddValue ("kappa_th",       "MP-S3 KL-divergence threshold kappa_th (Eq 3.18)",  kappa_th);
+    cmd.AddValue ("delta_th",       "TP-S5 drift threshold delta_th, m (Eq 3.20)",       delta_th);
+    cmd.AddValue ("drift_window_k", "TP-S5 drift observation window, beacons",           drift_window_k);
+    cmd.AddValue ("k_sybil",        "MP-S1 Sybil density factor K_sybil (Eq 3.8)",       K_sybil);
+    cmd.AddValue ("s_max_kmh",      "TP-S1/MP-S4 detection speed bound (km/h); overrides s_max, decoupled from --maxspeed/trace", g_s_max_cli_kmh);
     cmd.AddValue ("lambda", "lambda", lambda);
+    cmd.AddValue ("delta_hmac", "H5 Delta_HMAC beacon freshness window (s)", delta_hmac);
+    cmd.AddValue ("delta_trs", "H6 Delta_TRS sigma_TRS freshness window (s)", delta_trs);
     cmd.AddValue ("attack_number", "attack_number", attack_number);
+    cmd.AddValue ("stealthy_control_plane", "TP-S3/MP-S4 stealthy mode: small plausible controller falsification (beacon detectors blind, CP-DETECT still catches)", stealthy_control_plane);
+    cmd.AddValue ("verbose_tx", "verbose per-beacon [DSRC-TX]/[LL-SEL] stdout (off by default; bloats long runs)", g_verbose_tx);
     cmd.AddValue ("experiment_number", "experiment_number", experiment_number);
     cmd.AddValue ("routing_test", "routing_test", routing_test);
     cmd.AddValue ("routing_algorithm", "routing_algorithm", routing_algorithm);
     cmd.AddValue ("qf", "qf", qf);
     cmd.AddValue ("attack_percentage", "attack_percentage", attack_percentage);
+    cmd.AddValue ("stealth_fraction",
+                  "Exp1 attack intensity gamma: fraction of injected beacons using the "
+                  "stealth (low-magnitude) perturbation vs abrupt. {1.0 stealth-only, "
+                  "0.70 mixed(default), 0.0 abrupt-only}",
+                  stealth_fraction_theta_s);
+    cmd.AddValue ("phi_max",
+                  "#9 sensitivity: GAT edge heading-divergence bound (radians); two "
+                  "vehicles are graph neighbours only if heading diff <= phi_max "
+                  "(default pi/2=1.5708)",
+                  g_phi_max_graph);
+    cmd.AddValue ("fhe_ring_dim",
+                  "#12 sensitivity: force FHE ring dimension N (0=auto for L5; "
+                  "e.g. 32768 or 65536). Larger N = safer but slower crypto (COO_fhe).",
+                  g_fhe_ring_dim);
     cmd.AddValue ("rsu_seed", "RSU compromise random seed (0=random each run)", rsu_seed);
+    cmd.AddValue ("seed", "Unified run seed (ns-3 RngRun + attack randomness) for multi-seed mean±std runs", run_seed);
     cmd.AddValue ("sybil_registration_pct",
                   "Attack 3 enhanced mode: % of vehicles pre-registered as Sybil at startup "
                   "(0=original ghost-ID mode, >0=behavioural detection via MP-S3 KL)",
@@ -61,12 +113,148 @@ int main(int argc, char *argv[])
                   "Ablation variant: 0=Full, 1=A1 LW-only, 2=A2 GAT-only, 3=A3 AE-only, "
                   "4=A4 no-PQ, 5=A5 no-blockchain, 6=B1 Ghaleb-LTT baseline (default=1)",
                   ablation_mode);
+    cmd.AddValue ("ablation_ab",
+                  "C10: paper ablation AB1..AB11 (0=off). Full mode minus one mechanism: "
+                  "1=rules, 2=HMAC gate, 3=GAT, 4=LSTM-AE, 5=all AI (=mode 1), 6=TRS, "
+                  "7=FHE, 8=RSU lifecycle, 9=controller rotation, 10=blockchain (=mode 5), "
+                  "11=LKH tree (unicast rekey)",
+                  ablation_ab);
+    cmd.AddValue ("enable_rule_signatures", "AB1 toggle: 0=disable TP/MP rule scoring", enable_rule_signatures);
+    cmd.AddValue ("enable_hmac_gate", "AB2 toggle: 0=disable HMAC+nonce beacon gate", enable_hmac_gate);
+    cmd.AddValue ("sybil_gat_evasive",
+                  "AB3 Phase 2: 0=legacy a3 (ghosts clustered at one RSU, bypass GAT). "
+                  "1=distributed GAT-evasive Sybil (1 ghost/RSU, plausible kinematics, "
+                  "de-synced, relational-outlier heading, routed through GAT). Use with "
+                  "--honest_mp_s1=1 to isolate GAT's contribution.",
+                  g_sybil_gat_evasive);
+    cmd.AddValue ("ghost_batch",
+                  "Batch all ghosts of one interception into ONE RSU window so the GAT sees the ring (1=on, default 0)",
+                  g_ghost_batch);
+    cmd.AddValue ("ghost_ae",
+                  "Extend LSTM-AE temporal scoring to ghost IDs (vid>=10000) (1=on, default 0)",
+                  g_ghost_ae);
+    cmd.AddValue ("hmac_fail_closed",
+                  "Eq 3.37 fail-closed: reject beacons carrying NO HMAC (1=on, default 0)",
+                  g_hmac_fail_closed);
+    cmd.AddValue ("identity_binding",
+                  "FIX 1: reject vehicle_state writes whose transmitter does not own the claimed ID (1=on)",
+                  g_identity_binding);
+    cmd.AddValue ("gat_or_path_min_phi",
+                  "Minimum fusion phi before the GAT head OR-path may force a detection "
+                  "(0.0 = legacy no-floor; 0.5 suppresses the OR-only beacons)",
+                  g_gat_or_path_min_phi);
+    cmd.AddValue ("pop_anomalous_writes",
+                  "Remove a beacon from the vehicle kinematic history if the rule tier judged "
+                  "it anomalous, so a forged beacon cannot become the baseline for the victim's "
+                  "next honest beacon (1=on, default 0)",
+                  g_pop_anomalous_writes);
+    cmd.AddValue ("psi_cond_floor",
+                  "Floor the attack-conditioned psi at the global-weight psi so k_hat "
+                  "misrouting cannot erase rule evidence (1=on, default 0)",
+                  g_psi_cond_floor);
+    cmd.AddValue ("ring_detect",
+                  "Deterministic Sybil-ring geometry test: flag identities sitting on a "
+                  "consistent-radius ring about a common centroid, excluding the centroid "
+                  "(the victim). RULE-TIER — re-verify ablation ordering (1=on, default 0)",
+                  g_ring_detect);
+    cmd.AddValue ("per_rsu_vehicle_state",
+                  "FIX B: give each RSU its own vehicle_state history so one RSU's forged "
+                  "kinematics cannot be read back by another as a clean baseline (1=on, default 0)",
+                  g_per_rsu_vehicle_state);
+    cmd.AddValue ("honest_mp_s1",
+                  "AB3 Phase 1: 0=legacy MP-S1 (default; density OR ghost-ID marker, "
+                  "gated on ground-truth poison label). 1=paper-faithful MP-S1 (Eq. mp_s1: "
+                  "identity-density check on observable data only, no label leakage).",
+                  g_honest_mp_s1);
+    cmd.AddValue ("uniform_speed_trace",
+                  "AB5/E2: load the uniform-speed trace mobility_<tag>_uniform_<v>.tcl "
+                  "(every vType + road edge pinned to v; speedFactor=1, speedDev=0) "
+                  "instead of the realistic per-road-limit trace. Default 0.",
+                  g_uniform_speed_trace);
+    cmd.AddValue ("n_coord",
+                  "AB3 sweep: coordinated Sybil identities per compromised RSU "
+                  "(paper Fig 3.4 N_ghost; default 4). Use with --attack_number=3 "
+                  "(= sir's a4, Sybil-via-compromised-RSU).",
+                  g_n_coord);
+    cmd.AddValue ("streak_sigma",
+                  "E4 TL composite: malicious vehicle injects for sigma consecutive "
+                  "beacons then goes honest for sigma beacons, repeating; -1=off "
+                  "(continuous injection, default, byte-identical to every prior run).",
+                  g_streak_sigma);
+    cmd.AddValue ("eps_max",
+                  "AB4 sweep: stealth drift bound epsilon_max in m per beacon "
+                  "(Eq 3.5; default 0.5, must stay < the s_max*T_b = 3.33 m gate). "
+                  "Use with --attack_number=2 (= sir's a1, TP-via-malicious-vehicle).",
+                  epsilon_max_stealth);
+    cmd.AddValue ("lambda_ae",
+                  "AB4: per-run override of the GLOBAL fusion lambda_ae in [0,1] "
+                  "(default -1 = use fusion_weights.json unchanged). psi/gat are "
+                  "rescaled to 1-lambda_ae keeping their ratio. Needed because the "
+                  "deployed lambda_ae=0.3071 caps the AE's vote below phi_th=0.5, so "
+                  "on sub-gate stealth drift it cannot move any decision; the "
+                  "per-attack lambda_sets don't apply because k_hat is -1 always.",
+                  g_lambda_ae_cli);
+    cmd.AddValue ("lambda_gat",
+                  "AB3: per-run override of the GLOBAL fusion lambda_gat in [0,1] "
+                  "(default -1 = use fusion_weights.json unchanged). psi/ae are "
+                  "rescaled to 1-lambda_gat keeping their ratio. Needed because the "
+                  "deployed lambda_gat=0.1857 caps GAT's vote below phi_th=0.5, so on "
+                  "the evasive Sybil (--sybil_gat_evasive, psi/ae~0 by design) GAT "
+                  "alone can never move a fused decision no matter how well-calibrated; "
+                  "the per-attack lambda_sets don't apply because k_hat is -1 always.",
+                  g_lambda_gat_cli);
+    cmd.AddValue ("poison_theta",
+                  "AB4 sweep: attack deviation scale theta in [0,1] (default 0.5). "
+                  "Scales max_position_deviation / max_velocity_deviation in "
+                  "PoisonTrajectoryByType(); LOWER = stealthier, so the per-beacon "
+                  "psi rules and the spatial GAT stop saturating and the temporal "
+                  "LSTM-AE becomes the discriminating tier.",
+                  poisoning_intensity_theta);
+    cmd.AddValue ("mitm_stealth",
+                  "a6 stealth regime: 0=abrupt (default, trips psi speed bound), "
+                  "1=kinematically-plausible drift (psi cannot fire; HMAC sole detector)",
+                  g_mitm_stealth);
+    cmd.AddValue ("faithful_mitm",
+                  "a6 model: 0=legacy injection (default, preserves combined-attack results), "
+                  "1=faithful in-transit modification (relay to claimed-position RSU + stale victim MAC)",
+                  g_faithful_mitm);
+    cmd.AddValue ("per_pid_results",
+                  "1=isolate the live results dir per PID (analytics/results/<scenario>_pid<PID>/) so "
+                  "concurrent sims don't clobber each other's beacon_log.csv; default 0 (shared)",
+                  g_per_pid_results);
+    cmd.AddValue ("enable_trs", "AB6 toggle: 0=skip TRS sign/verify in crypto pipeline", enable_trs);
+    cmd.AddValue ("trs_compromised_f", "AB6 f/n sweep: force F of n ring members compromised (0..n); -1=off", g_trs_compromised_f);
+    cmd.AddValue ("enable_fhe", "AB7 toggle: 0=plaintext aggregates (TRS still signs)", enable_fhe);
+    cmd.AddValue ("ab7_ring_n", "AB7 x-axis: TRS/FHE signing-ring size n (BFT bound n>=4 at f=1; threshold t held fixed at 3); -1=off, default n=4", g_ab7_ring_n);
+    cmd.AddValue ("enable_rsu_lifecycle", "AB8 toggle: 0=RSUs permanently trusted", enable_rsu_lifecycle);
+    cmd.AddValue ("enable_sc_trust", "R3 config5: 0=skip vehicle SC-Trust evidence submission/finalize (Eq 3.55/3.56) — vehicle trust never decays off its initial value", enable_sc_trust);
+    cmd.AddValue ("enable_sc_revoke", "R3 config5: 0=skip vehicle SC-Revoke vote (Eq 3.58/3.65) — vehicles are never revoked regardless of behaviour", enable_sc_revoke);
+    cmd.AddValue ("rsu_malicious_fraction", "AB8 f/n sweep: malicious RSU fraction 0..1 (f/4 ring members ≈ f*16 RSUs), decoupled from attack_percentage; -1=off", g_rsu_malicious_frac);
+    cmd.AddValue ("lifecycle_gates_fusion", "AB8 option B: 1=a demoted RSU's psi is discounted in fusion (lets the lifecycle affect MCC/CDER_full); 0=off, default, all other sweeps unaffected", g_lifecycle_gates_fusion);
+    cmd.AddValue ("ctrl_compromise_onset", "AB9 x-axis: controller compromise onset as fraction of simTime (0=from first beacon/default, 1=never within run)", g_ctrl_compromise_onset);
+    cmd.AddValue ("rsu_trust_quorum", "AB8: override q_i quorum in SCRSUFinalizeEpoch (0=2f+1 default; 2=reachable at 30s, weakens BFT)", g_rsu_trust_quorum);
+    cmd.AddValue ("t_window", "AB8: override T_w SC-Revoke witness sliding window seconds (Eq 3.65); -1=off, chaincode keeps 30s default", g_t_window);
+    cmd.AddValue ("rsu_t_rev", "AB8: override T_rev consecutive low-trust epoch gate before permanent RSU demotion (default 3; races against T_w quorum-accumulation at short horizons)", g_rsu_t_rev);
+    cmd.AddValue ("rsu_trust_alpha", "AB8: override RSU trust EMA smoothing alpha (Eq eq:rsu_trust; default 0.3 -- THIS is the actual CLIENT-demotion gate, tau<tau_min=0.3; T_rev only gates the later revoke escalation)", g_rsu_trust_alpha);
+    cmd.AddValue ("demoted_psi_weight", "AB8 option B: multiplier on a demoted RSU's psi in fusion (0=silence, 1=no effect, default 0.5)", g_demoted_psi_weight);
+    cmd.AddValue ("enable_ctrl_rotation", "AB9 toggle: 0=single fixed controller", enable_ctrl_rotation);
+    cmd.AddValue ("use_lkh_tree", "AB11 toggle: 0=per-member unicast rekey instead of LKH tree", use_lkh_tree);
     cmd.AddValue ("enable_gat",
                   "R7f: force GAT spatial detector on(1)/off(0); -1=follow ablation_mode",
                   g_enable_gat_cli);
     cmd.AddValue ("enable_lstm_ae",
                   "R7f: force LSTM-AE temporal detector on(1)/off(0); -1=follow ablation_mode",
                   g_enable_lstm_ae_cli);
+    cmd.AddValue ("cder_credit_cp_detect",
+                  "CP-1: credit CP-DETECT in CDER — once flag_c is raised, a malicious "
+                  "controller's decisions count as a DETECTED compromise interval rather "
+                  "than undetected control error. 0=legacy (default), 1=enabled",
+                  g_cder_credit_cp_detect);
+    cmd.AddValue ("gat_det_flag_heads",
+                  "flag_i^GAT (eq:gat_det_flag) head bitmask: bit k => head k's detection "
+                  "verdict is OR-ed into the fusion decision. 0=off (default, legacy). "
+                  "46 = heads 1,2,3,5 (excludes head 6, precision 0.52)",
+                  g_gat_det_flag_heads);
     cmd.AddValue ("trs_classical",
                   "TRS scheme: 0=PQ Dilithium/ML-DSA-87 (default, paper Eq 3.49, NIST L5), "
                   "1=classical Shamir-Schnorr-P256 ECDSA-class baseline for RQ5 PBPO",
@@ -76,12 +264,86 @@ int main(int argc, char *argv[])
                   "(for training-data sweeps without a working Fabric env); "
                   "default=false",
                   skip_blockchain);
+    cmd.AddValue ("tiered_commit",
+                  "Tiered blockchain commit (paper §3.5.5): 1=Tier-3 batch anomaly "
+                  "evidence (default), 0=per-beacon synchronous submit",
+                  g_tiered_commit);
+    cmd.AddValue ("t_batch",
+                  "Tier-3 batch commit interval seconds (<< T_w); default 10",
+                  g_t_batch);
+    cmd.AddValue ("n_commit",
+                  "Tier-3 batch commit size in evidence entries; default 50",
+                  g_n_commit);
     cmd.AddValue ("mobility_source",
                   "Mobility provider: 0=hardcoded 16-veh ConstantVelocity (default, "
                   "fast smoke tests), 1=sumo_trace (Ns2MobilityHelper on .tcl from "
                   "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
                   g_mobility_source);
+    cmd.AddValue ("rsu_positions_csv_override",
+                  "Path to an RSU placement CSV to use instead of the default "
+                  "per-scenario file (empty = default, unchanged behaviour). "
+                  "Only needed when N_RSUs exceeds what the default file covers "
+                  "(e.g. E3 scalability sweep at N_RSUs=96/128/160).",
+                  g_rsu_positions_csv_override);
+    cmd.AddValue ("mobility_trace_csv_override",
+                  "Path to a .tcl mobility trace to use instead of the default "
+                  "per-scenario/speed file (empty = default, unchanged "
+                  "behaviour). Only needed when N_Vehicles exceeds what the "
+                  "default trace covers (e.g. E3 scalability sweep at "
+                  "N_Vehicles=300/400/500, default trace caps at 200).",
+                  g_mobility_trace_csv_override);
     cmd.Parse (argc, argv);
+    // AB7 ring-size sweep: n=3 violates the BFT bound n>=3f+1=4 at f=1 (paper
+    // §4.1.2 AB7). Fail fast rather than silently running an invalid ring.
+    if (g_ab7_ring_n != -1 && g_ab7_ring_n < 4) {
+        std::cerr << "[ABLATION] invalid --ab7_ring_n=" << g_ab7_ring_n
+                  << " (BFT bound requires n>=4 at f=1; -1=off)" << std::endl;
+        return 1;
+    }
+    // Combined-attack mode: --attack_number=0 activates all attack types in one run
+    // (sir's ablation/E1–E4 default). Vehicle attacks (a2/a4/a6) are assigned per-node
+    // in declare_attackers(); RSU (a1/a3) + controller (a5/a7) layers activate alongside.
+    g_combined_attack = (attack_number == 0);
+    // AB3 (attack 3 = RSU ghost injection / trajectory poisoning) MUST use the
+    // paper-faithful, density-calibrated MP-S1. The legacy MP-S1 path (count>N_v/N_r,
+    // ~3) flags ~48% of honest beacons at ghost-inflated RSU cells, burying GAT's
+    // signal under false positives. Force the honest path on for attack 3 so the
+    // ablation reads GAT's true spatial contribution to the 60m-displaced Sybils.
+    // (--honest_mp_s1 still overrides for other attacks.)  (2026-07-24)
+    if (attack_number == 3) g_honest_mp_s1 = true;
+    // Multi-seed: drive the ns-3 global RNG from --seed so stochastic ns-3 elements
+    // (channel, propagation, jitter) vary per seed. The attack-side randomness is
+    // additionally mixed with run_seed in 06a_attack_models.h. (2026-07-20)
+    ns3::RngSeedManager::SetSeed (1);
+    ns3::RngSeedManager::SetRun (run_seed > 0 ? run_seed : 1);
+    // --s_max_kmh: detection speed bound, decoupled from --maxspeed (which drives
+    // the SUMO trace filename mobility_<tag>_<speed>.tcl). km/h → m/s for TP-S1/MP-S4/MP-S3.
+    if (g_s_max_cli_kmh > 0.0) s_max = g_s_max_cli_kmh / 3.6;
+
+    // ── C10: dispatch paper ablation AB1..AB11 onto the fine-grained toggles ──
+    // AB variants are "full mode minus one mechanism", so every AB except
+    // AB5 (≡ legacy mode 1) and AB10 (≡ legacy mode 5) forces ablation_mode=0.
+    if (ablation_ab != 0) {
+        ablation_mode = 0;
+        switch (ablation_ab) {
+            case 1:  enable_rule_signatures = false; break;
+            case 2:  enable_hmac_gate       = false; break;
+            case 3:  g_enable_gat_cli       = 0;     break;
+            case 4:  g_enable_lstm_ae_cli   = 0;     break;
+            case 5:  ablation_mode = 1;              break;
+            case 6:  enable_trs             = false; break;
+            case 7:  enable_fhe             = false; break;
+            case 8:  enable_rsu_lifecycle   = false; break;
+            case 9:  enable_ctrl_rotation   = false; break;
+            case 10: ablation_mode = 5; skip_blockchain = true; break;
+            case 11: use_lkh_tree           = false; break;
+            default:
+                std::cerr << "[ABLATION] invalid --ablation_ab=" << ablation_ab
+                          << " (valid 0..11)" << std::endl;
+                return 1;
+        }
+        std::cout << "[ABLATION] Paper variant AB" << ablation_ab << " active" << std::endl;
+    }
 
     // ── Apply ablation mode overrides ─────────────────────────────────────────
     // A4: disable TRS + FHE to measure cryptographic mitigation contribution (RQ5)
@@ -91,6 +353,44 @@ int main(int argc, char *argv[])
     }
     if (ablation_mode == 5) {
         std::cout << "[ABLATION] Mode A5: Blockchain SC calls DISABLED" << std::endl;
+    }
+
+    // ── GUARD: forcing an AI detector ON is incompatible with A1 scoring ─────
+    // ablation_mode defaults to 1 (A1 = lightweight), and A1 scores the
+    // confusion matrix from the LIGHTWEIGHT tier only. The R7f --enable_gat /
+    // --enable_lstm_ae overrides below act on the detector toggles
+    // INDEPENDENTLY of ablation_mode, so a run that forces the detectors on
+    // while leaving ablation_mode at its default computes a full-mode fusion
+    // verdict for every beacon and then never scores it: the printed MCC/FPR
+    // come out lightweight-only and IDENTICAL across arms, and CDER_full is
+    // -1 (0/0 decisions).
+    //
+    // The D1/D4/D6 300 s runs of 2026-08-05 were produced exactly this way.
+    // Their per-beacon [FUSION-RSU] verdicts did differ by arm (MP-S1 recall
+    // 0.19/0.35/0.35), so the ablation ordering was real — but it had to be
+    // recomputed by hand from the logs because the simulator's own scored
+    // output could not show it. That is a silent failure, and this guard exists
+    // so it cannot recur.
+    //
+    // Promote to A0 (full) and say so loudly. Only A1 is promoted: mode 6 (B1)
+    // is a deliberately AI-free baseline, so it warns instead of being
+    // rewritten, which would destroy the baseline's meaning.
+    if (ablation_mode == 1 &&
+        (g_enable_gat_cli > 0 || g_enable_lstm_ae_cli > 0)) {
+        std::cout << "[ABLATION][GUARD] --enable_gat/--enable_lstm_ae forced ON "
+                     "but ablation_mode=A1 scores the LIGHTWEIGHT tier only "
+                     "(MCC/FPR would be LW-only and identical across arms, "
+                     "CDER_full=-1). PROMOTING ablation_mode A1 -> A0 (full) so "
+                     "the fusion verdict is actually scored."
+                  << std::endl;
+        ablation_mode = 0;
+    } else if (ablation_mode == 6 &&
+               (g_enable_gat_cli > 0 || g_enable_lstm_ae_cli > 0)) {
+        std::cout << "[ABLATION][GUARD][WARN] ablation_mode=A6 (B1 baseline) is "
+                     "AI-free by design, but --enable_gat/--enable_lstm_ae was "
+                     "forced ON. NOT promoting: the scored matrix stays "
+                     "lightweight. This combination is almost certainly a "
+                     "mistake." << std::endl;
     }
 
     // ── R7f: derive AI-component toggles from ablation_mode (paper §4.1.1) ───
@@ -107,6 +407,8 @@ int main(int argc, char *argv[])
         case 2: ab_gat_default = true;  ab_ae_default = false; break;   // A2
         case 3: ab_gat_default = false; ab_ae_default = true;  break;   // A3
         case 6: ab_gat_default = false; ab_ae_default = false; break;   // B1
+        case 7: ab_gat_default = true;  ab_ae_default = false; break;   // B2 standalone GAT (ψ excluded in scoring)
+        case 8: ab_gat_default = false; ab_ae_default = true;  break;   // B3 standalone AE  (ψ excluded in scoring)
         case 4: case 5: case 0: default: /* both true */          break;
     }
     g_enable_gat     = (g_enable_gat_cli     >= 0) ? (g_enable_gat_cli     != 0) : ab_gat_default;
@@ -131,18 +433,71 @@ int main(int argc, char *argv[])
         std::string scenario_sub = "urban";
         if (mobility_scenario == 1) scenario_sub = "rural";
         else if (mobility_scenario == 2) scenario_sub = "highway";
+        // Combined-attack mode (--attack_number=0) uses a SEPARATE calibration
+        // (θ_S/θ_ae/fusion_weights re-derived on the heavily-attacked combined graph,
+        // where clean beacons sit at higher GAT-S). The single-attack calibration in
+        // models/urban/ is left untouched. Only urban has a combined set for now;
+        // rural/highway fall through to their standard calibration.
+        if (g_combined_attack && mobility_scenario == 0) {
+            std::string cdir = std::string(NS3_ROOT) + "/analytics/ml/models/urban_combined/gat_model.onnx";
+            std::ifstream ctest(cdir);
+            if (ctest.good()) { scenario_sub = "urban_combined";
+                std::cout << "[AI-INIT] combined-attack calibration → models/urban_combined/" << std::endl; }
+        }
+        // AB3 / single-attack a3 (MP-S1 Sybil-via-compromised-RSU): the single-attack
+        // θ_S=8.31 in models/urban/ is ~70x too low — clean in-sim S p95≈18, poisoned
+        // S≈360-720, so 8.31 saturates the GAT term for 43% of CLEAN beacons → GAT
+        // becomes anti-informative (removing it IMPROVES MCC_full). urban_a3/ re-derives
+        // θ_S=18.4 (95th pct of clean in-sim S; same method as urban_combined) while
+        // symlinking the untouched model. Selected only when attack_number==3 so every
+        // other single-attack run is byte-identical.
+        else if (attack_number == 3 && mobility_scenario == 0) {
+            std::string a3dir = std::string(NS3_ROOT) + "/analytics/ml/models/urban_a3/gat_model.onnx";
+            std::ifstream a3test(a3dir);
+            if (a3test.good()) { scenario_sub = "urban_a3";
+                std::cout << "[AI-INIT] a3 Sybil calibration → models/urban_a3/ (θ_S recalibrated)" << std::endl; }
+        }
 
-        const std::string gat_path     = g_enable_gat
-                                         ? NS3_ROOT "/analytics/ml/models/shared/gat_model.onnx"
-                                         : std::string();
+        // GAT is now per-scenario (Phase-1b clean stats + θ_S re-derived on each
+        // scenario's clean SUMO traces — recalibrate_gat_per_scenario.py). The
+        // shared urban-only GAT mis-scored fast rural/highway motion (inflated
+        // FPR). θ_S auto-loads from the same directory (see below), so pointing
+        // gat_path at models/<scenario>/ swaps the threshold too. Fall back to
+        // the shared model if a scenario file is absent.
+        std::string gat_scen_path = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/gat_model.onnx";
+        {
+            std::ifstream gtest(gat_scen_path);
+            if (!gtest.good())
+                gat_scen_path = NS3_ROOT "/analytics/ml/models/shared/gat_model.onnx";
+        }
+        const std::string gat_path     = g_enable_gat ? gat_scen_path : std::string();
         const std::string lstm_ae_path = g_enable_lstm_ae
                                          ? NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/lstm_ae_model.onnx"
                                          : std::string();
         const std::string scaler_path  = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/scaler.json";
         const std::string theta_path   = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/theta_ae.txt";
         const std::string weights_path = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/fusion_weights.json";
+        // 2026-07-27 fix (urban_a3), extended 2026-08-03 to the shared urban
+        // model: scaler.json (shared with the LSTM-AE) was overwritten by the
+        // AB4 dead-reckoning-residual fix — incompatible with GAT's absolute-position
+        // inputs (measured |z| in the thousands, saturating GAT for clean and poisoned
+        // beacons alike). <scenario>/gat_scaler.json, where present, holds the original
+        // absolute-position stats (mean/scale ~ pos_x 1755±545 etc.) dedicated to GAT
+        // only; the LSTM-AE keeps using scaler_path unaffected. Confirmed live: the
+        // shared urban model (a1/a2/a4/a5/a6/a7) showed mean_S~250,000 for BOTH clean
+        // and malicious populations before this fix (θ_S=8.305) — same bug as urban_a3
+        // had, never previously fixed for the other six attack types. Generalized to
+        // check any scenario_sub's own gat_scaler.json; scenarios without one (rural,
+        // highway, urban_combined) pass "" and are byte-identical to before.
+        std::string gat_scaler_path;
+        {
+            std::string gspath = NS3_ROOT "/analytics/ml/models/" + scenario_sub + "/gat_scaler.json";
+            std::ifstream gstest(gspath);
+            if (gstest.good()) gat_scaler_path = gspath;
+        }
         const bool ai_ok = g_ai_engine.init(gat_path, lstm_ae_path,
-                                            scaler_path, theta_path, weights_path);
+                                            scaler_path, theta_path, weights_path,
+                                            gat_scaler_path);
         std::cout << "[AI-INIT] engine ready=" << (ai_ok ? "YES" : "NO")
                   << " gat=" << (g_ai_engine.has_gat() ? "YES" : "NO")
                   << " lstm_ae=" << (g_ai_engine.has_lstm_ae() ? "YES" : "NO")
@@ -228,7 +583,9 @@ int main(int argc, char *argv[])
       //                 exported from SUMO via traceExporter.py (paper-conformant).
       std::string trace_path;
       if (g_mobility_source == MOBILITY_SRC_SUMO_TRACE) {
-          trace_path = default_sumo_trace_path(mobility_scenario, maxspeed);
+          trace_path = g_mobility_trace_csv_override.empty()
+                     ? default_sumo_trace_path(mobility_scenario, maxspeed)
+                     : g_mobility_trace_csv_override;
           if (trace_path.empty()) {
               std::cerr << "[MOBILITY] no .tcl found for scenario="
                         << mobility_scenario << " speed=" << maxspeed
@@ -241,6 +598,59 @@ int main(int argc, char *argv[])
               g_mobility_source = MOBILITY_SRC_HARDCODED;
           }
       }
+      // ── Derive the map bounds from the trace (was hardcoded 0..2000) ────────
+      // min/max_position_* clamp poisoned coordinates in EnforceRealism() and at
+      // the TP-S1/MP-S1 injection sites. They were fixed at a 2000x2000 synthetic
+      // map, but every SUMO scenario has its own frame (urban x 664..2663,
+      // rural x 2842..5848, autobahn x 2755..3086). A stale bound silently pins
+      // out-of-range poisoned beacons to the boundary: it replaces the intended
+      // attack with a teleport AND hands the LSTM-AE a frozen (trivially
+      // reconstructable) coordinate, inverting its anomaly score. Derive per run
+      // so the clamp only rejects genuinely off-map fabrication.
+      if (!trace_path.empty()) {
+          std::ifstream bfin(trace_path);
+          if (bfin.is_open()) {
+              double xmn=1e18, xmx=-1e18, ymn=1e18, ymx=-1e18;
+              std::string bl;
+              while (std::getline(bfin, bl)) {
+                  std::size_t sp;
+                  if ((sp = bl.find(" set X_ ")) != std::string::npos) {
+                      double v = std::atof(bl.c_str() + sp + 8);
+                      if (v < xmn) xmn = v;
+                      if (v > xmx) xmx = v;
+                  } else if ((sp = bl.find(" set Y_ ")) != std::string::npos) {
+                      double v = std::atof(bl.c_str() + sp + 8);
+                      if (v < ymn) ymn = v;
+                      if (v > ymx) ymx = v;
+                  } else if ((sp = bl.find("setdest ")) != std::string::npos) {
+                      double x = 0.0, y = 0.0, sv = 0.0;
+                      if (std::sscanf(bl.c_str() + sp + 8, "%lf %lf %lf", &x, &y, &sv) >= 2) {
+                          if (x < xmn) xmn = x;
+                          if (x > xmx) xmx = x;
+                          if (y < ymn) ymn = y;
+                          if (y > ymx) ymx = y;
+                      }
+                  }
+              }
+              if (xmn <= xmx && ymn <= ymx) {
+                  const double bmargin = 100.0;   // headroom: never bind on sub-gate drift
+                  min_position_x = xmn - bmargin;  max_position_x = xmx + bmargin;
+                  min_position_y = ymn - bmargin;  max_position_y = ymx + bmargin;
+                  std::cout << "[MAP-BOUNDS] derived from trace: x ["
+                            << min_position_x << ", " << max_position_x << "]  y ["
+                            << min_position_y << ", " << max_position_y
+                            << "]  (trace extent x " << xmn << ".." << xmx
+                            << "  y " << ymn << ".." << ymx << ")" << std::endl;
+              } else {
+                  std::cout << "[MAP-BOUNDS] no coordinates parsed from "
+                            << trace_path << " — keeping defaults" << std::endl;
+              }
+          } else {
+              std::cout << "[MAP-BOUNDS] cannot open " << trace_path
+                        << " — keeping defaults" << std::endl;
+          }
+      }
+
       g_mobility_provider = create_mobility_provider(g_mobility_source, trace_path);
       std::cout << "[MOBILITY] provider=" << g_mobility_provider->provider_name()
                 << " sumo_derived="
@@ -272,6 +682,12 @@ int main(int argc, char *argv[])
   CsmaHelper csma;
   csma.SetChannelAttribute ("DataRate", StringValue ("1000Mbps"));
   csma.SetChannelAttribute ("Delay", TimeValue (MicroSeconds (10)));
+  // R9: one crypto epoch ships a ~2 MB frame RSU0→Cloud as ~36 UDP chunks
+  // (~1500 IP fragments) enqueued at the same sim instant — the default
+  // 100-packet DropTail queue would drop most of them. Likewise ARP holds only
+  // 3 pending packets while resolving, which silently ate epoch 0's burst.
+  csma.SetQueue ("ns3::DropTailQueue<Packet>", "MaxSize", StringValue ("16384p"));
+  Config::SetDefault ("ns3::ArpCache::PendingQueueSize", UintegerValue (4096));
   
   NodeContainer csma_nodes;
   Ipv4AddressHelper address;
@@ -285,10 +701,11 @@ int main(int argc, char *argv[])
 	  csma_nodes.Add(controller_Node);
 	  csma_nodes.Add(management_Node);
 	  // R4.b: backup_controller_Node no longer joins the CSMA backhaul.
-	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
+      csma_nodes.Add(cloud_Node);	  
+      // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
 	  //   → management index = N_RSUs + 1 (unchanged from prior layout)
 	  csmaDevices = csma.Install (csma_nodes);
-  	  address.SetBase ("10.1.1.0", "255.255.255.0");
+  	  address.SetBase ("10.1.0.0", "255.255.0.0");   // /16: CSMA backbone must hold up to 256 RSUs + controllers + mgmt (a /24's 254 hosts overflow at N_RSUs=256)
   	  stack.Install (csma_nodes);
   	  csmaInterfaces = address.Assign (csmaDevices);
   	  // ── Option B: management_node is the last entry in csma_nodes ─────────
@@ -296,6 +713,9 @@ int main(int argc, char *argv[])
   	  //   → management index = N_RSUs + N_Controllers
   	  g_management_csma_ip = csmaInterfaces.GetAddress(N_RSUs + N_Controllers);
   	  cout << "[OPT-B] management CSMA IP  = " << g_management_csma_ip << endl;
+      g_cloud_csma_ip = csmaInterfaces.GetAddress(N_RSUs + N_Controllers + 1);
+      cout << "[OPT-B] cloud CSMA IP = " << g_cloud_csma_ip << endl;
+
   	  // ── Store RSU CSMA IPs for management → RSU downlink (port 8888) ──────────────
   	  // CSMA order: RSU0..RSU(N_RSUs-1), controller, management
   	  // RSU r is at csmaInterfaces index r → IPs 10.1.1.1 .. 10.1.1.4
@@ -394,6 +814,12 @@ int main(int argc, char *argv[])
   }
   RSU_apps.Start(Seconds(0.00));
   RSU_apps.Stop(Seconds(simTime));
+
+  // R9: install the socket app on the Cloud node too
+  Ptr <SimpleUdpApplication> cloud_app = Create <SimpleUdpApplication> ();
+  cloud_Node.Get(0)->AddApplication(cloud_app);
+  cloud_app->SetStartTime(Seconds(0.00));
+  cloud_app->SetStopTime(Seconds(simTime));
 
   Ipv4GlobalRoutingHelper::PopulateRoutingTables ();
   Config::SetDefault("ns3::Ipv4GlobalRouting::RespondToInterfaceEvents", BooleanValue(true));
@@ -676,7 +1102,9 @@ int main(int argc, char *argv[])
   // crashes the run (it just reverts to the old behaviour with a warning).
   if (g_mobility_source == MOBILITY_SRC_SUMO_TRACE && N_RSUs > 0)
   {
-      std::string rsu_csv = default_rsu_positions_path(mobility_scenario);
+      std::string rsu_csv = g_rsu_positions_csv_override.empty()
+                           ? default_rsu_positions_path(mobility_scenario)
+                           : g_rsu_positions_csv_override;
       std::vector<std::pair<double,double>> rsu_xy = load_rsu_positions(rsu_csv);
       if (rsu_xy.size() >= (size_t)N_RSUs)
       {
@@ -989,20 +1417,25 @@ int main(int argc, char *argv[])
   	channel_182.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
   	channel_184.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
   }
-  if (mobility_scenario == 2)//open-highway mobility → Two-Ray Ground
+  if (mobility_scenario == 2)//open-highway mobility → LogDistance (supervisor 2026-07-02)
   {
-  	// Open highway has a strong ground-reflection (two-ray) channel. Frequency set
-  	// to the 5.9 GHz DSRC/WAVE band; HeightAboveZ = 1.5 m gives a realistic antenna
-  	// height (trace/RSU node z = 0, so the model's default height-0 must be lifted
-  	// or it degenerates). TxPower stays 41 dBm and R_max_comm stays 270 m (logical
-  	// range, see scenario-1 note) so coverage stays comparable across scenarios.
-  	channel.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_172.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_174.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_176.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_180.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_182.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
-  	channel_184.AddPropagationLoss("ns3::TwoRayGroundPropagationLossModel", "Frequency", DoubleValue(5.9e9), "HeightAboveZ", DoubleValue(1.5));
+  	// CHANGED 2026-07-02 (Nilmantha Sir): TwoRayGround was too ideal for the open
+  	// highway. At 41 dBm its low path loss gave a ~2 km *physical* radio range, so
+  	// with 200 vehicles over ~6.3 km each PHY node sensed ~145 concurrent
+  	// transmitters (vs ~17 in urban/Cost231). That overloaded the ns-3.35 WiFi PHY
+  	// into a non-advancing zero-time event loop (simulation froze at t≈13 s).
+  	// LogDistance (path-loss exponent 3.0 — the same model rural/scenario-1 uses)
+  	// has much higher path loss, shrinking the physical range and the concurrent-
+  	// reception load. TxPower stays 41 dBm and R_max_comm stays 270 m (logical
+  	// range) so coverage/detection gating stays comparable across scenarios.
+  	// Original (kept for provenance): TwoRayGround @ 5.9 GHz, HeightAboveZ = 1.5 m.
+  	channel.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_172.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_174.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_176.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_180.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_182.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
+  	channel_184.AddPropagationLoss("ns3::LogDistancePropagationLossModel");
   }
   
   //Physical layer helper for wave
@@ -1419,6 +1852,59 @@ int main(int argc, char *argv[])
       }
       g_option_b_active = true;  // all Option B globals are now set
       cout << "[OPT-B] DSRC-RSU relay ACTIVE (routing_test=" << routing_test << ")" << endl;
+  }
+
+  // ── FIX 1: bind each vehicle ID to its TRUE physical DSRC address ───────────
+  // Same container order as above: vehicle v's DSRC interface is index v. This
+  // is the registry-derived ground truth used by handle_readone to reject
+  // vehicle_state writes from a transmitter that does not own the claimed ID.
+  // Keyed by NS-3 NODE ID, which is exactly what a vehicle writes into the beacon
+  // (09_vehicle_beacon_tx.h:249, tag.SetVehicleId(nid) with nid = node->GetId()).
+  // Do NOT key this by any assumed offset: an earlier revision indexed via
+  // lkh_veh_idx() and was systematically 3 entries off, which rejected GENUINE
+  // beacons — every rejection showed owner == claimed + 3, a constant that no
+  // attack could produce (victim selection is a per-attacker std::shuffle).
+  //
+  // CORRECTED LOOKUP. Two earlier revisions inferred the DSRC interface index
+  // from the node ID (`GetAddress(v)` with v from container order, and via
+  // lkh_veh_idx()). Both were wrong: instrumentation showed checked=3912
+  // rejected=3912 — EVERY beacon failed, honest ones included — because the
+  // observed source address is 3.0.0.(vid-8) while those maps produced
+  // 3.0.0.(vid-5). The index inference does not hold.
+  //
+  // We therefore read each vehicle's address from its OWN node object and take
+  // whichever interface carries the DSRC subnet (3.x). No offset arithmetic, so
+  // no assumption to get wrong.
+  {
+      uint32_t bound = 0, skipped = 0;
+      for (uint32_t v = 0; v < Vehicle_Nodes.GetN(); v++) {
+          Ptr<Node> nd = Vehicle_Nodes.Get(v);
+          uint32_t node_id = nd->GetId();
+          if (node_id >= (uint32_t)(total_size + 2)) { skipped++; continue; }
+          Ptr<Ipv4> ip4 = nd->GetObject<Ipv4>();
+          if (!ip4) { skipped++; continue; }
+          bool found = false;
+          for (uint32_t ifc = 0; ifc < ip4->GetNInterfaces() && !found; ifc++) {
+              for (uint32_t ad = 0; ad < ip4->GetNAddresses(ifc) && !found; ad++) {
+                  Ipv4Address a = ip4->GetAddress(ifc, ad).GetLocal();
+                  // DSRC subnet is 3.0.0.0/8 (address_dsrc.SetBase above).
+                  if ((a.Get() >> 24) == 3u) {
+                      g_vehicle_owner_ip[node_id]       = a;
+                      g_vehicle_owner_ip_known[node_id] = true;
+                      bound++; found = true;
+                  }
+              }
+          }
+          if (!found) skipped++;
+      }
+      cout << "[FIX1-IDBIND] bound " << bound << " vehicle node-IDs from their OWN Ipv4 objects"
+           << " (skipped=" << skipped << ")";
+      if (Vehicle_Nodes.GetN()) {
+          uint32_t n0 = Vehicle_Nodes.Get(0)->GetId();
+          cout << "  node" << n0 << " -> "
+               << (g_vehicle_owner_ip_known[n0] ? g_vehicle_owner_ip[n0] : Ipv4Address());
+      }
+      cout << endl;
   }
   address_dsrc_172.SetBase ("4.0.0.0", "255.0.0.0");
   dsrc_interfaces_172 = address_dsrc_172.Assign (wifidevices_172);
@@ -1889,9 +2375,15 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
 
   ensure_analytics_dir(NS3_ROOT "/analytics");
   ensure_analytics_dir(NS3_ROOT "/analytics/results");
-  std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_a")
-                         + std::to_string(attack_number)
-                         + "_p" + std::to_string(attack_percentage) + ".xml";
+  // Filename keyed by scenario + attack + pct + ablation_mode. The old name used
+  // only attack+pct, so runs that differed solely in scenario (urban/rural/highway)
+  // or ablation mode (AB5 lightweight vs full) all wrote to the SAME xml and clobbered
+  // each other. Tag all four so an AB1–AB11 × 3-scenario sweep keeps distinct animations.
+  std::string anim_path = std::string(NS3_ROOT "/analytics/results/mptd_netanim_")
+                         + mptd_scenario_name()
+                         + "_a" + std::to_string(attack_number)
+                         + "_p" + std::to_string(attack_percentage)
+                         + "_m" + std::to_string(ablation_mode) + ".xml";
   AnimationInterface anim(anim_path);
   // NOTE: EnablePacketMetadata(true) is intentionally omitted — NS-3 3.35 requires
   // it to be called before ANY packet is created (before scheduling), otherwise it
@@ -2084,6 +2576,32 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // SCControllerSubmitEvidence / SCRevokeVote fires. No-op when
   // skip_blockchain=true or routing_algorithm != 4.
   if (routing_algorithm == 4) {
+    // Wipe any world state left over from a previous run so each simulation
+    // (every attack × percentage) starts from a clean ledger. No-op under
+    // skip_blockchain. Must precede register_all_nodes() so the fresh
+    // registrations are not rejected as duplicates of the prior run.
+    CallSCResetLedger();
+
+    // Push the simulation's ACTUAL detection threshold into the ledger config.
+    // Without this the chaincode silently uses its fallback PsiAnomalyTh=0.5
+    // while RSUs decide anomalies at psi_th=0.09 — the same symbol ψ_th holding
+    // two different values in two components. Effect: an RSU submits evidence it
+    // considers anomalous (median ψ=0.15; 57% of beacons exceed 0.09), the
+    // chaincode recomputes flag^rsu = 1[ψ > 0.5] and gets 0 (only 11% qualify),
+    // so the directional conflict (1−flag^ctrl)·flag^rsu (Eq 3.66) collapses to
+    // 0, controller trust never decays off 1.0, and CP-DETECT / SC-Revoke can
+    // never fire regardless of attack intensity.
+    //
+    // NumRSUs stays 4 ON PURPOSE: fByzantine(n)=(n-1)/3, so n=4 ⇒ f=1 ⇒
+    // 2f+1=3, matching the 3 endorsements register_one() actually collects.
+    // Passing the true 64 would demand 2f+1=43 endorsements and break every
+    // registration.
+    CallSCInitNetworkConfig(/*numRSUs=*/4, /*alpha=*/g_rsu_trust_alpha,
+                            /*tauWarn=*/0.5, /*tauMin=*/0.3,
+                            /*tRev=*/(uint32_t)g_rsu_t_rev, /*psiAnomalyTh=*/psi_th,
+                            /*rsuTrustQuorum=*/g_rsu_trust_quorum,
+                            /*tWindowSec=*/(g_t_window > 0 ? g_t_window : 0.0));
+
     register_all_nodes();
   }
 
@@ -2094,8 +2612,52 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   // of attack/percentage selection. Paper §3.5.5 Eq 3.58 cross-RSU broadcast.
   mptd_arm_event_drainer_if_env();
 
+  // C5 TTD: seed the onset/alert sentinels to -1. These are file-scope globals, so
+  // C++ zero-initialises them to 0.0 — and compute_TTD() treats ">= 0" as "recorded".
+  // Without this every one of the total_size slots looks recorded with onset==alert,
+  // so TTD collapsed to exactly 0.0000 in every run ever produced. init_vehicle_states()
+  // in 04_state_globals.h seeds these, but it is DEFINED AND NEVER CALLED; only these
+  // two arrays actually differ from zero-init, so we seed them here rather than call
+  // it (calling it would also clear pre_registered_sybil[] and clobber attacker setup).
+  for (int i = 0; i < total_size; i++) {
+      g_ttd_first_poison[i] = -1.0;
+      g_ttd_first_alert[i]  = -1.0;
+  }
+
+  // TEMP DIAGNOSTIC (Step 1 follow-up): sample coverage at multiple timestamps
+  // via a named free function (mptd_coverage_diag_check, declared above main).
+  for (double t = 2.0; t < simTime; t += 2.0) {
+      Simulator::Schedule(Seconds(t), &mptd_coverage_diag_check, t);
+  }
+
   Simulator::Stop(Seconds(simTime));
   Simulator::Run();
+
+  // TEMP DIAGNOSTIC (Step 1 follow-up): raw TX vs RX beacon counts, to localize
+  // the beacon-count gap. Compare against the confusion matrix total printed
+  // separately (cm_TP+cm_FP+cm_TN+cm_FN).
+  std::cout << "[COVERAGE-DIAG] beacon TX attempts=" << g_diag_beacon_tx_count
+            << "  RX at RSU (HandleBeaconReceived calls)=" << g_diag_beacon_rx_count
+            << "  RX/TX=" << (g_diag_beacon_tx_count > 0 ? (100.0*g_diag_beacon_rx_count/g_diag_beacon_tx_count) : 0.0)
+            << "%" << std::endl;
+  std::cout << "[COVERAGE-DIAG] confusion-matrix update() calls=" << g_diag_cm_update_count
+            << "  CM/RX=" << (g_diag_beacon_rx_count > 0 ? (100.0*g_diag_cm_update_count/g_diag_beacon_rx_count) : 0.0)
+            << "%  (Block 2: gap between RX and CM update means a filter exists between them)"
+            << std::endl;
+
+  // ── Tier-3 batched-commit: flush trailing partial batches + summary ──────
+  // (paper §3.5.5) The time-flush only fires on a subsequent same-RSU push, so
+  // each RSU's final sub-N_commit batch is drained here. The summary reports how
+  // much anomaly evidence was buffered vs committed as batched Fabric txs.
+  if (g_tiered_commit) {
+      tier3_flush_all(simTime);
+      std::cout << "[TIER3-SUMMARY] evidence_buffered=" << g_tier3_buffered
+                << " batches_committed=" << g_tier3_batches
+                << " entries_committed=" << g_tier3_entries
+                << " (T_batch=" << g_t_batch << "s N_commit=" << g_n_commit << ")"
+                << std::endl;
+  }
+
   Simulator::Destroy();
 
   // ── Write MPTD-PQS metrics CSV (Stage 4) ─────────────────────────────────
@@ -2120,6 +2682,18 @@ cout<<"Routing algorithm is "<<routing_algorithm<<"experiment number is "<<exper
   if (total_trajectories_received > 0) {
       double poison_rate = 100.0 * total_trajectories_poisoned / total_trajectories_received;
       std::cout << "  Actual poison rate   : " << poison_rate << "%" << std::endl;
+      // FIX 1 (identity binding) — DQ-FP4 answer + validation of the check itself.
+      if (g_hmac_fail_closed)
+          std::cout << "  [HMAC-FAILCLOSED] beacons rejected for missing MAC: "
+                    << g_hmac_missing_rejected << std::endl;
+      std::cout << "  [FIX1] idbind checked=" << g_idbind_checked
+                << " rejected=" << g_idbind_rejected
+                << "  of which poisoned=" << g_idbind_rej_poisoned
+                << " HONEST=" << g_idbind_rej_honest;
+      if (g_idbind_rejected)
+          std::cout << "  (precision=" 
+                    << (100.0 * g_idbind_rej_poisoned / g_idbind_rejected) << "%)";
+      std::cout << std::endl;
   }
   std::cout << "========================================" << std::endl;
   // ─────────────────────────────────────────────────────────────────────────

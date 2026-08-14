@@ -1,0 +1,11 @@
+{
+  "scenario": "highway",
+  "selected_candidate": "G8",
+  "heads": 4,
+  "hidden_dim": 16,
+  "emb_dim": 8,
+  "dropout": 0.1,
+  "val_mcc_mean": 0.5832886767846609,
+  "val_fpr_mean": 0.3781969716248887,
+  "best_seed": 1
+}

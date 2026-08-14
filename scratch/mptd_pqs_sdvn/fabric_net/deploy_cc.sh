@@ -92,7 +92,7 @@ peer lifecycle chaincode commit -o localhost:7050 \
 echo "[deploy] starting ONE shared CCAAS container"
 docker rm -f "${CC_NAME}_ccaas" 2>/dev/null || true
 docker run --rm -d --name "${CC_NAME}_ccaas" \
-  --network "${DOCKER_NET}" \
+  --network host \
   -e CHAINCODE_SERVER_ADDRESS=0.0.0.0:${CCAAS_PORT} \
   -e CHAINCODE_ID="${PACKAGE_ID}" -e CORE_CHAINCODE_ID_NAME="${PACKAGE_ID}" \
   "${CC_NAME}_ccaas_image:latest"

@@ -176,9 +176,13 @@ void initialize_crypto_backends()
     // Full-mode default is the paper-correct PQ scheme Dilithium / ML-DSA-87,
     // Eq 3.49); --trs_classical=1 selects the classical Shamir-Schnorr-P256
     // signing-latency baseline for RQ5 (paper §3.5.4, behind ITrsBackend).
+    // AB7 ring-size sweep (--ab7_ring_n): n grows, t stays fixed at 3 (f=1
+    // held fixed by design — see g_ab7_ring_n comment in 02_config_globals.h).
+    const uint32_t ab7_ring_n = (g_ab7_ring_n >= 4) ? (uint32_t)g_ab7_ring_n : 4;
     const TrsScheme trs_scheme = g_trs_classical_baseline
                                ? TrsScheme::Classical : TrsScheme::Dilithium;
-    if (init_trs_backend(/*n=*/4, /*t=*/3, trs_scheme)) {
+    const double coo_dkg_t0 = mptd_ms_now();   // C7 COO_dkg: TRS DKG + ThFHE keygen
+    if (init_trs_backend(/*n=*/ab7_ring_n, /*t=*/3, trs_scheme)) {
         std::cout << "[CRYPTO/TRS] " << g_trs_backend->scheme_name()
                   << " ready (n=" << g_trs_ring_n
                   << " t=" << g_trs_ring_t
@@ -190,9 +194,10 @@ void initialize_crypto_backends()
 
     // FHE: threshold (t, n+1) BFV-RNS — the paper-correct Full-mode scheme
     // (Eq 3.54 ThGen, multiparty key gen + Shamir ShareKeys "with aborts").
-    // n_rsus=4, threshold=3; Cloud is the mandatory (n+1)-th lead party.
-    if (init_threshold_fhe_backend(/*n_rsus=*/4, /*threshold=*/3,
-                                   /*ptmod=*/65537, /*depth=*/1)) {
+    // n_rsus=ab7_ring_n (default 4), threshold=3; Cloud is the mandatory
+    // (n+1)-th lead party. Shares the same ring size as the TRS backend above.
+    if (init_threshold_fhe_backend(/*n_rsus=*/ab7_ring_n, /*threshold=*/3,
+                                   /*ptmod=*/FHE_PLAINTEXT_MODULUS, /*depth=*/1)) {
         std::cout << "[CRYPTO/THFHE] " << g_thfhe_backend->scheme_name()
                   << " ready (ring_dim=" << g_thfhe_backend->ring_dim()
                   << " parties=" << g_thfhe_backend->num_parties()
@@ -204,10 +209,13 @@ void initialize_crypto_backends()
                   << (g_thfhe_backend ? (": " + g_thfhe_backend->last_error()) : "")
                   << " — Full-mode FHE-TRS pipeline (Alg 6/7) will be disabled\n";
     }
+    g_coo_dkg_ms = mptd_ms_now() - coo_dkg_t0;   // C7 COO_dkg (one-time setup)
+    std::cout << "[CRYPTO/COO] DKG+keygen setup latency = "
+              << g_coo_dkg_ms << " ms (COO_dkg)\n";
 
     // Single-key BFV retained ONLY for the 06b3 selftest's legacy sum/mean
     // checks; the live Full-mode aggregate path uses g_thfhe_backend above.
-    if (init_fhe_backend(/*ptmod=*/65537, /*depth=*/1)) {
+    if (init_fhe_backend(/*ptmod=*/FHE_PLAINTEXT_MODULUS, /*depth=*/1)) {
         std::cout << "[CRYPTO/FHE] " << g_fhe_backend->scheme_name()
                   << " ready (ring_dim=" << g_fhe_backend->ring_dim()
                   << " ptmod=" << g_fhe_backend->plaintext_modulus() << ")\n";
@@ -641,7 +649,9 @@ static std::vector<uint32_t> select_endorsers_trust_ranked(uint32_t n_rsus,
                                                            uint32_t need,
                                                            uint64_t seed)
 {
-    if (!g_trust_peer_selection || g_rsu_trusted_set.empty())
+    // AB8 (C10): lifecycle removed — every RSU is permanently trusted, so the
+    // endorser pick degrades to a uniform random sample over ALL RSUs.
+    if (!g_trust_peer_selection || !enable_rsu_lifecycle || g_rsu_trusted_set.empty())
         return random_endorser_sample(n_rsus, need, seed);
 
     // Candidate pool: trusted RSUs within the addressable index range.
@@ -673,7 +683,9 @@ static std::vector<uint32_t> select_endorsers_trust_ranked(uint32_t n_rsus,
 // under skip_blockchain or when trust selection is disabled. Reschedules itself.
 static void refresh_endorsement_committee()
 {
-    if (skip_blockchain || !g_trust_peer_selection) return;
+    // AB8 (C10): no lifecycle → no trust snapshot to track; committee refresh
+    // is a no-op and selection stays uniform random over all RSUs.
+    if (skip_blockchain || !g_trust_peer_selection || !enable_rsu_lifecycle) return;
 
     auto views = CallSCGetAllRSUTrustScores();
     if (!views.empty()) {
@@ -682,6 +694,10 @@ static void refresh_endorsement_committee()
         for (const auto& v : views) {
             g_rsu_trust_cache[v.rsu_idx] = v.trust;
             if (v.trusted) g_rsu_trusted_set.insert(v.rsu_idx);
+            // AB8 option B: publish demotion state where the detection path can
+            // see it (04_state_globals.h) — 08_detection_engine.h is included
+            // before this header and cannot read g_rsu_trusted_set directly.
+            if (v.rsu_idx < MAX_RSUS) rsu_demoted[v.rsu_idx] = !v.trusted;
         }
         const uint32_t need = 2 * /*paper fixed f=*/1u + 1u;   // 2f+1 = 3
         g_endorsement_committee = select_endorsers_trust_ranked(
@@ -740,11 +756,42 @@ static std::string build_endorsements_json(const std::string& target_id,
     return js.str();
 }
 
+// is_transient_ledger_err — does this failure deserve a retry?
+//
+// Mirrors isRetryableSubmitErr() in fabric_gateway_daemon/main.go. Gateway/orderer
+// hiccups (submit or endorse deadline, Aborted, Unavailable, MVCC/phantom read
+// conflicts) are TRANSIENT: the same call usually succeeds moments later. They are
+// NOT chaincode verdicts and must not be treated as permanent.
+//
+// Bug this fixes: the old code retried only on an empty message (transport) or on
+// "insufficient endorsements", and `break`-ed on everything else. A gateway
+// "DeadlineExceeded desc = context deadline exceeded" matches neither, so CTRL_0
+// gave up after attempt 0 and was never registered. Because an unregistered
+// controller is not in C_trusted, every RSU assigned to it rolled over to a
+// successor — which silently produced a non-zero TCL_reassign that looked like a
+// real CP-DETECT revocation but was pure registration fallout. The same class of
+// gap dropped 5 RSUs in an earlier run, and since vehicle SCRegister needs 2f+1
+// endorsements, that cascaded into ~60% of vehicle registrations failing.
+static bool is_transient_ledger_err(const std::string& m)
+{
+    if (m.empty()) return true;              // transport / daemon down
+    static const char* kTransient[] = {
+        "DeadlineExceeded", "context deadline exceeded",
+        "submit timeout expired", "endorsement timeout",
+        "code = Aborted", "code = Unavailable",
+        "MVCC_READ_CONFLICT", "PHANTOM_READ_CONFLICT",
+        "insufficient endorsements",         // transient endorser-set mismatch
+    };
+    for (const char* t : kTransient)
+        if (m.find(t) != std::string::npos) return true;
+    return false;                            // deterministic reject (dup id, bad pk…)
+}
+
 // register_one — generate keypair + chaincode register call for one node.
 // Returns true on commit (chaincode payload contains no "rejected:" prefix).
-// Wraps decision #5: strict-reject + bounded retry. RSU bootstrap path is
-// unconditional (no endorsers exist yet); vehicle/controller path samples
-// 2f+1 RSUs and retries on "rejected: insufficient endorsements" only.
+// Wraps decision #5: strict-reject + bounded retry. Both the RSU bootstrap path
+// and the vehicle/controller 2f+1 path retry on transient ledger errors
+// (is_transient_ledger_err) and fail fast on deterministic chaincode rejects.
 static bool register_one(const std::string& id, const std::string& role,
                           const std::string& h_ku_hex, double t_reg,
                           uint32_t n_rsus, uint32_t need_endorsers,
@@ -772,21 +819,29 @@ static bool register_one(const std::string& id, const std::string& role,
             try { rsu_idx = (uint32_t)std::stoul(id.substr(4)); }
             catch (...) { return false; }
         }
-        SCResult r = CallSCBootstrapRSU(rsu_idx, pk_hex, h_ku_hex, t_reg,
-                                        submit_identity);
-        if (!r.ok) {
-            // Daemon/transport failure (empty msg) OR chaincode-side reject
-            // ("rejected: …"). Both are fatal here — the RSU is not on chain
-            // and cannot endorse downstream SCRegister calls.
-            std::cerr << "[SC-REGISTER] " << id
-                      << " bootstrap FAILED: "
-                      << (r.msg.empty() ? "transport error (daemon down?)" : r.msg)
+        // Bounded retry on TRANSIENT ledger errors. An RSU that fails to land on
+        // chain cannot endorse downstream SCRegister calls, and since vehicles
+        // need 2f+1 endorsements, even a handful of missing RSUs cascades into
+        // mass vehicle-registration failure ("got 2 valid, need 3"). Losing an
+        // RSU to a one-off gateway timeout is therefore far more expensive than
+        // the retry.
+        for (uint32_t attempt = 0; attempt < max_retries; ++attempt) {
+            SCResult r = CallSCBootstrapRSU(rsu_idx, pk_hex, h_ku_hex, t_reg,
+                                            submit_identity);
+            if (r.ok) {
+                std::cout << "[SC-REGISTER] " << id << " bootstrap OK (pk="
+                          << pk_hex.substr(0, 16) << "..)"
+                          << (attempt ? " [after retry]" : "") << "\n";
+                return true;
+            }
+            const std::string& m = r.msg;
+            std::cerr << "[SC-REGISTER] " << id << " bootstrap attempt "
+                      << attempt << " FAILED: "
+                      << (m.empty() ? "transport error (daemon down?)" : m)
                       << std::endl;
-            return false;
+            if (!is_transient_ledger_err(m)) break;   // deterministic reject
         }
-        std::cout << "[SC-REGISTER] " << id << " bootstrap OK (pk="
-                  << pk_hex.substr(0, 16) << "..)\n";
-        return true;
+        return false;
     }
 
     // Vehicle / Controller path: 2f+1 endorsements via SCRegister.
@@ -823,14 +878,11 @@ static bool register_one(const std::string& id, const std::string& role,
                   << (m.empty() ? "transport error (daemon down?)" : m)
                   << std::endl;
 
-        // Transport-level failure (empty msg) — retry, daemon may recover.
-        if (m.empty()) continue;
-
-        // Chaincode-side failure: only retry on transient endorsement-set
-        // mismatch ("rejected: insufficient endorsements …"). Deterministic
-        // rejects (duplicate-ID, bad pk, bad hKuHex) won't change on retry.
-        if (m.find("insufficient endorsements") == std::string::npos)
-            break;
+        // Retry any TRANSIENT ledger error (transport, gateway/orderer deadline,
+        // Aborted/Unavailable, MVCC/phantom conflict, or a transient
+        // endorsement-set mismatch). Deterministic chaincode rejects
+        // (duplicate-ID, bad pk, bad hKuHex) won't change on retry — fail fast.
+        if (!is_transient_ledger_err(m)) break;
     }
     return false;
 }
@@ -886,7 +938,8 @@ std::string mptd_sign_revoke_vote_hex(const std::string& vehId,
 // touches the per-beacon hot path.
 static void mptd_active_controller_refresh_loop(double period)
 {
-    if (skip_blockchain) return;
+    // AB9 (C10): no rotation — c_assigned and the active controller are fixed.
+    if (skip_blockchain || !enable_ctrl_rotation) return;
     uint32_t prev = g_active_controller_idx;
     mptd_refresh_active_controller();
     if (g_active_controller_idx != prev) {
@@ -922,7 +975,13 @@ static void mptd_active_controller_refresh_loop(double period)
                 // Persist the new c_assigned(r_j) on-chain so SC-Trust's
                 // R^obs_ck(t) reconstruction (Table 3.2) follows the rollover
                 // (paper p.75). Sync invoke — cheap at the ~1 Hz refresh cadence.
+                // C9 TCL_reassign: wall-clock of the on-chain reassignment
+                // commit (detection lag is bounded by the 1 Hz refresh, not
+                // included here).
+                const double tcl_ra0 = mptd_ms_now();
                 CallSCSetRSUController(r, nc);
+                g_tcl_reassign_ms_sum += mptd_ms_now() - tcl_ra0;
+                g_tcl_reassign_cnt++;
             }
         }
     }

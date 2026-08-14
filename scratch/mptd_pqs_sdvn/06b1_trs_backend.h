@@ -885,6 +885,20 @@ inline std::vector<uint8_t> serialize_evidence(const EvidenceMessage &m)
 static uint64_t g_trs_verified_count = 0;
 static uint64_t g_trs_rejected_count = 0;
 
+// C4b — PARR reachability (paper Eq. 4.3, "poisoned aggregates injected").
+// g_parr_injected counts epochs in which a compromised ring coordinator injects
+// a poisoned aggregate; g_parr_rejected counts how many of those the cloud's
+// TRS Verify (Eq. 3.53) rejected. PARR = g_parr_rejected / g_parr_injected, and
+// is undefined (reported -1) when no poisoned aggregate was ever injected. The
+// full-mode-vs-AB6 contrast is structural: AB6 has no TRS gate, so an injected
+// aggregate is never rejected and PARR reads 0.
+static uint64_t g_parr_injected = 0;
+static uint64_t g_parr_rejected = 0;
+// C4b: compromised RSUs in the current ACTIVE signing ring (set per epoch by
+// run_full_mode_crypto_pipeline from ring_ids). The forgery-rejectability test
+// compares this against t_sign — counting over the elected ring, not 0..n.
+static uint32_t g_ring_f_actual = 0;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // evidence_sign_and_verify — paper Algorithm 6 (PQ-TRS-SIGN), Eq. 3.47–3.49
 //

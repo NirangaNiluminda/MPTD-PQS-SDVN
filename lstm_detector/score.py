@@ -1,5 +1,6 @@
 import os
 import sys
+import json
 import argparse
 import numpy as np
 import pandas as pd
@@ -21,7 +22,7 @@ def score_window(model: torch.nn.Module, window_seq: np.ndarray) -> float:
     x = torch.tensor(window_seq, dtype=torch.float32).unsqueeze(0).to(DEVICE)
     with torch.no_grad():
         recon = model(x)
-    return float(((recon - x) ** 2).mean().cpu())
+    return float(((recon - x) ** 2).sum(dim=-1).mean().cpu())
 
 def main():
     parser = argparse.ArgumentParser()
@@ -32,7 +33,18 @@ def main():
     print(f"\nScoring Scenario: {args.scenario.upper()} with file {args.attack_csv}")
     
     # Load model
-    model = LSTMAEDetector().to(DEVICE)
+    # Load the winning architecture for this scenario (hidden/latent/window
+    # differ per scenario after the Table 4.17 search) — falls back to the
+    # global defaults if no search has been run yet for this scenario.
+    arch_path = os.path.join(CHECKPOINT_DIR, f"arch_{args.scenario}.json")
+    if os.path.exists(arch_path):
+        with open(arch_path) as f:
+            arch = json.load(f)
+        model = LSTMAEDetector(hidden=arch["hidden"], latent=arch["latent"]).to(DEVICE)
+        window_size = arch["window"]
+    else:
+        model = LSTMAEDetector().to(DEVICE)
+        window_size = WINDOW_SIZE
     model_path = os.path.join(CHECKPOINT_DIR, f"lstm_ae_{args.scenario}.pt")
     if not os.path.exists(model_path):
         print(f"Error: Model checkpoint {model_path} not found.")
@@ -45,7 +57,6 @@ def main():
     if not os.path.exists(scaler_path):
         print(f"Error: Scaler JSON {scaler_path} not found.")
         return
-    import json
     with open(scaler_path) as f:
         scaler_data = json.load(f)
     scaler = StandardScaler()
@@ -64,13 +75,13 @@ def main():
 
     # Load data and score
     df = load_beacon_csv(args.attack_csv)
-    windows = build_all_windows(df)
+    windows = build_all_windows(df, window=window_size)
     if len(windows) == 0:
         print("No sequence windows could be built from the CSV file.")
         return
 
     # Normalize
-    wins_norm = scaler.transform(windows.reshape(-1, FEATURE_DIM)).reshape(len(windows), WINDOW_SIZE, FEATURE_DIM)
+    wins_norm = scaler.transform(windows.reshape(-1, FEATURE_DIM)).reshape(len(windows), window_size, FEATURE_DIM)
     
     print(f"Scoring {len(wins_norm)} windows...")
     errors = []
@@ -93,8 +104,8 @@ def main():
         for _key, vdf in df.groupby(group_keys):
             vdf = vdf.sort_values("sim_time").reset_index(drop=True)
             lbls = vdf[label_col].values
-            if len(lbls) >= WINDOW_SIZE:
-                y_list.extend(lbls[WINDOW_SIZE-1:])
+            if len(lbls) >= window_size:
+                y_list.extend(lbls[window_size-1:])
         y_labels = np.array(y_list)
     else:
         y_labels = None

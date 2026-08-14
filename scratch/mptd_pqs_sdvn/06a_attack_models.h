@@ -248,7 +248,7 @@ void SampleBoundedDrift(int vid, double &drift_x, double &drift_y,
     }
 
     // Deterministic per-(vid, beacon_count) RNG → reproducible across runs
-    uint32_t seed = 12345u * (uint32_t)vid + (uint32_t)drift_beacon_count[vid] + 7919u;
+    uint32_t seed = 12345u * (uint32_t)vid + (uint32_t)drift_beacon_count[vid] + 7919u + run_seed*100003u;
     std::mt19937 rng(seed);
     std::uniform_real_distribution<double> uni01(0.0, 1.0);
 
@@ -335,7 +335,18 @@ void EnforceRealism(Vector &position, Vector &velocity, Vector &acceleration)
 // ── declare_attack_states() — map attack_number → LDA flags + blockchain log ──
 void declare_attack_states()
 {
-    if (attack_number == 1) {
+    if (attack_number == 0) {
+        // COMBINED (§ ablation/E1–E4 default): all 7 attack types active at once.
+        // Vehicle-level union — a2 (tp_vehicle) + a4/a6 (sybil_mitm). Which vehicle
+        // runs which is assigned per-node in declare_attackers() (g_veh_attack[]).
+        // RSU-level (a1,a3) fires via declare_compromised_rsus(); controller-level
+        // (a5,a7) via the compromised-controller path in HandleBeaconReceived().
+        present_tp_vehicle_attack         = true;
+        present_heading_spoof_attack      = false;
+        present_rsu_fabrication_attack    = false;
+        present_sybil_mitm_attack         = true;
+        present_beacon_suppression_attack = false;
+    } else if (attack_number == 1) {
         // TP-S1: Compromised RSU trajectory poisoning (§3.4.1, Figure 3.1)
         // Attacker = RSU; all vehicles are honest
         present_tp_vehicle_attack         = false;
@@ -435,7 +446,7 @@ void declare_pre_registered_sybils()
 
     int count = 0;
     for (int i = 0; i < (int)N_Vehicles; i++) {
-        pre_registered_sybil[i] = GetBooleanWithProbability(sybil_registration_pct, i + 500);
+        pre_registered_sybil[i] = GetBooleanWithProbability(sybil_registration_pct, i + 500 + run_seed*100003u);
         if (pre_registered_sybil[i]) count++;
     }
 
@@ -458,7 +469,22 @@ void declare_pre_registered_sybils()
 void declare_attackers()
 {
     for (uint32_t i = 0; i < N_Vehicles; i++) {  // active count, not capacity (256)
-        bool attacking_state = GetBooleanWithProbability(attack_percentage, i);
+        bool attacking_state = GetBooleanWithProbability(attack_percentage, i + run_seed*100003u);
+
+        if (attack_number == 0) {
+            // Combined: assign each malicious vehicle exactly ONE vehicle-level
+            // attack type, round-robin over {2 TP-S2, 4 MP-S2, 6 MP-S3}. Only the
+            // matching per-node array is set so the vehicle runs a single attack.
+            static const int types[3] = {2, 4, 6};
+            int t = attacking_state ? types[i % 3] : 0;
+            g_veh_attack[i]             = t;
+            tp_vehicle_nodes[i]         = (t == 2);
+            sybil_mitm_nodes[i]         = (t == 4 || t == 6);
+            heading_spoof_nodes[i]      = false;
+            rsu_fabrication_nodes[i]    = false;
+            beacon_suppression_nodes[i] = false;
+            continue;
+        }
 
         tp_vehicle_nodes[i]         = present_tp_vehicle_attack         ? attacking_state : false;
         heading_spoof_nodes[i]      = present_heading_spoof_attack      ? attacking_state : false;
@@ -496,9 +522,9 @@ void declare_attackers()
 //   - rsu_relay_log.csv     (is_poisoned column)
 void declare_compromised_rsus()
 {
-    for (uint32_t r = 0; r < N_RSUs && r < MAX_RSUS; r++) compromised_rsu[r] = false;
+    for (uint32_t r = 0; r < N_RSUs && r < MAX_RSUS; r++) { compromised_rsu[r] = false; g_rsu_attack[r] = 0; }
 
-    if (attack_number != 1 && attack_number != 3) return; // only RSU-level attacks
+    if (attack_number != 1 && attack_number != 3 && attack_number != 0) return; // RSU-level attacks (0=combined)
 
     // Attack 3 enhanced mode: attack is vehicle-level (pre-registered Sybil),
     // NOT RSU-level.  RSUs remain honest — skip RSU compromise selection.
@@ -511,7 +537,16 @@ void declare_compromised_rsus()
     // How many RSUs to compromise
     int n_active = (int)N_RSUs;
     if (n_active > MAX_RSUS) n_active = MAX_RSUS;
-    int n_comp = (int)std::round((double)n_active * attack_percentage / 100.0);
+    // AB8: --rsu_malicious_fraction decouples the malicious RSU count from
+    // attack_percentage, so f/n can sweep while ρ_a stays pinned (the vehicle
+    // attacking state above still comes from attack_percentage). -1 = off.
+    int n_comp;
+    if (g_rsu_malicious_frac >= 0.0) {
+        double frac = (g_rsu_malicious_frac > 1.0) ? 1.0 : g_rsu_malicious_frac;
+        n_comp = (int)std::round((double)n_active * frac);
+    } else {
+        n_comp = (int)std::round((double)n_active * attack_percentage / 100.0);
+    }
     if (n_comp < 0) n_comp = 0;
     if (n_comp > n_active) n_comp = n_active;
 
@@ -520,9 +555,9 @@ void declare_compromised_rsus()
     for (int r = 0; r < n_active; r++) candidates.push_back(r);
 
     // Seed the RNG
-    uint32_t actual_seed = (rsu_seed == 0)
-        ? (uint32_t)std::chrono::system_clock::now().time_since_epoch().count()
-        : rsu_seed;
+    uint32_t actual_seed = (rsu_seed != 0) ? rsu_seed
+                         : (run_seed > 0 ? (run_seed * 2654435761u + 12345u)
+                                         : (uint32_t)std::chrono::system_clock::now().time_since_epoch().count());
     std::mt19937 rng(actual_seed);
     std::shuffle(candidates.begin(), candidates.end(), rng);
 
@@ -530,10 +565,22 @@ void declare_compromised_rsus()
     for (int i = 0; i < n_comp; i++)
         compromised_rsu[candidates[i]] = true;
 
+    // Per-RSU attack type. Single-attack mode: every compromised RSU runs
+    // attack_number. Combined mode (attack_number==0): partition across a1 (TP-S1
+    // drift) and a3 (MP-S1 ghost) — alternate so no single RSU runs both.
+    for (int i = 0; i < n_comp; i++) {
+        int r = candidates[i];
+        g_rsu_attack[r] = (attack_number == 0) ? ((i % 2 == 0) ? 1 : 3) : attack_number;
+    }
+
     // Report
     cout << "\n[RSU-SELECTION] attack=" << attack_number
-         << "  pct=" << attack_percentage << "%"
-         << "  compromising " << n_comp << "/" << n_active << " RSUs"
+         << "  pct=" << attack_percentage << "%";
+    if (g_rsu_malicious_frac >= 0.0)
+        cout << "  [AB8 f/n=" << g_rsu_malicious_frac
+             << " → ring f=" << (int)std::round(g_rsu_malicious_frac * 4.0)
+             << "/4, decoupled from pct]";
+    cout << "  compromising " << n_comp << "/" << n_active << " RSUs"
          << "  seed=" << actual_seed << endl;
     for (int r = 0; r < n_active; r++)
     {

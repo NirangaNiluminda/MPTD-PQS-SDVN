@@ -1,4 +1,4 @@
-# Beacon CSV format — THE schema everything depends on
+<!-- # Beacon CSV format — THE schema everything depends on
 
 Every script in this project reads **one flat CSV** with **one row per beacon**
 (one vehicle, one timestep). When your NS-3/SUMO pipeline is ready, make it
@@ -59,4 +59,45 @@ urban,1,0.0,11,135.0,79.9,8.1,1.55,0.0,0
 urban,1,0.0,12,118.0,200.0,9.0,1.60,0.2,1
 urban,1,0.1,10,121.3,80.2,8.3,1.57,0.0,0
 ...
-```
+``` -->
+
+
+# Data format
+
+## On disk (real NS-3 export — read directly)
+
+    data/<scenario>/a<N>_p<pct>/beacon_log.csv
+
+beacon_log.csv raw columns (full simulator schema):
+
+    sim_time, vehicle_id, rsu_id, pos_x, pos_y, speed, heading, accel,
+    is_poisoned, detected, sig_mask, psi_score, attack_number, attack_pct,
+    attacker_class, gt_pos_x, gt_pos_y, gt_speed
+
+## Column mapping used by the GAT (dataset.py)
+
+| raw column   | used as      | notes                                   |
+|--------------|--------------|-----------------------------------------|
+| sim_time     | t            | bucketed to 0.1 s (Tb) to form a graph  |
+| vehicle_id   | node id      | per-node calibration key                |
+| pos_x, pos_y | x, y         | position (m)                            |
+| speed        | speed        | m/s                                     |
+| heading      | heading      | radians -> expanded to (sin, cos)       |
+| accel        | accel        | m/s^2                                   |
+| is_poisoned  | label        | 1 = malicious node, 0 = honest          |
+| attack_number, attack_pct | seed | seed = attack_number*100 + attack_pct |
+| (others)     | ignored      | rsu_id, gt_*, sig_mask, etc.            |
+
+## Clean vs attack split
+
+| split  | rule            | used by                  |
+|--------|-----------------|--------------------------|
+| clean  | attack_pct == 0 | calibrate.py (Phase 1b)  |
+| attack | attack_pct  > 0 | train.py, score.py       |
+
+## Node feature vector (order)
+
+    [x, y, speed, sin(heading), cos(heading), accel]   # 6 dims
+
+Each feature is rolling z-score normalised across the vehicles present in the
+same 100 ms graph (Eq. 3.28, eps = 1e-8).

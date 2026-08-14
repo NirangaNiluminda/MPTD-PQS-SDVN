@@ -23,7 +23,7 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 def kinematic_loss(recon_raw: torch.Tensor, dt: float = DT) -> torch.Tensor:
     """
-    Computes the physics-informed kinematic constraint loss (Paper Eq. 3.45).
+    Computes the physics-informed kinematic constraint loss (Paper Eq. 3.39).
     Verifies that the predicted next state coordinates (pred_x, pred_y) match the 
     actual physical kinematics (dead reckoning check).
     
@@ -120,8 +120,15 @@ def train_model(train_wins: np.ndarray, val_wins: np.ndarray, beta: float, scale
 
 def calibrate_threshold(model: nn.Module, clean_windows: torch.Tensor, kappa: float = KAPPA) -> float:
     """
-    Calibrates the anomaly detection threshold theta_ae based on the clean dataset 
-    reconstruction errors distribution (Equation 3.44: theta_ae = mean + kappa * std).
+    Calibrates the anomaly detection threshold theta_ae from the clean reconstruction
+    error distribution using robust statistics (Paper Eq. ta_threshold):
+
+        theta_ae = median(E_clean) + kappa * MAD(E_clean)
+
+    where MAD(E) = median(|E - median(E)|). Median+MAD replaces the previous mean+std
+    rule because it resists outlier contamination in the clean calibration set, exactly
+    as the paper mandates. NOTE: since MAD ~= 0.6745*std for normal data, a kappa tuned
+    for the old mean+std rule will need re-tuning for this robust form.
     """
     model.eval()
     errors = []
@@ -130,12 +137,14 @@ def calibrate_threshold(model: nn.Module, clean_windows: torch.Tensor, kappa: fl
             batch = clean_windows[i:i+64].to(DEVICE)
             recon = model(batch)
             # Compute Mean Squared Error (MSE) reconstruction error per window
-            mse   = ((recon - batch) ** 2).mean(dim=(1, 2))
+            mse   = ((recon - batch) ** 2).sum(dim=2).mean(dim=1)
             errors.extend(mse.cpu().numpy().tolist())
-            
+
     errors = np.array(errors)
-    # Define threshold as mean error + kappa standard deviations
-    theta  = float(errors.mean() + kappa * errors.std())
+    # Robust threshold: median + kappa * MAD  (Paper Eq. ta_threshold)
+    med = float(np.median(errors))
+    mad = float(np.median(np.abs(errors - med)))
+    theta = med + kappa * mad
     return theta
 
 def main():

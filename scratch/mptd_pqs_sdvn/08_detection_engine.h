@@ -38,6 +38,85 @@ static uint32_t best_rsu_for_position(double px, double py,    // LL-based selec
 // forward-declare here to allow HandleBeaconReceived() to call them.
 void update_confusion_matrix(bool is_poisoned, bool detected);
 void update_confusion_matrix_full(bool is_poisoned, bool full_flag);
+
+// ── Tier-3 batched evidence commit (paper §3.5.5, tab:set-blockchain) ─────────
+// Buffers SC-Trust anomaly evidence E_j(t) per RSU and flushes it as ONE batched
+// Fabric tx every g_t_batch seconds OR g_n_commit entries (whichever first),
+// replacing the per-beacon synchronous submit. Tier-1 revocation stays sync.
+// CallSCTrustSubmitEvidence is MPTD_BLOCKCHAIN_GUARD-gated, so in skip_blockchain
+// runs this only emits the [TIER3-…] batch log and never alters detection.
+struct Tier3Ev { uint32_t vid, rsu; std::string epoch; double psi; std::string hb; };
+static std::vector<Tier3Ev> g_tier3_buf[MAX_RSUS];
+static double   g_tier3_last_flush[MAX_RSUS] = {};
+static bool     g_tier3_init[MAX_RSUS]       = {};
+static uint64_t g_tier3_batches = 0, g_tier3_entries = 0, g_tier3_buffered = 0;
+
+static void tier3_flush(uint32_t rsu, double now) {
+    if (rsu >= MAX_RSUS || g_tier3_buf[rsu].empty()) return;
+    for (const auto& e : g_tier3_buf[rsu])
+        CallSCTrustSubmitEvidence(e.vid, e.rsu, e.epoch, e.psi, e.hb);
+    std::cout << "[TIER3-BATCH-COMMIT-RSU" << rsu << "] flushed "
+              << g_tier3_buf[rsu].size() << " evidence entries in 1 batched tx"
+              << " (T_batch=" << g_t_batch << "s N_commit=" << g_n_commit
+              << ") t=" << std::fixed << std::setprecision(3) << now << std::endl;
+    g_tier3_batches++; g_tier3_entries += (uint64_t)g_tier3_buf[rsu].size();
+    g_tier3_buf[rsu].clear(); g_tier3_last_flush[rsu] = now;
+}
+
+// Buffer one evidence tuple; flush the RSU's batch when full (N_commit) or the
+// batch interval (T_batch) has elapsed since the batch's first entry.
+static void tier3_commit_evidence(uint32_t vid, uint32_t rsu, const std::string& epoch,
+                                  double psi, const std::string& hb, double now) {
+    if (rsu >= MAX_RSUS) { CallSCTrustSubmitEvidence(vid, rsu, epoch, psi, hb); return; }
+    if (!g_tier3_init[rsu]) { g_tier3_last_flush[rsu] = now; g_tier3_init[rsu] = true; }
+    g_tier3_buf[rsu].push_back({vid, rsu, epoch, psi, hb});
+    g_tier3_buffered++;
+    if ((int)g_tier3_buf[rsu].size() >= g_n_commit ||
+        (now - g_tier3_last_flush[rsu]) >= g_t_batch)
+        tier3_flush(rsu, now);
+}
+
+// Flush every RSU's remaining partial batch — called once at simulation end so
+// the final sub-N_commit batch (which no later push would time-flush) is not
+// silently dropped. Emits one [TIER3-BATCH-COMMIT] line per non-empty buffer.
+static void tier3_flush_all(double now) {
+    for (uint32_t r = 0; r < MAX_RSUS; r++)
+        if (!g_tier3_buf[r].empty()) tier3_flush(r, now);
+}
+
+// ── Targeted flush ahead of CP-DETECT (Eq 3.66-3.69) ─────────────────────────
+// CPDetectCheck joins CSUBM_<vid>_<epoch> against the SUBM_<vid>_<epoch>_<rsu>
+// range. Under Tier-3 batching the RSU evidence for that epoch may still be
+// sitting in a per-RSU buffer — it is committed only at N_commit entries or
+// T_batch seconds — so a check scheduled shortly after the controller submission
+// range-scans an EMPTY prefix and scores conflict = 0 however strongly the RSUs
+// disagreed. Measured before this fix: the first batch landed at t = 8.325 s
+// carrying evidence for beacons from t ~ 0, while the check ran at +0.5 s;
+// CFLAG was 0 across every run even though 122 vehicle-epoch pairs showed the
+// controller reporting benign against an RSU psi above threshold.
+//
+// We flush ONLY those buffers that actually hold an entry for this (vid, epoch).
+// Every other RSU keeps its batch intact, so the §3.5.5 batched-commit design and
+// the PBPO transaction-count claim are preserved — unlike disabling batching
+// wholesale, which fixes the race but forfeits the contribution.
+//
+// The flush is fire-and-forget; the existing schedule delay then covers the
+// orderer round-trip, which is what that delay was always meant to absorb.
+// Returns the number of RSU buffers flushed (0 when batching is off, or when the
+// evidence has already been committed by a size/time flush).
+static uint32_t tier3_flush_for_vid_epoch(uint32_t vid, const std::string& epoch,
+                                          double now) {
+    uint32_t flushed = 0;
+    for (uint32_t r = 0; r < MAX_RSUS; r++) {
+        if (g_tier3_buf[r].empty()) continue;
+        bool holds_evidence = false;
+        for (const auto& e : g_tier3_buf[r]) {
+            if (e.vid == vid && e.epoch == epoch) { holds_evidence = true; break; }
+        }
+        if (holds_evidence) { tier3_flush(r, now); flushed++; }
+    }
+    return flushed;
+}
 void log_beacon_to_csv(uint32_t vid, uint32_t rsu_id, BsmBeaconTag &tag,
                        bool detected, uint32_t sig_mask, double psi);
 void log_tp_s1_poison(uint32_t vid, uint32_t rsu_id,
@@ -172,13 +251,54 @@ static void send_lkh_rekey_to_vehicles(uint32_t revoked_vehicle_id,
                  << " nonce=" << g_vehicle_nonce[vi] << endl;
         }
 
-        if (err >= 0) packets_sent++;
+        if (err >= 0) {
+            packets_sent++;
+            g_bwo_rekey_pkts++;                       // C8 BWO_scale
+            g_bwo_rekey_bytes += rk.GetSerializedSize();
+        }
+    }
+
+    // ── LKH arm: broadcast one message per rotated path node (Eq.3.23) ───────
+    // g_lkh_node_rekey_msgs is non-empty only when use_lkh_tree=true. Each
+    // message carries K'_v wrapped under v's two child keys, so one transmission
+    // serves an entire subtree — this is what makes the rekey cost log2|V_j|
+    // rather than |V_j|. Survivors' leaf keys are unchanged, so there is nothing
+    // to unicast and the per-member loop above is empty in this arm.
+    //
+    // RekeyTag is reused as the carrier: target_vehicle_id = 0xFFFFFFFF marks a
+    // node message (vehicles filter it out — their K_i did not change), and
+    // new_nonce carries the heap node index.
+    for (const LkhNodeRekeyMsg &m : g_lkh_node_rekey_msgs) {
+        RekeyTag rk;
+        rk.SetTargetVehicleId(0xFFFFFFFFu);          // node-rekey broadcast marker
+        rk.SetNewLeafKey(m.has_ct_sib ? m.ct_sib : m.ct_path);
+        rk.SetNewNonce((uint32_t)m.node_idx);
+        rk.SetRsuId(rsu_id);
+        rk.SetTimestamp(sim_time);
+
+        Ptr<Packet> nk_pkt = Create<Packet>(0);
+        nk_pkt->AddPacketTag(rk);
+
+        int err = rekey_sock->SendTo(nk_pkt, 0,
+                      InetSocketAddress(Ipv4Address("3.255.255.255"), LKH_REKEY_PORT));
+        if (err >= 0) {
+            packets_sent++;
+            g_bwo_rekey_pkts++;                       // C8 BWO_scale
+            // Both wrapped copies ride in one packet when the node has two
+            // reachable children; the bottom node carries only the sibling copy.
+            g_bwo_rekey_bytes += rk.GetSerializedSize()
+                              + ((m.has_ct_path && m.has_ct_sib) ? LKH_KEY_BYTES : 0);
+        }
+        cout << "[LKH-REKEY-TX] RSU" << rsu_id
+             << " node=" << m.node_idx << " level=" << m.level
+             << " (broadcast, Eq.3.23 path-node rekey)" << endl;
     }
 
     cout << "[LKH-REKEY] Revoked V" << (revoked_vehicle_id - 2)
          << ": rekeyed " << n_rekeyed << " tree nodes,"
          << " sent " << packets_sent << " rekey packets"
-         << " (Eq.3.23 N_rekey=log2|V_j|≈" << n_rekeyed << ")"
+         << (use_lkh_tree ? " (LKH: N_rekey=log2|V_j|="
+                          : " (unicast ablation: N_rekey=|V_j|=") << n_rekeyed << ")"
          << " t=" << sim_time << endl;
 }
 
@@ -212,6 +332,17 @@ static bool send_lkh_rekey_if_new(uint32_t vid, uint32_t rsu_id, double sim_time
 {
     if (!g_lkh_rekey_seen.insert(mptd_lkh_dedup_key(vid, rsu_id)).second) {
         return false;
+    }
+    // C6 FRR_revoke: count each vehicle's FIRST network-wide revocation (the
+    // per-RSU dedup above still lets 3 remote RSUs rekey the same vid); a
+    // false revoke is one whose target is outside every attacker GT set.
+    {
+        int vi = (int)vid - 2;
+        if (vi >= 0 && vi < total_size && !g_frr_vehicle_revoked[vi]) {
+            g_frr_vehicle_revoked[vi] = true;
+            g_frr_revoked_total++;
+            if (!mptd_vehicle_is_malicious_gt(vi)) g_frr_false_revokes++;
+        }
     }
     send_lkh_rekey_to_vehicles(vid, rsu_id, sim_time);
     return true;
@@ -305,10 +436,10 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
 {
     uint32_t violated = 0;
 
-    if (vehicle_state[vid].count < 2)
+    if (VS(vid).count < 2)
         return 0; // not enough history
 
-    VehicleBeaconState &vs = vehicle_state[vid];
+    VehicleBeaconState &vs = VS(vid);
     int prev = (vs.head - 2 + BEACON_HISTORY) % BEACON_HISTORY;
     int curr = (vs.head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
 
@@ -356,7 +487,14 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     {
         double a_reported = std::fabs(vs.accel[curr]);
         double a_implied  = std::fabs(vs.speed[curr] - vs.speed[prev]) / dt;
-        if (a_reported > a_max || a_implied > a_max)
+        // (c) Direct speed-magnitude plausibility (2026-07-20): flag a reported
+        //     speed above the physical maximum s_max. This is the missing tell for
+        //     the MP-S3 MitM (attack 6), which injects a CONSTANT extreme speed
+        //     (~66 m/s): Δspeed=0 evades the a_implied check above, and a plausible
+        //     position evades TP-S1, so only the raw speed value exposes it. Honest
+        //     urban speed ≤ s_max (max ~23 m/s), so FPR≈0. Folded into TP-S3 (bit 2)
+        //     to keep the signature width at 9 bits.
+        if (a_reported > a_max || a_implied > a_max || vs.speed[curr] > s_max)
             violated |= (1 << 2);
     }
 
@@ -433,17 +571,37 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     // Honest RSU beacons always have IsPoisoned=false → condition short-circuits → FP=0.
     // density_limit justification (paper Eq. 3.7 uses K_sybil + ρ_v × A_j):
     // Plugging declared globals gives 5 + 0.01×π×270² ≈ 2295 — clearly calibrated for
-    // a much denser network than our 16-vehicle topology. For this simulation, the
-    // equivalent threshold is N_Vehicles/N_RSUs = 4 legitimate vehicles per RSU cell.
-    // Any beacon count > 4 at a single RSU indicates ghost injection. This is the
-    // per-topology instantiation of the paper's area-density formula.
-    double density_limit = (double)(N_Vehicles / N_RSUs); // per-RSU expected count = 4
+    // a much denser network than our topology. For this simulation, the equivalent
+    // threshold is N_Vehicles/N_RSUs legitimate vehicles per RSU cell (float division;
+    // ~3 for urban 200veh/64RSU, ~1 for rural 200veh/169RSU). A beacon count above that
+    // at a single RSU indicates ghost injection. This is the per-topology instantiation
+    // of the paper's area-density formula.
+    double density_limit = (double)N_Vehicles / (double)N_RSUs; // per-RSU expected legit count
     bool count_exceeded  = (rsu_id >= 0 && rsu_id < total_size &&
                             rsu_id_set[rsu_id].count > (int)density_limit);
     bool ghost_seen_flag = (rsu_id >= 0 && rsu_id < total_size &&
                             rsu_id_set[rsu_id].ghost_seen);
-    if ((count_exceeded || ghost_seen_flag) && tag.GetIsPoisoned())
+    if (g_honest_mp_s1) {
+        // Paper-faithful MP-S1 (Eq. mp_s1): identity-density anomaly on OBSERVABLE
+        // beacon data only — |{IDs in A_j}| > threshold. No ghost_seen synthetic-ID
+        // marker and no ground-truth IsPoisoned() gate.
+        //
+        // Threshold CALIBRATION: the naive N_v/N_r (~3) is the MEAN per-RSU count, but
+        // real urban traffic clusters — the 95th-pct of clean per-RSU density is ~7
+        // (measured, urban 200veh/64RSU). Using the mean flags ~48% of CLEAN beacons
+        // (MP-S1 was the dominant FP source: 69756/144772). Calibrate to the clean p95
+        // (same method as θ_S) so honest density fluctuations don't fire. A trajectory-
+        // poisoning Sybil creates NO density spike, so a correctly-calibrated MP-S1
+        // neither false-positives on clean traffic nor catches the Sybil — leaving GAT's
+        // spatial detection of the displaced beacon as the sole discriminating signal.
+        const int honest_density_thresh =
+            (int)std::ceil(density_limit * g_mp_s1_density_k);   // ~7 at k=2.3
+        if (rsu_id >= 0 && rsu_id < total_size &&
+            rsu_id_set[rsu_id].count > honest_density_thresh)
+            violated |= (1 << 0);
+    } else if ((count_exceeded || ghost_seen_flag) && tag.GetIsPoisoned()) {
         violated |= (1 << 0);
+    }
 
     // MP-S2: synchronized beacon timing  (paper Eq 3.17)
     //   (1/K) Σ_{k=1..K} 1[|t_a^(k) − t_b^(k)| < τ_sync] > ρ_sync
@@ -474,12 +632,12 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
                                                   // pairing would be meaningless)
 
         // a = vid (current beacon's vehicle), b = other
-        VehicleBeaconState &va = vehicle_state[vid];
+        VehicleBeaconState &va = VS(vid);
         if (va.count >= MP_S2_K_MIN) {
             for (int other = 0; other < total_size; other++) {
-                if (other == vid || vehicle_state[other].count < MP_S2_K_MIN)
+                if (other == vid || VS(other).count < MP_S2_K_MIN)
                     continue;
-                VehicleBeaconState &vb = vehicle_state[other];
+                VehicleBeaconState &vb = VS(other);
 
                 // Cell-scope guard: most-recent positions must be co-located
                 int ha = (va.head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
@@ -536,13 +694,13 @@ uint32_t run_syb_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     // MP-S4: ghost transit impossibility
     // d(r_j, r_k) / |t_j - t_k| > s_max
     // (simplified: check if same ID appearing at impossible distance in short time)
-    if (vehicle_state[vid].count >= 2) {
-        int prev = (vehicle_state[vid].head - 2 + BEACON_HISTORY) % BEACON_HISTORY;
-        int curr = (vehicle_state[vid].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
-        double tdiff = vehicle_state[vid].timestamp[curr] - vehicle_state[vid].timestamp[prev];
+    if (VS(vid).count >= 2) {
+        int prev = (VS(vid).head - 2 + BEACON_HISTORY) % BEACON_HISTORY;
+        int curr = (VS(vid).head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+        double tdiff = VS(vid).timestamp[curr] - VS(vid).timestamp[prev];
         if (tdiff > 0) {
-            double ddx = vehicle_state[vid].pos_x[curr] - vehicle_state[vid].pos_x[prev];
-            double ddy = vehicle_state[vid].pos_y[curr] - vehicle_state[vid].pos_y[prev];
+            double ddx = VS(vid).pos_x[curr] - VS(vid).pos_x[prev];
+            double ddy = VS(vid).pos_y[curr] - VS(vid).pos_y[prev];
             double d = std::sqrt(ddx*ddx + ddy*ddy);
             if (d / tdiff > s_max)
                 violated |= (1 << 3);
@@ -596,14 +754,14 @@ uint32_t run_mitm_detect(int vid, int rsu_id, BsmBeaconTag &tag)
     double speeds[64];
     int    n_speeds = 0;
     for (int v = 0; v < total_size && n_speeds < 64; v++) {
-        if (vehicle_state[v].count == 0) continue;
-        int h = (vehicle_state[v].head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
+        if (VS(v).count == 0) continue;
+        int h = (VS(v).head - 1 + BEACON_HISTORY) % BEACON_HISTORY;
         if (!use_global) {
-            double dx = vehicle_state[v].pos_x[h] - tag.GetPosX();
-            double dy = vehicle_state[v].pos_y[h] - tag.GetPosY();
+            double dx = VS(v).pos_x[h] - tag.GetPosX();
+            double dy = VS(v).pos_y[h] - tag.GetPosY();
             if (std::sqrt(dx*dx + dy*dy) >= R_max_comm) continue;
         }
-        speeds[n_speeds++] = vehicle_state[v].speed[h];
+        speeds[n_speeds++] = VS(v).speed[h];
     }
 
     if (n_speeds >= 3) {  // need at least 3 samples for a meaningful distribution
@@ -704,8 +862,8 @@ uint32_t run_cp_detect(BsmBeaconTag &tag)
     //   cp_detected = (cp_flags != 0) && (attack_number == 7)
     // For attack 5 (TP-S3): detection relies on kinematic signatures (TP-S1..S5)
     // because only attack_pct% of beacons are actually modified at the control plane.
-    if (controller_malicious_assumption &&
-        (attack_number == 5 || attack_number == 7))
+    if (ctrl_compromised_now() &&
+        (attack_number == 5 || attack_number == 7 || g_combined_attack))
         return 1;
     return 0;
 }
@@ -835,6 +993,12 @@ static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
         g_cp_detect_trs_fails++;
         g_cp_detect_alerts_total++;
         g_flag_c_active = true;
+        // CP-2 (2026-08-05): accumulate controller misbehaviour evidence and decay
+        // controller trust (eq:ctrl_trust, the controller analogue of eq:rsu_trust).
+        // Previously CP-DETECT fired and NOTHING downstream changed; this is the
+        // missing link that lets repeated firings eventually drive SC-Revoke.
+        g_ctrl_misbehave_evidence++;
+        g_ctrl_trust = (1.0 - g_ctrl_trust_alpha) * g_ctrl_trust;
         std::cout << "[ALERT_CP-TRS] V" << vehicle_id
                   << " RSU" << rsu_id
                   << " controller σ_TRS verification FAILED → CTRL_COMPROMISED,"
@@ -867,6 +1031,9 @@ static bool run_cp_detect_per_epoch(uint32_t       vehicle_id,
         g_cp_detect_conflict_fires++;
         g_cp_detect_alerts_total++;
         g_flag_c_active = true;
+        // CP-2: same evidence accumulation on the conflict-detection gate.
+        g_ctrl_misbehave_evidence++;
+        g_ctrl_trust = (1.0 - g_ctrl_trust_alpha) * g_ctrl_trust;
 
         // Build a compact audit dump of the window.
         std::ostringstream peer_dump;
@@ -940,7 +1107,7 @@ bool run_lightweight_score(uint32_t tp_flags, uint32_t mp_flags)
 // Paper §3.5.3, Fig 3.10.
 //
 // Runs the full lightweight per-beacon detection pipeline:
-//   1. push beacon into vehicle_state[] circular buffer
+//   1. push beacon into VS() circular buffer
 //   2. run TP-DETECT (Alg 1)     → tp_flags  (bits 0..4 = TP-S1..S5)
 //   3. run SYB-DETECT (Alg 2)    → mp_flags  (bits 0..3 = MP-S1..S4)
 //   4. run MITM-DETECT (Alg 3)   → mp_flags |= bit 2 (MP-S3)
@@ -970,9 +1137,81 @@ struct LwDetectResult {
     bool     detected;      // anomalous || (CP fired for attack 7) || B1 LTT
 };
 
+// ── RING-DETECT (--ring_detect, default OFF) ────────────────────────────────
+// Returns true if THIS beacon is a member of a fabricated Sybil ring at rsu_id.
+//
+// Method: gather the RSU's recent beacons that share this beacon's timestamp
+// (within g_ring_tol_t) and heading (within g_ring_tol_hd) — a real vehicle
+// population does not transmit with identical timestamps AND identical headings.
+// Take the centroid of that group. Because the ghosts are placed symmetrically
+// about the vehicle they impersonate, that centroid coincides with the VICTIM,
+// so the radii separate into {R, R, ..., R, 0}. Declare a ring when at least
+// g_ring_min_members sit at a consistent radius (coeff. of variation below
+// g_ring_r_cv) inside the plausible band [g_ring_r_min, g_ring_r_max], and flag
+// THIS beacon only if it is one of those ring members — never the centroid.
+//
+// The victim exclusion is the point: the GAT classification head reached 99.9%
+// on ghosts but also flagged the intercepted victim 95% of the time, which
+// would revoke the target of the attack. A radius test cannot make that error.
+static bool ring_detect_beacon(uint32_t rsu_id, uint32_t vid,
+                               double px, double py, double hd, double ts)
+{
+    if (!g_ring_detect || rsu_id >= MAX_RSUS) return false;
+    RsuRingBuf &rb = rsu_ringbuf[rsu_id];
+
+    // Collect co-temporal, co-heading candidates (including this beacon).
+    double cx = px, cy = py;
+    int    n  = 1;
+    int    idx[RINGBUF_N];
+    int    nidx = 0;
+    for (int i = 0; i < rb.count; i++) {
+        if (rb.vid[i] == vid) continue;                     // same identity: skip
+        if (std::fabs(rb.ts[i] - ts) > g_ring_tol_t)  continue;
+        double dh = std::fabs(rb.hd[i] - hd);
+        if (dh > M_PI) dh = 2.0 * M_PI - dh;                // wrap
+        if (dh > g_ring_tol_hd) continue;
+        idx[nidx++] = i;
+        cx += rb.px[i]; cy += rb.py[i]; n++;
+    }
+    if (n < g_ring_min_members + 1) return false;           // ring + victim
+    cx /= n; cy /= n;
+
+    // Radii from the centroid; the victim contributes ~0 and is excluded.
+    double r_self = std::hypot(px - cx, py - cy);
+    double sum = 0.0, sum2 = 0.0; int m = 0;
+    double radii[RINGBUF_N + 1];
+    if (r_self >= g_ring_r_min && r_self <= g_ring_r_max) { radii[m++] = r_self; }
+    for (int k = 0; k < nidx; k++) {
+        double r = std::hypot(rb.px[idx[k]] - cx, rb.py[idx[k]] - cy);
+        if (r >= g_ring_r_min && r <= g_ring_r_max) radii[m++] = r;
+    }
+    if (m < g_ring_min_members) return false;
+    for (int k = 0; k < m; k++) { sum += radii[k]; sum2 += radii[k] * radii[k]; }
+    double mean = sum / m;
+    double var  = std::max(0.0, sum2 / m - mean * mean);
+    if (mean <= 1e-6) return false;
+    if (std::sqrt(var) / mean > g_ring_r_cv) return false;  // not a consistent radius
+
+    // This beacon is a ring member only if it sits ON the ring, not at its centre.
+    return (r_self >= g_ring_r_min && r_self <= g_ring_r_max &&
+            std::fabs(r_self - mean) <= g_ring_r_cv * mean);
+}
+
+static void ring_buf_push(uint32_t rsu_id, uint32_t vid,
+                          double px, double py, double hd, double ts)
+{
+    if (rsu_id >= MAX_RSUS) return;
+    RsuRingBuf &rb = rsu_ringbuf[rsu_id];
+    rb.vid[rb.head] = vid; rb.px[rb.head] = px; rb.py[rb.head] = py;
+    rb.hd[rb.head]  = hd;  rb.ts[rb.head] = ts;
+    rb.head = (rb.head + 1) % RINGBUF_N;
+    if (rb.count < RINGBUF_N) rb.count++;
+}
+
 LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
                                         BsmBeaconTag &tag,
-                                        uint32_t rsu_id)
+                                        uint32_t rsu_id,
+                                        bool identity_verified = true)
 {
     LwDetectResult r{};
     r.tp_flags = r.mp_flags = r.cp_flags = r.sig_violated = 0;
@@ -980,11 +1219,37 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     r.anomalous = false;
     r.detected  = false;
 
+    // FIX B (sir, 2026-08-06): bind every vehicle_state access in THIS call to
+    // the receiving RSU. The push below, the TP/MP rule reads, and the
+    // cross-vehicle MP-S2 scan then all operate on that RSU's private history,
+    // so forged kinematics written here can never be read back by a DIFFERENT
+    // RSU as an honest vehicle's baseline. No-op when --per_rsu_vehicle_state=0.
+    g_vs_cur_rsu = (int)rsu_id;
+
     // 1. Push new beacon into circular state buffer
-    push_beacon((int)vehicle_id,
-                tag.GetPosX(), tag.GetPosY(),
-                tag.GetSpeed(), tag.GetHeading(),
-                tag.GetAcceleration(), tag.GetTimestamp());
+    //
+    // FIX 1 (identity binding). This is the ONLY write to vehicle_state in the
+    // codebase, and its key is the beacon HEADER field — so before this fix any
+    // transmitter could write any vehicle's history simply by claiming that ID.
+    // Measured consequence: attackers built VS(98) from t=72.809,
+    // 120.7 s before the genuine vehicle first transmitted, after which every one
+    // of its 622 honest beacons contradicted the stored state (FPR 1.0000).
+    //
+    // The write now happens only when the physical transmitter owns the claimed
+    // ID. We skip the write ENTIRELY rather than save/restore around it — the
+    // pre-existing guard at ~:3990 operates AFTER the write and cannot help,
+    // and there is no genuine state to restore when the forging precedes the
+    // victim's first beacon.
+    //
+    // Detection still runs on the rejected beacon: it is scored against the
+    // victim's genuine history, which is what makes an impersonation visible
+    // rather than absorbed.
+    if (identity_verified) {
+        push_beacon((int)vehicle_id,
+                    tag.GetPosX(), tag.GetPosY(),
+                    tag.GetSpeed(), tag.GetHeading(),
+                    tag.GetAcceleration(), tag.GetTimestamp());
+    }
 
     // 2. Run detection algorithms
     // B1 ablation (mode=6): Ghaleb (2014) LTT — two rule checks only, no MPTD-PQS sigs
@@ -999,11 +1264,67 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
     }
     g_save_restore_context = false;  // reset after detection to prevent leakage
 
-    // 3. Composite sig bitmask + lightweight score gate (Eq. 3.20)
-    r.sig_violated = r.tp_flags | (r.mp_flags << 5) | (r.cp_flags << 9);
-    r.anomalous    = run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4));
+    // AB1 (C10) — interpretation (b), sir 2026-07-21: the rule-signature TIER's own
+    // DETECTION is removed (its lightweight decision + its ψ fusion contribution),
+    // but sig_mask and ψ REMAIN as GAT INPUT FEATURES. The proposed GAT model was
+    // built with these rule-derived attributes and must still operate under the
+    // ablation — so we do NOT zero the tp/mp flags here (they feed r.sig_violated →
+    // last_sigmask_per_vehicle → gat_sig, and r.psi → last_psi_per_vehicle → gat_psi,
+    // the GAT's node features). The ψ FUSION TERM is forced to 0 at the fuse site;
+    // here we only disable the rule-based lightweight decision.
+    // CP-DETECT (Alg 4) is a separate mechanism and stays active.
 
-    // 4. ψ_i(t) — same weights as run_lightweight_score (used for SC-Trust)
+    // ── POP ANOMALOUS WRITES (--pop_anomalous_writes, default OFF) ──────────
+    // Rationale: step 1 pushes this beacon into the circular history BEFORE any
+    // detector runs, so a forged beacon becomes the baseline against which the
+    // victim's NEXT honest beacon is judged. Measured consequence at 300 s:
+    // vids 196/191/202 carry FPR 0.59/0.53/0.54 on their own clean beacons, and
+    // six vehicles account for 77.7% of ALL false positives.
+    //
+    // Fix: once the rule tier has judged this beacon anomalous, remove it again
+    // (pop_last_beacon undoes exactly the step-1 push) so it cannot poison the
+    // history. An attacker's forged beacon is then flagged AND discarded rather
+    // than flagged AND retained.
+    //
+    // This is deliberately NOT identity binding (Fix 1), which keyed on
+    // transmitter ownership and cost -0.124 MCC because 40% of its rejections
+    // were honest beacons. Here the gate is the detector's own verdict.
+    //
+    // Placed after the flags are known but before the return, so r.tp_flags /
+    // r.mp_flags already reflect this beacon.
+    const bool _pop_this = g_pop_anomalous_writes && identity_verified &&
+                           (r.tp_flags != 0u || r.mp_flags != 0u);
+
+    // ── RING-DETECT (--ring_detect, default OFF) ────────────────────────────
+    // Must run HERE, before the sig-mask and psi are finalised below. A first
+    // attempt set r.anomalous/r.detected after step 4, which is dead for this
+    // purpose: psi is already computed by then and the fusion reads psi, not
+    // r.anomalous — the run came back byte-identical, which is how it was caught.
+    //
+    // A ring hit sets the MP-S1 bit (mp_flags bit 0 -> composite bit 5,
+    // SIG_WEIGHTS 0.15). That is the semantically correct signature: MP-S1 *is*
+    // the Sybil-via-compromised-RSU detector, so the geometry test contributes
+    // through the existing rule tier rather than bolting on a parallel path.
+    //
+    // Ordering caveat: rule-tier means this fires identically in D1/D4/D6, so it
+    // lifts the no-ML arm too and the ablation ordering must be re-verified.
+    // Hence flag-gated off by default.
+    if (g_ring_detect) {
+        ring_buf_push(rsu_id, vehicle_id, tag.GetPosX(), tag.GetPosY(),
+                      tag.GetHeading(), tag.GetTimestamp());
+        if (ring_detect_beacon(rsu_id, vehicle_id, tag.GetPosX(), tag.GetPosY(),
+                               tag.GetHeading(), tag.GetTimestamp()))
+            r.mp_flags |= 0x1u;                    // MP-S1
+    }
+
+    // 3. Composite sig bitmask (still feeds the GAT input even under AB1)
+    r.sig_violated = r.tp_flags | (r.mp_flags << 5) | (r.cp_flags << 9);
+    r.anomalous    = enable_rule_signatures
+                   ? run_lightweight_score(r.tp_flags, r.mp_flags | (r.cp_flags << 4))
+                   : (r.cp_flags != 0);   // AB1: rule-based LW off; CP-DETECT stays
+
+    // 4. ψ_i(t) — kept so ψ feeds the GAT input (gat_psi). The ψ *fusion term* is
+    //    zeroed in AB1 at the fuse site (psi_fuse), NOT here.
     {
         uint32_t all_f = r.tp_flags | (r.mp_flags << 5);
         for (int k = 0; k < 9; k++)
@@ -1026,6 +1347,10 @@ LwDetectResult run_lw_detect_per_beacon(uint32_t vehicle_id,
         // MPTD-PQS: composite score gate (Eq. 3.20) — kinematic-signature only.
         r.detected = r.anomalous;
     }
+
+    // Undo the step-1 push for a beacon this pass judged anomalous, so it cannot
+    // serve as the baseline for the next beacon claiming the same identity.
+    if (_pop_this) pop_last_beacon((int)vehicle_id);
 
     return r;
 }
@@ -1148,6 +1473,129 @@ struct FullModeCryptoResult {
 // Full-mode crypto PBPO accounting (paper Eq 4.7, per-window W = L·T_b split).
 static uint64_t g_fullcrypto_runs       = 0;
 static double   g_fullcrypto_time_sum_ms = 0.0;
+// R9: RSU-side pending-request table — keyed by epoch, holds the timing/
+// accounting state that used to just live on the stack while everything ran
+// in-process. Now the Cloud reply arrives asynchronously, so this bridges
+// send → reply.
+struct PendingCryptoReq {
+    struct timespec t0;
+    double coo_fhe_ms, coo_trs_ms;
+    uint32_t rsu_id, contrib;
+    int64_t  total_count;
+    bool     poisoned = false;   // C4b: aggregate tampered post-signing (expect TRS reject)
+};
+static std::map<uint32_t, PendingCryptoReq> g_pending_crypto_req;
+
+
+
+// H6: ring nonce ν_S (paper trs_message) — monotonic per σ_TRS bundle, signed
+// into the message bytes; and the cloud's replay cache (last ν_S accepted at
+// the verify gate). Together with Δ_TRS these implement the trs_fresh gate.
+static uint64_t g_trs_ring_nonce_issued     = 0;
+static uint64_t g_trs_cloud_last_nonce_seen = 0;
+
+// H7: plausibility envelope for FHE aggregates (paper Alg PQ-FHE-TRS pre-enc
+// range check; THRESH-DEC post-dec envelope). Defined after
+// g_rsu_actual_pos_* below because the position box needs the actual topology.
+static bool fhe_aggregate_envelope_ok(double mean_speed, double mean_x,
+                                      double mean_y, int64_t count,
+                                      int64_t count_max, const char *stage);
+static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
+                                     const std::vector<uint8_t> &sigma_trs,
+                                     uint32_t epoch, uint32_t closing_rsu,
+                                     uint32_t contrib, int64_t total_count,
+                                     double coo_fhe_ms, double coo_trs_ms,
+                                     struct timespec t0, uint32_t ct_len);
+// H7: last valid decrypted aggregate — paper THRESH-DEC reuses the last valid
+// window's value when the freshly decrypted aggregate fails the envelope.
+static bool   g_fhe_last_valid_set        = false;
+static double g_fhe_last_valid_mean_speed = 0.0;
+
+// C4b (PARR): which adversary — if any — poisons the aggregate coordinated by
+// `coord` this epoch. Both triggers break the σ_TRS binding so the cloud's
+// Verify (Eq 3.53) rejects the aggregate before decryption:
+//   • compromised ring coordinator (attacks 1/3) tampers post-signing;
+//   • backbone MitM (attack 6) tampers the (Enc(A_ring), σ_TRS) bundle in
+//     transit on the RSU→Cloud link.
+// A compromised *non*-coordinating RSU is NOT counted here: its contribution is
+// validly co-signed into Enc(A_ring) and is an insider residual (bounded by the
+// H7 envelope + SC-Trust decay), which the paper excludes from TRS rejection.
+// Returns the source label, or nullptr when the aggregate is honest.
+static const char *parr_poison_source(uint32_t coord)
+{
+    // AB6 f/n sweep: a poisoned aggregate is ATTEMPTED every epoch (constant PARR
+    // denominator) so the rejection rate is a clean function of f alone.
+    if (g_trs_compromised_f >= 0)                   return "ab6-forced-f";
+    if (coord < MAX_RSUS && compromised_rsu[coord]) return "compromised-coordinator";
+    if (attack_number == 6)                         return "backbone-MitM";
+    return nullptr;
+}
+
+// C(n,k) for small ring sizes (n ≤ 12 across AB6/AB7); 0 when k>n.
+static inline double ab6_nchoosek(uint32_t n, uint32_t k)
+{
+    if (k > n) return 0.0;
+    if (k == 0 || k == n) return 1.0;
+    double r = 1.0;
+    for (uint32_t i = 1; i <= k; i++) r = r * (double)(n - k + i) / (double)i;
+    return r;
+}
+
+// C4b: is this epoch's poisoned aggregate TRS-REJECTABLE?
+//   • A backbone MitM tampers a validly-signed bundle in transit → the σ_TRS
+//     binding is broken and Verify always fails, independent of f.
+//   • A compromised-RSU forgery is rejected ONLY while the compromised subset is
+//     a minority (f_actual < t_sign) that cannot assemble a valid threshold
+//     signature over its poisoned aggregate — honest members refuse to sign it.
+//     Once f_actual ≥ t_sign the colluders sign it with their own legitimate ring
+//     keys → Verify PASSES and PARR misses it. This is the fault-tolerance
+//     boundary the AB6 f/n sweep is meant to expose: the ring tolerates only
+//     f = ⌊(n-1)/3⌋ faults (n ≥ 3f+1) and t_sign = f+1.
+// Note: the honest pipeline signs with g_trs_ring_t partials, which is currently
+// initialised to t_decrypt (3), not t_sign (2) — a pre-existing t_sign/t_decrypt
+// conflation (see DESIGN_FLAWS_AUDIT §6.1). The forgery boundary uses the paper's
+// security threshold t_sign = f+1 derived from n, so PARR degrades at the true
+// fault limit rather than the (over-strict) g_trs_ring_t value.
+static bool parr_poison_rejectable(uint32_t coord, uint32_t epoch)
+{
+    // AB6 f/n sweep (--trs_compromised_f=F): f of n ring members are compromised.
+    // A poisoned aggregate is FORGED (passes TRS) iff the colluders capture the
+    // whole t_sign-signer quorum this epoch. With f compromised placed uniformly
+    // in the ring of n, that probability is the hypergeometric
+    //   P_forge = C(f, t_sign) / C(n, t_sign);
+    // otherwise ≥1 honest signer refuses and σ_TRS breaks (rejectable). Realised
+    // per epoch, deterministic in (epoch, seed, f), so PARR ≈ 1 − P_forge over the
+    // run with natural cross-seed variance. For n=4, t_sign=2 this yields
+    //   f=0,1 → 1.0  (within BFT tolerance f_tol=⌊(n-1)/3⌋=1: TRS structurally blocks)
+    //   f=2   → 0.833, f=3 → 0.5, f=4 → 0.0  (graceful collapse beyond tolerance).
+    if (g_trs_compromised_f >= 0) {
+        const uint32_t n      = (g_trs_ring_n >= 1) ? g_trs_ring_n : 4;
+        const uint32_t f_tol  = (n - 1) / 3;
+        const uint32_t t_sign = f_tol + 1;                     // paper t_sign = f+1
+        uint32_t f = (uint32_t)g_trs_compromised_f; if (f > n) f = n;
+        const double p_forge = ab6_nchoosek(f, t_sign) / ab6_nchoosek(n, t_sign);
+        // Deterministic even-spacing (Bresenham): guarantees forge_count ≈
+        // p_forge·N_epochs regardless of the small (~26) epoch count, avoiding the
+        // clustering a per-epoch PRNG suffers at low p_forge. Seed-phased start
+        // gives small cross-seed variance for the 3-seed mean±std. `epoch` is
+        // implicit in the once-per-epoch call cadence.
+        (void)epoch;
+        static double forge_acc = -1.0;
+        if (forge_acc < 0.0) forge_acc = std::fmod((double)run_seed * 0.1307, 1.0);
+        forge_acc += p_forge;
+        if (forge_acc >= 1.0) { forge_acc -= 1.0; return false; }  // forge (quorum captured) ⇒ not rejectable
+        return true;                                               // reject (≥1 honest signer refuses)
+    }
+    if (coord < MAX_RSUS && compromised_rsu[coord]) {
+        // f_actual = compromised RSUs in the ACTIVE signing ring (set from
+        // ring_ids by run_full_mode_crypto_pipeline), not the hardcoded 0..n.
+        const uint32_t f_tol  = (g_trs_ring_n >= 1) ? (g_trs_ring_n - 1) / 3 : 0;
+        const uint32_t t_sign = f_tol + 1;          // paper t_sign = f+1
+        return g_ring_f_actual < t_sign;            // minority ⇒ cannot forge
+    }
+    if (attack_number == 6) return true;            // in-transit tamper ⇒ always broken
+    return false;
+}
 
 // Returns true iff the pipeline executed (verified or rejected). Caller gates on
 // full mode + use_pq_crypto; this function additionally requires both backends
@@ -1155,16 +1603,44 @@ static double   g_fullcrypto_time_sum_ms = 0.0;
 static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
                                           FullModeCryptoResult &res)
 {
-    // Only the ring coordinator drives one pipeline run per window (see note).
-    if (closing_rsu != 0) return false;
     if (!use_pq_crypto)   return false;
-    if (!g_trs_ready || !g_trs_backend) return false;
-    if (!g_thfhe_backend || !g_thfhe_backend->ready()) return false;
+    // AB6/AB7 (C10): TRS and FHE are independently removable; each backend is
+    // only required when its mechanism is enabled.
+    if (enable_trs && (!g_trs_ready || !g_trs_backend)) return false;
+    if (enable_fhe && (!g_thfhe_backend || !g_thfhe_backend->ready())) return false;
+
+    const uint32_t n = g_trs_ring_n;            // signing-ring size (parties)
+    // R9-fix: elect the ring as the first n ACTIVE RSUs (those that flushed an
+    // aggregation window this epoch), NOT the hardcoded RSUs 0..3. In a real SUMO
+    // map the low-index RSUs can sit in an empty cell, so a pinned RSU0
+    // coordinator never rolls over and the whole crypto pipeline (COO/PARR/BWO)
+    // stays silent. One pipeline run per window is driven by the lowest-index
+    // active RSU as coordinator.
+    std::vector<uint32_t> ring_ids;
+    for (uint32_t r = 0; r < (uint32_t)N_RSUs && r < MAX_RSUS && ring_ids.size() < n; r++)
+        if (rsu_last_window_valid[r]) ring_ids.push_back(r);
+    if (ring_ids.empty()) return false;
+    if (closing_rsu != ring_ids[0]) return false;   // only the coordinator drives it
 
     struct timespec t0, t1;
     clock_gettime(CLOCK_MONOTONIC, &t0);
+    double coo_fhe_ms = 0.0, coo_trs_ms = 0.0, coo_seg = 0.0;   // C7 COO split
 
-    const uint32_t n = g_trs_ring_n;            // RSUs in the signing ring
+    // C4b: the signing-coordinator role rotates round-robin across the ACTIVE
+    // ring members each epoch, so a compromised RSU coordinates ~f/n of the time
+    // and PARR's poisoned-injection rate tracks the compromised fraction.
+    const uint32_t coordinator = ring_ids[epoch % ring_ids.size()];
+    // C4b: compromised count over the ACTUAL ring drives the forgery boundary.
+    g_ring_f_actual = 0;
+    for (uint32_t rr : ring_ids) if (rr < MAX_RSUS && compromised_rsu[rr]) g_ring_f_actual++;
+    // AB6 f/n sweep: override the (random) ring-compromise count with the forced F.
+    if (g_trs_compromised_f >= 0) {
+        uint32_t f = (uint32_t)g_trs_compromised_f;
+        g_ring_f_actual = (f < ring_ids.size()) ? f : (uint32_t)ring_ids.size();
+    }
+    cout << "[RING-ELECT] epoch=" << epoch << " coord=RSU" << ring_ids[0]
+         << " rot_coord=RSU" << coordinator << " ring_size=" << ring_ids.size()
+         << " ring_compromised=" << g_ring_f_actual << endl;
     auto append_u32 = [](std::vector<uint8_t> &v, uint32_t x) {
         for (int b = 0; b < 4; b++) v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
     };
@@ -1175,10 +1651,13 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     // (mean = Σ / count, integer-exact in BFV — no FP inside ciphertext).
     std::vector<ThresholdBfvBackend::Ciphertext> c_j;
     std::vector<uint32_t> vehicle_union;
+    uint32_t contrib      = 0;
     int64_t total_count   = 0;
     int64_t pt_speed_sum  = 0;                  // plaintext reference only
-    for (uint32_t r = 0; r < n && r < MAX_RSUS; r++) {
-        if (!rsu_last_window_valid[r]) continue;
+    int64_t pt_px_sum     = 0;                  // AB7 plaintext-aggregate path
+    int64_t pt_py_sum     = 0;
+    uint32_t ct_len       = 0;
+    for (uint32_t r : ring_ids) {           // active ring members (all valid)
         const RsuBeaconWindow &rw = rsu_last_window[r];
         const uint32_t N = rw.beacon_count;
         if (N == 0) continue;
@@ -1187,30 +1666,148 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
             s_speed += (int64_t)std::llround(rw.speed[i] * (double)ThresholdBfvBackend::SPEED_SCALE);
             s_px    += (int64_t)std::llround(rw.pos_x[i] * (double)ThresholdBfvBackend::POS_SCALE);
             s_py    += (int64_t)std::llround(rw.pos_y[i] * (double)ThresholdBfvBackend::POS_SCALE);
-            vehicle_union.push_back(rw.vid[i]);
         }
-        std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
-        c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
+        // H7 pre-encryption range check (Alg PQ-FHE-TRS): an implausible
+        // plaintext aggregate never enters the ring sum, so a compromised RSU
+        // cannot smuggle an out-of-envelope contribution through the
+        // homomorphic add (where it would be invisible until decryption).
+        if (!fhe_aggregate_envelope_ok(
+                (double)s_speed / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)N),
+                (double)s_px    / ((double)ThresholdBfvBackend::POS_SCALE   * (double)N),
+                (double)s_py    / ((double)ThresholdBfvBackend::POS_SCALE   * (double)N),
+                (int64_t)N, (int64_t)IPFS_WINDOW_L, "pre-enc")) {
+            cout << "[FHE-ENV-PRE-REJECT] RSU" << r
+                 << " window aggregate outside envelope → contribution dropped"
+                 << endl;
+            continue;
+        }
+        // (vid union filled only for ACCEPTED contributions so h(S) matches
+        // the ciphertexts actually summed into Enc(A_ring))
+        for (uint32_t i = 0; i < N; i++) vehicle_union.push_back(rw.vid[i]);
+        if (enable_fhe) {
+            std::vector<int64_t> A_r{ s_speed, s_px, s_py, (int64_t)N };
+            coo_seg = mptd_ms_now();
+            c_j.push_back(g_thfhe_backend->encrypt_vector_int(A_r));   // Eq 3.46
+            coo_fhe_ms += mptd_ms_now() - coo_seg;
+        }
+        contrib++;
         total_count  += (int64_t)N;
         pt_speed_sum += s_speed;
+        pt_px_sum    += s_px;
+        pt_py_sum    += s_py;
     }
-    if (c_j.empty()) return false;
-    res.contributing_rsus = c_j.size();
+    if (contrib == 0) return false;
+    res.contributing_rsus = contrib;
     res.total_vehicles    = total_count;
 
     // ── Algorithm 6 line 6: ring homomorphic add (Eq 3.47), ciphertext-only ──
-    ThresholdBfvBackend::Ciphertext enc_ring = g_thfhe_backend->add_many(c_j);
+    // AB7 (C10): FHE removed — the ring aggregate travels as PLAINTEXT sums;
+    // TRS below then signs the plaintext aggregate instead of a ciphertext.
+    ThresholdBfvBackend::Ciphertext enc_ring;
+    if (enable_fhe) {
+        coo_seg = mptd_ms_now();
+        enc_ring = g_thfhe_backend->add_many(c_j);
+        coo_fhe_ms += mptd_ms_now() - coo_seg;
+    }
 
     // ── Algorithm 6 line 7: bind ciphertext into TRS message (Eq 3.48) ───────
-    std::vector<uint8_t> msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
-    append_u32(msg, g_trs_ring_t);              // t
-    append_u32(msg, closing_rsu);               // ID_S (ring identity)
-    append_u32(msg, epoch);                      // timestamp surrogate
+    // H6: paper trs_message m = (Enc(A_ring), t, ν_S, ID_S, h(S)) — the wall-
+    // clock timestamp t and the monotonic ring nonce ν_S are INSIDE the signed
+    // bytes, so the cloud's freshness gate below is signature-protected: a
+    // replayed bundle cannot be given a fresh t/ν_S without invalidating σ_TRS.
+    auto append_u64 = [](std::vector<uint8_t> &v, uint64_t x) {
+        for (int b = 0; b < 8; b++) v.push_back((uint8_t)((x >> (b * 8)) & 0xFF));
+    };
+    const double   t_msg = Simulator::Now().GetSeconds();
+    const uint64_t nu_S  = ++g_trs_ring_nonce_issued;
+    std::vector<uint8_t> msg;
+    if (enable_fhe) {
+        coo_seg = mptd_ms_now();
+        // msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
+        // coo_fhe_ms += mptd_ms_now() - coo_seg;
+        // g_bwo_fhe_bytes += msg.size();              // C8: ciphertext on the wire
+        msg = g_thfhe_backend->serialize_ciphertext(enc_ring);
+        coo_fhe_ms += mptd_ms_now() - coo_seg;
+        ct_len = (uint32_t)msg.size();
+        g_bwo_fhe_bytes += msg.size();              // C8: ciphertext on the wire
+    } else {
+        // AB7: signed payload = plaintext ring sums (same binding structure)
+        uint64_t s;
+        std::memcpy(&s, &pt_speed_sum, 8); append_u64(msg, s);
+        std::memcpy(&s, &pt_px_sum,    8); append_u64(msg, s);
+        std::memcpy(&s, &pt_py_sum,    8); append_u64(msg, s);
+        std::memcpy(&s, &total_count,  8); append_u64(msg, s);
+    }
+    append_u32(msg, g_trs_ring_t);              // t (threshold)
+    append_u32(msg, coordinator);               // ID_S (rotating ring coordinator)
+    append_u32(msg, epoch);                      // window epoch
+    uint64_t t_bits; std::memcpy(&t_bits, &t_msg, 8);
+    append_u64(msg, t_bits);                     // t (timestamp, trs_message)
+    append_u64(msg, nu_S);                       // ν_S (ring nonce, trs_message)
     for (uint32_t v : vehicle_union) append_u32(msg, v);   // h(S) material
 
+    // C4b (PARR reachability): a compromised coordinator (attacks 1/3) or a
+    // backbone MitM (attack 6) injects a poisoned aggregate this epoch. The
+    // denominator is booked here — before the enable_trs branch — so AB6 (no TRS
+    // gate) also counts injections and yields PARR = 0; full mode tampers the
+    // signed bundle in send_aggregate_to_cloud() so the cloud's Verify rejects
+    // it (numerator).
+    const char *parr_src = parr_poison_source(coordinator);
+    if (parr_src) g_parr_injected++;             // Eq 4.3 denominator
+
+    // AB6 (C10) minimum alternative (sir, 2026-07-27): removing TRS shouldn't be
+    // modeled as "zero authentication whatsoever" (PARR≡0 flat, disconnected from
+    // f — there's no gate left for f to act on). A real deployment without BFT
+    // threshold-signing would fall back to something minimal: single-signer auth
+    // (the coordinator alone signs, no t-of-n quorum). That still catches
+    // post-sign tampering (backbone MitM, attack 6 — ANY signature scheme detects
+    // a byte-flip after signing) but can NEVER catch a coordinator forging its own
+    // poison (no quorum needed to defeat a lone signer). Under the AB6 f/n sweep's
+    // forced-f model this is the SAME hypergeometric family as
+    // parr_poison_rejectable(), just with quorum size 1 (single signer) instead of
+    // t_sign=f_tol+1 (BFT threshold): p_forge_single = C(f,1)/C(n,1) = f/n — a
+    // genuine degradation curve, not a constant. The aggregate still proceeds into
+    // the pipeline exactly as before (trs_verified stays true — AB6 has no gate to
+    // block on); only the PARR bookkeeping changes so the metric reflects what
+    // this minimum alternative would have caught.
+    if (!enable_trs) {
+        res.trs_verified = true;
+        res.sigma_bytes  = 0;
+        if (parr_src) {
+            bool caught;
+            if (g_trs_compromised_f >= 0) {
+                const uint32_t n = (g_trs_ring_n >= 1) ? g_trs_ring_n : 4;
+                uint32_t f = (uint32_t)g_trs_compromised_f; if (f > n) f = n;
+                const double p_forge_single = (double)f / (double)n;   // quorum=1
+                static double min_alt_acc = -1.0;
+                if (min_alt_acc < 0.0) min_alt_acc = std::fmod((double)run_seed * 0.271, 1.0);
+                min_alt_acc += p_forge_single;
+                if (min_alt_acc >= 1.0) { min_alt_acc -= 1.0; caught = false; }
+                else                    { caught = true; }
+            } else {
+                // Real (non-swept) attack model: an in-transit MitM tamper always
+                // breaks single-signer auth; a genuinely-compromised elected
+                // coordinator always forges its own poison alone.
+                caught = (attack_number == 6);
+            }
+            // AB6-off CDER coupling (sir 2026-07-27, same gap class as the PARR
+            // fix): the full-TRS forge branch books a wrong aggregate-plane
+            // control decision when TRS admits poison (line ~1750 below); that
+            // coupling lives ONLY inside send_aggregate_to_cloud(), which the
+            // !enable_trs path never calls — so AB6-off's CDER was silently stuck
+            // on baseline per-beacon decisions, flat in f for the same reason PARR
+            // was. Mirror it here: caught -> correct macro decision (booked as
+            // right); missed -> the ring's macro decision is wrong for all
+            // total_count vehicles it governs.
+            g_agg_ctrl_total += (uint64_t)total_count;
+            if (caught) g_parr_rejected++;
+            else        g_agg_ctrl_wrong += (uint64_t)total_count;
+        }
+    } else {
     // ── Algorithm 6 lines 8–11: t partial sigs + aggregate (Eq 3.49–3.50) ────
     std::vector<std::vector<uint8_t>> partials;
     std::vector<uint32_t> signers;
+    coo_seg = mptd_ms_now();
     for (uint32_t j = 0; j < g_trs_ring_t && j < g_trs_ring_n; j++) {
         std::vector<uint8_t> p;
         if (!g_trs_backend->partial_sign(msg, g_trs_ring_sks[j], p)) return false;
@@ -1219,36 +1816,121 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
     }
     std::vector<uint8_t> sigma_trs;
     if (!g_trs_backend->aggregate(partials, signers, sigma_trs)) return false;
+    coo_trs_ms += mptd_ms_now() - coo_seg;
     res.sigma_bytes = sigma_trs.size();
+    g_bwo_trs_bytes += sigma_trs.size();        // C8: σ_TRS on the wire
 
-    // ── Cloud-side Eq 3.51: TRS-verify gate. Reject before any decryption ────
-    res.trs_verified = g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
-    if (!res.trs_verified) {
+    // ── Cloud-side trs_fresh gate (H6): reject stale/replayed bundles BEFORE
+    // signature verification. Honest pipeline signs and verifies within the
+    // same window close (age ≈ 0, ν_S strictly increasing); a replayed bundle
+    // fails the nonce cache even though its σ_TRS still verifies.
+    const double now_s = Simulator::Now().GetSeconds();
+    const bool fresh = (now_s - t_msg <= delta_trs) && (t_msg - now_s <= delta_trs)
+                    && (nu_S > g_trs_cloud_last_nonce_seen);
+    if (!fresh) {
+        cout << "[TRS-FRESH-FAIL] epoch=" << epoch << " age=" << (now_s - t_msg)
+             << "s Δ_TRS=" << delta_trs << " ν_S=" << nu_S
+             << " last=" << g_trs_cloud_last_nonce_seen
+             << " → σ_TRS rejected (trs_fresh)" << endl;
+    } else {
+        g_trs_cloud_last_nonce_seen = nu_S;
+    }
+
+    // // ── Cloud-side Eq 3.51: TRS-verify gate. Reject before any decryption ────
+    // coo_seg = mptd_ms_now();
+    // res.trs_verified = fresh
+    //                 && g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
+    // coo_trs_ms += mptd_ms_now() - coo_seg;
+    // if (!res.trs_verified) {
+    //     g_trs_rejected_count++;                 // PARR numerator (Eq 4.3)
+    //     clock_gettime(CLOCK_MONOTONIC, &t1);
+    //     res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
+    //                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
+    //     g_fullcrypto_runs++;
+    //     g_fullcrypto_time_sum_ms += res.elapsed_ms;
+    //     g_coo_trs_ms_sum += coo_trs_ms;         // C7 COO (reject path)
+    //     g_coo_fhe_ms_sum += coo_fhe_ms;
+    //     g_coo_epochs++;
+    //     res.ran = true;
+    //     return true;
+    // }
+
+    // ── R9: freshness stays local (cheap, RSU-side); everything from Eq 3.51
+    // onward now happens on the real Cloud node — send and return async.
+    if (!fresh) {
         g_trs_rejected_count++;                 // PARR numerator (Eq 4.3)
+        res.trs_verified = false;
         clock_gettime(CLOCK_MONOTONIC, &t1);
         res.elapsed_ms = (t1.tv_sec - t0.tv_sec) * 1000.0
                        + (t1.tv_nsec - t0.tv_nsec) / 1e6;
         g_fullcrypto_runs++;
         g_fullcrypto_time_sum_ms += res.elapsed_ms;
+        g_coo_trs_ms_sum += coo_trs_ms;         // C7 COO (reject path)
+        g_coo_fhe_ms_sum += coo_fhe_ms;
+        g_coo_epochs++;
         res.ran = true;
         return true;
     }
-    g_trs_verified_count++;
 
-    // ── Eq 3.52: cloud blind global aggregate. Single ring cluster ⇒ M=1, so
-    // Enc(X_global) = Enc(A_ring); the mean is taken after decryption ──────────
-    ThresholdBfvBackend::Ciphertext enc_global = enc_ring;
+    // send_aggregate_to_cloud(msg, sigma_trs, epoch, closing_rsu,
+    //                         contrib, total_count, coo_fhe_ms, coo_trs_ms, t0);
+    send_aggregate_to_cloud(msg, sigma_trs, epoch, coordinator,
+                            contrib, total_count, coo_fhe_ms, coo_trs_ms, t0, ct_len);
+    res.ran = true;
+    return true;   // async now — trs_verified/decrypt_ok/g_fullcrypto_* are
+                   // filled in later by handle_cloud_reply_at_rsu(), not here
+    }  // enable_trs
 
-    // ── Algorithm 7 (THRESH-DEC): cloud(lead) + t−1 RSU partials (Eq 3.53–3.56)
-    std::vector<uint32_t> present;              // t−1 RSUs; cloud auto-added
-    for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++) present.push_back(j);
     std::vector<int64_t> out_vec;
-    res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
+
+    if (enable_fhe) {
+        // ── Eq 3.52: cloud blind global aggregate. Single ring cluster ⇒ M=1, so
+        // Enc(X_global) = Enc(A_ring); the mean is taken after decryption ──────
+        ThresholdBfvBackend::Ciphertext enc_global = enc_ring;
+
+        // ── Algorithm 7 (THRESH-DEC): cloud(lead) + t−1 RSU partials (Eq 3.53–3.56)
+        std::vector<uint32_t> present;          // t−1 RSUs; cloud auto-added
+        for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < n; j++) present.push_back(j);
+        coo_seg = mptd_ms_now();
+        res.decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_global, present, 4, out_vec);
+        coo_fhe_ms += mptd_ms_now() - coo_seg;
+    } else {
+        // AB7: no ciphertext — the "decrypted" aggregate IS the plaintext sums.
+        // The H7 post-aggregation envelope below still applies unchanged.
+        out_vec = { pt_speed_sum, pt_px_sum, pt_py_sum, total_count };
+        res.decrypt_ok = true;
+    }
     if (res.decrypt_ok && total_count > 0) {
-        res.recovered_mean_speed = (double)out_vec[0]
-                                 / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
         res.plaintext_mean_speed = (double)pt_speed_sum
                                  / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)total_count);
+        // H7 post-decryption envelope (Alg THRESH-DEC): validate the DECRYPTED
+        // aggregate against the plausibility envelope using only decrypted
+        // fields (the cloud must not trust plaintext-side state). On reject,
+        // reuse the last valid window's value per the paper; if no valid
+        // window exists yet, discard the aggregate outright.
+        const int64_t dec_cnt = out_vec[3];
+        const double  dm_spd  = dec_cnt > 0
+            ? (double)out_vec[0] / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)dec_cnt) : -1.0;
+        const double  dm_x    = dec_cnt > 0
+            ? (double)out_vec[1] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)dec_cnt) : 0.0;
+        const double  dm_y    = dec_cnt > 0
+            ? (double)out_vec[2] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)dec_cnt) : 0.0;
+        const int64_t cnt_max = (int64_t)n * (int64_t)IPFS_WINDOW_L;
+        if (fhe_aggregate_envelope_ok(dm_spd, dm_x, dm_y, dec_cnt, cnt_max, "post-dec")) {
+            res.recovered_mean_speed    = dm_spd;
+            g_fhe_last_valid_set        = true;
+            g_fhe_last_valid_mean_speed = dm_spd;
+        } else if (g_fhe_last_valid_set) {
+            res.recovered_mean_speed = g_fhe_last_valid_mean_speed;
+            cout << "[FHE-ENVELOPE-REJECT] epoch=" << epoch
+                 << " decrypted aggregate outside envelope → reusing last valid"
+                 << " window mean_speed=" << g_fhe_last_valid_mean_speed << endl;
+        } else {
+            res.decrypt_ok = false;
+            cout << "[FHE-ENVELOPE-REJECT] epoch=" << epoch
+                 << " decrypted aggregate outside envelope, no last-valid"
+                 << " window → aggregate discarded" << endl;
+        }
     }
 
     clock_gettime(CLOCK_MONOTONIC, &t1);
@@ -1256,12 +1938,848 @@ static bool run_full_mode_crypto_pipeline(uint32_t closing_rsu, uint32_t epoch,
                    + (t1.tv_nsec - t0.tv_nsec) / 1e6;
     g_fullcrypto_runs++;
     g_fullcrypto_time_sum_ms += res.elapsed_ms;
+    g_coo_trs_ms_sum += coo_trs_ms;             // C7 COO (Δt_TRS/Δt_FHE split)
+    g_coo_fhe_ms_sum += coo_fhe_ms;
+    g_coo_epochs++;
     res.ran = true;
     return true;
 }
 
+// R9: RSU-side — stash pending state, frame (msg, sigma_trs), send to Cloud.
+static void send_aggregate_to_cloud(const std::vector<uint8_t> &msg,
+                                     const std::vector<uint8_t> &sigma_trs,
+                                     uint32_t epoch, uint32_t closing_rsu,
+                                     uint32_t contrib, int64_t total_count,
+                                     double coo_fhe_ms, double coo_trs_ms,
+                                     struct timespec t0, uint32_t ct_len)
+{
+    PendingCryptoReq pr;
+    pr.t0 = t0; pr.coo_fhe_ms = coo_fhe_ms; pr.coo_trs_ms = coo_trs_ms;
+    pr.rsu_id = closing_rsu; pr.contrib = contrib; pr.total_count = total_count;
+
+    // C4b (PARR): the aggregate is perturbed AFTER the honest ring signatures are
+    // aggregated — either by a compromised coordinator or a backbone MitM (see
+    // parr_poison_source). σ_TRS was computed over the intact msg, so the shipped
+    // (tampered) msg no longer verifies and the cloud's Verify (Eq. 3.53) rejects
+    // it — the PARR numerator trigger. The denominator was already booked at the
+    // injection point in the pipeline. (`closing_rsu` here is the rotating
+    // coordinator id passed by run_full_mode_crypto_pipeline.)
+    std::vector<uint8_t> tx_msg = msg;
+    const char *poison_src = parr_poison_source(closing_rsu);
+    if (poison_src) {
+        pr.poisoned = true;
+        if (parr_poison_rejectable(closing_rsu, epoch) && !tx_msg.empty()) {
+            tx_msg[0] ^= 0xFF;      // insufficient signers / in-transit tamper → σ_TRS breaks
+            // AB6: TRS blocked the poison → the ring's macro control decision is
+            // CORRECT (controller falls back to last-valid window). Book as clean.
+            if (g_trs_compromised_f >= 0) g_agg_ctrl_total += (uint64_t)total_count;
+            cout << "[C4b-PARR-INJECT] epoch=" << epoch << " " << poison_src
+                 << " poisoned aggregate (coord RSU" << closing_rsu
+                 << ") → σ_TRS broken, cloud Verify must reject" << endl;
+        } else {
+            // f_actual ≥ t_sign: colluding compromised RSUs sign their poisoned
+            // aggregate with their own valid ring keys → σ_TRS verifies → PARR
+            // miss. Shipped intact (no tamper), so the cloud accepts it.
+            // AB6: TRS ADMITTED the poison → the ring's macro control decision is
+            // WRONG for all total_count vehicles it governs (CDER degradation).
+            if (g_trs_compromised_f >= 0) {
+                g_agg_ctrl_total += (uint64_t)total_count;
+                g_agg_ctrl_wrong += (uint64_t)total_count;
+            }
+            cout << "[C4b-PARR-FORGE] epoch=" << epoch << " " << poison_src
+                 << " valid σ_TRS forged over poisoned aggregate (coord RSU"
+                 << closing_rsu << ", f≥t_sign) → cloud Verify PASSES (PARR miss)"
+                 << endl;
+        }
+    }
+    g_pending_crypto_req[epoch] = pr;
+
+    std::vector<uint8_t> frame;
+    auto append_u32 = [&](uint32_t x){ for (int b=0;b<4;b++) frame.push_back((uint8_t)((x>>(b*8))&0xFF)); };
+    append_u32(epoch);
+    append_u32(ct_len);
+    append_u32((uint32_t)tx_msg.size());
+    frame.insert(frame.end(), tx_msg.begin(), tx_msg.end());
+    append_u32((uint32_t)sigma_trs.size());
+    frame.insert(frame.end(), sigma_trs.begin(), sigma_trs.end());
+
+    // An IPv4/UDP datagram caps at 65507 B but the serialized FHE ciphertext
+    // alone is ~2 MB, so the frame ships as ≤60000 B chunks with a 12 B
+    // (epoch, idx, n_chunks) header; the Cloud reassembles per epoch.
+    static const size_t R9_CHUNK = 60000;
+    const uint32_t n_chunks = (uint32_t)((frame.size() + R9_CHUNK - 1) / R9_CHUNK);
+    uint32_t sent_ok = 0;
+    for (uint32_t ci = 0; ci < n_chunks; ci++) {
+        const size_t beg = (size_t)ci * R9_CHUNK;
+        const size_t len = std::min(R9_CHUNK, frame.size() - beg);
+        std::vector<uint8_t> chunk;
+        chunk.reserve(12 + len);
+        auto put_u32 = [&](uint32_t x){ for (int b=0;b<4;b++) chunk.push_back((uint8_t)((x>>(b*8))&0xFF)); };
+        put_u32(epoch); put_u32(ci); put_u32(n_chunks);
+        chunk.insert(chunk.end(), frame.begin()+beg, frame.begin()+beg+len);
+        Ptr<Packet> pkt = Create<Packet>(chunk.data(), chunk.size());
+        if (g_rsu0_send_socket->SendTo(pkt, 0, InetSocketAddress(g_cloud_csma_ip, 9090)) >= 0)
+            sent_ok++;
+    }
+    cout << "[R9-RSU-TX] epoch=" << epoch << " sent " << frame.size()
+         << "B to Cloud in " << sent_ok << "/" << n_chunks << " chunks" << endl;
+}
+
+// R9: Cloud-side — verify TRS, blind-decrypt, reply to RSU0.
+void SimpleUdpApplication::handle_cloud_receive(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    uint32_t sz = packet->GetSize();
+    if (sz < 12) return;
+    std::vector<uint8_t> chunk(sz);
+    packet->CopyData(chunk.data(), sz);
+
+    // Reassemble the ≤60000 B chunks (12 B header: epoch, idx, n_chunks) back
+    // into the full (msg, sigma_trs) frame before parsing. std::map keeps the
+    // chunks idx-ordered even if the backbone reorders delivery.
+    size_t hoff = 0;
+    auto read_hu32 = [&](){ uint32_t x=0; for(int b=0;b<4;b++) x |= ((uint32_t)chunk[hoff+b])<<(b*8); hoff+=4; return x; };
+    const uint32_t r_epoch = read_hu32();
+    const uint32_t r_idx   = read_hu32();
+    const uint32_t r_total = read_hu32();
+    static std::map<uint32_t, std::map<uint32_t, std::vector<uint8_t>>> reasm;
+    auto &parts = reasm[r_epoch];
+    parts[r_idx].assign(chunk.begin()+12, chunk.end());
+    if ((uint32_t)parts.size() < r_total) return;   // wait for the rest
+
+    std::vector<uint8_t> frame;
+    for (auto &p : parts) frame.insert(frame.end(), p.second.begin(), p.second.end());
+    reasm.erase(r_epoch);
+
+    size_t off = 0;
+    auto read_u32 = [&](){ uint32_t x=0; for(int b=0;b<4;b++) x |= ((uint32_t)frame[off+b])<<(b*8); off+=4; return x; };
+    uint32_t epoch   = read_u32();
+    uint32_t ct_len  = read_u32();
+    uint32_t msg_len = read_u32();
+    std::vector<uint8_t> msg(frame.begin()+off, frame.begin()+off+msg_len); off += msg_len;
+    uint32_t sig_len = read_u32();
+    std::vector<uint8_t> sigma_trs(frame.begin()+off, frame.begin()+off+sig_len);
+
+    // C7 COO: the verify/decrypt legs now run cloud-side — time them here and
+    // ship the split back in the reply so the RSU accumulates the full epoch.
+    double coo_seg = mptd_ms_now();
+    bool trs_verified = g_trs_backend->verify_threshold(msg, sigma_trs, g_trs_ring_pks);
+    const double cloud_trs_ms = mptd_ms_now() - coo_seg;
+    double cloud_fhe_ms = 0.0;
+
+    bool   decrypt_ok = false;
+    double recovered_mean_speed = -1.0;
+    if (trs_verified && enable_fhe) {
+        coo_seg = mptd_ms_now();
+        std::vector<uint8_t> ct_bytes(msg.begin(), msg.begin() + ct_len);
+        ThresholdBfvBackend::Ciphertext enc_ring =
+            g_thfhe_backend->deserialize_ciphertext(ct_bytes);
+        std::vector<uint32_t> present;
+        for (uint32_t j = 0; j + 1 < g_trs_ring_t && j < g_trs_ring_n; j++) present.push_back(j);
+        std::vector<int64_t> out_vec;
+        decrypt_ok = g_thfhe_backend->threshold_decrypt_vec(enc_ring, present, 4, out_vec);
+        cloud_fhe_ms = mptd_ms_now() - coo_seg;
+        if (decrypt_ok && out_vec[3] > 0) {
+            double dm_spd = (double)out_vec[0] / ((double)ThresholdBfvBackend::SPEED_SCALE * (double)out_vec[3]);
+            double dm_x   = (double)out_vec[1] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)out_vec[3]);
+            double dm_y   = (double)out_vec[2] / ((double)ThresholdBfvBackend::POS_SCALE   * (double)out_vec[3]);
+            int64_t cnt_max = (int64_t)g_trs_ring_n * (int64_t)IPFS_WINDOW_L;
+            if (fhe_aggregate_envelope_ok(dm_spd, dm_x, dm_y, out_vec[3], cnt_max, "post-dec")) {
+                recovered_mean_speed = dm_spd;
+                g_fhe_last_valid_set = true;
+                g_fhe_last_valid_mean_speed = dm_spd;
+            } else if (g_fhe_last_valid_set) {
+                recovered_mean_speed = g_fhe_last_valid_mean_speed;
+            } else {
+                decrypt_ok = false;
+            }
+        }
+    } else if (trs_verified && !enable_fhe) {
+        decrypt_ok = true;   // AB7: plaintext path
+    }
+
+    if (!trs_verified) g_trs_rejected_count++;
+    else                g_trs_verified_count++;
+
+    std::vector<uint8_t> reply;
+    auto append_u32r = [&](uint32_t x){ for (int b=0;b<4;b++) reply.push_back((uint8_t)((x>>(b*8))&0xFF)); };
+    append_u32r(epoch);
+    reply.push_back(trs_verified ? 1 : 0);
+    reply.push_back(decrypt_ok   ? 1 : 0);
+    int64_t spd_fixed = (int64_t)std::llround(recovered_mean_speed * 1e6);
+    for (int b = 0; b < 8; b++) reply.push_back((uint8_t)((spd_fixed >> (b*8)) & 0xFF));
+    append_u32r((uint32_t)std::llround(cloud_trs_ms * 1000.0));   // C7: µs, cloud verify leg
+    append_u32r((uint32_t)std::llround(cloud_fhe_ms * 1000.0));   // C7: µs, cloud decrypt leg
+
+    Ptr<Packet> reply_pkt = Create<Packet>(reply.data(), reply.size());
+    m_cloud_reply_socket->SendTo(reply_pkt, 0, InetSocketAddress(g_rsu_csma_ip[0], 9092));
+
+    cout << "[R9-CLOUD] epoch=" << epoch
+         << " trs=" << (trs_verified ? "VERIFIED" : "REJECTED")
+         << " dec=" << (decrypt_ok ? "ok" : "fail")
+         << std::fixed << std::setprecision(3)
+         << " verify=" << cloud_trs_ms << "ms dec=" << cloud_fhe_ms << "ms" << endl;
+}
+
+void SimpleUdpApplication::handle_cloud_reply_at_rsu(Ptr<Socket> socket)
+{
+    Ptr<Packet> packet = socket->Recv();
+    uint32_t sz = packet->GetSize();
+    std::vector<uint8_t> frame(sz);
+    packet->CopyData(frame.data(), sz);
+
+    size_t off = 0;
+    auto read_u32 = [&](){ uint32_t x=0; for(int b=0;b<4;b++) x |= ((uint32_t)frame[off+b])<<(b*8); off+=4; return x; };
+    uint32_t epoch = read_u32();
+    bool trs_verified = frame[off++] != 0;
+    bool decrypt_ok   = frame[off++] != 0;
+    int64_t spd_fixed = 0;
+    for (int b = 0; b < 8; b++) spd_fixed |= ((int64_t)frame[off+b]) << (b*8);
+    off += 8;
+    double recovered_mean_speed = (double)spd_fixed / 1e6;
+    double cloud_trs_ms = 0.0, cloud_fhe_ms = 0.0;   // C7: cloud-side split (µs on wire)
+    if (off + 8 <= frame.size()) {
+        cloud_trs_ms = read_u32() / 1000.0;
+        cloud_fhe_ms = read_u32() / 1000.0;
+    }
+
+    auto it = g_pending_crypto_req.find(epoch);
+    if (it == g_pending_crypto_req.end()) return;   // stale/duplicate — drop
+    PendingCryptoReq pr = it->second;
+    g_pending_crypto_req.erase(it);
+
+    // C4b (PARR numerator): a tampered aggregate that the cloud's TRS Verify
+    // rejected. A tampered aggregate that verified would be a missed poisoning
+    // (should not happen — σ_TRS binds the whole msg); log it if it ever does.
+    if (pr.poisoned) {
+        if (!trs_verified) g_parr_rejected++;        // Eq 4.3 numerator (TRS caught it)
+        else cout << "[C4b-PARR-MISS] epoch=" << epoch
+                  << " poisoned aggregate PASSED TRS verify → PARR miss"
+                  << " (expected sub-threshold forgery f≥t_sign; H7 envelope is"
+                  << " the next gate)" << endl;
+    }
+
+    // PBPO (Eq 4.7): wall-clock t0→now would also count every unrelated sim
+    // event processed while the request was in (simulated) flight, so the
+    // per-epoch compute cost is the sum of the measured crypto segments.
+    double elapsed_ms = pr.coo_trs_ms + pr.coo_fhe_ms + cloud_trs_ms + cloud_fhe_ms;
+
+    g_fullcrypto_runs++;
+    g_fullcrypto_time_sum_ms += elapsed_ms;
+    g_coo_trs_ms_sum += pr.coo_trs_ms + cloud_trs_ms;
+    g_coo_fhe_ms_sum += pr.coo_fhe_ms + cloud_fhe_ms;
+    g_coo_epochs++;
+
+    cout << "[FULLCRYPTO] epoch=" << epoch
+         << " rings=" << pr.contrib
+         << " veh=" << pr.total_count
+         << " trs=" << (trs_verified ? "VERIFIED" : "REJECTED")
+         << " dec=" << (decrypt_ok ? "ok" : "fail")
+         << std::fixed << std::setprecision(3)
+         << " mean_speed_dec=" << recovered_mean_speed
+         << " " << std::setprecision(2) << elapsed_ms << "ms"
+         << " (Alg6/7 Eq 3.45-3.56, R9 networked)" << endl;
+}
+
+// Extracted from HandleBeaconReceived (Block 3 fix): the GAT/fusion scoring
+// block, made callable so it can run immediately after a force-flushed ghost
+// window, not only reactively when a matching real beacon next arrives at
+// the same RSU. Behaviourally identical to the original inline block for
+// every existing call site (real-beacon path passes cw.window_epoch as
+// window_epoch_for_log, unchanged).
+void run_gat_fusion_for_rsu(uint32_t rsu_id, uint32_t window_epoch_for_log)
+{
+            if ((g_ai_engine.ready() || enable_rule_signatures) && rsu_id < N_RSUs && rsu_last_window_valid[rsu_id]) {
+                const RsuBeaconWindow &rw = rsu_last_window[rsu_id];
+                const int N = (int)rw.beacon_count;
+                if (N > 0) {
+                    // ── 1. GAT spatial scores (one per row of the L-beacon window) ──
+                    std::vector<float>    feats5(N * 5);
+                    std::vector<float>    gat_psi(N, 0.0f);   // richer-feat: per-vehicle mean ψ
+                    std::vector<uint32_t> gat_sig(N, 0u);     // richer-feat: per-vehicle sig_mask (ψ sub-scores)
+                    for (int i = 0; i < N; ++i) {
+                        feats5[i*5 + 0] = (float)rw.pos_x[i];
+                        feats5[i*5 + 1] = (float)rw.pos_y[i];
+                        feats5[i*5 + 2] = (float)rw.speed[i];
+                        feats5[i*5 + 3] = (float)rw.heading[i];
+                        feats5[i*5 + 4] = (float)rw.accel[i];
+                        const uint32_t v = rw.vid[i];
+                        if (v < (uint32_t)total_size) {
+                            gat_psi[i] = psi_cnt_per_vehicle[v] > 0
+                                ? (float)(last_psi_per_vehicle[v] / psi_cnt_per_vehicle[v]) : 0.0f;
+                            gat_sig[i] = last_sigmask_per_vehicle[v];
+                        } else if (v >= 10000u) {
+                            // Ghost path (Critical Issue 3 fix) — read from the
+                            // map instead of the fixed array; see accumulation
+                            // site (~line 3846) and GhostPsiState definition.
+                            auto git = g_ghost_psi_state.find(v);
+                            if (git != g_ghost_psi_state.end() && git->second.psi_cnt > 0) {
+                                gat_psi[i] = (float)(git->second.psi_sum / git->second.psi_cnt);
+                                gat_sig[i] = git->second.sig_mask;
+                            }
+                        }
+                    }
+                    std::vector<float> gat_scores;
+                    std::vector<int>   gat_attack_types;   // k̂_i per vehicle (multi-task GAT)
+                    bool gat_ok = false;
+                    if (g_ai_engine.has_gat()) {
+                        // TEMP DIAGNOSTIC (Critical Issue 3, calibration): expose gt for the
+                        // score_gat()-internal [GAT-CONF] print via a scratch global.
+                        extern std::vector<uint8_t> g_diag_gt_scratch;
+                        g_diag_gt_scratch.assign(rw.is_poisoned, rw.is_poisoned + N);
+                        gat_ok = g_ai_engine.score_gat(
+                            feats5.data(), N, nullptr, gat_scores, &gat_attack_types,
+                            gat_psi.data(), gat_sig.data());
+                    }
+                    if (gat_ok) {
+                        double smin = gat_scores[0], smax = gat_scores[0], smean = 0.0;
+                        for (float s : gat_scores) {
+                            if (s < smin) smin = s;
+                            if (s > smax) smax = s;
+                            smean += s;
+                        }
+                        smean /= (double)gat_scores.size();
+                        cout << "[GAT-SCORE-RSU" << rsu_id << "] epoch="
+                             << window_epoch_for_log << " N=" << N
+                             << " min=" << std::fixed << std::setprecision(4) << smin
+                             << " mean=" << smean << " max=" << smax
+                             << " (paper §3.5.3 Eq 3.42)" << endl;
+                    } else if (g_ai_engine.has_gat()) {
+                        // GAT enabled but inference failed — degrade to zeros so
+                        // fusion still runs (ψ + ε will carry the decision).
+                        gat_scores.assign(N, 0.0f);
+                    }
+
+                    // ── 2. Fusion (paper Eq 3.46) per vehicle in window ────────────
+                    // For each beacon row in this RSU's last window:
+                    //   ψ_i    = cached LW-DETECT score from RSU handle_readone
+                    //   S_i    = gat_scores[i] (rolled-up sigmoid output)
+                    //   ε_i    = LSTM-AE recon MSE on the vehicle's 20-beacon ring,
+                    //            normalised by θ_ae inside fuse_scores()
+                    //   Φ_i    = λ₁ψ + λ₂S + λ₃·min(ε/θ_ae,1) ; flag if Φ > 0.5
+                    // R7d's GAT-only log is preserved above; this adds per-vehicle
+                    // fusion lines. ψ_total / Φ_total counters surface in metrics.
+                    const float theta_ae = g_ai_engine.theta_ae();
+                    int        fused_count = 0;
+                    int        full_flag_count = 0;
+                    double     phi_sum = 0.0;
+                    double     phi_max = 0.0;
+
+                    // ── Per-window dedup for Eq 3.57 CSUBM (TASK ①-L) ─────────
+                    // Multiple beacons from the same vehicle in one L-beacon
+                    // window collapse to ONE controller submission per
+                    // (vid, epoch). The chaincode side is idempotent on
+                    // CSUBM_<vid>_<epoch> but every duplicate submit costs an
+                    // async orderer round-trip — keep it cheap. Scope is local
+                    // to this window only; a fresh window starts a new set.
+                    std::unordered_set<std::string> csubm_seen;
+
+                    for (int i = 0; i < N; ++i) {
+                        const uint32_t vid_i = rw.vid[i];
+                        const bool is_ghost_i = vid_i >= 10000u;
+                        // Block 3 fix: previously any vid >= total_size (including
+                        // ghosts, which are intentionally >= GHOST_VID_BASE=10000)
+                        // was skipped here entirely — GAT spatial scoring above ran
+                        // fine for ghosts (their embeddings are in feats5/gat_scores),
+                        // but they never got a [FUSION-RSU] line, never contributed to
+                        // fused_count, and never reached update_confusion_matrix_full.
+                        // Let ghosts through; still reject genuinely out-of-range vids.
+                        if (vid_i >= (uint32_t)total_size && !is_ghost_i) continue;
+                        float psi_i = 0.0f;
+                        uint32_t sig_mask_i = 0u;
+                        if (!is_ghost_i) {
+                            psi_i = psi_cnt_per_vehicle[vid_i] > 0
+                                ? (float)(last_psi_per_vehicle[vid_i] / psi_cnt_per_vehicle[vid_i])
+                                : 0.0f;   // H8: per-window MEAN ψ
+                            sig_mask_i = last_sigmask_per_vehicle[vid_i];
+                        } else {
+                            auto git = g_ghost_psi_state.find(vid_i);
+                            if (git != g_ghost_psi_state.end() && git->second.psi_cnt > 0) {
+                                psi_i = (float)(git->second.psi_sum / git->second.psi_cnt);
+                                sig_mask_i = git->second.sig_mask;
+                            }
+                        }
+                        const float gat_i = gat_ok ? gat_scores[i] : 0.0f;
+                        float ae_err = 0.0f;
+                        bool  ae_dumped = false;   // H8 diag
+                        // lstm_ring_dump indexes a fixed total_size-sized array, so
+                        // ghosts were guarded out here to avoid an out-of-bounds
+                        // access. The stated rationale — "ghosts have no temporal
+                        // ring history (one-shot fabricated identity)" — is not
+                        // borne out by measurement: there are only 44 distinct ghost
+                        // IDs, averaging 361 beacons each, with 84.1% exceeding the
+                        // L=50 window. Ghosts DO have usable sequences.
+                        //
+                        // With --ghost_ae the ring is backed by a slot map
+                        // (04_state_globals.h) so the bounds concern no longer
+                        // applies and ghosts can be scored. FPR-safe: no honest
+                        // beacon carries vid >= 10000.
+                        if ((!is_ghost_i || g_ghost_ae) && g_ai_engine.has_lstm_ae()) {
+                            float ring_buf[LSTM_RING_SIZE * 6];
+                            if (lstm_ring_dump(vid_i, ring_buf)) {
+                                ae_dumped = true;
+                                (void)g_ai_engine.score_lstm_ae(ring_buf, ae_err);
+                            }
+                        }
+                        // Attack-conditioned fusion (revised eq:fusion): k̂_i from
+                        // the multi-task GAT selects the λ^(k̂) weight set. -1 →
+                        // global λ fallback (no per-attack sets or GAT off).
+                        int k_hat_i = (gat_ok && i < (int)gat_attack_types.size())
+                                          ? gat_attack_types[i] : -1;
+                        // Round 5 hybrid routing fix: the K=7 ML classifier confuses
+                        // MP-S1 (a3) with MP-S2 (a4) — only 10.4% of true a3 beacons
+                        // were routed correctly, 34.7% misrouted to a4's weights
+                        // (measured 2026-08-04). But the pre-existing RULE-based
+                        // signature (SYB-DETECT, sig_mask bits 5=MP-S1/6=MP-S2, see
+                        // 08:1032) is a PERFECT discriminator wherever it fires:
+                        // 0% cross-contamination measured (bit5 never fires for true
+                        // a4, bit6 never fires for true a3). Trust the rule bit over
+                        // the ambiguous ML k̂ whenever it fires — doesn't cover every
+                        // beacon (fires on 19.5% of a3, 87.2% of a4), but is strictly
+                        // more reliable than k̂ on the beacons it does cover.
+                        // ── FIX 2: route ghost IDs to the a3 weight set by identity ──
+                        // Ghost beacons are MP-S1 (a3) by construction, but they never
+                        // fire the MP-S1 rule bit — measured 0 / 20 754 (DQ-G9) — because
+                        // they carry no kinematic history, so sig_mask is 0 and the
+                        // override below can never reach them. The result is k̂ = −1 for
+                        // 71.4 % of ghosts (DQ-G1), which applies the global fallback λ
+                        // and under-weights the one component that does carry signal:
+                        // misrouted ghosts have median S/θ_S = 0.392 (DQ-G3).
+                        //
+                        // Every ghost that DOES reach a real head is detected with recall
+                        // 1.0000 (DQ-G1), so routing — not signal — is the bottleneck.
+                        // `vid >= GHOST_VID_BASE` is available here and is a reliable
+                        // discriminator, so we route by identity rather than waiting for a
+                        // rule bit that cannot fire.
+                        //
+                        // This mirrors the existing rationale for trusting the rule bit
+                        // over the ML k̂ (the classifier routes only 10.4 % of true a3
+                        // correctly): ghosts ARE a3, we simply know it by ID instead.
+                        //
+                        // CRITICAL: routing a ghost by IDENTITY must NOT by itself
+                        // constitute a detection. `vid >= GHOST_VID_BASE` is a
+                        // simulation artifact of the attack generator, not an
+                        // observable a real detector could use — a genuine Sybil
+                        // would forge plausible IDs. The OR-flag path below fires on
+                        // k̂ ALONE, without requiring the GAT to have scored, so a
+                        // naive `k_hat_i = 2` here makes every ghost flagged purely
+                        // because of its ID. Measured when we tried exactly that:
+                        // D1 (no GAT) reported ghost recall 1.0000 with 100 % of
+                        // detections via the OR-flag and 0 % via Φ — i.e. label
+                        // leakage, not detection.
+                        //
+                        // So we set k̂ for WEIGHTING only and record that it came
+                        // from identity, so the OR-flag can exclude it. Detection
+                        // must still come from Φ crossing threshold on the GAT's
+                        // real spatial score.
+                        bool khat_from_ghost_id = false;
+                        if (is_ghost_i)                 { k_hat_i = 2; khat_from_ghost_id = true; }
+                        else if (sig_mask_i & (1u << 5))  k_hat_i = 2;  // MP-S1 -> attack=3 slot
+                        else if (sig_mask_i & (1u << 6))  k_hat_i = 3;  // MP-S2 -> attack=4 slot
+                        // sir Change 1: attack-conditioned ψ. Recompute the LW
+                        // composite from this vehicle's sig_mask with the weight
+                        // vector for k̂ (or the aggregate w when k̂=-1, i.e. GAT
+                        // unconfident — the Change-2 gate). Sums to 1 → same scale
+                        // as the global-weighted ψ that fuse_scores normalises by ψ_th.
+                        // AB1 (b): remove the ψ FUSION TERM (the rule-signature tier's
+                        // contribution to the full-mode decision) while sig_mask/ψ still
+                        // feed the GAT input above → φ = λ_gat·gat + λ_ae·ae for AB1.
+                        float psi_fuse = enable_rule_signatures ? psi_i : 0.0f;
+                        if (enable_rule_signatures && g_fusion.has_sig_weights) {
+                            const uint32_t sm = sig_mask_i;
+                            const bool cond = (k_hat_i >= 0 && k_hat_i < FusionParams::K_ATTACK);
+                            const float *w = cond ? g_fusion.sig_w_k[k_hat_i]
+                                                  : g_fusion.sig_w_global;
+                            float s = 0.0f, s_glob = 0.0f;
+                            for (int b = 0; b < FusionParams::N_SIG; ++b)
+                                if ((sm >> b) & 1u) { s += w[b]; s_glob += g_fusion.sig_w_global[b]; }
+
+                            // --psi_cond_floor: attack-conditioning must REFINE the
+                            // rule evidence, never destroy it.
+                            //
+                            // MEASURED root cause of D4 < D1. Only a GAT-bearing arm
+                            // derives k_hat, so only it takes the conditioned branch.
+                            // For the 158 true positives D1 catches and D4 loses,
+                            // 155 route to k_hat=4, whose weight set is
+                            //   [0.0045, 0, 0, 0, .3275, .2836, .3844, 0, 0]
+                            // against the global
+                            //   [0.0976, 0, 0, .1685, .2018, .2214, .2310, 0, .0797]
+                            // i.e. it assigns ~zero weight to the very bits those
+                            // beacons carry. Measured effect: psi_fuse 0.1770 -> 0.0020
+                            // and phi 1.0000 -> 0.3480, so the detection is lost purely
+                            // by enabling the GAT. fusion_weights.json documents slot 4
+                            // as a known misrouting sink ("head 3 (a4 slot) is where a3
+                            // beacons are misrouted").
+                            //
+                            // The floor keeps conditioning's upside (it may RAISE psi
+                            // for correctly-routed beacons) while removing its ability
+                            // to erase evidence on a misroute. D1 is unaffected: with
+                            // k_hat < 0 the global set is already used, so the floor is
+                            // a no-op there. Default OFF = byte-identical.
+                            psi_fuse = (g_psi_cond_floor && cond) ? std::max(s, s_glob) : s;
+                        }
+                        // AB8 option B (opt-in via --lifecycle_gates_fusion=1):
+                        // a demoted/CLIENT RSU carries zero quorum weight on-chain
+                        // (§3.5.1); extend that to the AI plane so the detector
+                        // also stops trusting its rule verdict. Without this the
+                        // lifecycle cannot influence MCC/CDER at all — toggling
+                        // enable_rsu_lifecycle alone left both metrics BIT-IDENTICAL
+                        // (0.825 / 0.607, same seed), because fusion never reads RSU
+                        // trust state. With the lifecycle ABLATED (AB8 arm) nothing
+                        // is ever demoted, so poisoned rule verdicts keep feeding
+                        // fusion — which is precisely the loss AB8 aims to quantify.
+                        // g_demoted_psi_weight scales rather than silences: full
+                        // suppression (weight 0) threw away the demoted RSU's TRUE
+                        // positives too and, because demotion is noisy (4 of 9
+                        // demotes were honest RSUs), cost more signal than the
+                        // poison it blocked — MCC_full fell 0.825 -> 0.361.
+                        if (g_lifecycle_gates_fusion && enable_rsu_lifecycle &&
+                            rsu_id < MAX_RSUS && rsu_demoted[rsu_id]) {
+                            psi_fuse *= (float)g_demoted_psi_weight;
+                        }
+                        const FusionScore fs = fuse_scores(
+                            psi_fuse, gat_i, ae_err, theta_ae, k_hat_i);
+                        // Standalone SOTA baselines (B2/B3): score the full-mode
+                        // decision on a SINGLE detector's native threshold, WITHOUT
+                        // the ψ composite tier (modes 2/3 keep ψ on via fuse_scores,
+                        // so they are ψ+GAT / ψ+AE — not true SOTA). mode 7 = pure
+                        // GAT (S_i > θ_S); mode 8 = pure LSTM-AE (ε_i > θ_ae).
+                        bool full_flag = fs.anomalous;
+                        if      (ablation_mode == 7) full_flag = (gat_i  > (float)g_theta_s);
+                        else if (ablation_mode == 8) full_flag = (ae_err > theta_ae);
+                        // Hard speed-bound override (physical-impossibility rule): a
+                        // reported speed above s_max is a definite fabrication (MP-S3
+                        // MitM ~66 m/s) regardless of the soft fusion score / GAT
+                        // routing. Full mode only (not the standalone-tier ablations).
+                        else {
+                            full_flag = full_flag || (rw.speed[i] > s_max);
+                            // flag_i^GAT (paper revised eq:gat_det_flag): the GAT
+                            // detects an attack iff any head fires above theta_conf,
+                            // which is exactly the condition encoded by k_hat_i >= 0.
+                            // OR it into the verdict for the enabled heads. Guarded by
+                            // g_gat_det_flag_heads (default 0 = off) so every prior
+                            // run stays byte-identical. See 02_config_globals.h for
+                            // the measured per-head precision that motivates the mask.
+                            // `!khat_from_ghost_id`: a k̂ derived from the ghost ID
+                            // carries no detection evidence (see the routing block
+                            // above), so it must not trigger this bypass. Without
+                            // this guard the flag fires on identity alone, which
+                            // measured as ghost recall 1.0000 in the no-GAT arm.
+                            // --gat_or_path_min_phi: require the fusion score to
+                            // reach this floor before the head OR-path may force a
+                            // detection. MEASURED motivation (300 s, ring_detect on,
+                            // t<=180): beacons flagged ONLY by this path (phi<0.5)
+                            // account for 54.2% of D4's and 55.1% of D6's false
+                            // positives while contributing 285/306 true positives —
+                            // a poor exchange. Suppressing them is a STRICT
+                            // improvement on both metrics:
+                            //     D4  MCC 0.8027->0.8184   FPR 0.0705->0.0323
+                            //     D6  MCC 0.8236->0.8375   FPR 0.0694->0.0312
+                            // D1 is untouched (it has ZERO such beacons — the
+                            // OR-path exists only in GAT-bearing arms), so this is
+                            // removing a defect in the GAT path, not handicapping
+                            // the baseline.
+                            // Default 0.0 == previous behaviour, byte-identical.
+                            if (g_gat_det_flag_heads != 0u && k_hat_i >= 0 &&
+                                k_hat_i < 32 && !khat_from_ghost_id &&
+                                fs.phi >= g_gat_or_path_min_phi &&
+                                (g_gat_det_flag_heads & (1u << (uint32_t)k_hat_i)) != 0u)
+                                full_flag = true;
+                        }
+                        fused_count++;
+                        if (full_flag) full_flag_count++;
+                        phi_sum += fs.phi;
+                        if (fs.phi > phi_max) phi_max = fs.phi;
+
+                        // ── C1: score the full-mode Fusion verdict (Eq 3.45
+                        // Φ_i > Φ_th) against this beacon's ground-truth poison
+                        // label into the full-mode confusion matrix (Eq 4.1/4.2).
+                        // Gated to full-mode ablations only (A2/A3/A4/A5/Full):
+                        // for A1 (mode 1) and B1 (mode 6) full mode is inactive,
+                        // so the LW confusion matrix at HandleBeaconReceived stays
+                        // authoritative and this matrix is left empty. This is the
+                        // window-close (W = L·T_b) controller-side scoring path —
+                        // invariant #3 (LW skip-on-pass) is untouched.
+                        if (ablation_mode != 1 && ablation_mode != 6) {
+                            update_confusion_matrix_full(
+                                rw.is_poisoned[i], full_flag);
+                            // CDER_full (additive): score the fusion verdict as a
+                            // control decision so control-plane error responds to
+                            // the AI layer. wrong iff verdict disagrees with truth.
+                            ctrl_full_total++;
+                            if (full_flag != rw.is_poisoned[i]) ctrl_full_wrong++;
+                        }
+                        // C5 TTD (alert side): the alert timestamp must come from the
+                        // FUSION decision so TTD responds to the ablation. The previous
+                        // alert assignment (per-beacon `detected` in handle_readone) fired
+                        // on the same call — and with the same t_now — as the onset
+                        // assignment, so alert==onset and TTD collapsed to 0.000 in every
+                        // run. `detected` is also ablation-inert (beacon_log.csv is
+                        // byte-identical FULL vs AB1), so it cannot measure AB1/AB3/AB4.
+                        // INDEX BASE: vid_i is a NodeId (tag.GetVehicleId(), see 08:3029),
+                        // whereas g_ttd_* is indexed by (NodeId - g_first_vehicle_node_id)
+                        // — the same transform used at the onset site. Do not drop it.
+                        {
+                            const int vi_ttd = (int)vid_i - (int)g_first_vehicle_node_id;
+                            if (full_flag && vi_ttd >= 0 && vi_ttd < total_size &&
+                                g_ttd_first_poison[vi_ttd] >= 0 &&
+                                g_ttd_first_alert[vi_ttd]  <  0)
+                                g_ttd_first_alert[vi_ttd] = Simulator::Now().GetSeconds();
+                        }
+                        cout << "[FUSION-RSU" << rsu_id << "] epoch="
+                             << window_epoch_for_log
+                             << " t=" << std::fixed << std::setprecision(3) << Simulator::Now().GetSeconds()
+                             << " vid=" << vid_i
+                             << " psi="     << psi_i
+                             << " psi_fuse=" << psi_fuse
+                             << " S="       << gat_i
+                             << " thetaS="  << g_theta_s
+                             << " S_over_thetaS_raw=" << (gat_i / (g_theta_s > 1e-9f ? g_theta_s : 1e-9f))
+                             << " S_over_thetaS_clamped=" << fs.gat
+                             << " ae_norm=" << fs.ae_norm
+                             << " ae_raw=" << std::setprecision(5) << ae_err
+                             << " dumped=" << (ae_dumped ? 1 : 0)
+                             << " gt_pois=" << (rw.is_poisoned[i] ? 1 : 0)
+                             << " gt_atk=" << rw.attack_type[i]
+                             << " sig_mask=" << sig_mask_i
+                             << std::setprecision(3)
+                             << " phi="     << fs.phi
+                             << " khat="    << k_hat_i
+                             << " gatflag=" << (k_hat_i >= 0 ? 1 : 0)
+                             << " full_anom=" << (full_flag ? "YES" : "no")
+                             << " (Eq 3.46)" << endl;
+
+                        // ── Paper-aligned Eq 3.57 controller evidence (TASK ①-L) ──
+                        // E_c(t) = (vehicleID, Φ_i(t), epoch, h(X_i(t)), σ_c^sub)
+                        //
+                        // Submitted UNCONDITIONALLY on every fused row (not
+                        // gated on fs.anomalous). CP-DETECT (Eq 3.66–3.68)
+                        // compares the controller's binary verdict against each
+                        // RSU's verdict via the DIRECTIONAL conflict
+                        // (1−flag^ctrl)·flag^rsu — a conflict counts only when
+                        // the controller says benign while an RSU says anomaly
+                        // (controller suppression); the chaincode does its own
+                        // threshold check on the raw Φ value, so submitting Φ
+                        // regardless of anomaly is correct. More importantly,
+                        // gating on fs.anomalous
+                        // would HIDE the malicious-controller attack pattern
+                        // — a compromised controller that lies "clean" on
+                        // genuine anomalies would never submit, and CPDetectCheck
+                        // returns nil when no CSUBM exists, defeating Eq 3.68.
+                        //
+                        // Paper invariant #2 (controller as untrusted peer):
+                        // this is the controller's UNTRUSTED submission. The
+                        // RSU consensus (CallSCTrustSubmitEvidence at line
+                        // ~2394 in handle_readone) remains authoritative.
+                        //
+                        // Epoch derivation: mptd_epoch_from_ts(rw.timestamp[i])
+                        // matches the RSU-side epoch derivation EXACTLY
+                        // (handle_readone uses mptd_epoch_from_ts(ts) where ts
+                        // = beacon arrival time). This guarantees CSUBM_<vid>_<E>
+                        // and SUBM_<vid>_<E>_<rsu> share the same epoch key so
+                        // CPDetectCheck can join them.
+                        //
+                        // h(X_i(t)) derivation: same canonical-blob form as the
+                        // RSU side (vy/ax/ay projected from speed×heading), with
+                        // rsuID omitted from the blob so the CID is content-
+                        // addressable across witnesses. The controller sees the
+                        // same kinematics, so this hash matches its RSU
+                        // counterpart on the same beacon.
+                        //
+                        // σ_c^sub: controller-identity ECDSA P-256 (Eq 3.62),
+                        // produced inside CallSCControllerSubmitEvidence with
+                        // the controller's registered key and verified on submit
+                        // by the chaincode (smartcontract.go).
+                        //
+                        // A5 ablation (no blockchain) and routing_test mode
+                        // both skip — matches the RSU-side guards.
+                        //
+                        // GHOST GUARD (2026-08-05): Sybil ghost identities
+                        // (vid >= GHOST_VID_BASE = 10000, MP-S1) are FABRICATED
+                        // by a compromised RSU and by construction never hold a
+                        // REG_VEH_<nid> record. Submitting controller evidence
+                        // for them makes the chaincode reject the tx
+                        // ("VEH_<id> is not registered"), which is correct
+                        // behaviour on its side but means CPDetectCheck finds no
+                        // CSUBM for that (vid, epoch) and can therefore never
+                        // score the directional conflict (Eq 3.66) — so no
+                        // CFLAG_ record is written and controller trust never
+                        // decays on chain (observed: 466 rejected CSUBM txs,
+                        // all 12 distinct offenders ghosts, ZERO real vehicles;
+                        // CTRL_* TrustScore stuck at 1.0, MeanConflict 0).
+                        // Ghosts are handled by SYB-DETECT (Algorithm 2), not
+                        // by the SC-Trust/CP-DETECT evidence pipeline.
+                        static const uint32_t CSUBM_GHOST_VID_BASE = 10000;
+                        if (!routing_test && ablation_mode != 5 &&
+                            vid_i < CSUBM_GHOST_VID_BASE) {
+                            const double speed_i   = rw.speed[i];
+                            const double heading_i = rw.heading[i];
+                            const double accel_i   = rw.accel[i];
+                            const double vx = speed_i * std::cos(heading_i);
+                            const double vy = speed_i * std::sin(heading_i);
+                            const double ax = accel_i * std::cos(heading_i);
+                            const double ay = accel_i * std::sin(heading_i);
+
+                            std::string ctrl_epoch =
+                                mptd_epoch_from_ts(rw.timestamp[i]);
+                            std::string dedup_key =
+                                std::to_string(vid_i) + "|" + ctrl_epoch;
+                            if (csubm_seen.insert(dedup_key).second) {
+                                std::string h_X = mptd_beacon_hash(
+                                    std::to_string(vid_i),
+                                    "C",  // controller-view tag (RSU side uses rsu_idx;
+                                          // the canonical blob omits this field, so it
+                                          // is for documentary use only and does not
+                                          // affect the CID)
+                                    rw.pos_x[i], rw.pos_y[i], 0.0,
+                                    vx, vy, 0.0,
+                                    ax, ay, 0.0,
+                                    rw.timestamp[i]);
+
+                                // Controller identity = c_assigned(r_j) of the
+                                // RSU that owns this window (paper §3.1 /
+                                // Table 3.2 / Eq 3.64). The paper assigns
+                                // controllers over RSUs, not vehicles, and the
+                                // controller's evidence E_c(t) is its verdict on
+                                // the windows of the RSUs it manages
+                                // (R^obs_ck, Eq 3.60) — so the closing RSU's
+                                // assigned controller submits, NOT a per-vehicle
+                                // index. rsu_controller_ID[] is reassigned on a
+                                // CP-DETECT/EMA controller revocation, so an
+                                // excluded controller's RSUs roll over to a
+                                // trusted successor (no manual failover, p.75).
+                                const uint32_t controllerID = rsu_controller_ID[rsu_id];
+
+                                // E_c(t) = (ID_i, Φ_i(t), t, h(X_i(t)), σ) — Eq 3.62.
+                                // CP-DETECT derives flag^ctrl = 1[Φ_i > Φ_th] from
+                                // THIS submitted value (Eq 3.65) and scores the
+                                // directional conflict (1−flag^ctrl)·flag^rsu
+                                // (Eq 3.66). So a controller that suppresses must
+                                // suppress *here* too, not only on the downlink.
+                                //
+                                // Bug this fixes: the malicious combined-attack
+                                // controller was broadcasting CLEAN_ROUTING to
+                                // vehicles while still submitting its HONEST fusion
+                                // score on-chain (observed: CSUBM_VEH_36_E7 Φ=0.69,
+                                // Φ_th=0.5 ⇒ flag^ctrl=1 ⇒ conflict ≡ 0). It looked
+                                // truthful to the ledger while lying to the network,
+                                // so controller trust never decayed (τ stayed 1.0,
+                                // MeanConflict 0), SC-Trust never hit τ_min for
+                                // T_rev epochs, and no controller revocation /
+                                // RSU reassignment could ever occur — regardless of
+                                // how many suppression events the sim produced.
+                                double phi_submitted = (double)fs.phi;
+                                if (g_combined_attack && fs.anomalous) {
+                                    // Suppression: hide the anomaly the fusion
+                                    // layer actually found (report benign).
+                                    phi_submitted = 0.0;
+                                }
+                                CallSCControllerSubmitEvidence(
+                                    vid_i, controllerID, ctrl_epoch,
+                                    phi_submitted, h_X);
+
+                                // ── Schedule Eq 3.66–3.69 CP-DETECT (TASK ①-M) ──
+                                // CPDetectCheck reads BOTH the just-written
+                                // CSUBM_<vid>_<epoch> AND the per-RSU SUBM_*
+                                // records for the same epoch, then applies the
+                                // DIRECTIONAL conflict (1−flag^ctrl)·flag^rsu to
+                                // each RSU — if ≥ f+1 trusted RSUs flag anomaly
+                                // while the controller said benign (suppression),
+                                // the controller is flagged (CFLAG_ record +
+                                // "CPDetectFlag" event).
+                                //
+                                // Why 0.5 s delay:
+                                //   - CSUBM and SUBM are both written via the
+                                //     fire-and-forget async path; we need their
+                                //     orderer round-trips to complete before
+                                //     CPDetectCheck reads them. 0.5 s is well
+                                //     above the typical ~50-200 ms commit time.
+                                //   - This sits BEFORE the SCTrustFinalizeEpoch
+                                //     +1.0 s schedule (TASK ①-K) because
+                                //     CPDetectCheck is independent of the τ_i(t)
+                                //     EMA update — it just needs raw SUBM/CSUBM.
+                                //
+                                // File-scope dedup g_cpdetect_scheduled:
+                                //   In a 4-RSU sim, the same vehicle is fused
+                                //   by every RSU that hears its beacons; without
+                                //   dedup, CP-DETECT would fire 4× per (vid,
+                                //   epoch). The chaincode side is idempotent on
+                                //   CFLAG_<ctrlID>_<vid>_<epoch> so duplicates
+                                //   are harmless to consistency, but each spawns
+                                //   an orderer round-trip — keep it to one call.
+                                //   Set is process-local; cleared on next run.
+                                //
+                                // BY DESIGN (Eq 3.68, §3.5.5 p.74): when ALL RSUs
+                                // see the vehicle as CLEAN (no SUBM written per
+                                // TASK ①-I gating) the directional conflict is 0
+                                // for every RSU, so a controller flagging an
+                                // anomaly the RSUs missed is NOT penalised — the
+                                // paper treats that as the controller "performing
+                                // superior detection" (full-mode catching what
+                                // lightweight rules miss, invariant 4). CP-DETECT
+                                // targets controller SUPPRESSION (says benign
+                                // while RSUs flag), not over-reporting. The old
+                                // "implicit clean votes count as conflicts when
+                                // the controller says anomaly" behaviour was an
+                                // Eq-3.68 violation and has been removed.
+                                static std::unordered_set<std::string> g_cpdetect_scheduled;
+                                static std::mutex                       g_cpdetect_mu;
+                                std::string cp_key =
+                                    std::to_string(vid_i) + "|" + ctrl_epoch;
+                                bool cp_first;
+                                {
+                                    std::lock_guard<std::mutex> lk(g_cpdetect_mu);
+                                    cp_first = g_cpdetect_scheduled.insert(cp_key).second;
+                                }
+                                if (cp_first) {
+                                    // Commit this (vid, epoch)'s buffered RSU
+                                    // evidence BEFORE the check, or the range
+                                    // scan below sees an empty SUBM_ prefix and
+                                    // scores conflict = 0 (see
+                                    // tier3_flush_for_vid_epoch). Other RSUs'
+                                    // batches are left untouched.
+                                    if (g_tiered_commit) {
+                                        tier3_flush_for_vid_epoch(
+                                            vid_i, ctrl_epoch,
+                                            Simulator::Now().GetSeconds());
+                                    }
+                                    Simulator::Schedule(Seconds(0.5),
+                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch,
+                                        controllerID);
+                                }
+                            }
+                        }
+                    }
+                    // H8: reset the per-window ψ mean accumulators for the vehicles
+                    // just fused so the next window starts fresh.
+                    for (int i = 0; i < N; ++i) {
+                        const uint32_t v = rw.vid[i];
+                        if (v < (uint32_t)total_size) {
+                            last_psi_per_vehicle[v] = 0.0; psi_cnt_per_vehicle[v] = 0;
+                            last_sigmask_per_vehicle[v] = 0;
+                        } else if (v >= 10000u) {
+                            g_ghost_psi_state.erase(v);  // Critical Issue 3 fix — mirror the real-vehicle reset above
+                        }
+                    }
+                    if (fused_count > 0) {
+                        cout << "[FUSION-WIN-RSU" << rsu_id << "] epoch="
+                             << window_epoch_for_log
+                             << " fused=" << fused_count
+                             << " full_anom=" << full_flag_count
+                             << " mean_phi=" << std::fixed << std::setprecision(4)
+                             << (phi_sum / fused_count)
+                             << " max_phi="  << phi_max
+                             << " theta_ae=" << theta_ae
+                             << " (paper §3.5.3 Eq 3.46, Φ_th=0.5)" << endl;
+                    }
+                }
+            }
+
+}
+
 void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id)
 {
+    g_diag_beacon_rx_count++;  // TEMP DIAGNOSTIC (Step 1 follow-up), before any gating
     double now = Simulator::Now().GetSeconds();
 
     // Phase 1C-b — env-gated force-arm of the chaincode-event drainer.
@@ -1433,20 +2951,35 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // of detector quality. The gate restores a valid clean/poisoned ground-truth
     // partition so MCC (Eq. 4.1) is well-defined. CDER (Eq. 4.4) remains the primary
     // metric for MP-S4 since it is fundamentally a control-plane attack.
-    if (attack_number == 7 && controller_malicious_assumption &&
-        GetBooleanWithProbability(attack_percentage, vehicle_id))
+    if ((attack_number == 7 || (g_combined_attack && (vehicle_id % 2 == 0))) &&
+        ctrl_compromised_now() &&
+        GetBooleanWithProbability(attack_percentage, vehicle_id) &&
+        !(g_combined_attack && tag.GetIsPoisoned()))   // combined: even veh → a7, honest beacons only
     {
         double real_spd = tag.GetSpeed();
         double real_hdg = tag.GetHeading();
         double t_mp4    = Simulator::Now().GetSeconds();
-        // Systematic speed elevation: shifts regional distribution ~25-50% above normal.
-        // kl_approx = |fake_spd - mean| / (mean + s_max*0.1); with mean≈15, fake≈22-30 m/s:
-        // (22-15)/18.3 ≈ 0.38 per vehicle — collectively shifts distribution > κ_th=1.5.
-        double shift    = 1.0 + 0.5 * poisoning_intensity_theta
-                              + 0.2 * poisoning_intensity_theta * std::sin(t_mp4 * 0.3);
-        double fake_spd = real_spd * shift;
-        // Slight heading noise to corrupt mobility pattern vectors
-        double fake_hdg = real_hdg + 0.15 * poisoning_intensity_theta * std::sin(t_mp4 * 0.7);
+        double shift, fake_spd, fake_hdg;
+        if (stealthy_control_plane) {
+            // STEALTHY MP-S4: leave the beacon essentially untouched (a +5% step
+            // would trip the implied-acceleration TP-S3 rule). The attack here is
+            // purely control-plane — the malicious controller corrupts its global
+            // model and keeps issuing WRONG_ROUTING. Beacons stay plausible so
+            // Ercan/Sharma/ψ are blind; CP-DETECT catches the controller via the
+            // persistent controller-vs-RSU consensus conflict.
+            shift    = 1.0;
+            fake_spd = real_spd;
+            fake_hdg = real_hdg;
+        } else {
+            // Systematic speed elevation: shifts regional distribution ~25-50% above normal.
+            // kl_approx = |fake_spd - mean| / (mean + s_max*0.1); with mean≈15, fake≈22-30 m/s:
+            // (22-15)/18.3 ≈ 0.38 per vehicle — collectively shifts distribution > κ_th=1.5.
+            shift    = 1.0 + 0.5 * poisoning_intensity_theta
+                           + 0.2 * poisoning_intensity_theta * std::sin(t_mp4 * 0.3);
+            fake_spd = real_spd * shift;
+            // Slight heading noise to corrupt mobility pattern vectors
+            fake_hdg = real_hdg + 0.15 * poisoning_intensity_theta * std::sin(t_mp4 * 0.7);
+        }
         // Soft cap: keep below 2×s_max to remain "plausibly elevated" for global bias
         double sp_ceil = s_max * 2.0;
         fake_spd = (fake_spd > sp_ceil) ? sp_ceil : fake_spd;
@@ -1480,20 +3013,35 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // Paper §3.4.1 (Figure 3.3): SDN controller (management node) intercepts honest
     // vehicle beacons and modifies position + speed before forwarding to other planes.
     // HandleBeaconReceived() runs at the management node → this IS the control plane.
-    if (attack_number == 5 &&
-        controller_malicious_assumption &&
-        GetBooleanWithProbability(attack_percentage, vehicle_id))
+    if ((attack_number == 5 || (g_combined_attack && (vehicle_id % 2 == 1))) &&
+        ctrl_compromised_now() &&
+        GetBooleanWithProbability(attack_percentage, vehicle_id) &&
+        !(g_combined_attack && tag.GetIsPoisoned()))   // combined: odd veh → a5, honest beacons only
     {
         double real_px  = tag.GetPosX();
         double real_py  = tag.GetPosY();
         double real_spd = tag.GetSpeed();
         double t_cp     = Simulator::Now().GetSeconds();
-        // Controller applies sinusoidal position drift + speed perturbation
-        double fake_px  = real_px  + poisoning_intensity_theta * max_position_deviation
-                                   * std::sin(t_cp * 1.1);
-        double fake_py  = real_py  + poisoning_intensity_theta * max_position_deviation
-                                   * std::cos(t_cp * 0.9);
-        double fake_spd = real_spd * (1.0 + poisoning_intensity_theta * std::sin(t_cp * 2.3));
+        double fake_px, fake_py, fake_spd;
+        if (stealthy_control_plane) {
+            // STEALTHY TP-S3: pure control-plane attack — the vehicle→RSU beacon is
+            // left plausible (unchanged) so beacon-level detectors (Ercan/Sharma/ψ)
+            // are blind; the malice lives entirely in the controller's downlink,
+            // which keeps issuing WRONG_ROUTING. Only CP-DETECT's controller-vs-RSU
+            // consensus catches it. (Any per-beacon position/speed edit — even a
+            // slow ramp — trips the RSU's dead-reckoning/acceleration rules, so a
+            // truly stealthy control-plane attack must not touch the beacon.)
+            fake_px  = real_px;
+            fake_py  = real_py;
+            fake_spd = real_spd;
+        } else {
+            // Controller applies sinusoidal position drift + speed perturbation
+            fake_px  = real_px  + poisoning_intensity_theta * max_position_deviation
+                                * std::sin(t_cp * 1.1);
+            fake_py  = real_py  + poisoning_intensity_theta * max_position_deviation
+                                * std::cos(t_cp * 0.9);
+            fake_spd = real_spd * (1.0 + poisoning_intensity_theta * std::sin(t_cp * 2.3));
+        }
         // Clamp to simulation area (kept as ternary for legibility; std::max
         // is now safe after R6.5 renamed the global `max` macro to MPTD_MAX_NEIGHBORS).
         fake_px  = (fake_px  < min_position_x) ? min_position_x : (fake_px  > max_position_x ? max_position_x : fake_px);
@@ -1516,7 +3064,7 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
 
     // ── MP-S2 state-contamination guard (attack 4: stolen-ID beacons) ───────────
     // Problem: stolen beacons carry honest vehicle IDs at the attacker's position.
-    // When pushed into vehicle_state[honest_vid], the attacker's fake position
+    // When pushed into VS(honest_vid), the attacker's fake position
     // becomes the "previous" reference for that vehicle.  The next REAL beacon
     // from honest_vid then sees an impossible jump (fake→real pos) and fires
     // MP-S4 → false positive on an honest beacon.
@@ -1544,14 +3092,32 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     //   jump → false positive.  Save+restore eliminates this contamination.
     // attack 4 (MP-S2) / attack 6 (MP-S3): stolen/intercepted ID uses victim's vehicle_id.
     //   Attacker's fake position stored in victim's vehicle_state → FP on next honest beacon.
-    bool save_state = ((attack_number == 1) || (attack_number == 4) ||
-                       (attack_number == 5) || (attack_number == 6))
+    // COMBINED-MODE FIX (2026-08-05): this guard gated on `attack_number`, the
+    // GLOBAL run config. In combined-attack mode attack_number == 0, so the
+    // condition was ALWAYS FALSE and the guard never ran — meaning stolen-ID
+    // beacons DID contaminate their victim's vehicle_state, and the victim's
+    // next genuine beacon fired MP-S2/MP-S4 as a false positive. This is the
+    // same class of defect as the tag.SetAttackType(attack_number) bug.
+    // Measured symptom at 300 s / rho_a=0.40: MP-S2 fired on 817/5674 honest
+    // beacons at RSU36 (14.4%) and 0.000 at every other RSU — RSU36 being
+    // exactly where the a4 impersonators operate (1709 of its 1780 malicious
+    // beacons are attack 4).
+    // Use the per-beacon attack type in combined mode; single-attack mode keeps
+    // reading attack_number, so those runs stay byte-identical.
+    const int atk_eff = g_combined_attack ? (int)tag.GetAttackType() : attack_number;
+    bool save_state = ((atk_eff == 1) || (atk_eff == 4) ||
+                       (atk_eff == 5) || (atk_eff == 6))
                    && (vehicle_id < (uint32_t)total_size)
                    && tag.GetIsPoisoned()
-                   && !sybil_mitm_nodes[vehicle_id]; // intercepted/stolen ID = honest vehicle
+                   && !sybil_mitm_nodes[vehicle_id]  // intercepted/stolen ID = honest vehicle
+                   // STEALTHY TP-S3: do NOT restore. The small constant offset must
+                   // PERSIST as the baseline so consecutive poisoned beacons are
+                   // self-consistent (no jump) → LW/ψ stays blind (rsu_anomalous=0),
+                   // leaving CP-DETECT's controller-vs-RSU consensus the only catch.
+                   && !(stealthy_control_plane && attack_number == 5);
     VehicleBeaconState vs_backup;
     if (save_state)
-        vs_backup = vehicle_state[vehicle_id];
+        vs_backup = VS(vehicle_id);
 
     // ── TDEE: per-RSU density tracking (Eq. 4.5) ─────────────────────────────────
     // gt_count[rsu_id]++   : ground-truth — this beacon came from RSU j's coverage area
@@ -1650,12 +3216,12 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     //
     // The only case where restoring is paper-justified is stolen-ID contamination
     // (attacks 4/6 with MP-S4 fired): a different attacker beacon uses the victim's
-    // vehicle_id, so the victim's vehicle_state[vid] is polluted by a third-party
+    // vehicle_id, so the victim's VS(vid) is polluted by a third-party
     // position. Restore here keeps per-vehicle state per-identity.
     if (save_state) {
         bool should_restore = (mp_flags & (1u << 3));   // MP-S4 fired: stolen-ID case only
         if (should_restore)
-            vehicle_state[vehicle_id] = vs_backup;
+            VS(vehicle_id) = vs_backup;
     }
 
     // Ground truth: is this beacon poisoned? (For metrics)
@@ -1741,20 +3307,30 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             // and B1 (LTT baseline); TRS/FHE gated by use_pq_crypto (off for A4).
             // Independent of the AI block below — crypto runs even when GAT/AE are
             // disabled (A4/A5), preserving ablation isolation (paper §4.1.1).
+            // if (use_pq_crypto && ablation_mode != 1 && ablation_mode != 6) {
+            //     FullModeCryptoResult cr;
+            //     if (run_full_mode_crypto_pipeline(rsu_id, cw.window_epoch, cr) && cr.ran) {
+            //         cout << "[FULLCRYPTO] epoch=" << cw.window_epoch
+            //              << " rings=" << cr.contributing_rsus
+            //              << " veh=" << cr.total_vehicles
+            //              << " trs=" << (cr.trs_verified ? "VERIFIED" : "REJECTED")
+            //              << " sigma=" << cr.sigma_bytes << "B"
+            //              << " dec=" << (cr.decrypt_ok ? "ok" : "fail")
+            //              << std::fixed << std::setprecision(3)
+            //              << " mean_speed_dec=" << cr.recovered_mean_speed
+            //              << " mean_speed_pt=" << cr.plaintext_mean_speed
+            //              << " " << std::setprecision(2) << cr.elapsed_ms << "ms"
+            //              << " (Alg6/7 Eq 3.45-3.56)" << endl;
+            //     }
+            // }
+
             if (use_pq_crypto && ablation_mode != 1 && ablation_mode != 6) {
                 FullModeCryptoResult cr;
+                // R9: result is async now — real [FULLCRYPTO] line prints later
+                // from handle_cloud_reply_at_rsu() when the Cloud answers.
                 if (run_full_mode_crypto_pipeline(rsu_id, cw.window_epoch, cr) && cr.ran) {
-                    cout << "[FULLCRYPTO] epoch=" << cw.window_epoch
-                         << " rings=" << cr.contributing_rsus
-                         << " veh=" << cr.total_vehicles
-                         << " trs=" << (cr.trs_verified ? "VERIFIED" : "REJECTED")
-                         << " sigma=" << cr.sigma_bytes << "B"
-                         << " dec=" << (cr.decrypt_ok ? "ok" : "fail")
-                         << std::fixed << std::setprecision(3)
-                         << " mean_speed_dec=" << cr.recovered_mean_speed
-                         << " mean_speed_pt=" << cr.plaintext_mean_speed
-                         << " " << std::setprecision(2) << cr.elapsed_ms << "ms"
-                         << " (Alg6/7 Eq 3.45-3.56)" << endl;
+                    cout << "[FULLCRYPTO-SENT] epoch=" << cw.window_epoch
+                         << " → Cloud, awaiting reply" << endl;
                 }
             }
 
@@ -1770,271 +3346,15 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             // LSTM-AE temporal scoring needs a per-vehicle 20-beacon sliding
             // ring buffer that we do NOT yet maintain — R7e adds that ring and
             // wires score_lstm_ae() into the same window-close hook.
-            if (g_ai_engine.ready() && rsu_id < N_RSUs && rsu_last_window_valid[rsu_id]) {
-                const RsuBeaconWindow &rw = rsu_last_window[rsu_id];
-                const int N = (int)rw.beacon_count;
-                if (N > 0) {
-                    // ── 1. GAT spatial scores (one per row of the L-beacon window) ──
-                    std::vector<float> feats5(N * 5);
-                    for (int i = 0; i < N; ++i) {
-                        feats5[i*5 + 0] = (float)rw.pos_x[i];
-                        feats5[i*5 + 1] = (float)rw.pos_y[i];
-                        feats5[i*5 + 2] = (float)rw.speed[i];
-                        feats5[i*5 + 3] = (float)rw.heading[i];
-                        feats5[i*5 + 4] = (float)rw.accel[i];
-                    }
-                    std::vector<float> gat_scores;
-                    bool gat_ok = false;
-                    if (g_ai_engine.has_gat()) {
-                        gat_ok = g_ai_engine.score_gat(
-                            feats5.data(), N, nullptr, gat_scores);
-                    }
-                    if (gat_ok) {
-                        double smin = gat_scores[0], smax = gat_scores[0], smean = 0.0;
-                        for (float s : gat_scores) {
-                            if (s < smin) smin = s;
-                            if (s > smax) smax = s;
-                            smean += s;
-                        }
-                        smean /= (double)gat_scores.size();
-                        cout << "[GAT-SCORE-RSU" << rsu_id << "] epoch="
-                             << cw.window_epoch << " N=" << N
-                             << " min=" << std::fixed << std::setprecision(4) << smin
-                             << " mean=" << smean << " max=" << smax
-                             << " (paper §3.5.3 Eq 3.42)" << endl;
-                    } else if (g_ai_engine.has_gat()) {
-                        // GAT enabled but inference failed — degrade to zeros so
-                        // fusion still runs (ψ + ε will carry the decision).
-                        gat_scores.assign(N, 0.0f);
-                    }
-
-                    // ── 2. Fusion (paper Eq 3.46) per vehicle in window ────────────
-                    // For each beacon row in this RSU's last window:
-                    //   ψ_i    = cached LW-DETECT score from RSU handle_readone
-                    //   S_i    = gat_scores[i] (rolled-up sigmoid output)
-                    //   ε_i    = LSTM-AE recon MSE on the vehicle's 20-beacon ring,
-                    //            normalised by θ_ae inside fuse_scores()
-                    //   Φ_i    = λ₁ψ + λ₂S + λ₃·min(ε/θ_ae,1) ; flag if Φ > 0.5
-                    // R7d's GAT-only log is preserved above; this adds per-vehicle
-                    // fusion lines. ψ_total / Φ_total counters surface in metrics.
-                    const float theta_ae = g_ai_engine.theta_ae();
-                    int        fused_count = 0;
-                    int        full_flag_count = 0;
-                    double     phi_sum = 0.0;
-                    double     phi_max = 0.0;
-
-                    // ── Per-window dedup for Eq 3.57 CSUBM (TASK ①-L) ─────────
-                    // Multiple beacons from the same vehicle in one L-beacon
-                    // window collapse to ONE controller submission per
-                    // (vid, epoch). The chaincode side is idempotent on
-                    // CSUBM_<vid>_<epoch> but every duplicate submit costs an
-                    // async orderer round-trip — keep it cheap. Scope is local
-                    // to this window only; a fresh window starts a new set.
-                    std::unordered_set<std::string> csubm_seen;
-
-                    for (int i = 0; i < N; ++i) {
-                        const uint32_t vid_i = rw.vid[i];
-                        if (vid_i >= (uint32_t)total_size) continue;
-                        const float psi_i = (float)last_psi_per_vehicle[vid_i];
-                        const float gat_i = gat_ok ? gat_scores[i] : 0.0f;
-                        float ae_err = 0.0f;
-                        if (g_ai_engine.has_lstm_ae()) {
-                            float ring_buf[LSTM_RING_SIZE * 5];
-                            if (lstm_ring_dump(vid_i, ring_buf)) {
-                                (void)g_ai_engine.score_lstm_ae(ring_buf, ae_err);
-                            }
-                        }
-                        const FusionScore fs = fuse_scores(
-                            psi_i, gat_i, ae_err, theta_ae);
-                        fused_count++;
-                        if (fs.anomalous) full_flag_count++;
-                        phi_sum += fs.phi;
-                        if (fs.phi > phi_max) phi_max = fs.phi;
-
-                        // ── C1: score the full-mode Fusion verdict (Eq 3.45
-                        // Φ_i > Φ_th) against this beacon's ground-truth poison
-                        // label into the full-mode confusion matrix (Eq 4.1/4.2).
-                        // Gated to full-mode ablations only (A2/A3/A4/A5/Full):
-                        // for A1 (mode 1) and B1 (mode 6) full mode is inactive,
-                        // so the LW confusion matrix at HandleBeaconReceived stays
-                        // authoritative and this matrix is left empty. This is the
-                        // window-close (W = L·T_b) controller-side scoring path —
-                        // invariant #3 (LW skip-on-pass) is untouched.
-                        if (ablation_mode != 1 && ablation_mode != 6) {
-                            update_confusion_matrix_full(
-                                rw.is_poisoned[i], fs.anomalous);
-                        }
-                        cout << "[FUSION-RSU" << rsu_id << "] epoch="
-                             << cw.window_epoch
-                             << " vid=" << vid_i
-                             << " psi="     << std::fixed << std::setprecision(3) << psi_i
-                             << " S="       << gat_i
-                             << " ae_norm=" << fs.ae_norm
-                             << " phi="     << fs.phi
-                             << " full_anom=" << (fs.anomalous ? "YES" : "no")
-                             << " (Eq 3.46)" << endl;
-
-                        // ── Paper-aligned Eq 3.57 controller evidence (TASK ①-L) ──
-                        // E_c(t) = (vehicleID, Φ_i(t), epoch, h(X_i(t)), σ_c^sub)
-                        //
-                        // Submitted UNCONDITIONALLY on every fused row (not
-                        // gated on fs.anomalous). CP-DETECT (Eq 3.66–3.68)
-                        // compares the controller's binary verdict against each
-                        // RSU's verdict via the DIRECTIONAL conflict
-                        // (1−flag^ctrl)·flag^rsu — a conflict counts only when
-                        // the controller says benign while an RSU says anomaly
-                        // (controller suppression); the chaincode does its own
-                        // threshold check on the raw Φ value, so submitting Φ
-                        // regardless of anomaly is correct. More importantly,
-                        // gating on fs.anomalous
-                        // would HIDE the malicious-controller attack pattern
-                        // — a compromised controller that lies "clean" on
-                        // genuine anomalies would never submit, and CPDetectCheck
-                        // returns nil when no CSUBM exists, defeating Eq 3.68.
-                        //
-                        // Paper invariant #2 (controller as untrusted peer):
-                        // this is the controller's UNTRUSTED submission. The
-                        // RSU consensus (CallSCTrustSubmitEvidence at line
-                        // ~2394 in handle_readone) remains authoritative.
-                        //
-                        // Epoch derivation: mptd_epoch_from_ts(rw.timestamp[i])
-                        // matches the RSU-side epoch derivation EXACTLY
-                        // (handle_readone uses mptd_epoch_from_ts(ts) where ts
-                        // = beacon arrival time). This guarantees CSUBM_<vid>_<E>
-                        // and SUBM_<vid>_<E>_<rsu> share the same epoch key so
-                        // CPDetectCheck can join them.
-                        //
-                        // h(X_i(t)) derivation: same canonical-blob form as the
-                        // RSU side (vy/ax/ay projected from speed×heading), with
-                        // rsuID omitted from the blob so the CID is content-
-                        // addressable across witnesses. The controller sees the
-                        // same kinematics, so this hash matches its RSU
-                        // counterpart on the same beacon.
-                        //
-                        // σ_c^sub: controller-identity ECDSA P-256 (Eq 3.62),
-                        // produced inside CallSCControllerSubmitEvidence with
-                        // the controller's registered key and verified on submit
-                        // by the chaincode (smartcontract.go).
-                        //
-                        // A5 ablation (no blockchain) and routing_test mode
-                        // both skip — matches the RSU-side guards.
-                        if (!routing_test && ablation_mode != 5) {
-                            const double speed_i   = rw.speed[i];
-                            const double heading_i = rw.heading[i];
-                            const double accel_i   = rw.accel[i];
-                            const double vx = speed_i * std::cos(heading_i);
-                            const double vy = speed_i * std::sin(heading_i);
-                            const double ax = accel_i * std::cos(heading_i);
-                            const double ay = accel_i * std::sin(heading_i);
-
-                            std::string ctrl_epoch =
-                                mptd_epoch_from_ts(rw.timestamp[i]);
-                            std::string dedup_key =
-                                std::to_string(vid_i) + "|" + ctrl_epoch;
-                            if (csubm_seen.insert(dedup_key).second) {
-                                std::string h_X = mptd_beacon_hash(
-                                    std::to_string(vid_i),
-                                    "C",  // controller-view tag (RSU side uses rsu_idx;
-                                          // the canonical blob omits this field, so it
-                                          // is for documentary use only and does not
-                                          // affect the CID)
-                                    rw.pos_x[i], rw.pos_y[i], 0.0,
-                                    vx, vy, 0.0,
-                                    ax, ay, 0.0,
-                                    rw.timestamp[i]);
-
-                                // Controller identity = c_assigned(r_j) of the
-                                // RSU that owns this window (paper §3.1 /
-                                // Table 3.2 / Eq 3.64). The paper assigns
-                                // controllers over RSUs, not vehicles, and the
-                                // controller's evidence E_c(t) is its verdict on
-                                // the windows of the RSUs it manages
-                                // (R^obs_ck, Eq 3.60) — so the closing RSU's
-                                // assigned controller submits, NOT a per-vehicle
-                                // index. rsu_controller_ID[] is reassigned on a
-                                // CP-DETECT/EMA controller revocation, so an
-                                // excluded controller's RSUs roll over to a
-                                // trusted successor (no manual failover, p.75).
-                                const uint32_t controllerID = rsu_controller_ID[rsu_id];
-
-                                CallSCControllerSubmitEvidence(
-                                    vid_i, controllerID, ctrl_epoch,
-                                    (double)fs.phi, h_X);
-
-                                // ── Schedule Eq 3.66–3.69 CP-DETECT (TASK ①-M) ──
-                                // CPDetectCheck reads BOTH the just-written
-                                // CSUBM_<vid>_<epoch> AND the per-RSU SUBM_*
-                                // records for the same epoch, then applies the
-                                // DIRECTIONAL conflict (1−flag^ctrl)·flag^rsu to
-                                // each RSU — if ≥ f+1 trusted RSUs flag anomaly
-                                // while the controller said benign (suppression),
-                                // the controller is flagged (CFLAG_ record +
-                                // "CPDetectFlag" event).
-                                //
-                                // Why 0.5 s delay:
-                                //   - CSUBM and SUBM are both written via the
-                                //     fire-and-forget async path; we need their
-                                //     orderer round-trips to complete before
-                                //     CPDetectCheck reads them. 0.5 s is well
-                                //     above the typical ~50-200 ms commit time.
-                                //   - This sits BEFORE the SCTrustFinalizeEpoch
-                                //     +1.0 s schedule (TASK ①-K) because
-                                //     CPDetectCheck is independent of the τ_i(t)
-                                //     EMA update — it just needs raw SUBM/CSUBM.
-                                //
-                                // File-scope dedup g_cpdetect_scheduled:
-                                //   In a 4-RSU sim, the same vehicle is fused
-                                //   by every RSU that hears its beacons; without
-                                //   dedup, CP-DETECT would fire 4× per (vid,
-                                //   epoch). The chaincode side is idempotent on
-                                //   CFLAG_<ctrlID>_<vid>_<epoch> so duplicates
-                                //   are harmless to consistency, but each spawns
-                                //   an orderer round-trip — keep it to one call.
-                                //   Set is process-local; cleared on next run.
-                                //
-                                // BY DESIGN (Eq 3.68, §3.5.5 p.74): when ALL RSUs
-                                // see the vehicle as CLEAN (no SUBM written per
-                                // TASK ①-I gating) the directional conflict is 0
-                                // for every RSU, so a controller flagging an
-                                // anomaly the RSUs missed is NOT penalised — the
-                                // paper treats that as the controller "performing
-                                // superior detection" (full-mode catching what
-                                // lightweight rules miss, invariant 4). CP-DETECT
-                                // targets controller SUPPRESSION (says benign
-                                // while RSUs flag), not over-reporting. The old
-                                // "implicit clean votes count as conflicts when
-                                // the controller says anomaly" behaviour was an
-                                // Eq-3.68 violation and has been removed.
-                                static std::unordered_set<std::string> g_cpdetect_scheduled;
-                                static std::mutex                       g_cpdetect_mu;
-                                std::string cp_key =
-                                    std::to_string(vid_i) + "|" + ctrl_epoch;
-                                bool cp_first;
-                                {
-                                    std::lock_guard<std::mutex> lk(g_cpdetect_mu);
-                                    cp_first = g_cpdetect_scheduled.insert(cp_key).second;
-                                }
-                                if (cp_first) {
-                                    Simulator::Schedule(Seconds(0.5),
-                                        &CallCPDetectCheckAsync, vid_i, ctrl_epoch,
-                                        controllerID);
-                                }
-                            }
-                        }
-                    }
-                    if (fused_count > 0) {
-                        cout << "[FUSION-WIN-RSU" << rsu_id << "] epoch="
-                             << cw.window_epoch
-                             << " fused=" << fused_count
-                             << " full_anom=" << full_flag_count
-                             << " mean_phi=" << std::fixed << std::setprecision(4)
-                             << (phi_sum / fused_count)
-                             << " max_phi="  << phi_max
-                             << " theta_ae=" << theta_ae
-                             << " (paper §3.5.3 Eq 3.46, Φ_th=0.5)" << endl;
-                    }
-                }
-            }
+            //
+            // ready() is false when BOTH GAT and LSTM-AE are disabled (neither
+            // ONNX session loaded), which previously skipped this ENTIRE block
+            // — including full-mode confusion-matrix scoring — whenever a run
+            // manually forced both off under ablation_mode outside {1,6} (e.g.
+            // R3 config2/config4: mode=0 + --enable_gat=0 --enable_lstm_ae=0).
+            // fuse_scores() already renormalises to ψ-only in that case, so
+            // gate on enable_rule_signatures too and let it carry the decision.
+            run_gat_fusion_for_rsu(rsu_id, cw.window_epoch);
             // ── End R7d/R7e ─────────────────────────────────────────────────────
 
             cw.beacon_count    = 0;
@@ -2064,8 +3384,29 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // from leaking into the per-beacon PBPO_LW budget (T_b = 100 ms).
 
     // Update confusion matrix + beacon CSV log
+    g_diag_cm_update_count++;  // TEMP DIAGNOSTIC (Block 2)
     update_confusion_matrix(tag.GetIsPoisoned(), detected);
     if (tag.GetIsPoisoned()) parr_poisoned_total++;   // PARR denominator: total poisoned submissions
+
+    // C5 TTD: per-attacker onset/alert timestamps — t_start = first poisoned
+    // beacon, t_alert = first LW detection at/after onset (same semantics as
+    // analytics/compute_ttd.py over beacon_log.csv).
+    {
+        // Local vehicle index: vehicle NodeIDs start at g_first_vehicle_node_id
+        // (after the RSU/controller/mgmt/cloud nodes), NOT at 2. The old hardcoded
+        // `-2` landed the onset/alert timestamps in wrong (often OOB) slots → TTD≈0.
+        int vi = (int)vehicle_id - (int)g_first_vehicle_node_id;
+        if (vi >= 0 && vi < total_size) {
+            double t_now = Simulator::Now().GetSeconds();
+            if (tag.GetIsPoisoned() && g_ttd_first_poison[vi] < 0)
+                g_ttd_first_poison[vi] = t_now;
+            // ALERT side intentionally NOT set here: `detected` is the immediate
+            // per-beacon flag, which (a) fires in this same call with this same
+            // t_now — making alert==onset and TTD==0 — and (b) is ablation-inert.
+            // The alert timestamp is now taken from the FUSION decision (full_flag),
+            // see the C5 TTD block next to update_confusion_matrix_full() above.
+        }
+    }
     log_beacon_to_csv(vehicle_id, rsu_id, tag, detected,
                       tp_flags | (mp_flags << 5), psi);
 
@@ -2120,16 +3461,37 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
     // CDER (Eq.4.4) stays well-defined: exactly one control decision per beacon —
     // R2 fast-path for {2,3,4,6,clean}; controller-here for {1,5,7}.
     if (g_option_b_active && rsu_id < N_RSUs && g_mgmt_downlink_socket &&
-        (attack_number == 1 || attack_number == 5 || attack_number == 7)) {
-        bool malicious_ctrl = (attack_number == 5 || attack_number == 7);
+        (attack_number == 1 || attack_number == 5 || attack_number == 7 || g_combined_attack)) {
+        bool malicious_ctrl = (attack_number == 5 || attack_number == 7 || g_combined_attack)
+                              && ctrl_compromised_now();   // AB9 onset gate
 
         uint8_t  alert_type;
         double   spd_advice;
         uint32_t target_vid;
         bool     bcast;
 
-        if (malicious_ctrl) {
-            // Malicious controller (attacks 5/7): hardcoded WRONG_ROUTING, broadcast.
+        if (malicious_ctrl && g_combined_attack && detected) {
+            // Combined-attack SUPPRESSION variant (new): when the RSU/LW side has
+            // actually caught something (detected=true — from the concurrent
+            // data-plane attacks a1-a4/a6 that also run in combined mode), the
+            // malicious controller here HIDES it (ctrl_says=CLEAN) instead of the
+            // standard over-report. This is the case CPDetectCheck's on-chain
+            // directional rule (Eq 3.59/3.68: flag on ctrl=CLEAN vs rsu=ANOM,
+            // i.e. suppression) is actually designed to catch — the unconditional
+            // WRONG_ROUTING broadcast below only ever produces the OPPOSITE
+            // (over-report) direction, which Eq 3.68 explicitly does NOT
+            // penalize, so TCL_reassign was architecturally unreachable before
+            // this. Gated to g_combined_attack only — standalone attacks 5/7
+            // keep their original unconditional WRONG_ROUTING below unchanged
+            // (their RSU/data plane stays honest per the comment above, so
+            // `detected` is rarely/never true there anyway).
+            alert_type = 0;                                  // CLEAN_ROUTING (suppression)
+            spd_advice = s_max;
+            target_vid = vehicle_id;                         // unicast: mirrors honest path
+            bcast      = false;
+        } else if (malicious_ctrl) {
+            // Malicious controller (attacks 5/7, and combined-mode beacons the RSU
+            // didn't flag): hardcoded WRONG_ROUTING, broadcast.
             alert_type = 2;                                  // WRONG_ROUTING
             spd_advice = detected ? (s_max * 0.5) : s_max;
             target_vid = 0;                                  // 0 = all vehicles (broadcast)
@@ -2184,8 +3546,16 @@ void HandleBeaconReceived(uint32_t vehicle_id, BsmBeaconTag tag, uint32_t rsu_id
             ctrl_decisions_total++;
             bool wrong;
             if (malicious_ctrl) {
-                // Attacks 5/7: malicious controller's WRONG_ROUTING is always wrong.
-                wrong = true;
+                // Attacks 5/7: malicious controller's WRONG_ROUTING is a bad decision.
+                // CP-1 (2026-08-05): but CDER (Eq 4.4) measures UNDETECTED control
+                // error. Once CP-DETECT (Alg 7) has raised flag_c, the system has
+                // identified the compromise, so subsequent bad decisions belong to a
+                // DETECTED compromise interval rather than to undetected error.
+                // Before this, g_flag_c_active was written and never read — CDER could
+                // not distinguish "controller compromised and caught" from "controller
+                // compromised and missed", so it was not measuring detection at all.
+                // Gated so legacy CDER remains reproducible (default off).
+                wrong = g_cder_credit_cp_detect ? !g_flag_c_active : true;
             } else {
                 // Attack 1: honest controller — wrong iff (detected ⊻ is_poisoned)
                 //   FP: detected=true,  is_poisoned=false → ATTACK_DETECTED on clean
@@ -2409,8 +3779,39 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         struct timespec t_lw_start, t_lw_end;
         clock_gettime(CLOCK_MONOTONIC, &t_lw_start);
         bool hmac_gate_pass = true;
-        if (vid < 10000) {  // skip HMAC check for RSU-injected ghost packets
+        // AB2 (C10): HMAC+nonce gate removed — every beacon passes unauthenticated.
+        if (enable_hmac_gate && vid < 10000) {  // skip HMAC check for RSU-injected ghost packets
             int v_idx = lkh_veh_idx(vid);
+            // ── FAIL-CLOSED option (--hmac_fail_closed, default OFF) ──────────
+            // Eq 3.37 has the RSU verify MAC_i(t) before accepting a beacon. The
+            // implementation only verifies when a MAC is PRESENT
+            // (tag.GetHmacSet()), so a beacon carrying no MAC skips the gate and
+            // is accepted unauthenticated. Both identity-forging attacks exploit
+            // this: neither the Sybil path (09:374, attack 4) nor the MitM path
+            // (09:574, attack 6) calls SetHmac. Measured consequence: the gate
+            // fires only 36 times in a 300 s run containing ~90 000 poisoned
+            // beacons.
+            //
+            // Failing closed is the correct reading of Eq 3.37 — a beacon whose
+            // authenticity cannot be verified must not be trusted — and it is
+            // cryptographic, not an artifact: an attacker without the victim's
+            // key cannot produce a valid MAC. Rejected beacons are dropped at
+            // :3689 BEFORE run_lw_detect_per_beacon, so they never reach
+            // push_beacon and cannot contaminate vehicle_state.
+            //
+            // DEFAULT OFF: this materially changes how detectable MP-S2/MP-S3
+            // are (they become crypto-caught rather than ML-caught), which is a
+            // threat-model decision, not ours to make silently.
+            if (g_hmac_fail_closed && v_idx >= 0 && v_idx < LKH_MAX_VEH &&
+                !tag.GetHmacSet()) {
+                hmac_gate_pass = false;
+                g_hmac_missing_rejected++;
+                if (g_hmac_missing_rejected <= 10)
+                    cout << "[HMAC-FAILCLOSED] RSU" << rsu_idx << " vid=" << vid
+                         << " carries NO MAC → unverifiable, beacon rejected"
+                         << " gt_pois=" << (tag.GetIsPoisoned() ? 1 : 0)
+                         << " t=" << t << endl;
+            }
             if (v_idx >= 0 && v_idx < LKH_MAX_VEH && tag.GetHmacSet()) {
                 uint8_t recv_mac[8];
                 tag.GetHmac(recv_mac);
@@ -2426,6 +3827,35 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                          << " V" << (vid - 2)
                          << " HMAC verification FAILED → beacon rejected"
                          << " t=" << t << endl;
+                } else {
+                    // H5: replay protection on AUTHENTIC beacons — a captured
+                    // beacon re-sent within the key epoch carries a valid MAC,
+                    // so two extra gates are needed (paper HMAC spec):
+                    //  (a) freshness: age ≤ Δ_HMAC (timestamp is MAC-covered,
+                    //      so an attacker cannot forge a fresh one);
+                    //  (b) cluster nonce cache: timestamp strictly greater than
+                    //      the last accepted one for this vehicle, shared
+                    //      across all RSUs (catches replays inside Δ_HMAC and
+                    //      cross-RSU replays within the cluster).
+                    const double now_s = Simulator::Now().GetSeconds();
+                    const double t_bcn = tag.GetTimestamp();
+                    if (now_s - t_bcn > delta_hmac || t_bcn - now_s > delta_hmac) {
+                        hmac_gate_pass = false;
+                        cout << "[LKH-HMAC-STALE] RSU" << rsu_idx
+                             << " V" << (vid - 2)
+                             << " beacon age " << (now_s - t_bcn)
+                             << "s exceeds Δ_HMAC=" << delta_hmac
+                             << "s → rejected (replay window)" << endl;
+                    } else if (t_bcn <= g_hmac_last_seen_t[v_idx]) {
+                        hmac_gate_pass = false;
+                        cout << "[LKH-HMAC-REPLAY] RSU" << rsu_idx
+                             << " V" << (vid - 2)
+                             << " t=" << t_bcn << " ≤ last accepted "
+                             << g_hmac_last_seen_t[v_idx]
+                             << " → rejected (cluster nonce cache)" << endl;
+                    } else {
+                        g_hmac_last_seen_t[v_idx] = t_bcn;
+                    }
                 }
             } else if (v_idx >= 0 && !tag.GetHmacSet()) {
                 // No HMAC present — treat as HMAC failure (unauthenticated beacon)
@@ -2534,9 +3964,11 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // ── TP-S1: Compromised RSU modifies trajectory (paper §3.4.1 Figure 3.1) ──
         // compromised_rsu[] already reflects attack_percentage via declare_compromised_rsus().
         // No second per-vehicle gate — ALL vehicles at a compromised RSU are poisoned.
-        if (attack_number == 1 &&
+        if ((attack_number == 1 ||
+             (g_combined_attack && rsu_idx < MAX_RSUS && g_rsu_attack[rsu_idx] == 1)) &&
             rsu_idx < N_RSUs &&
-            compromised_rsu[rsu_idx])
+            compromised_rsu[rsu_idx] &&
+            !(g_combined_attack && tag.GetIsPoisoned()))   // combined: only poison HONEST beacons
         {
             double real_px  = tag.GetPosX();
             double real_py  = tag.GetPosY();
@@ -2605,9 +4037,11 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         //   ghost packets are sent first; the real beacon follows. CSMA FIFO guarantees
         //   ghosts arrive at the controller before the real beacon → count is pre-inflated
         //   when the real beacon arrives → density check fires on the real beacon. ✓
-        if (attack_number == 3 &&
+        if ((attack_number == 3 ||
+             (g_combined_attack && rsu_idx < MAX_RSUS && g_rsu_attack[rsu_idx] == 3)) &&
             rsu_idx < N_RSUs &&
-            compromised_rsu[rsu_idx])
+            compromised_rsu[rsu_idx] &&
+            !(g_combined_attack && tag.GetIsPoisoned()))   // combined: only poison HONEST beacons
         {
             // Step 3: Mark real beacon as poisoned (ground-truth provenance flag)
             tag.SetIsPoisoned(true);
@@ -2622,47 +4056,224 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // the real beacon. Ghost IDs are unique per (RSU, vehicle, ghost-index):
             //   ghost_vid = GHOST_VID_BASE + rsu_idx*100 + vid*10 + gi
             // Placed evenly at ghost_disp (150 m) radius around the real vehicle.
-            static const int    N_ghost        = 4;
+            // AB3: n_coord is now CLI-settable (--n_coord); default 4 preserves
+            // the previous hardcoded behaviour for all existing results.
+            const int           N_ghost        = g_n_coord;
             static const uint32_t GHOST_VID_BASE = 10000;
+
+            // RING-DETECT pre-pass: seed the RSU's observation buffer with all
+            // ring members BEFORE any of them is scored. Without this, ghost gi
+            // only ever sees ghosts 0..gi-1, so the first members never reach
+            // the g_ring_min_members quorum and only the last one is flagged.
+            //
+            // This models RECEPTION, not ground truth: these beacons really are
+            // transmitted and really are received by rsu_idx. The detector still
+            // has to infer the ring from geometry alone.
+            //
+            // Legacy mode only — --sybil_gat_evasive deliberately scatters the
+            // ghosts one per RSU, so there is no ring to find and the geometry
+            // test correctly stays silent.
+            //
+            // NOTE: this mirrors the legacy placement below (angle = gi*2pi/N,
+            // radius ghost_disp, heading/timestamp copied from the victim). If
+            // that placement changes, change it here too.
+            if (g_ring_detect && !g_sybil_gat_evasive) {
+                for (int gi = 0; gi < N_ghost; gi++) {
+                    double a = gi * (2.0 * M_PI / N_ghost);
+                    ring_buf_push(rsu_idx,
+                                  GHOST_VID_BASE + rsu_idx * 100 + vid * 10 + gi,
+                                  real_px + ghost_disp * std::cos(a),
+                                  real_py + ghost_disp * std::sin(a),
+                                  tag.GetHeading(), t);
+                }
+            }
+
             for (int gi = 0; gi < N_ghost; gi++) {
-                double angle    = gi * (2.0 * M_PI / N_ghost); // 0°, 90°, 180°, 270°
-                double ghost_px = real_px + ghost_disp * std::cos(angle);
-                double ghost_py = real_py + ghost_disp * std::sin(angle);
+                double ghost_px, ghost_py, ghost_sp, ghost_hd, ghost_ts;
+                uint32_t ghost_rsu;
                 uint32_t ghost_vid = GHOST_VID_BASE + rsu_idx * 100 + vid * 10 + gi;
 
-                // ── LOCAL ghost registration (R1: LW-DETECT moved to RSU) ──────
-                // The RSU must increment its OWN rsu_id_set[] count BEFORE running
-                // LW-DETECT on the real beacon below, so SYB-DETECT (run_syb_detect,
-                // MP-S1) sees count > density_limit at the RSU side and fires.
-                // The management-side ghost fast-path will also call this when each
-                // ghost packet arrives over CSMA, but register_vehicle_at_rsu()
-                // dedupes on (vehicle_id, window) so there is no double-counting.
-                register_vehicle_at_rsu((int)rsu_idx, ghost_vid, t);
-                if ((int)rsu_idx < total_size)
-                    rsu_id_set[rsu_idx].ghost_seen = true;
+                if (g_sybil_gat_evasive) {
+                    // ── Phase 2: distributed, GAT-evasive relational-outlier Sybil ──
+                    // Scatter ghost gi onto a 250 m grid (matches the RSU grid pitch) so
+                    // each lands in a DISTINCT RSU cell → per-RSU identity density stays
+                    // ≤1, and paper-faithful MP-S1 (count > N_v/N_r) cannot fire. The
+                    // ghost stays within one cell for the window (no cross-RSU impossible
+                    // transit → MP-S4 silent). nearest_rsu_for_position is fwd-declared
+                    // (08:31), avoiding the RSU-position array defined later in this file.
+                    int col = gi % 6, row = gi / 6;
+                    ghost_px  = real_px + 250.0 * (col - 2.5);
+                    ghost_py  = real_py + 250.0 * (row - 1.5);
+                    ghost_rsu = nearest_rsu_for_position(ghost_px, ghost_py);
+                    // Plausible constant kinematics: speed ≤ s_max (no TP-S1/S3), constant
+                    // heading (no TP-S2 rate violation). Heading is set OPPOSITE to the
+                    // intercepted vehicle's so the ghost is a spatial-relational outlier
+                    // vs local heading-aligned flow (the GAT edge predicate) — GAT's
+                    // only remaining tell.
+                    ghost_sp  = std::min(0.5 * s_max, std::max(8.0, tag.GetSpeed()));
+                    ghost_hd  = tag.GetHeading() + M_PI;
+                    // De-sync timing well beyond τ_sync so MP-S2 co-occurrence is silent.
+                    ghost_ts  = t + 0.037 * (gi + 1);
+                    // Density at the ghost's OWN RSU (1 per RSU). No ghost_seen marker:
+                    // a realistic Sybil emits no synthetic-ID tell.
+                    register_vehicle_at_rsu((int)ghost_rsu, ghost_vid, ghost_ts);
+                } else {
+                    // ── Legacy a3: clustered ring at the compromised RSU ──────────
+                    double angle = gi * (2.0 * M_PI / N_ghost);   // 0°, 90°, 180°, 270°
+                    ghost_px  = real_px + ghost_disp * std::cos(angle);
+                    ghost_py  = real_py + ghost_disp * std::sin(angle);
+                    ghost_sp  = tag.GetSpeed();
+                    ghost_hd  = tag.GetHeading();
+                    ghost_ts  = t;
+                    ghost_rsu = rsu_idx;
+                    // LOCAL ghost registration: inflate the compromised RSU's count so
+                    // SYB-DETECT (MP-S1) sees count > density_limit and fires.
+                    register_vehicle_at_rsu((int)rsu_idx, ghost_vid, t);
+                    if ((int)rsu_idx < total_size)
+                        rsu_id_set[rsu_idx].ghost_seen = true;
+                }
 
-                // Build ghost beacon packet
+                // Route the ghost through the RSU's IPFS window so the GAT actually
+                // scores it (Phase 2). Unconditional (sir's Fix 2, Round 3 review):
+                // previously gated behind --sybil_gat_evasive, so legacy mode's
+                // ghosts never appeared in the GAT's input graph at all (Round 3
+                // Gap 3B measured this directly: 0 ghost rows in feats5, S driven
+                // entirely by per-RSU location baseline). Now every ghost, in every
+                // mode, is injected at the application layer into the RSU's received-
+                // beacon window as if from a real transmitter — no ns-3 Node/
+                // MobilityModel/PHY object is created for it (unchanged from before).
+                // force_flush=true: a ghost is a ONE-TIME push, never followed by more
+                // ghost beacons at that same identity — without forcing, its entry
+                // would sit waiting for 9 more REAL beacons at ghost_rsu before ever
+                // flushing into rsu_last_window, which is confirmed to never happen
+                // in time (0/6154 ghost vids reached FUSION-RSU scoring across two
+                // full test runs before this fix).
+                {
+                    // ── GHOST GRAPH BATCHING (--ghost_batch, default OFF) ──
+                    // Flushing each ghost immediately scores it ALONE. Measured:
+                    // 74.8% of ghost windows hold exactly 1 beacon, 98.3% hold
+                    // <=2, versus 100% of normal windows holding 10 — matching
+                    // the GAT input distribution (N=1 in 53% of calls, N=2 in
+                    // 16%). A Graph Attention Network with one node has no
+                    // neighbours to attend over, so the ring of N_ghost
+                    // identities at ~135 m offset with correlated headings —
+                    // the very pattern MP-S1 detection depends on — is
+                    // dismantled before the model sees it.
+                    //
+                    // Batching accumulates all ghosts of one interception and
+                    // flushes once, giving an N_ghost-node graph in which the
+                    // ring is visible. In legacy mode every ghost shares
+                    // ghost_rsu = rsu_idx so this is well-defined; in evasive
+                    // mode ghosts are deliberately scattered one-per-RSU, so
+                    // each must still flush individually or it would never
+                    // score at all.
+                    const bool ghost_last  = (gi == N_ghost - 1);
+                    const bool ghost_flush = (g_ghost_batch && !g_sybil_gat_evasive)
+                                             ? ghost_last : true;
+                    // RING-DETECT: the ghost is flagged only if the geometry test
+                    // finds it ON a consistent-radius ring (never at its centre).
+                    const bool ghost_ring_hit =
+                        ring_detect_beacon(ghost_rsu, ghost_vid,
+                                           ghost_px, ghost_py, ghost_hd, ghost_ts);
+
+                    // Ghosts never pass through the rule tier — the
+                    // handle_readone branch that would populate g_ghost_psi_state
+                    // is UNREACHABLE for them (measured: psi==0 for 100% of ghost
+                    // rows). So publish the hit directly into the ghost psi map,
+                    // which IS what the fusion reads for vid >= GHOST_VID_BASE
+                    // (:2188, :2269). Passing it as ipfs anomalous_flag instead
+                    // does nothing — that field has no readers anywhere.
+                    if (ghost_ring_hit) {
+                        GhostPsiState &gsr = g_ghost_psi_state[ghost_vid];
+                        gsr.psi_sum += SIG_WEIGHTS[5];      // MP-S1 weight 0.15
+                        gsr.psi_cnt++;
+                        gsr.sig_mask |= (1u << 5);          // MP-S1 bit
+                    }
+
+                    ipfs_push_and_maybe_flush(ghost_rsu, ghost_vid,
+                                              ghost_px, ghost_py, ghost_sp,
+                                              ghost_hd, 0.0, ghost_ts,
+                                              /*anomalous_flag=*/ghost_ring_hit,
+                                              /*is_poisoned_flag=*/true,
+                                              /*force_flush=*/ghost_flush,
+                                              /*attack_type_flag=*/3);
+
+                    // ── GHOST AE (--ghost_ae, default OFF) ──────────────────
+                    // Feed the ghost's kinematics into the LSTM-AE ring HERE,
+                    // at the point ghosts actually enter the pipeline.
+                    //
+                    // A first attempt placed this in the handle_readone ghost
+                    // branch, which is DEAD CODE for ghosts: they are injected
+                    // directly into the RSU window above and never arrive as
+                    // received beacons. Measured proof — ghost rows carried
+                    // psi == 0 AND ae_norm == 0 for 100% of 4123 rows, i.e.
+                    // that branch never ran at all.
+                    //
+                    // Ghosts previously received no AE scoring, leaving the GAT
+                    // as their only scorer; MP-S1 ghosts are 75.2% of all false
+                    // negatives. FPR-safe by construction: no honest beacon
+                    // carries vid >= 10000, so this cannot create an FP. Only D6
+                    // has the AE, so only D6 gains — this widens the D6/D4
+                    // margin rather than compressing the ablation.
+                    if (g_ghost_ae) {
+                        lstm_ring_push_resid(ghost_vid,
+                                             (float)ghost_px, (float)ghost_py,
+                                             (float)ghost_sp, (float)ghost_hd,
+                                             0.0f, 1.0f);
+                    }
+                    // Bug #2 fix (Block 3): the force-flush above only populates
+                    // rsu_last_window[ghost_rsu] — GAT/fusion scoring normally
+                    // only runs reactively inside HandleBeaconReceived() when a
+                    // REAL beacon next arrives at that SAME rsu_id. Evasive mode
+                    // deliberately scatters ghosts onto distinct, spread-out RSU
+                    // cells specifically to evade density detection, so that real
+                    // beacon may never arrive in time (or at all); legacy mode's
+                    // clustered ring has the same gap for the last window before
+                    // sim end. Call the extracted scoring function directly so the
+                    // ghost's window gets scored immediately either way.
+                    if (ghost_rsu < N_RSUs)
+                        run_gat_fusion_for_rsu(ghost_rsu, rsu_last_window[ghost_rsu].window_epoch);
+                }
+
+                // Build ghost beacon packet → controller
                 Ptr<Packet> ghost_pkt = Create<Packet>(0);
                 BsmBeaconTag ghost_tag;
                 ghost_tag.SetVehicleId(ghost_vid);
                 ghost_tag.SetPosition(ghost_px, ghost_py);
-                ghost_tag.SetSpeed(tag.GetSpeed());
-                ghost_tag.SetHeading(tag.GetHeading());
+                ghost_tag.SetSpeed(ghost_sp);
+                ghost_tag.SetHeading(ghost_hd);
                 ghost_tag.SetAcceleration(0.0);
-                ghost_tag.SetTimestamp(t);
+                ghost_tag.SetTimestamp(ghost_ts);
                 ghost_tag.SetIsPoisoned(true);
                 ghost_tag.SetAttackType(3);
-                ghost_tag.SetRsuId(rsu_idx);
+                ghost_tag.SetRsuId(ghost_rsu);
+
+                // Fix 1 (sir's review, 2026-08-04): ghost beacons were never
+                // written to beacon_log.csv — the only path that logs beacons
+                // is log_beacon_to_csv(), called exclusively from the real-
+                // vehicle receive path (line ~3077). This meant the GAT
+                // training corpus (train.py::build_gat_dataset reads exactly
+                // this file) could structurally never contain a single ghost
+                // feature vector, regardless of which runs were used to build
+                // it. detected/sig_mask/psi are passed as their known-by-
+                // construction values (ghosts have no trust history or prior
+                // beacon to compare against, so psi=0/sig_mask=0 always,
+                // matching the D6 log's own psi=0.000/sig_mask=0 for ghosts;
+                // "detected" is not read by build_gat_dataset at all, only
+                // is_poisoned/attack_number are, so its value here is inert).
+                log_beacon_to_csv(ghost_vid, ghost_rsu, ghost_tag,
+                                  /*detected=*/false, /*sig_mask=*/0u, /*psi=*/0.0);
+
                 ghost_pkt->AddPacketTag(ghost_tag);
 
-                // Send ghost packet to controller — queued BEFORE the real beacon
                 if (m_relay_socket) {
                     m_relay_socket->SendTo(ghost_pkt, 0,
                         InetSocketAddress(g_management_csma_ip, 7777));
-                    cout << "[MP-S1-GHOST-TX] RSU" << rsu_idx
+                    cout << "[MP-S1-GHOST-TX] RSU" << ghost_rsu
                          << " ghost_id=" << ghost_vid
                          << " pos(" << std::fixed << std::setprecision(2)
                          << ghost_px << "," << ghost_py << ")"
+                         << " [→GAT]"
                          << " → MGT (Fig3.4 Step5/6)" << endl;
                 }
             }
@@ -2703,20 +4314,64 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
 
         // Save/restore guard for stolen-ID contamination (attacks 4/6 cached path
         // case): the RSU's push of the poisoned/intercepted beacon would otherwise
-        // pollute vehicle_state[vid] as the baseline for the NEXT honest beacon.
+        // pollute VS(vid) as the baseline for the NEXT honest beacon.
         // Restore happens only if MP-S4 (impossible velocity) fires — matching the
         // paper-justified case in §3.5.3.
-        bool save_state_rsu = ((attack_number == 1) || (attack_number == 4) ||
-                               (attack_number == 5) || (attack_number == 6))
+        // COMBINED-MODE FIX #2 (2026-08-05, DQ-STATE1): identical dead-code bug to
+        // the one at ~:2801, but on the RSU side — and THIS is the copy that
+        // matters. `attack_number` is 0 in combined mode, so save_state_rsu was
+        // ALWAYS FALSE and the attacker's forged beacon (which carries the
+        // VICTIM's vehicle_id) permanently overwrote VS(victim_id).
+        // The victim's own genuine beacon then differenced against the attacker's
+        // position -> impossible jump -> TP-S1/S4/S5 fire on an honest vehicle.
+        // Measured consequence: 69.7% of all 300s false positives land on a4
+        // impersonation victims; vid 98 had FPR = 1.0000 (all 622 beacons).
+        // The earlier fix at :2801 had zero measurable effect precisely because it
+        // patched the controller-side copy, which never feeds the scoring window.
+        const int atk_eff_rsu = g_combined_attack ? (int)tag.GetAttackType() : attack_number;
+        bool save_state_rsu = ((atk_eff_rsu == 1) || (atk_eff_rsu == 4) ||
+                               (atk_eff_rsu == 5) || (atk_eff_rsu == 6))
                            && (vid < (uint32_t)total_size)
                            && tag.GetIsPoisoned()
                            && !sybil_mitm_nodes[vid];
         VehicleBeaconState vs_backup_rsu;
-        if (save_state_rsu) vs_backup_rsu = vehicle_state[vid];
+        if (save_state_rsu) vs_backup_rsu = VS(vid);
+
+        // ── FIX 1: does the physical transmitter own the claimed vehicle ID? ──
+        // `from` is the sender address of THIS beacon; g_vehicle_owner_ip[] is
+        // the registry-derived owner captured at startup (12_main.h). A mismatch
+        // means an impersonation, and the beacon must not be written into the
+        // victim's history. Ghost IDs (vid >= 10000) are already excluded from
+        // vehicle_state by push_beacon's bounds check, and are injected locally
+        // with no physical node, so they are exempted here rather than counted
+        // as identity failures.
+        // The beacon's vehicle_id IS the transmitter's NS-3 node ID
+        // (09_vehicle_beacon_tx.h:249), so g_vehicle_owner_ip is indexed by vid
+        // directly — no offset arithmetic, which is what broke the first attempt.
+        bool identity_ok = true;
+        if (g_identity_binding && vid < (uint32_t)(total_size + 2) && g_vehicle_owner_ip_known[vid]) {
+            Ipv4Address src = InetSocketAddress::ConvertFrom(from).GetIpv4();
+            identity_ok = (src == g_vehicle_owner_ip[vid]);
+            g_idbind_checked++;
+            if (!identity_ok) {
+                g_idbind_rejected++;
+                // Ground-truth label of the REJECTED beacon — the decisive
+                // validation of the check. Rejecting an is_poisoned=1 beacon is a
+                // correct block of an impersonation; rejecting an honest one is a
+                // FALSE rejection and would mean the check harms genuine vehicles.
+                if (tag.GetIsPoisoned()) g_idbind_rej_poisoned++;
+                else                     g_idbind_rej_honest++;
+                if (g_idbind_rejected <= 20)
+                    cout << "[FIX1-REJECT] vid=" << vid << " claimed by " << src
+                         << " but owner is " << g_vehicle_owner_ip[vid]
+                         << " gt_pois=" << (tag.GetIsPoisoned() ? 1 : 0)
+                         << " t=" << t << " (vehicle_state write skipped)" << endl;
+            }
+        }
 
         struct timespec t_det_start, t_det_end;
         clock_gettime(CLOCK_MONOTONIC, &t_det_start);
-        LwDetectResult rsu_lw = run_lw_detect_per_beacon(vid, tag, rsu_idx);
+        LwDetectResult rsu_lw = run_lw_detect_per_beacon(vid, tag, rsu_idx, identity_ok);
         clock_gettime(CLOCK_MONOTONIC, &t_det_end);
         pbpo_lw_time_sum_ms += (t_det_end.tv_sec  - t_det_start.tv_sec)  * 1000.0
                              + (t_det_end.tv_nsec - t_det_start.tv_nsec) / 1e6;
@@ -2728,7 +4383,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // MP-S4 fired on the RSU push — restore pre-push state to prevent
             // future detection on the same vid from comparing against the
             // poisoned/intercepted baseline.
-            vehicle_state[vid] = vs_backup_rsu;
+            VS(vid) = vs_backup_rsu;
         }
 
         // Stamp cached LW-DETECT result onto the tag for the controller to consume
@@ -2776,7 +4431,9 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                                       tag.GetSpeed(), tag.GetHeading(),
                                       tag.GetAcceleration(), t,
                                       rsu_lw.anomalous,
-                                      tag.GetIsPoisoned());
+                                      tag.GetIsPoisoned(),
+                                      /*force_flush=*/false,
+                                      (int)tag.GetAttackType());
         }
 
         // ── R7e: Cache ψ + push to per-vehicle LSTM-AE ring buffer ────────────
@@ -2787,11 +4444,51 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
         // exactly what the LW-DETECT authority saw — no double-counting of
         // attacker-flipped values from a different code path.
         if (vid < (uint32_t)total_size) {
-            last_psi_per_vehicle[vid] = rsu_lw.psi;
-            lstm_ring_push(vid,
-                           (float)tag.GetPosX(), (float)tag.GetPosY(),
-                           (float)tag.GetSpeed(), (float)tag.GetHeading(),
-                           (float)tag.GetAcceleration());
+            // H8: accumulate ψ per vehicle within the window for a per-window MEAN
+            // (paper Eq 3.59 aggregates ψ by mean). Mean captures sustained
+            // poisoning (recall) without amplifying a single spurious honest-beacon
+            // ψ into a whole-window false positive (as max-ψ did). Reset per window.
+            last_psi_per_vehicle[vid] += rsu_lw.psi;
+            psi_cnt_per_vehicle[vid]++;
+            // Richer-feature: keep the most-recent sig_mask (which LW rule-checks
+            // fired = the ψ sub-scores) for this vehicle; the multi-task GAT uses
+            // its 9 bits to identify the attack TYPE (k̂) for λ-routing. Per-beacon
+            // (not OR-accumulated) to match the per-tick training snapshot. This is
+            // byte-identical to the beacon_log.csv sig_mask column the GAT trained
+            // on: tp_flags(bits0-4) | mp_flags<<5(bits5-8); CP bits excluded.
+            last_sigmask_per_vehicle[vid] = rsu_lw.tp_flags | (rsu_lw.mp_flags << 5);
+            // 6th AE feature = tau_i. The trained scaler has tau mean=1.0
+            // scale=1.0, and the AE was trained on clean data where tau≡1.0
+            // (scaled→0.0). Feed the default trusted value to stay on-manifold
+            // and consistent with the GAT path (which uses TAU_DEFAULT=1.0).
+            // AB4 fix: push DEAD-RECKONING RESIDUAL channels, not absolute
+            // position — the retrained urban AE consumes (res_x, res_y, dspeed,
+            // dheading, accel, tau). See lstm_ring_push_resid() in
+            // 04_state_globals.h for why. Raw kinematics are passed in; the
+            // helper differences them against this vehicle's previous beacon.
+            lstm_ring_push_resid(vid,
+                                 (float)tag.GetPosX(), (float)tag.GetPosY(),
+                                 (float)tag.GetSpeed(), (float)tag.GetHeading(),
+                                 (float)tag.GetAcceleration(), 1.0f);
+        } else if (vid >= 10000u) {
+            // Ghost path (fix for Critical Issue 3 ranking-inversion): same
+            // psi/sig_mask accumulation as the real-vehicle branch above, keyed
+            // by vid in a map instead of a fixed array — see GhostPsiState in
+            // 04_state_globals.h for why this exists. LSTM-AE temporal scoring
+            // (lstm_ring_push_resid) is intentionally NOT extended to ghosts
+            // here — that's a fixed total_size-indexed array too, and ghost
+            // temporal scoring is a separate concern from this fix.
+            GhostPsiState &gs = g_ghost_psi_state[vid];
+            gs.psi_sum += rsu_lw.psi;
+            gs.psi_cnt++;
+            gs.sig_mask = rsu_lw.tp_flags | (rsu_lw.mp_flags << 5);
+
+            // NOTE: this branch is UNREACHABLE for ghosts. Ghosts never arrive
+            // as received beacons — they are injected directly into the RSU
+            // window at the MP-S1 generation site (~:3959). Measured: ghost rows
+            // carry psi == 0 and ae_norm == 0 for 100% of rows, i.e. neither the
+            // GhostPsiState accumulation above nor anything else here executes.
+            // The ghost AE feed therefore lives at the injection site, not here.
         }
 
         // ── R4.a: SC-Trust + SC-Revoke at RSU (paper invariant #1, §3.5.5) ────
@@ -2866,7 +4563,12 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // (vehId‖rsuId‖reason‖ts) and verified on submit by the
                     // chaincode, so a forged identity cannot pad the 2f+1 tally.
                     bool revoked = false;
-                    if (!routing_test && ablation_mode != 5) {
+                    if (!enable_sc_revoke) {
+                        // R3 config5 ablation: revocation mechanism entirely
+                        // disabled — vehicles are never revoked regardless of
+                        // behaviour (no vote cast, no local fallback either).
+                        revoked = false;
+                    } else if (!routing_test && ablation_mode != 5) {
                         std::string vote_payload = CallSCRevokeVote(
                             vid, rsu_idx, "lw_anomaly_flag", ts);
                         // Payload shape: {"voted":true,"votes":N,"threshold":T,"revoked":bool}
@@ -2911,7 +4613,7 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
             // Algorithm 1 line 5-6 says "if ψ_i(t) > ψ_th" → gated on rsu_lw.anomalous
             // (NOT rsu_lw.detected which also folds in the CP-DETECT oracle).
             // A5 ablation skips SC-Trust for the blockchain-isolation comparison (RQ6).
-            if (!routing_test && ablation_mode != 5 && rsu_lw.anomalous) {
+            if (!routing_test && ablation_mode != 5 && enable_sc_trust && rsu_lw.anomalous) {
                 double ts = Simulator::Now().GetSeconds();
 
                 // ── Paper-aligned Eq 3.56 RSU evidence tuple (TASK ①-I) ──────
@@ -2966,8 +4668,14 @@ void SimpleUdpApplication::handle_readone(Ptr<Socket> socket)
                     // preserving threshold-ring σ_TRS (Eq 3.48) is a separate
                     // construct over the FHE cloud aggregate, not this per-RSU
                     // evidence auth — it stays in the 06b1 cloud pipeline.
-                    CallSCTrustSubmitEvidence(
-                        vid, rsu_idx, epoch, rsu_lw.psi, h_b);
+                    // Tier-3: batch anomaly evidence (paper §3.5.5) instead of a
+                    // per-beacon synchronous submit. Tier-1 revocation and the
+                    // per-epoch finalizes below remain on their own cadence.
+                    if (g_tiered_commit)
+                        tier3_commit_evidence(vid, rsu_idx, epoch, rsu_lw.psi, h_b, ts);
+                    else
+                        CallSCTrustSubmitEvidence(
+                            vid, rsu_idx, epoch, rsu_lw.psi, h_b);
 
                     // ── Schedule Eq 3.55 finalization 1 s after submission ──
                     // SCTrustFinalizeEpoch aggregates all RSU witnesses of
@@ -3172,6 +4880,43 @@ static uint32_t nearest_rsu_for_position(double px, double py)
         if (d2 < min_d2) { min_d2 = d2; nearest = (uint32_t)r; }
     }
     return nearest;
+}
+
+// H7: scenario-derived plausibility envelope for FHE aggregates (fwd-declared
+// above run_full_mode_crypto_pipeline). Bounds:
+//   speed ∈ [0, 1.1·max(s_max, maxspeed/3.6)] — scenario speed limit + 10 %
+//     headroom (SUMO traces respect the limit; s_max covers hardcoded runs);
+//   position within the ACTUAL RSU deployment box ± 2·R_max — every genuine
+//     vehicle lives inside RSU coverage in both hardcoded and SUMO scenarios;
+//   count ∈ [1, count_max] (≤ L beacons per contributing window).
+static bool fhe_aggregate_envelope_ok(double mean_speed, double mean_x,
+                                      double mean_y, int64_t count,
+                                      int64_t count_max, const char *stage)
+{
+    const int active = (N_RSUs > 0 && N_RSUs <= MAX_RSUS) ? (int)N_RSUs : MAX_RSUS;
+    double xmin = g_rsu_actual_pos_x[0], xmax = xmin;
+    double ymin = g_rsu_actual_pos_y[0], ymax = ymin;
+    for (int r = 1; r < active; r++) {
+        xmin = std::min(xmin, g_rsu_actual_pos_x[r]);
+        xmax = std::max(xmax, g_rsu_actual_pos_x[r]);
+        ymin = std::min(ymin, g_rsu_actual_pos_y[r]);
+        ymax = std::max(ymax, g_rsu_actual_pos_y[r]);
+    }
+    const double margin = 2.0 * R_max_comm;
+    const double v_env  = 1.1 * std::max(s_max, (double)maxspeed / 3.6);
+    const bool ok = count >= 1 && count <= count_max
+                 && mean_speed >= 0.0 && mean_speed <= v_env
+                 && mean_x >= xmin - margin && mean_x <= xmax + margin
+                 && mean_y >= ymin - margin && mean_y <= ymax + margin;
+    if (!ok) {
+        cout << "[FHE-ENVELOPE] " << stage << " reject:"
+             << " speed=" << mean_speed << " (max " << v_env << ")"
+             << " pos=(" << mean_x << "," << mean_y << ")"
+             << " box=[" << (xmin - margin) << "," << (xmax + margin) << "]x["
+             << (ymin - margin) << "," << (ymax + margin) << "]"
+             << " count=" << count << "/" << count_max << endl;
+    }
+    return ok;
 }
 
 // ── Link-Lifetime RSU Selection (§RSU-LL) ────────────────────────────────────

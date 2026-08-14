@@ -234,8 +234,12 @@ inline std::string default_sumo_trace_path(int scenario, int speed_kmh)
                      : (scenario == 2) ? "autobahn"
                                        : nullptr;
     if (!tag) return "";
+    // AB5/E2: uniform-speed companion traces are tagged "<tag>_uniform" so they
+    // coexist with the realistic ones and never overwrite them.
+    std::string tag_s(tag);
+    if (g_uniform_speed_trace) tag_s += "_uniform";
     std::ostringstream oss;
-    oss << root << "mobility_" << tag << "_" << speed_kmh << ".tcl";
+    oss << root << "mobility_" << tag_s << "_" << speed_kmh << ".tcl";
 
     struct stat st;
     if (stat(oss.str().c_str(), &st) != 0) return "";  // file not present

@@ -1,0 +1,140 @@
+--- GetAllControllerFlags: 42 ---
+[
+ {
+  "ID": "CFLAG_CTRL_0_VEH_129_E7",
+  "ControllerID": "CTRL_0",
+  "VehicleID": "VEH_129",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-06T11:36:25Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_1_VEH_108_E7",
+  "ControllerID": "CTRL_1",
+  "VehicleID": "VEH_108",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-06T11:36:25Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_1_VEH_38_E7",
+  "ControllerID": "CTRL_1",
+  "VehicleID": "VEH_38",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-06T11:36:22Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_2_VEH_191_E7",
+  "ControllerID": "CTRL_2",
+  "VehicleID": "VEH_191",
+  "Epoch": "E7",
+  "ConflictCount": 2,
+  "NumRSUs": 2,
+  "ImplicitCleanVotes": 2,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-06T11:36:26Z"
+ },
+ {
+  "ID": "CFLAG_CTRL_2_VEH_23_E7",
+  "ControllerID": "CTRL_2",
+  "VehicleID": "VEH_23",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "NumRSUs": 1,
+  "ImplicitCleanVotes": 3,
+  "ThresholdFP1": 1,
+  "FlaggedAt": "2026-08-06T11:36:29Z"
+ },
+ {
+  "ID": "CFLAG
+--- GetControllerReassignments: 3 ---
+[
+ {
+  "ID": "CTRLREASSIGN_CTRL_0_E7",
+  "ExcludedController": "CTRL_0",
+  "SuccessorController": "CTRL_2",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "ThresholdFP1": 1,
+  "At": "2026-08-06T11:36:25Z"
+ },
+ {
+  "ID": "CTRLREASSIGN_CTRL_1_E7",
+  "ExcludedController": "CTRL_1",
+  "SuccessorController": "CTRL_0",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E7",
+  "ConflictCount": 1,
+  "ThresholdFP1": 1,
+  "At": "2026-08-06T11:36:22Z"
+ },
+ {
+  "ID": "CTRLREASSIGN_CTRL_2_E7",
+  "ExcludedController": "CTRL_2",
+  "SuccessorController": "CTRL_3",
+  "Reason": "cp_detect_conflict",
+  "Epoch": "E7",
+  "ConflictCount": 2,
+  "ThresholdFP1": 1,
+  "At": "2026-08-06T11:36:26Z"
+ }
+]
+--- GetAllControllerTrustScores: 4 ---
+[
+ {
+  "ID": "CTRUST_CTRL_0",
+  "ControllerID": "CTRL_0",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-06T11:30:48Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_1",
+  "ControllerID": "CTRL_1",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-06T11:30:50Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_2",
+  "ControllerID": "CTRL_2",
+  "TrustScore": 1,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 0,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "",
+  "UpdateCount": 0,
+  "UpdatedAt": "2026-08-06T11:30:52Z"
+ },
+ {
+  "ID": "CTRUST_CTRL_3",
+  "ControllerID": "CTRL_3",
+  "TrustScore": 0.9999999999801564,
+  "MeanConflict": 0,
+  "NumRSUsLastEpoch": 34,
+  "ConsecutiveLowEpochs": 0,
+  "LastEpochTimestamp": "E26",
+  "UpdateCount": 20,
+  "UpdatedAt": "2026-08-06T11:53:20Z"
+ }
+]
+--- GetActiveController --- CTRL_3
