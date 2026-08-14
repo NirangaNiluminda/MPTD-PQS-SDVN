@@ -151,6 +151,16 @@ mobility/mobility_rural3k_*.tcl
 # Python bytecode (any depth)
 __pycache__/
 
+# ── Demo UI (demo_ui/) — regeneratable build/dependency output ────────────────
+demo_ui/.venv/
+demo_ui/frontend/node_modules/
+demo_ui/frontend/dist/
+demo_ui/frontend/*.tsbuildinfo
+# `tsc -b` on tsconfig.node.json emits these next to vite.config.ts — the
+# .ts source is what's committed, not its compiled output.
+demo_ui/frontend/vite.config.js
+demo_ui/frontend/vite.config.d.ts
+
 # ── ns-3 RLC/PHY trace dumps (regenerated whenever the binary is run from the
 #    repo root instead of $NS3; not source, not results — DlRsrpSinrStats.txt
 #    alone has reached 440MB and blocked a GitHub push once already) ───────────
