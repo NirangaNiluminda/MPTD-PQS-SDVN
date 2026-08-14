@@ -325,38 +325,85 @@ func (s *SmartContract) InitLedger(ctx contractapi.TransactionContextInterface) 
 // re-seeds config + RSU/vehicle/controller registrations at the start of every
 // run (CallSCInitNetworkConfig + register_all_nodes), so wiping every namespace
 // is safe. Returns the number of keys deleted.
-func (s *SmartContract) ResetLedger(ctx contractapi.TransactionContextInterface) (int, error) {
-	prefixes := []string{
-		"REG_", "SCTRUST_", "RSUTRUST_", "CTRUST_",
-		"SCREVOKE_", "SUBM_", "CSUBM_", "CFLAG_",
-		"CTRLREASSIGN_", "CTRL_", "VOTE_", "NETCFG",
+// resetLedgerPrefixes is the canonical prefix list -- single source of truth
+// shared by ResetLedger (legacy, whole-ledger) and ResetLedgerPrefix (one
+// prefix per call, see below).
+var resetLedgerPrefixes = []string{
+	"REG_", "SCTRUST_", "RSUTRUST_", "CTRUST_",
+	"SCREVOKE_", "SUBM_", "CSUBM_", "CFLAG_",
+	"CTRLREASSIGN_", "CTRL_", "VOTE_", "NETCFG",
+}
+
+func resetLedgerOnePrefix(ctx contractapi.TransactionContextInterface, p string) (int, error) {
+	iter, err := ctx.GetStub().GetStateByRange(p, p+"~")
+	if err != nil {
+		return 0, fmt.Errorf("ResetLedger: range %s: %w", p, err)
 	}
-	deleted := 0
-	for _, p := range prefixes {
-		iter, err := ctx.GetStub().GetStateByRange(p, p+"~")
+	// Collect keys first; deleting while the range iterator is open is not
+	// guaranteed safe across state DBs.
+	var keys []string
+	for iter.HasNext() {
+		kv, err := iter.Next()
 		if err != nil {
-			return deleted, fmt.Errorf("ResetLedger: range %s: %w", p, err)
+			iter.Close()
+			return 0, fmt.Errorf("ResetLedger: iter %s: %w", p, err)
 		}
-		// Collect keys first; deleting while the range iterator is open is not
-		// guaranteed safe across state DBs.
-		var keys []string
-		for iter.HasNext() {
-			kv, err := iter.Next()
-			if err != nil {
-				iter.Close()
-				return deleted, fmt.Errorf("ResetLedger: iter %s: %w", p, err)
-			}
-			keys = append(keys, kv.Key)
+		keys = append(keys, kv.Key)
+	}
+	iter.Close()
+	deleted := 0
+	for _, k := range keys {
+		if err := ctx.GetStub().DelState(k); err != nil {
+			return deleted, fmt.Errorf("ResetLedger: del %s: %w", k, err)
 		}
-		iter.Close()
-		for _, k := range keys {
-			if err := ctx.GetStub().DelState(k); err != nil {
-				return deleted, fmt.Errorf("ResetLedger: del %s: %w", k, err)
-			}
-			deleted++
+		deleted++
+	}
+	return deleted, nil
+}
+
+// ResetLedger — legacy whole-ledger wipe, ALL 12 prefixes in ONE transaction.
+// KEPT for any caller not yet updated to ResetLedgerPrefix, but do not use
+// this for a campaign that runs many simulations back to back: as state
+// accumulates (a full 200-vehicle/64-RSU/300s run leaves far more live keys
+// than the ~91 an empty-ledger run sees), the single-transaction read+write
+// set grows every call, and was observed (2026-08-10, AB8 sweep) to both
+// blow the client commit deadline (DeadlineExceeded) AND trigger Fabric's
+// MVCC phantom-read-conflict check (PHANTOM_READ_CONFLICT) -- the wipe
+// silently fails, the NEXT run's registrations then get rejected as
+// duplicates against the stale, un-wiped state, and the ledger only gets
+// dirtier from there. Use ResetLedgerPrefix in a loop instead (see
+// CallSCResetLedger in 06c_blockchain_api.h).
+func (s *SmartContract) ResetLedger(ctx contractapi.TransactionContextInterface) (int, error) {
+	deleted := 0
+	for _, p := range resetLedgerPrefixes {
+		n, err := resetLedgerOnePrefix(ctx, p)
+		deleted += n
+		if err != nil {
+			return deleted, err
 		}
 	}
 	return deleted, nil
+}
+
+// ResetLedgerPrefix — wipes ONE key prefix per call (one Fabric transaction,
+// one commit). Caller loops over all 12 prefixes (see resetLedgerPrefixes),
+// making 12 small commits instead of ResetLedger's one large one. Fixes the
+// growing-transaction-size failure mode documented above: each call's
+// read/write set is bounded by that single prefix's current key count, not
+// the whole ledger's, so per-call latency and MVCC conflict risk stay flat
+// across a long campaign instead of growing with accumulated state.
+func (s *SmartContract) ResetLedgerPrefix(ctx contractapi.TransactionContextInterface, prefix string) (int, error) {
+	valid := false
+	for _, p := range resetLedgerPrefixes {
+		if p == prefix {
+			valid = true
+			break
+		}
+	}
+	if !valid {
+		return 0, fmt.Errorf("ResetLedgerPrefix: unknown prefix %q", prefix)
+	}
+	return resetLedgerOnePrefix(ctx, prefix)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

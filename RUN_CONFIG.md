@@ -4,7 +4,7 @@
 
 # Simulation run configuration — flags, defaults, and why
 
-Derived from `scratch/mptd_pqs_sdvn/`. 84 CLI flags found in `12_main.h`.
+Derived from `scratch/mptd_pqs_sdvn/`. 86 CLI flags found in `12_main.h`.
 
 ## The canonical run
 
@@ -103,6 +103,8 @@ for p in <pids>; do tr '\0' ' ' < /proc/$p/cmdline; echo; done
 | `--gat_det_flag_heads` | `46` | `0` | DISABLES the GAT head OR-path entirely. Default is 46 (on). Beacons flagged only via this path were 54-55% of D4/D6 false positives for 285/306 true positives -- a poor exchange. Note this means paper item G4's Phi floor had nothing to act on. |
 | `--skip_blockchain` | `false` | `true` | Detection runs do not need the Fabric round-trip. Turn OFF for the RQ5/RQ6 crypto-latency runs. |
 | `--mobility_source` | `0` | `1` | Drive mobility from the SUMO trace rather than an ns-3 mobility model. |
+| `--rsu_positions_csv_override` | `""` | `unset for the canonical run; only E3 (scalability sweep) sets it for N_Vehicles=300/400/500` | Default RSU coverage file (rsu_positions_urban.csv) is a fixed 64-RSU grid (supervisor-mandated 2026-06-12). E3 sweeps N_RSUs up to 160, which the file does not cover; without this override the simulator silently falls back to a broken legacy hardcoded grid with zero DSRC coverage on the real urban map (12_main.h ~1088-1107). Points at a separate place_rsus.py-generated CSV (mobility/e3_scalability/rsu_positions_urban_n{96,128,160}.csv, 100% coverage) instead, without touching the shared default file used by every other experiment. |
+| `--mobility_trace_csv_override` | `""` | `unset for the canonical run; only E3 (scalability sweep) sets it for N_Vehicles=300/400/500` | Default mobility trace (mobility_urban_60.tcl) only has 200 vehicle trajectories. E3 sweeps N_Vehicles up to 500, which the trace does not cover; without this override nodes beyond 199 get no MobilityModel and the simulator aborts inside LteHelper::InstallUeDevice() (12_main.h ~584-600). Points at a separately generated trace (mobility/mobility_urban{300,400,500}_60.tcl, built via sumo/build_sumo_trace.sh with VEH_COUNT_OVERRIDE, same road network, KEEP_IN so vehicles never despawn) instead, without touching the shared default trace used by every other experiment. Also required bumping total_size 256->550 and MAX_NODES 320->600 (02_config_globals.h) since those are fixed compile-time array capacities sized for the old 200-vehicle ceiling. |
 
 ## Flags deliberately NOT used
 

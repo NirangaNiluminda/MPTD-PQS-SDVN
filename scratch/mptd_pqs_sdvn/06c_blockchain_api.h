@@ -41,6 +41,8 @@
 #include <cstdio>      // snprintf for \uXXXX JSON escape
 #include <mutex>       // once-flag for libcurl global init + warn-once
 #include <atomic>      // ipfs_disabled latch
+#include <thread>      // std::this_thread::sleep_for — CallSCResetLedger retry backoff
+#include <chrono>      // std::chrono::seconds — CallSCResetLedger retry backoff
 #if __has_include(<curl/curl.h>)
 #include <curl/curl.h> // TASK ①-E: kubo HTTP API client for h(b_i(t)) CID
 #endif
@@ -900,11 +902,63 @@ inline void CallSCInitNetworkConfig(
 // only current state is cleared, not block history. Synchronous: the wipe must
 // commit before register_all_nodes() re-registers nodes for this run. No-op when
 // skip_blockchain is set (training-sweep mode).
+//
+// One ResetLedgerPrefix call per prefix (12 small commits), NOT the legacy
+// single-transaction ResetLedger — found 2026-08-10 (AB8 sweep, seed 2 of a
+// back-to-back campaign): once a prior run has left a full 200-vehicle/64-RSU
+// ledger behind, one giant delete-everything transaction is big enough to
+// blow the client commit deadline (DeadlineExceeded) or trip Fabric's MVCC
+// phantom-read-conflict check -- and CRITICALLY, the old code treated that
+// failure as non-fatal, printed the error, and carried on straight into
+// registration against the STILL-DIRTY ledger. Every RSU/vehicle bootstrap
+// then failed as "duplicate identity", and every downstream metric silently
+// came back 0/-1 for the rest of that run (and the run after, since the
+// ledger just got dirtier). Per-prefix calls keep each transaction's
+// read/write set bounded by that prefix's own key count rather than the
+// whole ledger, so latency/conflict risk stay flat across a long campaign.
+// Retries transient failures; a prefix that still won't commit after retries
+// aborts the whole run rather than silently proceeding on a dirty ledger --
+// a genuine measurement is not possible at that point, so failing loud here
+// is strictly better than another N hours producing unusable output.
 inline void CallSCResetLedger()
 {
     MPTD_BLOCKCHAIN_GUARD();
-    std::string out = mptd_fabric_invoke_sync("invoke", "ResetLedger", {});
-    std::cout << "[SC-RESET] per-run ledger wipe → " << out;
+    // Must match resetLedgerPrefixes in chaincode/chaincode/smartcontract.go.
+    static const char* kPrefixes[] = {
+        "REG_", "SCTRUST_", "RSUTRUST_", "CTRUST_",
+        "SCREVOKE_", "SUBM_", "CSUBM_", "CFLAG_",
+        "CTRLREASSIGN_", "CTRL_", "VOTE_", "NETCFG",
+    };
+    constexpr int kMaxAttempts = 4;
+    int total_deleted = 0;
+    std::cout << "[SC-RESET] per-run ledger wipe (per-prefix)";
+    for (const char* prefix : kPrefixes) {
+        bool ok = false;
+        std::string payload;
+        for (int attempt = 0; attempt < kMaxAttempts && !ok; attempt++) {
+            if (attempt > 0) {
+                std::cerr << "[SC-RESET] retry " << attempt << " for prefix "
+                          << prefix << " after: " << payload << '\n';
+                std::this_thread::sleep_for(std::chrono::seconds(2 * attempt));
+            }
+            ok = mptd_fabric_call_socket("invoke", "ResetLedgerPrefix",
+                                          {prefix}, /*fire_and_forget=*/false,
+                                          payload);
+        }
+        if (!ok) {
+            std::cerr << "\n[SC-RESET] FATAL: prefix " << prefix
+                       << " never committed after " << kMaxAttempts
+                       << " attempts (" << payload << "). Refusing to run "
+                       << "registration against a possibly-dirty ledger -- "
+                       << "aborting run.\n";
+            std::exit(1);
+        }
+        if (!payload.empty()) {
+            try { total_deleted += std::stoi(payload); } catch (...) {}
+        }
+    }
+    std::cout << " → " << total_deleted << " keys deleted across "
+              << (sizeof(kPrefixes) / sizeof(kPrefixes[0])) << " prefixes\n";
 }
 
 // SCResult — registration-call outcome (ok flag + error/payload string).

@@ -150,3 +150,11 @@ mobility/mobility_rural3k_*.tcl
 
 # Python bytecode (any depth)
 __pycache__/
+
+# ── ns-3 RLC/PHY trace dumps (regenerated whenever the binary is run from the
+#    repo root instead of $NS3; not source, not results — DlRsrpSinrStats.txt
+#    alone has reached 440MB and blocked a GitHub push once already) ───────────
+/DlRsrpSinrStats.txt
+/DlRlcStats.txt
+/UlRlcStats.txt
+/UlSinrStats.txt

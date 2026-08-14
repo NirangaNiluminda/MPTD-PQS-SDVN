@@ -46,7 +46,9 @@ using namespace std::chrono;
 // Most per-vehicle loops self-guard (skip vehicle_state[i].count==0), so they
 // stay correct at this larger capacity; the non-self-guarding consortium split
 // in 11_blockchain_setup.h uses N_Vehicles explicitly.
-#define MAX_NODES 320
+// Bumped 320->600 (2026-08-09) for the E3 scalability sweep's N_Vehicles=500
+// point; see total_size below for the matching vehicle-array bump.
+#define MAX_NODES 600
 
 // MAX_RSUS = per-RSU array CAPACITY (compile-time). The ACTIVE RSU count is the
 // runtime global N_RSUs below. Test net uses N_RSUs=4; SUMO urban uses an 8×8 =
@@ -92,7 +94,8 @@ double g_ring_r_max        = 250.0;  // m     max plausible ring radius
 double g_ring_r_cv         = 0.25;   // -     max radius coeff. of variation
 int    g_ring_min_members  = 3;      // min ring members to declare a ring
 
-const int total_size = 256;  // vehicle-array CAPACITY (was 16; now sized for SUMO 200-veh runs)
+const int total_size = 550;  // vehicle-array CAPACITY (was 16, then 256 for SUMO 200-veh runs;
+                              // bumped 2026-08-09 for the E3 scalability sweep's N_Vehicles=500 point)
 uint32_t N_RSUs     = 4;    // ACTIVE RSU count (test net=4; SUMO urban 8×8 grid=64)
 uint32_t N_Vehicles = 16;   // 4 vehicles per RSU cluster
 uint32_t N_Controllers = 4;
@@ -115,6 +118,26 @@ int    maxspeed             = 60;  // km/h max vehicle speed
 // 2 = sumo_live: RESERVED for future live TraCI bridge (R7a-B, not implemented).
 // See 09b_mobility_provider.h for the IMobilityProvider abstraction.
 int g_mobility_source = 0;  // MOBILITY_SRC_HARDCODED
+
+// ── RSU placement CSV override (--rsu_positions_csv_override) ─────────────
+// Empty by default -> default_rsu_positions_path(scenario) picks the
+// supervisor-mandated per-scenario file (e.g. rsu_positions_urban.csv, fixed
+// at 64 RSUs) exactly as before. Set only when a sweep needs an RSU count
+// that file doesn't cover (E3 scalability: N_RSUs=96/128/160), so those runs
+// point at their own place_rsus.py-generated CSV instead of silently falling
+// back to the broken legacy hardcoded grid. Never touches the default file.
+std::string g_rsu_positions_csv_override = "";
+
+// ── Mobility trace override (--mobility_trace_csv_override) ───────────────
+// Empty by default -> default_sumo_trace_path(scenario, speed) picks the
+// standard mobility_<tag>_<speed>.tcl exactly as before. The standard urban
+// trace only has 200 vehicle trajectories (build_sumo_trace.sh's committed
+// output); N_Vehicles beyond that silently leaves extra nodes with no
+// MobilityModel, which aborts inside LteHelper::InstallUeDevice(). Set only
+// for sweeps needing more vehicles than the default trace covers (E3
+// scalability: N_Vehicles=300/400/500), pointing at a separately generated
+// mobility_urban{300,400,500}_60.tcl. Never touches the default trace file.
+std::string g_mobility_trace_csv_override = "";
 
 // ── RSU Compromise Seed (TP-S1 / MP-S1 random selection) ──────────────────
 // 0 = different random RSUs each run  (uses system clock)

@@ -59,7 +59,8 @@ VEH_NAME=(car      bus   lorry van      truck)
 VEH_CLASS=(passenger bus  truck delivery truck)
 VEH_VMAX=(41.67    27.78 25.00 33.33    23.61)
 VEH_LEN=(4.5       12.0  7.5   5.5      10.0)
-VEH_COUNT=(100     25    25    25       25)
+VEH_COUNT_OVERRIDE="${VEH_COUNT_OVERRIDE:-100 25 25 25 25}"
+read -r -a VEH_COUNT <<< "$VEH_COUNT_OVERRIDE"
 # Departures are SPREAD over [0, INSERT_WINDOW] (not bunched) so 200 vehicles
 # insert without congestion-discard; we OVER-GENERATE by OVERGEN to absorb
 # route-validation losses + insertion failures, then select the exact target

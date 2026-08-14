@@ -448,6 +448,16 @@
     "poison_theta": {
       "status": "sweep",
       "why": "AB4 sweep: attack deviation scale theta in [0,1], default 0.5. Scales max_position_deviation / max_velocity_deviation in PoisonTrajectoryByType(). LOWER = stealthier, so the psi rules and the spatial GAT stop saturating and the LSTM-AE becomes the discriminating tier. Left at its default in the reported runs."
+    },
+    "rsu_positions_csv_override": {
+      "status": "used",
+      "value": "unset for the canonical run; only E3 (scalability sweep) sets it for N_Vehicles=300/400/500",
+      "why": "Default RSU coverage file (rsu_positions_urban.csv) is a fixed 64-RSU grid (supervisor-mandated 2026-06-12). E3 sweeps N_RSUs up to 160, which the file does not cover; without this override the simulator silently falls back to a broken legacy hardcoded grid with zero DSRC coverage on the real urban map (12_main.h ~1088-1107). Points at a separate place_rsus.py-generated CSV (mobility/e3_scalability/rsu_positions_urban_n{96,128,160}.csv, 100% coverage) instead, without touching the shared default file used by every other experiment."
+    },
+    "mobility_trace_csv_override": {
+      "status": "used",
+      "value": "unset for the canonical run; only E3 (scalability sweep) sets it for N_Vehicles=300/400/500",
+      "why": "Default mobility trace (mobility_urban_60.tcl) only has 200 vehicle trajectories. E3 sweeps N_Vehicles up to 500, which the trace does not cover; without this override nodes beyond 199 get no MobilityModel and the simulator aborts inside LteHelper::InstallUeDevice() (12_main.h ~584-600). Points at a separately generated trace (mobility/mobility_urban{300,400,500}_60.tcl, built via sumo/build_sumo_trace.sh with VEH_COUNT_OVERRIDE, same road network, KEEP_IN so vehicles never despawn) instead, without touching the shared default trace used by every other experiment. Also required bumping total_size 256->550 and MAX_NODES 320->600 (02_config_globals.h) since those are fixed compile-time array capacities sized for the old 200-vehicle ceiling."
     }
   }
 }

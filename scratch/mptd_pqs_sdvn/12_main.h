@@ -279,6 +279,19 @@ int main(int argc, char *argv[])
                   "fast smoke tests), 1=sumo_trace (Ns2MobilityHelper on .tcl from "
                   "SUMO FCD; paper-conformant), 2=sumo_live (TraCI; reserved)",
                   g_mobility_source);
+    cmd.AddValue ("rsu_positions_csv_override",
+                  "Path to an RSU placement CSV to use instead of the default "
+                  "per-scenario file (empty = default, unchanged behaviour). "
+                  "Only needed when N_RSUs exceeds what the default file covers "
+                  "(e.g. E3 scalability sweep at N_RSUs=96/128/160).",
+                  g_rsu_positions_csv_override);
+    cmd.AddValue ("mobility_trace_csv_override",
+                  "Path to a .tcl mobility trace to use instead of the default "
+                  "per-scenario/speed file (empty = default, unchanged "
+                  "behaviour). Only needed when N_Vehicles exceeds what the "
+                  "default trace covers (e.g. E3 scalability sweep at "
+                  "N_Vehicles=300/400/500, default trace caps at 200).",
+                  g_mobility_trace_csv_override);
     cmd.Parse (argc, argv);
     // AB7 ring-size sweep: n=3 violates the BFT bound n>=3f+1=4 at f=1 (paper
     // §4.1.2 AB7). Fail fast rather than silently running an invalid ring.
@@ -570,7 +583,9 @@ int main(int argc, char *argv[])
       //                 exported from SUMO via traceExporter.py (paper-conformant).
       std::string trace_path;
       if (g_mobility_source == MOBILITY_SRC_SUMO_TRACE) {
-          trace_path = default_sumo_trace_path(mobility_scenario, maxspeed);
+          trace_path = g_mobility_trace_csv_override.empty()
+                     ? default_sumo_trace_path(mobility_scenario, maxspeed)
+                     : g_mobility_trace_csv_override;
           if (trace_path.empty()) {
               std::cerr << "[MOBILITY] no .tcl found for scenario="
                         << mobility_scenario << " speed=" << maxspeed
@@ -1087,7 +1102,9 @@ int main(int argc, char *argv[])
   // crashes the run (it just reverts to the old behaviour with a warning).
   if (g_mobility_source == MOBILITY_SRC_SUMO_TRACE && N_RSUs > 0)
   {
-      std::string rsu_csv = default_rsu_positions_path(mobility_scenario);
+      std::string rsu_csv = g_rsu_positions_csv_override.empty()
+                           ? default_rsu_positions_path(mobility_scenario)
+                           : g_rsu_positions_csv_override;
       std::vector<std::pair<double,double>> rsu_xy = load_rsu_positions(rsu_csv);
       if (rsu_xy.size() >= (size_t)N_RSUs)
       {
