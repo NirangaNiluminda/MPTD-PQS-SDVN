@@ -18,6 +18,7 @@ from parsers import beacon as beacon_parser
 from parsers import catalog
 from parsers import geometry
 from parsers import sigmask
+from parsers import topology
 
 app = FastAPI(title="SENTINEL Demo API")
 
@@ -99,6 +100,7 @@ def _beacon_to_dict(b: beacon_parser.Beacon) -> dict:
         "psi_score": b.psi_score,
         "attacker_class": b.attacker_class,
         "attacker_class_label": beacon_parser.ATTACKER_CLASS_LABELS.get(b.attacker_class, "unknown"),
+        "attacker_class_plain": beacon_parser.ATTACKER_CLASS_PLAIN.get(b.attacker_class, "unknown"),
         "drift_m": b.drift_m if b.has_ground_truth else None,
         "accusations": accusations,
     }
@@ -136,30 +138,95 @@ def vehicle_trajectory(scenario_id: str, vehicle_id: int):
     }
 
 
-# NOTE: registered LAST among /api/scenarios/* routes on purpose. Starlette
-# matches routes in registration order, and {scenario_id:path} is a greedy
-# converter with no required suffix here — if this were declared before
-# /timerange, /frame, /vehicle/{id}, it would swallow their trailing segments
-# into scenario_id and shadow all three (confirmed live: hit /timerange before
-# reordering and got back "scenario not found: <id>/timerange").
-@app.get("/api/scenarios/{scenario_id:path}")
-def scenario_detail(scenario_id: str):
-    s = _scenario_or_404(scenario_id)
-    metrics_path = s.dir / "metrics.csv"
-    metrics_row = None
-    if metrics_path.is_file():
-        import csv
+@app.get("/api/scenarios/{scenario_id:path}/trails")
+def scenario_trails(scenario_id: str, t: float, lookback: float = 6.0, max_vehicles: int = 400):
+    """Recent movement history per vehicle, for motion trails on the map.
 
-        with open(metrics_path, newline="") as fh:
-            rows = list(csv.DictReader(fh))
-            metrics_row = rows[0] if rows else None
+    Uses REPORTED positions (what each vehicle claimed), so a poisoned
+    vehicle's trail visibly diverges from the honest traffic flow — which is
+    the point. Ground-truth trails would hide the attack.
+    """
+    beacons = _beacons_for(scenario_id)
+    lo = max(t - lookback, 0.0)
+    tracks: dict[int, list[tuple[float, float, float]]] = {}
+    for b in beacons:
+        if lo <= b.sim_time <= t:
+            tracks.setdefault(b.vehicle_id, []).append((b.sim_time, b.pos_x, b.pos_y))
+    out = []
+    for vid, pts in list(tracks.items())[:max_vehicles]:
+        pts.sort(key=lambda p: p[0])
+        if len(pts) >= 2:
+            out.append({"vehicle_id": vid, "path": [[p[1], p[2]] for p in pts]})
+    return {"t": t, "lookback": lookback, "trails": out}
+
+
+@app.get("/api/scenarios/{scenario_id:path}/stats")
+def scenario_stats(scenario_id: str, t: float | None = None):
+    """Live counters for the KPI header.
+
+    Cumulative up to time t (or whole run if t is omitted). These are counted
+    straight off the beacon rows — the confusion-matrix style figures here are
+    the UI's own tally of beacon outcomes for the selected window, NOT the
+    simulator's reported MCC/FPR. Scenario-level MCC comes from metrics.csv
+    via /api/scenarios/{id} and must not be recomputed here.
+    """
+    beacons = _beacons_for(scenario_id)
+    rows = [b for b in beacons if t is None or b.sim_time <= t]
+    tp = sum(1 for b in rows if b.is_poisoned and b.detected)
+    fn = sum(1 for b in rows if b.is_poisoned and not b.detected)
+    fp = sum(1 for b in rows if not b.is_poisoned and b.detected)
+    tn = sum(1 for b in rows if not b.is_poisoned and not b.detected)
     return {
-        "id": s.id,
-        "road": s.road,
+        "t": t,
+        "beacons": len(rows),
+        "poisoned": tp + fn,
+        "clean": fp + tn,
+        "caught": tp,
+        "missed": fn,
+        "false_alarms": fp,
+        "vehicles_seen": len({b.vehicle_id for b in rows}),
+        "ghosts_seen": len({b.vehicle_id for b in rows if b.is_ghost}),
+        "note": "window tally of beacon outcomes; scenario MCC/FPR come from metrics.csv",
+    }
+
+
+@app.get("/api/scenarios/{scenario_id:path}/topology")
+def scenario_topology(scenario_id: str):
+    """Controllers, their RSU clusters, and the hostile-entity roster.
+
+    Controller positions are DERIVED centroids (see parsers/topology.py) —
+    the simulator gives control-plane nodes no coordinates.
+    """
+    s = _scenario_or_404(scenario_id)
+    rsus, _ = _geometry_for(s.road)
+    beacons = list(_beacons_for(scenario_id))
+    controllers = topology.build_controllers(rsus)
+    roster = topology.build_threat_roster(beacons, n_rsus=len(rsus))
+    for c in controllers:
+        c.hostile = c.controller_id in roster.hostile_controllers
+    return {
+        "scenario_id": scenario_id,
         "attack_number": s.attack_number,
         "attack_name": s.attack_name,
-        "attack_pct": s.attack_pct,
-        "metrics": metrics_row,
+        "controllers": [
+            {
+                "controller_id": c.controller_id,
+                "x": c.x,
+                "y": c.y,
+                "rsu_ids": c.rsu_ids,
+                "position_is_derived": c.position_is_derived,
+                "hostile": c.hostile,
+            }
+            for c in controllers
+        ],
+        "compromised_rsus": sorted(roster.compromised_rsus),
+        "malicious_vehicles": sorted(roster.malicious_vehicles),
+        "mitm_relays": sorted(roster.mitm_relays),
+        "hostile_controllers": sorted(roster.hostile_controllers),
+        "rsu_controller_map": {
+            r.rsu_id: topology.controller_for_rsu(r.rsu_id, len(rsus), topology.DEFAULT_N_CONTROLLERS)
+            for r in rsus
+        },
     }
 
 
@@ -220,6 +287,37 @@ def road_positions(road: str, t: float):
         if wp is not None:
             out.append({"vehicle_id": nid, "x": wp.x, "y": wp.y, "speed": wp.speed})
     return {"t": t, "positions": out}
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CATCH-ALL — MUST STAY BELOW EVERY OTHER /api/scenarios/* ROUTE.
+#
+# Starlette matches routes in REGISTRATION ORDER, not by specificity, and
+# {scenario_id:path} is a greedy converter that will happily swallow
+# "urban/a1_p40/topology" whole. Declaring this above the sub-routes shadows
+# every one of them and they 404 with "scenario not found: <id>/<suffix>".
+# This has now bitten twice — once for /timerange|/frame|/vehicle, once for
+# /trails|/stats|/topology. Add new sub-routes ABOVE this line, never below.
+# ═══════════════════════════════════════════════════════════════════════════
+@app.get("/api/scenarios/{scenario_id:path}")
+def scenario_detail(scenario_id: str):
+    s = _scenario_or_404(scenario_id)
+    metrics_path = s.dir / "metrics.csv"
+    metrics_row = None
+    if metrics_path.is_file():
+        import csv
+
+        with open(metrics_path, newline="") as fh:
+            rows = list(csv.DictReader(fh))
+            metrics_row = rows[0] if rows else None
+    return {
+        "id": s.id,
+        "road": s.road,
+        "attack_number": s.attack_number,
+        "attack_name": s.attack_name,
+        "attack_pct": s.attack_pct,
+        "metrics": metrics_row,
+    }
 
 
 # ── Serve the built frontend (present after `npm run build`) ───────────────

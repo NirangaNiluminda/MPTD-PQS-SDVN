@@ -24,13 +24,31 @@ from typing import Iterator, TextIO
 
 GHOST_VID_BASE = 10000
 
-# attacker_class values (attacker_class_for(), 08_detection_engine.h) — the
-# CSV's own encoding; kept here as the single place the UI maps int -> label.
+# attacker_class values — VERBATIM from the AttackerClass enum at
+# 02_config_globals.h:204-208. Do not reorder from memory: an earlier version
+# of this file guessed 1=rsu/2=vehicle/3=controller and omitted MITM entirely,
+# which mislabelled the attacker on every single attack type.
+ATTACKER_NONE = 0
+ATTACKER_MALICIOUS_VEHICLE = 1  # TP-S2 (a2), MP-S2 (a4)
+ATTACKER_COMPROMISED_RSU = 2  # TP-S1 (a1), MP-S1 (a3)
+ATTACKER_MITM = 3  # MP-S3 (a6)
+ATTACKER_MALICIOUS_CONTROLLER = 4  # TP-S3 (a5), MP-S4 (a7)
+
 ATTACKER_CLASS_LABELS = {
-    0: "none",
-    1: "compromised_rsu",
-    2: "malicious_vehicle",
-    3: "compromised_controller",
+    ATTACKER_NONE: "none",
+    ATTACKER_MALICIOUS_VEHICLE: "malicious_vehicle",
+    ATTACKER_COMPROMISED_RSU: "compromised_rsu",
+    ATTACKER_MITM: "mitm_relay",
+    ATTACKER_MALICIOUS_CONTROLLER: "malicious_controller",
+}
+
+# Plain-language, for the non-technical audience.
+ATTACKER_CLASS_PLAIN = {
+    ATTACKER_NONE: "no attacker",
+    ATTACKER_MALICIOUS_VEHICLE: "a lying vehicle",
+    ATTACKER_COMPROMISED_RSU: "a hijacked roadside unit",
+    ATTACKER_MITM: "an intercepting relay vehicle",
+    ATTACKER_MALICIOUS_CONTROLLER: "a hijacked network controller",
 }
 
 

@@ -32,6 +32,8 @@ export interface BeaconDto {
   psi_score: number;
   attacker_class: number;
   attacker_class_label: string;
+  /** Non-technical phrasing, e.g. "a hijacked roadside unit". */
+  attacker_class_plain: string;
   drift_m: number | null;
   accusations: Accusation[];
 }
@@ -69,6 +71,55 @@ export interface VehiclePositionDto {
   speed: number;
 }
 
+export interface ControllerDto {
+  controller_id: number;
+  x: number;
+  y: number;
+  rsu_ids: number[];
+  /** Controllers have no simulator coordinates; x/y is a derived cluster centroid. */
+  position_is_derived: boolean;
+  hostile: boolean;
+}
+
+export interface TopologyDto {
+  scenario_id: string;
+  attack_number: number;
+  attack_name: string;
+  controllers: ControllerDto[];
+  compromised_rsus: number[];
+  malicious_vehicles: number[];
+  mitm_relays: number[];
+  hostile_controllers: number[];
+  rsu_controller_map: Record<string, number>;
+}
+
+export interface TrailDto {
+  vehicle_id: number;
+  path: [number, number][];
+}
+
+export interface StatsDto {
+  t: number | null;
+  beacons: number;
+  poisoned: number;
+  clean: number;
+  caught: number;
+  missed: number;
+  false_alarms: number;
+  vehicles_seen: number;
+  ghosts_seen: number;
+  note: string;
+}
+
+export interface ScenarioDetailDto {
+  id: string;
+  road: string;
+  attack_number: number;
+  attack_name: string;
+  attack_pct: number;
+  metrics: Record<string, string> | null;
+}
+
 const BASE = ""; // same-origin: Vite dev proxy in dev, FastAPI static mount in prod
 
 async function getJson<T>(path: string): Promise<T> {
@@ -96,4 +147,14 @@ export const api = {
     getJson<{ t: number; positions: VehiclePositionDto[] }>(
       `/api/geometry/${road}/positions?t=${t}`
     ),
+  detail: (scenarioId: string) =>
+    getJson<ScenarioDetailDto>(`/api/scenarios/${scenarioId}`),
+  topology: (scenarioId: string) =>
+    getJson<TopologyDto>(`/api/scenarios/${scenarioId}/topology`),
+  trails: (scenarioId: string, t: number, lookback = 6) =>
+    getJson<{ t: number; lookback: number; trails: TrailDto[] }>(
+      `/api/scenarios/${scenarioId}/trails?t=${t}&lookback=${lookback}`
+    ),
+  stats: (scenarioId: string, t: number) =>
+    getJson<StatsDto>(`/api/scenarios/${scenarioId}/stats?t=${t}`),
 };

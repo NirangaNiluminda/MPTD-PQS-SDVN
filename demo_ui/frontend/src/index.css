@@ -2,9 +2,42 @@
 @tailwind components;
 @tailwind utilities;
 
+:root {
+  color-scheme: dark;
+}
+
 body {
   margin: 0;
   background: #0b0f14;
-  color: #e6edf3;
+  color: #f2f5f8;
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin, recessive scrollbars — the feed and drawer scroll a lot. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #1f2933;
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #2c3742;
+}
+
+/* deck.gl injects its tooltip inline; restyle to match the panel language. */
+.deck-tooltip {
+  background: #151c24 !important;
+  border: 1px solid #1f2933 !important;
+  border-radius: 6px !important;
+  color: #f2f5f8 !important;
+  font-size: 11px !important;
+  line-height: 1.45 !important;
+  padding: 8px 10px !important;
+  white-space: pre-line !important;
 }
