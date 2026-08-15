@@ -151,6 +151,10 @@ mobility/mobility_rural3k_*.tcl
 # Python bytecode (any depth)
 __pycache__/
 
+# Parsed road-network cache written by demo_ui/backend/parsers/roadmap.py.
+# Derived from the .net.xml next to it; regenerated automatically when stale.
+sumo/**/.*.roadmap.json
+
 # ── Demo UI (demo_ui/) — regeneratable build/dependency output ────────────────
 demo_ui/.venv/
 demo_ui/frontend/node_modules/
