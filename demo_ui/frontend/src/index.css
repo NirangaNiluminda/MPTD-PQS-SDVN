@@ -32,6 +32,7 @@
   --c-status-missed: 208 59 59;
 
   --c-axis-line: 44 55 66; /* recharts axis strokes — not a Tailwind colour, chart-only */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
 }
 
 [data-theme="light"] {
@@ -94,4 +95,48 @@ body {
   line-height: 1.45 !important;
   padding: 8px 10px !important;
   white-space: pre-line !important;
+}
+
+/* Shared motion system — one vocabulary for every reveal in the app:
+ * .anim-rise    a panel/row settling into place (accordion bodies, modal
+ *               sections) — staggered with animation-delay where several
+ *               appear together.
+ * .anim-fadein  a backdrop/overlay appearing.
+ * .anim-sweep   a bar/progress fill drawing in from zero width.
+ * .anim-panel-in a drill-down modal growing from where it was opened —
+ *               set the two custom properties (--fx, --fy: the click
+ *               point's offset from viewport centre, in px) inline so the
+ *               panel visibly originates from the tile that opened it.
+ * prefers-reduced-motion collapses every one of these to a no-op, per the
+ * dataviz/accessibility norm — motion communicates state change here, it
+ * never carries information a static frame lacks. */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fadein {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes sweep {
+  from { width: 0; }
+}
+@keyframes panel-in {
+  from {
+    opacity: 0.6;
+    transform: translate(calc(var(--fx, 0px) * 0.5), calc(var(--fy, 0px) * 0.5)) scale(0.965);
+  }
+  to { opacity: 1; transform: none; }
+}
+
+.anim-rise { animation: rise 0.34s var(--ease) both; }
+.anim-fadein { animation: fadein 0.26s ease both; }
+.anim-sweep { animation: sweep 0.7s var(--ease) both; }
+.anim-panel-in { animation: panel-in 0.3s var(--ease) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
 }

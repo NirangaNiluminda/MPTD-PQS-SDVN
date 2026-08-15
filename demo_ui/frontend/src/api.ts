@@ -217,6 +217,30 @@ export interface LatencyHistogramDto {
   latencies_seconds: number[];
 }
 
+export interface AttackSignatureHitDto {
+  code: string;
+  name: string;
+  detail: string;
+  count: number;
+  pct: number;
+}
+
+// n_events==0 means this variant has NO per-event trace in the single
+// captured recording this endpoint reads from (TP-S3, MP-S4) — every other
+// field is then absent, not zero-filled, so the UI can't mistake "not
+// captured" for "measured and zero".
+export interface AttackEvidenceDto {
+  attack_number: number;
+  n_events: number;
+  n_caught?: number;
+  n_missed?: number;
+  detection_rate?: number;
+  mean_psi_fuse?: number;
+  mean_gat_score?: number;
+  mean_ae_norm?: number;
+  top_signatures?: AttackSignatureHitDto[];
+}
+
 export interface CryptoSummaryDto {
   ipfs: {
     windows_stored: number;
@@ -416,6 +440,8 @@ export const api = {
   captureThresholdSweep: () => getJson<SweepPointDto[]>("/api/capture/threshold_sweep"),
   captureLayerAgreement: () => getJson<LayerAgreementDto>("/api/capture/layer_agreement"),
   captureLatencyHistogram: () => getJson<LatencyHistogramDto>("/api/capture/latency_histogram"),
+  captureAttackEvidence: (attackNumber: number) =>
+    getJson<AttackEvidenceDto>(`/api/capture/attack_evidence/${attackNumber}`),
 
   attacks: () => getJson<AttackInfoDto[]>("/api/attacks"),
 

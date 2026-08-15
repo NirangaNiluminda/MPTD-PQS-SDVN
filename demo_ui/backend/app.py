@@ -663,6 +663,15 @@ def capture_latency_histogram():
     return capture_analytics.detection_latency(_capture_events())
 
 
+@app.get("/api/capture/attack_evidence/{attack_number}")
+def capture_attack_evidence(attack_number: int):
+    """Real per-layer detection profile for one attack variant (1-7),
+    filtered from the capture on the simulator's own gt_atk ground-truth
+    label. Two variants (TP-S3, MP-S4) have zero events in this particular
+    90s recording — n_events==0 in the response, not a fabricated figure."""
+    return capture_analytics.attack_evidence(_capture_events(), attack_number)
+
+
 @app.get("/api/capture/vehicle/{vid}")
 def capture_vehicle(vid: int):
     events = [e for e in _capture_events() if e.vid == vid]

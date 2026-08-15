@@ -20,10 +20,11 @@ per-event, all confirmed against real source constants — not invented:
              [AI-INIT] startup line, not a per-event field
 """
 
+from collections import Counter
 from dataclasses import dataclass
 
 from .fusion import FusionEvent
-from .sigmask import PSI_TH
+from .sigmask import PSI_TH, decode as decode_sigmask
 
 THETA_AE = 33.693885  # this run's constant, confirmed via [AI-INIT] θ_ae loaded: 33.6939
 
@@ -140,4 +141,44 @@ def detection_latency(events: list[FusionEvent]) -> dict:
         "vehicles_considered": considered,
         "vehicles_missed_entirely": missed,
         "latencies_seconds": sorted(latencies),
+    }
+
+
+def attack_evidence(events: list[FusionEvent], attack_number: int) -> dict:
+    """Real per-layer detection profile for ONE attack variant, built by
+    filtering this capture's events on the simulator's own ground-truth
+    label (gt_atk == attack_number — confirmed 1-7, 0=honest, at
+    04_state_globals.h:409). NOT every attack variant appears in this single
+    90s combined-attack recording (TP-S3 and MP-S4 have zero events here) —
+    n_events==0 must be shown as "not captured", never backfilled with a
+    plausible-looking number.
+    """
+    filtered = [e for e in events if e.gt_atk == attack_number and e.gt_pois]
+    n = len(filtered)
+    if n == 0:
+        return {"attack_number": attack_number, "n_events": 0}
+
+    caught = [e for e in filtered if e.full_anom]
+    sig_counts: Counter[str] = Counter()
+    sig_meta: dict[str, dict] = {}
+    for e in filtered:
+        for acc in decode_sigmask(e.sig_mask):
+            sig_counts[acc.code] += 1
+            sig_meta[acc.code] = {"name": acc.name, "detail": acc.detail}
+    top_signatures = [
+        {"code": code, "name": sig_meta[code]["name"], "detail": sig_meta[code]["detail"],
+         "count": count, "pct": round(count / n, 4)}
+        for code, count in sig_counts.most_common(3)
+    ]
+
+    return {
+        "attack_number": attack_number,
+        "n_events": n,
+        "n_caught": len(caught),
+        "n_missed": n - len(caught),
+        "detection_rate": round(len(caught) / n, 4),
+        "mean_psi_fuse": round(sum(e.psi_fuse for e in filtered) / n, 4),
+        "mean_gat_score": round(sum(e.S_over_thetaS_clamped for e in filtered) / n, 4),
+        "mean_ae_norm": round(sum(e.ae_norm for e in filtered) / n, 4),
+        "top_signatures": top_signatures,
     }

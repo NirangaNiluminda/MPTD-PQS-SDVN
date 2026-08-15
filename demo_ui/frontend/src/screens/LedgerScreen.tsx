@@ -9,6 +9,12 @@ import {
   TrustRecordDto,
 } from "../api";
 import { useTokens } from "../design/tokens";
+import Accordion from "../components/Accordion";
+
+function fmtTime(iso: string): string {
+  const d = new Date(iso);
+  return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
+}
 
 function formatBytes(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`;
@@ -72,16 +78,10 @@ function Section({
           {count}
         </span>
       </header>
-      <div className="max-h-72 overflow-y-auto">{children}</div>
+      <div className="flex max-h-72 flex-col gap-1 overflow-y-auto p-1.5">{children}</div>
     </section>
   );
 }
-
-const Row = ({ children }: { children: React.ReactNode }) => (
-  <div className="flex items-center gap-3 border-b border-surface-hairline/60 px-4 py-2 text-xs last:border-0">
-    {children}
-  </div>
-);
 
 export default function LedgerScreen() {
   const [summary, setSummary] = useState<LedgerSummaryDto | null>(null);
@@ -92,6 +92,11 @@ export default function LedgerScreen() {
   const [reassignments, setReassignments] = useState<ReassignmentDto[]>([]);
   const [crypto, setCrypto] = useState<CryptoSummaryDto | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [openRsu, setOpenRsu] = useState<string | null>(null);
+  const [openVeh, setOpenVeh] = useState<string | null>(null);
+  const [openRev, setOpenRev] = useState<string | null>(null);
+  const [openFlag, setOpenFlag] = useState<string | null>(null);
+  const [openReassign, setOpenReassign] = useState<string | null>(null);
 
   useEffect(() => {
     Promise.all([
@@ -321,17 +326,33 @@ export default function LedgerScreen() {
             </div>
           )}
           {demotedRsu.map((r) => (
-            <Row key={r.ID}>
-              <span className="w-20 font-mono text-ink-primary">{r.RSUID}</span>
-              <span className="rounded bg-status-missed/20 px-1.5 py-0.5 text-[10px] font-medium text-status-missed">
-                {r.State}
-              </span>
-              <TrustBar score={r.TrustScore} />
-              <span className="font-mono text-ink-secondary">{r.TrustScore.toFixed(4)}</span>
-              <span className="ml-auto text-ink-muted">
-                {r.ConsecutiveLowEpochs} low epochs · updated {r.UpdateCount}×
-              </span>
-            </Row>
+            <Accordion
+              key={r.ID}
+              open={openRsu === r.ID}
+              onToggle={() => setOpenRsu((v) => (v === r.ID ? null : r.ID))}
+              bodyMaxHeight={100}
+              header={
+                <div className="flex flex-1 items-center gap-3 text-xs">
+                  <span className="w-20 font-mono text-ink-primary">{r.RSUID}</span>
+                  <span className="rounded bg-status-missed/20 px-1.5 py-0.5 text-[10px] font-medium text-status-missed">
+                    {r.State}
+                  </span>
+                  <TrustBar score={r.TrustScore} />
+                  <span className="font-mono text-ink-secondary">{r.TrustScore.toFixed(4)}</span>
+                  <span className="ml-auto text-ink-muted">
+                    {r.ConsecutiveLowEpochs} low epochs · updated {r.UpdateCount}×
+                  </span>
+                </div>
+              }
+            >
+              <div className="border-t border-surface-hairline px-4 pb-3 pt-2 text-[11px] text-ink-secondary">
+                Crossed into <span className="text-ink-primary">{r.State}</span> after{" "}
+                {r.ConsecutiveLowEpochs} consecutive below-floor epochs, out of{" "}
+                {r.UpdateCount} ledger updates on record. Last epoch{" "}
+                {fmtTime(r.LastEpochTimestamp)}; trust record last written{" "}
+                {fmtTime(r.UpdatedAt)}.
+              </div>
+            </Accordion>
           ))}
         </Section>
 
@@ -339,61 +360,117 @@ export default function LedgerScreen() {
           {vehicleTrust
             .sort((a, b) => a.TrustScore - b.TrustScore)
             .map((v) => (
-              <Row key={v.ID}>
-                <span className="w-20 font-mono text-ink-primary">{v.VehicleID}</span>
-                {v.Probationary && (
-                  <span className="rounded bg-status-caught/20 px-1.5 py-0.5 text-[10px] font-medium text-status-caught">
-                    PROBATION
-                  </span>
-                )}
-                <TrustBar score={v.TrustScore} />
-                <span className="font-mono text-ink-secondary">{v.TrustScore.toFixed(3)}</span>
-                <span className="ml-auto text-ink-muted">updated {v.UpdateCount}×</span>
-              </Row>
+              <Accordion
+                key={v.ID}
+                open={openVeh === v.ID}
+                onToggle={() => setOpenVeh((val) => (val === v.ID ? null : v.ID))}
+                bodyMaxHeight={100}
+                  header={
+                  <div className="flex flex-1 items-center gap-3 text-xs">
+                    <span className="w-20 font-mono text-ink-primary">{v.VehicleID}</span>
+                    {v.Probationary && (
+                      <span className="rounded bg-status-caught/20 px-1.5 py-0.5 text-[10px] font-medium text-status-caught">
+                        PROBATION
+                      </span>
+                    )}
+                    <TrustBar score={v.TrustScore} />
+                    <span className="font-mono text-ink-secondary">{v.TrustScore.toFixed(3)}</span>
+                    <span className="ml-auto text-ink-muted">updated {v.UpdateCount}×</span>
+                  </div>
+                }
+              >
+                <div className="border-t border-surface-hairline px-4 pb-3 pt-2 text-[11px] text-ink-secondary">
+                  {v.ConsecutiveLowEpochs > 0
+                    ? `${v.ConsecutiveLowEpochs} consecutive below-floor epochs recorded. `
+                    : ""}
+                  Last epoch {fmtTime(v.LastEpochTimestamp)}; trust record last written{" "}
+                  {fmtTime(v.UpdatedAt)}.
+                </div>
+              </Accordion>
             ))}
         </Section>
 
         <Section title="Revocation votes" count={revocations.length}>
           {revocations.map((r) => (
-            <Row key={r.ID}>
-              <span className="w-20 font-mono text-ink-primary">
-                {r.RSUID ?? r.VehicleID}
-              </span>
-              <span className="text-ink-secondary">{r.Reason}</span>
-              <span className="ml-auto text-ink-muted">
-                {new Date(r.RevokedAt).toLocaleTimeString()}
-              </span>
-            </Row>
+            <Accordion
+              key={r.ID}
+              open={openRev === r.ID}
+              onToggle={() => setOpenRev((v) => (v === r.ID ? null : r.ID))}
+              bodyMaxHeight={100}
+              header={
+                <div className="flex flex-1 items-center gap-3 text-xs">
+                  <span className="w-20 font-mono text-ink-primary">
+                    {r.RSUID ?? r.VehicleID}
+                  </span>
+                  <span className="text-ink-secondary">{r.Reason}</span>
+                  <span className="ml-auto text-ink-muted">
+                    {new Date(r.RevokedAt).toLocaleTimeString()}
+                  </span>
+                </div>
+              }
+            >
+              <div className="border-t border-surface-hairline px-4 pb-3 pt-2 text-[11px] text-ink-secondary">
+                Vote recorded {fmtTime(r.Timestamp)}, committed to the ledger{" "}
+                {fmtTime(r.RevokedAt)}. Target: {r.RSUID ? `RSU ${r.RSUID}` : `vehicle ${r.VehicleID}`}.
+              </div>
+            </Accordion>
           ))}
         </Section>
 
         <Section title="Controller flags (CP-DETECT)" count={flags.length}>
           {flags.map((f) => (
-            <Row key={f.ID}>
-              <span className="w-16 font-mono text-ink-primary">{f.ControllerID}</span>
-              <span className="text-ink-secondary">re: {f.VehicleID}</span>
-              <span className="rounded bg-surface-raised px-1.5 py-0.5 text-[10px] text-ink-muted">
-                {f.Epoch}
-              </span>
-              <span className="ml-auto text-ink-muted">
-                {f.ConflictCount} conflict{f.ConflictCount !== 1 ? "s" : ""} /{" "}
-                {f.NumRSUs} RSU{f.NumRSUs !== 1 ? "s" : ""}
-              </span>
-            </Row>
+            <Accordion
+              key={f.ID}
+              open={openFlag === f.ID}
+              onToggle={() => setOpenFlag((v) => (v === f.ID ? null : f.ID))}
+              bodyMaxHeight={100}
+              header={
+                <div className="flex flex-1 items-center gap-3 text-xs">
+                  <span className="w-16 font-mono text-ink-primary">{f.ControllerID}</span>
+                  <span className="text-ink-secondary">re: {f.VehicleID}</span>
+                  <span className="rounded bg-surface-raised px-1.5 py-0.5 text-[10px] text-ink-muted">
+                    {f.Epoch}
+                  </span>
+                  <span className="ml-auto text-ink-muted">
+                    {f.ConflictCount} conflict{f.ConflictCount !== 1 ? "s" : ""} /{" "}
+                    {f.NumRSUs} RSU{f.NumRSUs !== 1 ? "s" : ""}
+                  </span>
+                </div>
+              }
+            >
+              <div className="border-t border-surface-hairline px-4 pb-3 pt-2 text-[11px] text-ink-secondary">
+                {f.ConflictCount} of {f.NumRSUs} RSUs disagreed on vehicle{" "}
+                {f.VehicleID}'s position, against this quorum's FP1 threshold
+                of {f.ThresholdFP1.toFixed(3)}. Flagged {fmtTime(f.FlaggedAt)}.
+              </div>
+            </Accordion>
           ))}
         </Section>
 
         <Section title="Controller reassignments" count={reassignments.length}>
           {reassignments.map((r) => (
-            <Row key={r.ID}>
-              <span className="font-mono text-status-missed">{r.ExcludedController}</span>
-              <span className="text-ink-muted">excluded →</span>
-              <span className="font-mono text-status-good">{r.SuccessorController}</span>
-              <span className="rounded bg-surface-raised px-1.5 py-0.5 text-[10px] text-ink-muted">
-                {r.Epoch}
-              </span>
-              <span className="ml-auto text-ink-muted">{r.Reason}</span>
-            </Row>
+            <Accordion
+              key={r.ID}
+              open={openReassign === r.ID}
+              onToggle={() => setOpenReassign((v) => (v === r.ID ? null : r.ID))}
+              bodyMaxHeight={100}
+              header={
+                <div className="flex flex-1 items-center gap-3 text-xs">
+                  <span className="font-mono text-status-missed">{r.ExcludedController}</span>
+                  <span className="text-ink-muted">excluded →</span>
+                  <span className="font-mono text-status-good">{r.SuccessorController}</span>
+                  <span className="rounded bg-surface-raised px-1.5 py-0.5 text-[10px] text-ink-muted">
+                    {r.Epoch}
+                  </span>
+                  <span className="ml-auto text-ink-muted">{r.Reason}</span>
+                </div>
+              }
+            >
+              <div className="border-t border-surface-hairline px-4 pb-3 pt-2 text-[11px] text-ink-secondary">
+                {r.ExcludedController} excluded at epoch {r.Epoch}, duties handed to{" "}
+                {r.SuccessorController}. Committed {fmtTime(r.At)}.
+              </div>
+            </Accordion>
           ))}
         </Section>
       </div>

@@ -14,6 +14,7 @@ import {
 } from "recharts";
 import { api, AttackInfoDto, LayerAgreementDto, LatencyHistogramDto, SweepPointDto } from "../api";
 import { useTokens } from "../design/tokens";
+import Accordion from "../components/Accordion";
 
 const LAYER_LABEL: Record<string, string> = { rules: "Rules", gat: "GAT", lstm_ae: "LSTM-AE" };
 const LAYER_ORDER = ["rules", "gat", "lstm_ae"];
@@ -45,6 +46,7 @@ export default function ResultsScreen() {
   const [agreement, setAgreement] = useState<LayerAgreementDto | null>(null);
   const [latency, setLatency] = useState<LatencyHistogramDto | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [openWindow, setOpenWindow] = useState<number | null>(0);
 
   useEffect(() => {
     Promise.all([api.attacks(), api.resultsAblation()])
@@ -289,35 +291,48 @@ export default function ResultsScreen() {
               D1 = rule signatures only. D4 = + GAT spatial. D6 = + LSTM-AE
               temporal. {ablation.config}. Source: {ablation.source}.
             </p>
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              {ablation.windows.map((w) => (
-                <div key={w.cutoff_s} className="rounded border border-surface-hairline bg-surface-raised p-3">
-                  <div className="mb-2 flex items-center justify-between">
-                    <span className="text-xs font-medium text-ink-primary">
-                      {w.cutoff_s}s cutoff
-                    </span>
-                    <span
-                      className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                        w.ordering_holds
-                          ? "bg-status-good/15 text-status-good"
-                          : "bg-status-missed/20 text-status-missed"
-                      }`}
-                    >
-                      {w.ordering_holds ? "D1 < D4 < D6 holds" : "ordering fails"}
-                    </span>
-                  </div>
-                  <dl className="space-y-1 text-xs">
-                    {(["D1", "D4", "D6"] as const).map((arm) => (
-                      <div key={arm} className="flex justify-between">
-                        <dt className="text-ink-muted">{arm}</dt>
-                        <dd className="font-mono text-ink-primary">
-                          {w.arms[arm].toFixed(4)}
-                        </dd>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              {ablation.windows.map((w, i) => (
+                <Accordion
+                  key={w.cutoff_s}
+                  open={openWindow === i}
+                  onToggle={() => setOpenWindow((v) => (v === i ? null : i))}
+                  bodyMaxHeight={220}
+                  header={
+                    <div className="flex flex-1 items-center justify-between">
+                      <span className="text-xs font-medium text-ink-primary">
+                        {w.cutoff_s}s cutoff
+                      </span>
+                      <span
+                        className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                          w.ordering_holds
+                            ? "bg-status-good/15 text-status-good"
+                            : "bg-status-missed/20 text-status-missed"
+                        }`}
+                      >
+                        {w.ordering_holds ? "D1 < D4 < D6 holds" : "ordering fails"}
+                      </span>
+                    </div>
+                  }
+                >
+                  <div className="border-t border-surface-hairline p-3">
+                    <dl className="space-y-1 text-xs">
+                      {(["D1", "D4", "D6"] as const).map((arm) => (
+                        <div key={arm} className="flex justify-between">
+                          <dt className="text-ink-muted">{arm}</dt>
+                          <dd className="font-mono text-ink-primary">
+                            {w.arms[arm].toFixed(4)}
+                          </dd>
+                        </div>
+                      ))}
+                    </dl>
+                    {w.note && (
+                      <div className="mt-2">
+                        <Callout>{w.note}</Callout>
                       </div>
-                    ))}
-                  </dl>
-                  {w.note && <Callout>{w.note}</Callout>}
-                </div>
+                    )}
+                  </div>
+                </Accordion>
               ))}
             </div>
           </section>

@@ -19,9 +19,14 @@ import {
   FusionEventDto,
 } from "../api";
 import { useTokens } from "../design/tokens";
+import Accordion from "../components/Accordion";
 
 const GHOST_VID_BASE = 10000;
 const PHI_TH = 0.5; // fusion decision threshold, 08_detection_engine.h FusionParams default
+// Same constant as demo_ui/backend/parsers/capture_analytics.py's THETA_AE —
+// this run's AE alarm point, confirmed via the [AI-INIT] startup line, not a
+// per-event field so it can't be read off `current` itself.
+const THETA_AE = 33.693885;
 
 function VehicleRow({
   row,
@@ -72,6 +77,7 @@ export default function DefenceInspectorScreen() {
   const [events, setEvents] = useState<FusionEventDto[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
+  const [openSignal, setOpenSignal] = useState<number | null>(null);
 
   useEffect(() => {
     api
@@ -213,18 +219,7 @@ export default function DefenceInspectorScreen() {
                     the bars show the normalised signals feeding the sum,
                     not the final weighted split.
                   </p>
-                  <div className="grid grid-cols-4 gap-3 text-center text-xs">
-                    <ContribBar label="ψ̂ (rules)" value={current.psi_fuse} color={SERIES[0]} />
-                    <ContribBar label="Ŝ (GAT)" value={current.S_norm} color={SERIES[1]} />
-                    <ContribBar label="ε̂ (LSTM-AE)" value={current.ae_norm} color={SERIES[2]} />
-                    <ContribBar
-                      label="Φ (fused)"
-                      value={current.phi}
-                      color={current.full_anom ? STATUS.caught : SURFACE.hairlineStrong}
-                      threshold={PHI_TH}
-                    />
-                  </div>
-                  <div className="mt-3 flex items-center gap-3 text-xs">
+                  <div className="mb-3 flex items-center gap-3 text-xs">
                     <span className="text-ink-muted">Verdict:</span>
                     <span
                       className={
@@ -250,18 +245,118 @@ export default function DefenceInspectorScreen() {
                       </span>
                     )}
                   </div>
-                  {current.accusations.length > 0 && (
-                    <div className="mt-3 border-t border-surface-hairline pt-2">
-                      <p className="mb-1 text-[10px] uppercase tracking-wider text-ink-muted">
-                        Rule signatures tripped
-                      </p>
-                      <ul className="space-y-0.5 text-[11px] text-ink-secondary">
-                        {current.accusations.map((a) => (
-                          <li key={a.code}>▸ {a.name}</li>
-                        ))}
-                      </ul>
-                    </div>
-                  )}
+
+                  <div className="flex flex-col gap-2">
+                    {[
+                      {
+                        label: "ψ̂ (rules)",
+                        value: current.psi_fuse,
+                        color: SERIES[0],
+                        body: (
+                          <div className="flex flex-col gap-1.5 text-[11px] text-ink-secondary">
+                            <p>
+                              Raw rule score ψ={current.psi.toFixed(3)}, fused
+                              ψ̂={current.psi_fuse.toFixed(3)} (threshold 0.09).
+                            </p>
+                            {current.accusations.length > 0 ? (
+                              <ul className="space-y-0.5">
+                                {current.accusations.map((a) => (
+                                  <li key={a.code}>
+                                    ▸ {a.name}{" "}
+                                    <span className="text-ink-muted">— {a.detail}</span>
+                                  </li>
+                                ))}
+                              </ul>
+                            ) : (
+                              <p className="text-ink-muted">No rule signatures tripped.</p>
+                            )}
+                          </div>
+                        ),
+                      },
+                      {
+                        label: "Ŝ (GAT)",
+                        value: current.S_norm,
+                        color: SERIES[1],
+                        body: (
+                          <p className="text-[11px] text-ink-secondary">
+                            Graph-attention score S={current.S.toFixed(2)}, this
+                            RSU's threshold θ<sub>S</sub>={current.thetaS.toFixed(2)}.
+                            Ratio S/θ<sub>S</sub> ={" "}
+                            {(current.S / current.thetaS).toFixed(3)}
+                            {current.S / current.thetaS > 1 ? " — over the line." : "."}
+                          </p>
+                        ),
+                      },
+                      {
+                        label: "ε̂ (LSTM-AE)",
+                        value: current.ae_norm,
+                        color: SERIES[2],
+                        body: (
+                          <p className="text-[11px] text-ink-secondary">
+                            Reconstruction error ae_raw=
+                            {current.ae_raw.toFixed(3)} against this run's alarm
+                            point θ<sub>ae</sub>={THETA_AE.toFixed(3)}
+                            {current.ae_raw > THETA_AE
+                              ? " — above it, flagged by this layer alone."
+                              : " — below it, this layer alone would not flag."}
+                          </p>
+                        ),
+                      },
+                      {
+                        label: "Φ (fused)",
+                        value: current.phi,
+                        color: current.full_anom ? STATUS.caught : SURFACE.hairlineStrong,
+                        threshold: PHI_TH,
+                        body: (
+                          <p className="text-[11px] text-ink-secondary">
+                            Φ = λ<sub>ψ</sub>·ψ̂ + λ<sub>gat</sub>·Ŝ + λ<sub>ae</sub>·ε̂
+                            (Eq 3.46) = {current.phi.toFixed(3)}, decision
+                            threshold 0.5. Predicted class k̂={current.khat}
+                            {current.khat >= 0 ? ` (attack ${current.khat + 1})` : " (none)"}.
+                          </p>
+                        ),
+                      },
+                    ].map((s, i) => (
+                      <Accordion
+                        key={s.label}
+                        open={openSignal === i}
+                        onToggle={() => setOpenSignal((v) => (v === i ? null : i))}
+                        bodyMaxHeight={160}
+                        header={
+                          <div className="flex flex-1 flex-col gap-1">
+                            <div className="flex items-baseline justify-between gap-2">
+                              <span className="text-xs font-semibold">{s.label}</span>
+                              <span
+                                className="font-mono text-sm font-semibold"
+                                style={{ color: s.color }}
+                              >
+                                {s.value.toFixed(3)}
+                              </span>
+                            </div>
+                            <div className="relative h-1.5 w-full overflow-hidden rounded bg-surface-page">
+                              <div
+                                className="anim-sweep h-full rounded"
+                                style={{
+                                  width: `${Math.max(0, Math.min(1, s.value)) * 100}%`,
+                                  background: s.color,
+                                }}
+                              />
+                              {s.threshold != null && (
+                                <div
+                                  className="absolute top-0 h-full w-px bg-ink-primary/60"
+                                  style={{ left: `${s.threshold * 100}%` }}
+                                />
+                              )}
+                            </div>
+                          </div>
+                        }
+                      >
+                        <div className="border-t border-surface-hairline px-3.5 pb-3 pt-2.5">
+                          {s.body}
+                        </div>
+                      </Accordion>
+                    ))}
+                  </div>
                 </section>
 
                 <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
@@ -319,34 +414,3 @@ export default function DefenceInspectorScreen() {
   );
 }
 
-function ContribBar({
-  label,
-  value,
-  color,
-  threshold,
-}: {
-  label: string;
-  value: number;
-  color: string;
-  threshold?: number;
-}) {
-  const pct = Math.max(0, Math.min(1, value)) * 100;
-  return (
-    <div>
-      <div className="mb-1 text-[10px] text-ink-muted">{label}</div>
-      <div className="relative h-16 w-full overflow-hidden rounded bg-surface-page">
-        {threshold != null && (
-          <div
-            className="absolute left-0 right-0 border-t border-dashed border-status-caught/70"
-            style={{ bottom: `${threshold * 100}%` }}
-          />
-        )}
-        <div
-          className="absolute bottom-0 left-0 right-0 transition-all"
-          style={{ height: `${pct}%`, background: color }}
-        />
-      </div>
-      <div className="mt-1 font-mono text-[11px] text-ink-primary">{value.toFixed(3)}</div>
-    </div>
-  );
-}
