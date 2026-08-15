@@ -7,6 +7,7 @@ import {
   PathLayer,
   IconLayer,
   PolygonLayer,
+  TextLayer,
 } from "@deck.gl/layers";
 import { usePlayback } from "../store/playback";
 import { BeaconDto } from "../api";
@@ -53,6 +54,52 @@ function beaconColor(b: BeaconDto): Color {
   if (b.is_poisoned && b.detected) return C.caught;
   if (b.is_ghost) return C.ghost;
   return C.vehicle;
+}
+
+interface RegionCell {
+  cx: number;
+  cy: number;
+  n: number;
+  caught: number;
+  missed: number;
+}
+
+/**
+ * Region-level clustering: bins the full fleet + active beacons into a grid
+ * over the road bounds. Each cell reports a count and its WORST observed
+ * state — a cell with even one missed detection is coloured as missed, so
+ * clustering never visually launders a real miss into "looks clean".
+ */
+function buildRegionCells(
+  bounds: { x_min: number; x_max: number; y_min: number; y_max: number },
+  positions: { x: number; y: number }[],
+  beacons: BeaconDto[],
+  cols = 6,
+  rows = 4
+): RegionCell[] {
+  const w = (bounds.x_max - bounds.x_min) / cols;
+  const h = (bounds.y_max - bounds.y_min) / rows;
+  if (w <= 0 || h <= 0) return [];
+  const cells: RegionCell[] = Array.from({ length: cols * rows }, (_, i) => ({
+    cx: bounds.x_min + (i % cols) * w + w / 2,
+    cy: bounds.y_min + Math.floor(i / cols) * h + h / 2,
+    n: 0,
+    caught: 0,
+    missed: 0,
+  }));
+  const cellIndex = (x: number, y: number) => {
+    const col = Math.min(cols - 1, Math.max(0, Math.floor((x - bounds.x_min) / w)));
+    const row = Math.min(rows - 1, Math.max(0, Math.floor((y - bounds.y_min) / h)));
+    return row * cols + col;
+  };
+  for (const p of positions) cells[cellIndex(p.x, p.y)].n++;
+  for (const b of beacons) {
+    if (!b.is_poisoned) continue;
+    const c = cells[cellIndex(b.pos.x, b.pos.y)];
+    if (b.detected) c.caught++;
+    else c.missed++;
+  }
+  return cells.filter((c) => c.n > 0);
 }
 
 // Infrastructure markers are drawn as ICONS sized in PIXELS, not polygons
@@ -109,6 +156,7 @@ export default function NetworkMap() {
     topology,
     layers,
     roadmap,
+    mapDetail,
     selectedVehicle,
     selectVehicle,
   } = usePlayback();
@@ -129,6 +177,57 @@ export default function NetworkMap() {
   const deckLayers = useMemo(() => {
     if (!geometry) return [];
     const L: any[] = [];
+
+    // ── Region: collapse the whole fleet into area clusters ─────────────────
+    // No individual entity, no road network, no rubber bands — a cell with
+    // even one missed poisoning renders as missed, so this can't visually
+    // launder a real detection failure into "looks clean from far away."
+    if (mapDetail === "region") {
+      const cells = buildRegionCells(geometry.bounds, positions, beacons);
+      L.push(
+        new ScatterplotLayer({
+          id: "region-cells",
+          data: cells,
+          getPosition: (d: RegionCell) => [d.cx, d.cy],
+          getRadius: (d: RegionCell) => 40 + Math.sqrt(d.n) * 22,
+          radiusUnits: "meters",
+          radiusMinPixels: 18,
+          radiusMaxPixels: 90,
+          getFillColor: (d: RegionCell) =>
+            d.missed > 0 ? C.missed : d.caught > 0 ? C.caught : C.vehicleDim,
+          opacity: 0.55,
+          stroked: true,
+          getLineColor: [255, 255, 255, 60],
+          getLineWidth: 1,
+          lineWidthUnits: "pixels",
+          pickable: false,
+        })
+      );
+      L.push(
+        new TextLayer({
+          id: "region-labels",
+          data: cells,
+          getPosition: (d: RegionCell) => [d.cx, d.cy],
+          getText: (d: RegionCell) =>
+            d.missed > 0
+              ? `${d.n}\n${d.missed} missed`
+              : d.caught > 0
+              ? `${d.n}\n${d.caught} caught`
+              : `${d.n}`,
+          getSize: 12,
+          sizeUnits: "pixels",
+          getColor: [235, 240, 245, 235],
+          fontFamily: "IBM Plex Mono, monospace",
+          getTextAnchor: "middle",
+          getAlignmentBaseline: "center",
+        })
+      );
+      return L;
+    }
+
+    // District hides per-vehicle state (colour, trails, rubber bands) — only
+    // street level and above show WHO is lying, not just THAT traffic exists.
+    const showIndividual = mapDetail === "street" || mapDetail === "entity";
 
     // ── Street network, drawn first so everything else sits on top ─────────
     // Geometry comes straight from the SUMO .net.xml the traces were
@@ -219,7 +318,7 @@ export default function NetworkMap() {
 
     // Movement trails from REPORTED positions, so a poisoned vehicle's trail
     // visibly peels away from honest traffic.
-    if (layers.trails && trails.length) {
+    if (showIndividual && layers.trails && trails.length) {
       L.push(
         new PathLayer({
           id: "trails",
@@ -278,7 +377,7 @@ export default function NetworkMap() {
     // Rubber band: claimed position -> true position. Never for ghosts (the
     // server sends gt_pos: null for them — a fabricated identity has no
     // "actual" location to compare against).
-    if (layers.rubberBands) {
+    if (showIndividual && layers.rubberBands) {
       const bands = beacons.filter((b) => b.gt_pos && b.is_poisoned);
       L.push(
         new LineLayer({
@@ -311,32 +410,36 @@ export default function NetworkMap() {
     }
 
     // Active beacons, coloured by ground truth vs detection outcome. These sit
-    // above the fleet dots and must stay clearly larger than them.
-    L.push(
-      new ScatterplotLayer({
-        id: "beacons",
-        data: beacons,
-        getPosition: (d: BeaconDto) => [d.pos.x, d.pos.y],
-        getRadius: (d: BeaconDto) => (d.is_poisoned ? 26 : 18),
-        radiusUnits: "meters",
-        radiusMinPixels: 6,
-        radiusMaxPixels: 16,
-        getFillColor: beaconColor,
-        stroked: true,
-        getLineColor: (d: BeaconDto) =>
-          d.vehicle_id === selectedVehicle ? C.selected : [0, 0, 0, 120],
-        getLineWidth: (d: BeaconDto) =>
-          d.vehicle_id === selectedVehicle ? 3 : 1,
-        lineWidthUnits: "pixels",
-        pickable: true,
-        onClick: (info: any) =>
-          info.object && selectVehicle(info.object.vehicle_id),
-        updateTriggers: { getLineColor: selectedVehicle, getLineWidth: selectedVehicle },
-      })
-    );
+    // above the fleet dots and must stay clearly larger than them. Hidden
+    // below street level: per-vehicle state IS the individual identity that
+    // district is meant to withhold.
+    if (showIndividual) {
+      L.push(
+        new ScatterplotLayer({
+          id: "beacons",
+          data: beacons,
+          getPosition: (d: BeaconDto) => [d.pos.x, d.pos.y],
+          getRadius: (d: BeaconDto) => (d.is_poisoned ? 26 : 18),
+          radiusUnits: "meters",
+          radiusMinPixels: 6,
+          radiusMaxPixels: 16,
+          getFillColor: beaconColor,
+          stroked: true,
+          getLineColor: (d: BeaconDto) =>
+            d.vehicle_id === selectedVehicle ? C.selected : [0, 0, 0, 120],
+          getLineWidth: (d: BeaconDto) =>
+            d.vehicle_id === selectedVehicle ? 3 : 1,
+          lineWidthUnits: "pixels",
+          pickable: true,
+          onClick: (info: any) =>
+            info.object && selectVehicle(info.object.vehicle_id),
+          updateTriggers: { getLineColor: selectedVehicle, getLineWidth: selectedVehicle },
+        })
+      );
+    }
 
     // Ghosts get a cross on top: magenta-vs-aqua fails CVD, so shape carries it.
-    const ghosts = beacons.filter((b) => b.is_ghost);
+    const ghosts = showIndividual ? beacons.filter((b) => b.is_ghost) : [];
     if (ghosts.length) {
       L.push(
         new PathLayer({
@@ -355,6 +458,29 @@ export default function NetworkMap() {
           pickable: false,
         })
       );
+    }
+
+    // Entity level only: vehicle-ID labels for anything poisoned, so a
+    // single-intersection zoom can name names. Skipped at street level
+    // because labels for the whole fleet would collide into noise.
+    if (mapDetail === "entity") {
+      const flagged = beacons.filter((b) => b.is_poisoned || b.is_ghost);
+      if (flagged.length) {
+        L.push(
+          new TextLayer({
+            id: "entity-labels",
+            data: flagged,
+            getPosition: (d: BeaconDto) => [d.pos.x, d.pos.y],
+            getText: (d: BeaconDto) => `#${d.vehicle_id}`,
+            getSize: 11,
+            sizeUnits: "pixels",
+            getColor: [235, 240, 245, 235],
+            fontFamily: "IBM Plex Mono, monospace",
+            getPixelOffset: [0, -18],
+            getTextAnchor: "middle",
+          })
+        );
+      }
     }
 
     // Controllers last so they sit above everything.
@@ -382,6 +508,7 @@ export default function NetworkMap() {
     topology,
     layers,
     roadmap,
+    mapDetail,
     compromisedRsus,
     selectedVehicle,
     selectVehicle,

@@ -20,6 +20,13 @@ export interface LayerToggles {
   controllerLinks: boolean;
 }
 
+// Level of detail: separate from continuous camera zoom (deck.gl still
+// handles pan/scroll), this controls WHICH layers render — region-level
+// clustering vs. every individual entity. Default "street" preserves the
+// map's pre-existing always-full-detail behaviour for anyone who never
+// touches the new control.
+export type MapDetail = "region" | "district" | "street" | "entity";
+
 interface PlaybackState {
   scenarios: ScenarioSummary[];
   scenarioId: string | null;
@@ -45,6 +52,8 @@ interface PlaybackState {
   loadingVehicle: boolean;
 
   layers: LayerToggles;
+  mapDetail: MapDetail;
+  setMapDetail: (d: MapDetail) => void;
   loading: boolean;
   error: string | null;
 
@@ -93,6 +102,8 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     rubberBands: true,
     controllerLinks: false,
   },
+  mapDetail: "street",
+  setMapDetail: (d) => set({ mapDetail: d }),
   loading: false,
   error: null,
 

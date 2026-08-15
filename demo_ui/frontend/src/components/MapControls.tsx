@@ -1,6 +1,29 @@
 import { useState } from "react";
-import { usePlayback, LayerToggles } from "../store/playback";
+import { usePlayback, LayerToggles, MapDetail } from "../store/playback";
 import { ENTITY, STATUS } from "../design/tokens";
+
+const DETAIL_STEPS: { level: MapDetail; label: string; note: string }[] = [
+  {
+    level: "region",
+    label: "Region",
+    note: "Entities collapse into area clusters — count and worst-case state only. Nothing overlaps, no individual is drawn.",
+  },
+  {
+    level: "district",
+    label: "District",
+    note: "Infrastructure at full detail; vehicles shown as density dots only. Individual identity is not readable at this level, by design.",
+  },
+  {
+    level: "street",
+    label: "Street",
+    note: "Every entity drawn with its own shape. Flagged vehicles get a claim-vs-actual line. The default view.",
+  },
+  {
+    level: "entity",
+    label: "Entity",
+    note: "Adds vehicle-ID labels for anything poisoned. Best used zoomed into one area — labels will collide across the full network.",
+  },
+];
 
 // Shape is part of the encoding, not decoration: the validated palette clears
 // the normal-vision floor but sits in the CVD warn band, which is only
@@ -97,9 +120,10 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
 }
 
 export default function MapControls() {
-  const { layers, toggleLayer } = usePlayback();
+  const { layers, toggleLayer, mapDetail, setMapDetail } = usePlayback();
   const [controlsOpen, setControlsOpen] = useState(true);
   const [legendOpen, setLegendOpen] = useState(false);
+  const activeStep = DETAIL_STEPS.find((s) => s.level === mapDetail) ?? DETAIL_STEPS[2];
 
   const changedCount = LAYER_CHIPS.filter((c) => layers[c.k] !== LAYER_DEFAULTS[c.k]).length;
 
@@ -126,7 +150,30 @@ export default function MapControls() {
 
       {controlsOpen && (
         <div className="rounded-lg border border-surface-hairline2 bg-surface-panel/95 p-2.5 shadow-lg backdrop-blur">
-          <div className="mb-1.5 text-[9px] font-bold uppercase tracking-widest text-ink-muted">
+          <div className="mb-1.5 flex items-center justify-between">
+            <span className="text-[9px] font-bold uppercase tracking-widest text-ink-muted">
+              Detail level
+            </span>
+            <span className="font-mono text-[10px] text-ink-muted">{activeStep.label}</span>
+          </div>
+          <div className="flex gap-1">
+            {DETAIL_STEPS.map((s) => (
+              <button
+                key={s.level}
+                onClick={() => setMapDetail(s.level)}
+                className={`flex-1 rounded px-2 py-1 text-[10.5px] font-semibold transition-colors ${
+                  mapDetail === s.level
+                    ? "bg-entity-rsu text-white"
+                    : "bg-surface-raised text-ink-secondary hover:text-ink-primary"
+                }`}
+              >
+                {s.label}
+              </button>
+            ))}
+          </div>
+          <p className="mb-1.5 mt-1.5 text-[10px] leading-relaxed text-ink-muted">{activeStep.note}</p>
+
+          <div className="mb-1.5 border-t border-surface-hairline pt-2 text-[9px] font-bold uppercase tracking-widest text-ink-muted">
             Layers
           </div>
           <div className="flex flex-wrap gap-1.5">
