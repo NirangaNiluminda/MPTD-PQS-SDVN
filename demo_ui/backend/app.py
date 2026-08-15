@@ -244,6 +244,68 @@ def scenario_topology(scenario_id: str):
     }
 
 
+# ── Attack explainer (per-attack description + real E5 result comparison) ──
+
+@lru_cache(maxsize=1)
+def _e5_results() -> dict:
+    if not config.E5_RESULTS_FILE.is_file():
+        return {}
+    with open(config.E5_RESULTS_FILE) as fh:
+        import json
+
+        return json.load(fh)
+
+
+@app.get("/api/attacks")
+def list_attacks():
+    """One entry per attack variant (1-7, no combined/0): description, which
+    entity is hostile, and the measured SENTINEL-vs-baseline comparison from
+    results_e5_final/e5_final_table.json — including the variants where a
+    baseline actually beats SENTINEL_Full (TP-S1, TP-S3, MP-S4). Never hide
+    those; showing only the wins would misrepresent the evaluation."""
+    e5 = _e5_results()
+    scenarios = _scenarios()
+    out = []
+    for n in range(1, 8):
+        code, _, human = catalog.ATTACK_NAMES[n].partition(":")
+        info = catalog.ATTACK_INFO[n]
+        result = e5.get(code, {})
+        full = result.get("SENTINEL_Full")
+        baselines = {k: result.get(k) for k in ("B1", "B2", "B3") if result.get(k)}
+        best_baseline = max(
+            ((k, v["MCC"]) for k, v in baselines.items() if "MCC" in v),
+            key=lambda kv: kv[1],
+            default=(None, None),
+        )
+        # Point the "show me" link at a mid-intensity urban recording if one
+        # exists in the corpus, so the card can jump straight into a replay.
+        sample = next(
+            (s.id for s in scenarios if s.road == "urban" and s.attack_number == n and s.attack_pct == 40),
+            next((s.id for s in scenarios if s.attack_number == n), None),
+        )
+        out.append(
+            {
+                "attack_number": n,
+                "code": code,
+                "human_name": human.replace("-", " "),
+                "actor": info["actor"],
+                "description": info["plain"],
+                "sentinel_full": full,
+                "sentinel_lw": result.get("SENTINEL_LW"),
+                "baselines": baselines,
+                "best_baseline_code": best_baseline[0],
+                "best_baseline_mcc": best_baseline[1],
+                "baseline_wins": (
+                    best_baseline[1] is not None
+                    and full is not None
+                    and best_baseline[1] > full.get("MCC", -999)
+                ),
+                "sample_scenario_id": sample,
+            }
+        )
+    return out
+
+
 # ── Signature-mask decode (utility, also useful standalone for the frontend) ─
 
 @app.get("/api/sigmask/{mask}")
@@ -573,6 +635,48 @@ def capture_vehicle(vid: int):
         raise HTTPException(404, f"vehicle {vid} has no FUSION events in the capture")
     events.sort(key=lambda e: e.t)
     return {"vid": vid, "events": [_fusion_event_to_dict(e) for e in events]}
+
+
+# ── Results & ablation (E1/E2 figures as static images, E5 as data,
+#    D1/D4/D6 ablation as documented facts) ─────────────────────────────────
+
+for _key, _dir in config.RESULTS_DIRS.items():
+    if _dir.is_dir():
+        app.mount(f"/static/results_{_key}", StaticFiles(directory=str(_dir)), name=f"results_{_key}")
+
+
+@app.get("/api/results/e5")
+def results_e5():
+    return _e5_results()
+
+
+@app.get("/api/results/ablation")
+def results_ablation():
+    """D1 (no ML) / D4 (GAT only) / D6 (GAT+LSTM-AE), combined attack, 40%
+    intensity, urban, seed 1. Hardcoded from CLAUDE.md's documented,
+    simulator-printed values (2026-08-07) rather than re-derived here — this
+    is exactly the kind of number a parsing bug could silently corrupt, and
+    RUN_CONFIG.md/CLAUDE.md already carry it as the audited source of truth.
+    Update this alongside CLAUDE.md if those figures are ever revised."""
+    return {
+        "source": "CLAUDE.md 'Current state' section, 2026-08-07",
+        "config": "300s combined-attack run, seed 1, rho_a 0.40, urban",
+        "windows": [
+            {
+                "cutoff_s": 90,
+                "ordering_holds": True,
+                "arms": {"D1": 0.8339, "D4": 0.8432, "D6": 0.8477},
+            },
+            {
+                "cutoff_s": 300,
+                "ordering_holds": False,
+                "arms": {"D1": 0.763, "D4": 0.758, "D6": 0.766},
+                "note": "D4 falls 0.005 below D1 over the full run. The D4-vs-D1 "
+                "gap (0.0011 at 90s) is inside ONNX run-to-run variance (~0.007) "
+                "and should not be read as a resolved ordering.",
+            },
+        ],
+    }
 
 
 # ── Serve the built frontend (present after `npm run build`) ───────────────

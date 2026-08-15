@@ -9,15 +9,16 @@ import StatBar from "../components/StatBar";
 import VehicleDrawer from "../components/VehicleDrawer";
 
 export default function NetworkReplayScreen() {
-  const loadScenarios = usePlayback((s) => s.loadScenarios);
+  // loadScenarios() is called once at the app root (App.tsx), not here.
+  // This screen only mounts when its tab is active, but the Attack
+  // Explainer's "Show me this attack" needs to call selectScenario()
+  // BEFORE this screen has ever mounted — if the scenario list were only
+  // loaded here, that jump would silently no-op (selectScenario looks up
+  // the id in an empty array and returns early, no error surfaced).
   const tick = usePlayback((s) => s.tick);
   const playing = usePlayback((s) => s.playing);
   const error = usePlayback((s) => s.error);
   const lastFrameRef = useRef<number | null>(null);
-
-  useEffect(() => {
-    loadScenarios();
-  }, [loadScenarios]);
 
   // Wall-clock-driven playback: each frame advances sim time by the real
   // elapsed delta × the speed multiplier.

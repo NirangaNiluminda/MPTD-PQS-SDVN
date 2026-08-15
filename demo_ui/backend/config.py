@@ -33,6 +33,22 @@ CAPTURES_DIR = Path(__file__).resolve().parents[1] / "captures"
 LEDGER_SNAPSHOT = CAPTURES_DIR / "ledger_snapshot.json"
 FUSION_CAPTURE_LOG = CAPTURES_DIR / "combined_bc_90s.log"
 
+# results_e5_final/e5_final_table.json: SENTINEL vs B1/B2/B3 baselines, per
+# attack variant. Validated 2026-08-14 against the repo's own results dir.
+E5_RESULTS_FILE = REPO_ROOT / "results_e5_final" / "e5_final_table.json"
+
+# E1 (penetration/intensity sweep) and E2 (speed regime sweep): the raw CSVs
+# have no header row and no generating script survives in the repo, so their
+# ~13 numeric columns can't be safely re-derived — a wrong guess there would
+# silently plot the wrong metric. The PNGs were already correctly built by
+# someone who had that context; serve them as static images rather than
+# reinterpret the columns.
+RESULTS_DIRS = {
+    "e1": REPO_ROOT / "results_e1_final",
+    "e2": REPO_ROOT / "results_e2_final",
+    "e5": REPO_ROOT / "results_e5_final",
+}
+
 # SUMO .net.xml per road type — the real street geometry the traces were
 # generated on. Same coordinate frame as the traces (verified via
 # convBoundary vs trace extent), so no transform is needed.

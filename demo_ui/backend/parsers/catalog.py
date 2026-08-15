@@ -31,6 +31,43 @@ ATTACK_NAMES = {
     7: "MP-S4:ControlPlane-MobilityPatternPoisoning",
 }
 
+# Actor + plain description, verified against 06a_attack_models.h's own
+# comments (declare_attack_states(), attack_number == 1..7 branches).
+ATTACK_INFO = {
+    1: {
+        "actor": "compromised_rsu",
+        "plain": "A hijacked roadside unit rewrites vehicles' trajectories as it relays them.",
+    },
+    2: {
+        "actor": "malicious_vehicle",
+        "plain": "A lying vehicle reports a fake but physically plausible trajectory.",
+    },
+    3: {
+        "actor": "compromised_rsu",
+        "plain": "A hijacked roadside unit injects ghost identities (Sybil). In enhanced mode "
+        "the ghosts pre-register with valid pool IDs, so detection must be behavioural.",
+    },
+    4: {
+        "actor": "malicious_vehicle",
+        "plain": "A vehicle steals another vehicle's identity and beacons under it.",
+    },
+    5: {
+        "actor": "malicious_controller",
+        "plain": "A hijacked network controller poisons trajectories at the control plane; "
+        "vehicles and roadside units stay honest throughout.",
+    },
+    6: {
+        "actor": "mitm_relay",
+        "plain": "A vehicle acts as an intercepting relay, amplifying reported speed to "
+        "breach the neighbourhood similarity threshold.",
+    },
+    7: {
+        "actor": "malicious_controller",
+        "plain": "A hijacked controller corrupts the global mobility model despite receiving "
+        "correct data from every honest vehicle and roadside unit.",
+    },
+}
+
 _FOLDER_RE = re.compile(r"^a(?P<attack>\d+)_p(?P<pct>\d+)$")
 
 

@@ -248,6 +248,29 @@ export interface FusionEventDto {
   accusations: Accusation[];
 }
 
+export interface AttackResultDto {
+  MCC: number;
+  MCC_std?: number;
+  TTD?: number;
+  CDER?: number;
+  PBPO_ms?: number;
+}
+
+export interface AttackInfoDto {
+  attack_number: number;
+  code: string;
+  human_name: string;
+  actor: string;
+  description: string;
+  sentinel_full: AttackResultDto | null;
+  sentinel_lw: AttackResultDto | null;
+  baselines: Record<string, AttackResultDto>;
+  best_baseline_code: string | null;
+  best_baseline_mcc: number | null;
+  baseline_wins: boolean;
+  sample_scenario_id: string | null;
+}
+
 export interface ScenarioDetailDto {
   id: string;
   road: string;
@@ -308,4 +331,19 @@ export const api = {
   captureVehicle: (vid: number) =>
     getJson<{ vid: number; events: FusionEventDto[] }>(`/api/capture/vehicle/${vid}`),
   captureCryptoSummary: () => getJson<CryptoSummaryDto>("/api/capture/crypto_summary"),
+
+  attacks: () => getJson<AttackInfoDto[]>("/api/attacks"),
+
+  resultsE5: () => getJson<Record<string, any>>("/api/results/e5"),
+  resultsAblation: () =>
+    getJson<{
+      source: string;
+      config: string;
+      windows: {
+        cutoff_s: number;
+        ordering_holds: boolean;
+        arms: { D1: number; D4: number; D6: number };
+        note?: string;
+      }[];
+    }>("/api/results/ablation"),
 };
