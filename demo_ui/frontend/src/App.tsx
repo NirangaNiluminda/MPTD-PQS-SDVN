@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { usePlayback } from "./store/playback";
+import { useMode, CopyMode } from "./store/mode";
 import NetworkReplayScreen from "./screens/NetworkReplayScreen";
 import DefenceInspectorScreen from "./screens/DefenceInspectorScreen";
 import LedgerScreen from "./screens/LedgerScreen";
@@ -13,7 +14,7 @@ type Tab = "attacks" | "replay" | "inspector" | "ledger" | "results" | "console"
 
 interface ScreenMeta {
   title: string;
-  blurb: string;
+  blurb: Record<CopyMode, string>;
   provenance: ProvenanceKind;
 }
 
@@ -38,38 +39,62 @@ const TAB_LABEL: Record<Tab, string> = {
 const SCREEN_META: Record<Tab, ScreenMeta> = {
   attacks: {
     title: "Attack Explainer",
-    blurb:
-      "The seven ways an attacker can poison this network, what each does, and how well the defence handles it against a baseline — including where the baseline wins.",
+    blurb: {
+      plain:
+        "Seven ways someone can try to fool this network, and whether our defence actually catches each one — compared with a simpler existing method. Every result is shown, even the ones where the simpler method wins.",
+      expert:
+        "Threat taxonomy across 7 attack variants with hostile-entity assignment and measured MCC against the strongest of three baselines (B1/B2/B3), from results_e5_final/e5_final_table.json — including variants where a baseline outperforms SENTINEL_Full.",
+    },
     provenance: "snapshot",
   },
   replay: {
     title: "Network Replay",
-    blurb:
-      "Every vehicle, roadside unit, and controller in the road network, replayed from a recorded simulation. Lines connect a claimed position to the real one for anything caught lying.",
+    blurb: {
+      plain:
+        "A recorded drive-through of the road network. Every dot is a car, every square a roadside sensor, every diamond a network controller. When a car lies about its position, a line shows the gap between its claim and the truth.",
+      expert:
+        "Entity-level replay of a completed simulation over the real Shinjuku street graph. Claim-vs-ground-truth vectors, RSU coverage discs (R_max_comm = 270 m), and derived controller-cluster assignment, filtered by class and detection outcome.",
+    },
     provenance: "replayed",
   },
   inspector: {
     title: "Defence Stack Inspector",
-    blurb:
-      "Pick a vehicle and see the three independent signals — rule signatures, a graph attention network, an LSTM autoencoder — that combine into one fused decision.",
+    blurb: {
+      plain:
+        "Click any car to see exactly why it was trusted or not. Three separate checks — hard rules, a pattern-matching AI, and a memory-based AI — each form their own opinion, and those combine into one final decision.",
+      expert:
+        "Per-vehicle decomposition of the fused decision Φ (Eq 3.46) into its three normalised inputs — rule signatures (ψ̂), GAT spatial score (Ŝ), LSTM-AE reconstruction (ε̂) — against the 0.5 threshold, from one blockchain-enabled capture run's [FUSION-RSU*] output.",
+    },
     provenance: "replayed",
   },
   ledger: {
     title: "Blockchain Ledger",
-    blurb:
-      "Trust decay, revocation votes, and controller reassignments recorded on-chain, plus the measured cost of the post-quantum cryptography behind them.",
+    blurb: {
+      plain:
+        "A permanent, tamper-proof record. Cars and roadside sensors that keep misbehaving lose trust over time and eventually get removed from the network; a compromised controller can be voted out by the honest ones.",
+      expert:
+        "Point-in-time snapshot of the Hyperledger Fabric ledger: RSU/vehicle/controller trust-score decay, the append-only revocation and CP-DETECT flag log, and measured PQ-crypto cost (TRS/FHE/DKG latency, bandwidth overhead).",
+    },
     provenance: "snapshot",
   },
   results: {
     title: "Results & Ablation",
-    blurb:
-      "What happens to accuracy when parts of the defence are switched off — every figure states the window it was measured over and the caveat that goes with it.",
+    blurb: {
+      plain:
+        "What happens to accuracy if pieces of the defence are removed, one at a time. Every number here states exactly how it was measured and what its limits are — not just the figure that looks best.",
+      expert:
+        "D1/D4/D6 ablation (rules-only / +GAT / +GAT+LSTM-AE) at both a 90 s and 300 s window, the E1 penetration-intensity and E2 speed-regime sweeps, and the E5 baseline comparison — every figure states its window and caveat inline.",
+    },
     provenance: "snapshot",
   },
   console: {
     title: "Run Console",
-    blurb:
-      "Launch a real simulation on this machine — not a replay. Runs take minutes to hours; safe-default flags are applied automatically.",
+    blurb: {
+      plain:
+        "Start a brand-new simulation for real, right now, on this machine — not a recording. It can take a few minutes to a few hours, and you can watch it happen live.",
+      expert:
+        "Launches the compiled simulator directly with every documented safe-default flag pre-applied (routing_test=false, ablation_mode=0, gat_det_flag_heads=0, the routing_algorithm/skip_blockchain pairing). Verifies the deployed model before every launch.",
+    },
     provenance: "live",
   },
 };
@@ -78,6 +103,8 @@ export default function App() {
   const [tab, setTab] = useState<Tab>("attacks");
   const loadScenarios = usePlayback((s) => s.loadScenarios);
   const selectScenario = usePlayback((s) => s.selectScenario);
+  const mode = useMode((s) => s.mode);
+  const setMode = useMode((s) => s.setMode);
 
   // Loaded once here, not inside NetworkReplayScreen — that screen only
   // mounts when its tab is active, but "Show me this attack" (below) needs
@@ -105,6 +132,25 @@ export default function App() {
         <span className="hidden text-xs text-ink-muted lg:inline">
           Trajectory-poisoning defence for software-defined vehicle networks
         </span>
+
+        <div className="ml-auto flex items-center gap-0.5 rounded-md border border-surface-hairline2 bg-surface-raised p-0.5">
+          <button
+            onClick={() => setMode("plain")}
+            className={`rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${
+              mode === "plain" ? "bg-entity-rsu text-white" : "text-ink-secondary hover:text-ink-primary"
+            }`}
+          >
+            Plain English
+          </button>
+          <button
+            onClick={() => setMode("expert")}
+            className={`rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${
+              mode === "expert" ? "bg-entity-rsu text-white" : "text-ink-secondary hover:text-ink-primary"
+            }`}
+          >
+            Expert
+          </button>
+        </div>
       </header>
 
       <div className="grid min-h-0 grid-cols-[188px_1fr]">
@@ -147,7 +193,7 @@ export default function App() {
             <div className="min-w-0">
               <h2 className="text-base font-semibold text-ink-primary">{meta.title}</h2>
               <p className="mt-0.5 max-w-[70ch] text-[11px] leading-relaxed text-ink-secondary">
-                {meta.blurb}
+                {meta.blurb[mode]}
               </p>
             </div>
             <div className="shrink-0 pt-0.5">
