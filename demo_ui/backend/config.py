@@ -27,6 +27,12 @@ ROAD_TRACE_FILES = {
 
 SUMO_DIR = REPO_ROOT / "sumo"
 
+# Written by scripts/snapshot_ledger.py. Deliberately a point-in-time capture,
+# not a live query on every request — see that script's docstring.
+CAPTURES_DIR = Path(__file__).resolve().parents[1] / "captures"
+LEDGER_SNAPSHOT = CAPTURES_DIR / "ledger_snapshot.json"
+FUSION_CAPTURE_LOG = CAPTURES_DIR / "combined_bc_90s.log"
+
 # SUMO .net.xml per road type — the real street geometry the traces were
 # generated on. Same coordinate frame as the traces (verified via
 # convBoundary vs trace extent), so no transform is needed.

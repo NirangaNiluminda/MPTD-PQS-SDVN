@@ -17,7 +17,9 @@ from fastapi.staticfiles import StaticFiles
 import config
 from parsers import beacon as beacon_parser
 from parsers import catalog
+from parsers import fusion
 from parsers import geometry
+from parsers import ledger
 from parsers import roadmap
 from parsers import sigmask
 from parsers import topology
@@ -350,6 +352,174 @@ def scenario_detail(scenario_id: str):
         "attack_pct": s.attack_pct,
         "metrics": metrics_row,
     }
+
+
+# ── Blockchain ledger (from a snapshot, not a live query — see
+#    scripts/snapshot_ledger.py and parsers/ledger.py for why) ──────────────
+
+@lru_cache(maxsize=1)
+def _ledger_snapshot() -> dict:
+    if not config.LEDGER_SNAPSHOT.is_file():
+        raise HTTPException(
+            404,
+            "No ledger snapshot yet. Run: cd demo_ui/backend && "
+            "python3 scripts/snapshot_ledger.py",
+        )
+    return ledger.load_snapshot(config.LEDGER_SNAPSHOT)
+
+
+def _ledger_data(key: str) -> list:
+    d = _ledger_snapshot()["data"].get(key)
+    if isinstance(d, dict) and "_error" in d:
+        raise HTTPException(502, f"ledger query '{key}' failed at capture time: {d['_error']}")
+    return d or []
+
+
+@app.get("/api/ledger/summary")
+def ledger_summary():
+    snap = _ledger_snapshot()
+    rsu = _ledger_data("rsu_trust")
+    veh = _ledger_data("vehicle_trust")
+    ctrl = _ledger_data("controller_trust")
+    return {
+        "captured_at": snap["captured_at"],
+        "rsus": {
+            "total": len(rsu),
+            "trusted": sum(1 for r in rsu if r.get("State") == "TRUSTED"),
+            "demoted": sum(1 for r in rsu if r.get("State") not in (None, "TRUSTED")),
+        },
+        "vehicles": {
+            "total": len(veh),
+            "decayed": sum(1 for v in veh if v.get("UpdateCount", 0) > 0),
+        },
+        "controllers": {
+            "total": len(ctrl),
+            "decayed": sum(1 for c in ctrl if c.get("UpdateCount", 0) > 0),
+        },
+        "revocations": len(_ledger_data("revocations")),
+        "controller_flags": len(_ledger_data("controller_flags")),
+        "reassignments": len(_ledger_data("reassignments")),
+    }
+
+
+@app.get("/api/ledger/trust/{entity}")
+def ledger_trust(entity: str):
+    """entity: rsu | vehicle | controller. Sorted worst-trust first."""
+    key = {"rsu": "rsu_trust", "vehicle": "vehicle_trust", "controller": "controller_trust"}.get(entity)
+    if key is None:
+        raise HTTPException(404, f"unknown entity type: {entity} (expected rsu|vehicle|controller)")
+    rows = _ledger_data(key)
+    return sorted(rows, key=lambda r: r.get("TrustScore", 1))
+
+
+@app.get("/api/ledger/revocations")
+def ledger_revocations():
+    return _ledger_data("revocations")
+
+
+@app.get("/api/ledger/flags")
+def ledger_flags():
+    return _ledger_data("controller_flags")
+
+
+@app.get("/api/ledger/reassignments")
+def ledger_reassignments():
+    return _ledger_data("reassignments")
+
+
+# ── FUSION capture: the [FUSION-RSU*] stdout from one blockchain-enabled
+#    run, giving the psi/S/ae_norm/phi breakdown the replay corpus lacks
+#    (that corpus was recorded at ablation_mode=1, so it never ran fusion). ─
+
+@lru_cache(maxsize=1)
+def _capture_events() -> list[fusion.FusionEvent]:
+    if not config.FUSION_CAPTURE_LOG.is_file():
+        raise HTTPException(404, f"no FUSION capture log at {config.FUSION_CAPTURE_LOG}")
+    with open(config.FUSION_CAPTURE_LOG) as fh:
+        return list(fusion.iter_events(fh))
+
+
+def _fusion_event_to_dict(e: "fusion.FusionEvent") -> dict:
+    accusations = [
+        {"code": a.code, "name": a.name, "detail": a.detail, "weight": a.weight}
+        for a in sigmask.decode(e.sig_mask)
+    ]
+    return {
+        "rsu_id": e.rsu_id,
+        "epoch": e.epoch,
+        "t": e.t,
+        "vid": e.vid,
+        "psi": e.psi,
+        "psi_fuse": e.psi_fuse,  # psi normalised to [0,1] against psi_th — the actual term summed into phi
+        "S": e.S,
+        "thetaS": e.thetaS,
+        "S_norm": e.S_over_thetaS_clamped,  # S/thetaS clamped to [0,1] — the actual GAT term summed into phi
+        "ae_norm": e.ae_norm,  # already the [0,1] term used in the fusion sum
+        "ae_raw": e.ae_raw,
+        "phi": e.phi,
+        "khat": e.khat,
+        "gt_pois": e.gt_pois,
+        "gt_atk": e.gt_atk,
+        "sig_mask": e.sig_mask,
+        "full_anom": e.full_anom,
+        "accusations": accusations,
+    }
+
+
+@app.get("/api/capture/summary")
+def capture_summary():
+    events = _capture_events()
+    vids = {e.vid for e in events}
+    poisoned = sum(1 for e in events if e.gt_pois)
+    flagged = sum(1 for e in events if e.full_anom)
+    return {
+        "source": config.FUSION_CAPTURE_LOG.name,
+        "events": len(events),
+        "vehicles": len(vids),
+        "gt_poisoned": poisoned,
+        "flagged": flagged,
+        "t_min": min((e.t for e in events), default=0),
+        "t_max": max((e.t for e in events), default=0),
+    }
+
+
+@app.get("/api/capture/vehicles")
+def capture_vehicles():
+    """One row per vehicle that appears in the capture, worst-first (missed
+    poisoning ranks above caught, which ranks above clean) so the interesting
+    cases are easy to find without scrolling 200+ entries."""
+    events = _capture_events()
+    by_vid: dict[int, list] = {}
+    for e in events:
+        by_vid.setdefault(e.vid, []).append(e)
+
+    rows = []
+    for vid, evs in by_vid.items():
+        poisoned = sum(1 for e in evs if e.gt_pois)
+        flagged = sum(1 for e in evs if e.gt_pois and e.full_anom)
+        rows.append(
+            {
+                "vid": vid,
+                "events": len(evs),
+                "gt_poisoned": poisoned,
+                "flagged": flagged,
+                "missed": poisoned - flagged,
+            }
+        )
+
+    def rank(r):
+        return (0 if r["missed"] > 0 else 1 if r["gt_poisoned"] > 0 else 2, -r["events"])
+
+    return sorted(rows, key=rank)
+
+
+@app.get("/api/capture/vehicle/{vid}")
+def capture_vehicle(vid: int):
+    events = [e for e in _capture_events() if e.vid == vid]
+    if not events:
+        raise HTTPException(404, f"vehicle {vid} has no FUSION events in the capture")
+    events.sort(key=lambda e: e.t)
+    return {"vid": vid, "events": [_fusion_event_to_dict(e) for e in events]}
 
 
 # ── Serve the built frontend (present after `npm run build`) ───────────────

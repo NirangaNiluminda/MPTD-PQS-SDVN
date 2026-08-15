@@ -119,6 +119,102 @@ export interface RoadMapDto {
   source: string;
 }
 
+// ── Blockchain ledger (point-in-time snapshot, see scripts/snapshot_ledger.py)
+
+export interface LedgerSummaryDto {
+  captured_at: string;
+  rsus: { total: number; trusted: number; demoted: number };
+  vehicles: { total: number; decayed: number };
+  controllers: { total: number; decayed: number };
+  revocations: number;
+  controller_flags: number;
+  reassignments: number;
+}
+
+export interface TrustRecordDto {
+  ID: string;
+  RSUID?: string;
+  VehicleID?: string;
+  ControllerID?: string;
+  TrustScore: number;
+  State?: string; // present on RSU records only
+  UpdateCount: number;
+  ConsecutiveLowEpochs: number;
+  Probationary?: boolean;
+  LastEpochTimestamp: string;
+  UpdatedAt: string;
+}
+
+export interface RevocationDto {
+  ID: string;
+  RSUID?: string;
+  VehicleID: string;
+  Reason: string;
+  Timestamp: string;
+  RevokedAt: string;
+}
+
+export interface ControllerFlagDto {
+  ID: string;
+  ControllerID: string;
+  VehicleID: string;
+  Epoch: string;
+  ConflictCount: number;
+  NumRSUs: number;
+  ThresholdFP1: number;
+  FlaggedAt: string;
+}
+
+export interface ReassignmentDto {
+  ID: string;
+  ExcludedController: string;
+  SuccessorController: string;
+  Reason: string;
+  Epoch: string;
+  At: string;
+}
+
+// ── FUSION capture ([FUSION-RSU*] stdout from one blockchain-enabled run) ───
+
+export interface CaptureSummaryDto {
+  source: string;
+  events: number;
+  vehicles: number;
+  gt_poisoned: number;
+  flagged: number;
+  t_min: number;
+  t_max: number;
+}
+
+export interface CaptureVehicleRowDto {
+  vid: number;
+  events: number;
+  gt_poisoned: number;
+  flagged: number;
+  missed: number;
+}
+
+export interface FusionEventDto {
+  rsu_id: number;
+  epoch: number;
+  t: number;
+  vid: number;
+  psi: number;
+  psi_fuse: number;
+  S: number;
+  thetaS: number;
+  S_norm: number;
+  ae_norm: number;
+  ae_raw: number;
+  phi: number;
+  khat: number;
+  gt_pois: boolean;
+  gt_atk: number;
+  sig_mask: number;
+  full_anom: boolean;
+  accusations: Accusation[];
+}
+
 export interface ScenarioDetailDto {
   id: string;
   road: string;
@@ -166,4 +262,16 @@ export const api = {
   stats: (scenarioId: string, t: number) =>
     getJson<StatsDto>(`/api/scenarios/${scenarioId}/stats?t=${t}`),
   roadmap: (road: string) => getJson<RoadMapDto>(`/api/roadmap/${road}`),
+
+  ledgerSummary: () => getJson<LedgerSummaryDto>("/api/ledger/summary"),
+  ledgerTrust: (entity: "rsu" | "vehicle" | "controller") =>
+    getJson<TrustRecordDto[]>(`/api/ledger/trust/${entity}`),
+  ledgerRevocations: () => getJson<RevocationDto[]>("/api/ledger/revocations"),
+  ledgerFlags: () => getJson<ControllerFlagDto[]>("/api/ledger/flags"),
+  ledgerReassignments: () => getJson<ReassignmentDto[]>("/api/ledger/reassignments"),
+
+  captureSummary: () => getJson<CaptureSummaryDto>("/api/capture/summary"),
+  captureVehicles: () => getJson<CaptureVehicleRowDto[]>("/api/capture/vehicles"),
+  captureVehicle: (vid: number) =>
+    getJson<{ vid: number; events: FusionEventDto[] }>(`/api/capture/vehicle/${vid}`),
 };
