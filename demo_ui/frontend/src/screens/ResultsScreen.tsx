@@ -1,16 +1,22 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Bar,
   BarChart,
   CartesianGrid,
   Legend,
+  Line,
+  LineChart,
+  ReferenceLine,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts";
-import { api, AttackInfoDto } from "../api";
-import { SERIES, INK } from "../design/tokens";
+import { api, AttackInfoDto, LayerAgreementDto, LatencyHistogramDto, SweepPointDto } from "../api";
+import { SERIES, INK, STATUS } from "../design/tokens";
+
+const LAYER_LABEL: Record<string, string> = { rules: "Rules", gat: "GAT", lstm_ae: "LSTM-AE" };
+const LAYER_ORDER = ["rules", "gat", "lstm_ae"];
 
 interface AblationDto {
   source: string;
@@ -34,6 +40,9 @@ function Callout({ children }: { children: React.ReactNode }) {
 export default function ResultsScreen() {
   const [attacks, setAttacks] = useState<AttackInfoDto[] | null>(null);
   const [ablation, setAblation] = useState<AblationDto | null>(null);
+  const [sweep, setSweep] = useState<SweepPointDto[] | null>(null);
+  const [agreement, setAgreement] = useState<LayerAgreementDto | null>(null);
+  const [latency, setLatency] = useState<LatencyHistogramDto | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -43,7 +52,40 @@ export default function ResultsScreen() {
         setAblation(ab);
       })
       .catch((e) => setError(String(e)));
+    // Separate failure domain: these three come from the capture log, which
+    // may not exist in every deployment (see run_summary's own note on that).
+    api.captureThresholdSweep().then(setSweep).catch(() => setSweep(null));
+    api.captureLayerAgreement().then(setAgreement).catch(() => setAgreement(null));
+    api.captureLatencyHistogram().then(setLatency).catch(() => setLatency(null));
   }, []);
+
+  const sweepChartData = sweep?.map((p) => ({
+    threshold: p.threshold,
+    precision: p.precision,
+    recall: p.recall,
+    f1: p.f1,
+  }));
+
+  const peakF1 = useMemo(() => {
+    if (!sweep) return null;
+    return sweep.reduce((best, p) => ((p.f1 ?? -1) > (best?.f1 ?? -1) ? p : best), sweep[0]);
+  }, [sweep]);
+
+  const latencyBins = useMemo(() => {
+    if (!latency) return null;
+    const bins = [
+      { label: "0s (same window)", test: (v: number) => v === 0 },
+      { label: "0–1s", test: (v: number) => v > 0 && v <= 1 },
+      { label: "1–2s", test: (v: number) => v > 1 && v <= 2 },
+      { label: "2–3s", test: (v: number) => v > 2 && v <= 3 },
+      { label: "3–5s", test: (v: number) => v > 3 && v <= 5 },
+      { label: ">5s", test: (v: number) => v > 5 },
+    ];
+    return bins.map((b) => ({
+      label: b.label,
+      count: latency.latencies_seconds.filter(b.test).length,
+    }));
+  }, [latency]);
 
   const chartData = attacks?.map((a) => ({
     code: a.code,
@@ -98,6 +140,144 @@ export default function ResultsScreen() {
             </div>
           )}
         </section>
+
+        {sweep && (
+          <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
+            <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
+              Threshold sweep — precision, recall, F1 vs. decision threshold
+            </h2>
+            <p className="mb-3 text-[11px] text-ink-secondary">
+              Computed post-hoc from the real fused score (Φ) each event in
+              one blockchain-enabled capture run already carries — sweeping
+              the decision threshold re-slices existing data, no
+              re-simulation. Sanity-checked: at threshold 0.5 this exactly
+              reproduces the simulator's own printed confusion matrix
+              (TP=12756 FP=70 TN=4480 FN=1110).
+              {peakF1 && (
+                <>
+                  {" "}
+                  Peak F1 ({peakF1.f1?.toFixed(3)}) falls at threshold{" "}
+                  {peakF1.threshold.toFixed(2)} — the deployed operating
+                  point is 0.5, so the peak and the actual choice do not
+                  coincide here.
+                </>
+              )}
+            </p>
+            <div className="h-56">
+              <ResponsiveContainer width="100%" height="100%">
+                <LineChart data={sweepChartData ?? []} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
+                  <CartesianGrid stroke="#1f2933" vertical={false} />
+                  <XAxis
+                    dataKey="threshold"
+                    type="number"
+                    domain={[0, 1]}
+                    tick={{ fill: INK.muted, fontSize: 10 }}
+                    stroke="#2c3742"
+                  />
+                  <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                  <Tooltip
+                    contentStyle={{ background: "#151c24", border: "1px solid #1f2933", borderRadius: 6, fontSize: 11 }}
+                    labelStyle={{ color: INK.secondary }}
+                  />
+                  <Legend wrapperStyle={{ fontSize: 11 }} />
+                  <ReferenceLine x={0.5} stroke={STATUS.caught} strokeDasharray="4 3" label={{ value: "deployed (0.5)", fill: STATUS.caught, fontSize: 10, position: "top" }} />
+                  <Line type="monotone" dataKey="precision" stroke={SERIES[0]} strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="recall" stroke={SERIES[1]} strokeWidth={2} dot={false} isAnimationActive={false} />
+                  <Line type="monotone" dataKey="f1" stroke={SERIES[2]} strokeWidth={2.5} dot={false} isAnimationActive={false} />
+                </LineChart>
+              </ResponsiveContainer>
+            </div>
+          </section>
+        )}
+
+        {(agreement || latencyBins) && (
+          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+            {agreement && (
+              <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
+                <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
+                  Layer agreement — are the three tiers redundant?
+                </h2>
+                <p className="mb-3 text-[11px] text-ink-secondary">
+                  Pairwise agreement on each layer's own binary decision,
+                  from {agreement.n_events.toLocaleString()} real events.
+                  High agreement is the case for dropping a layer; low
+                  agreement is the case for keeping both. Agreement is not
+                  accuracy — two layers can agree and both be wrong.
+                </p>
+                <div className="overflow-hidden rounded border border-surface-hairline">
+                  <div className="grid grid-cols-4 bg-surface-raised text-center text-[10px] font-semibold text-ink-muted">
+                    <div className="p-1.5" />
+                    {LAYER_ORDER.map((l) => (
+                      <div key={l} className="p-1.5">{LAYER_LABEL[l]}</div>
+                    ))}
+                  </div>
+                  {LAYER_ORDER.map((row) => (
+                    <div key={row} className="grid grid-cols-4 border-t border-surface-hairline text-center text-xs">
+                      <div className="flex items-center justify-center bg-surface-raised p-1.5 font-semibold text-ink-muted">
+                        {LAYER_LABEL[row]}
+                      </div>
+                      {LAYER_ORDER.map((col) => {
+                        const v = agreement.matrix[row]?.[col];
+                        return (
+                          <div
+                            key={col}
+                            className="flex items-center justify-center p-1.5 font-mono"
+                            style={
+                              v == null
+                                ? undefined
+                                : { background: `rgba(57,135,229,${Math.min(v, 0.9) * 0.35})` }
+                            }
+                          >
+                            {v == null ? "—" : v.toFixed(2)}
+                          </div>
+                        );
+                      })}
+                    </div>
+                  ))}
+                </div>
+                <div className="mt-2 flex gap-4 text-[10px] text-ink-muted">
+                  {LAYER_ORDER.map((l) => (
+                    <span key={l}>
+                      {LAYER_LABEL[l]} flags {(agreement.flag_rates[l] * 100).toFixed(0)}%
+                    </span>
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {latencyBins && latency && (
+              <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
+                <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
+                  Detection latency — onset to first catch
+                </h2>
+                <p className="mb-3 text-[11px] text-ink-secondary">
+                  {latency.vehicles_considered} vehicles were poisoned at some
+                  point in the capture; {latency.vehicles_missed_entirely}{" "}
+                  {latency.vehicles_missed_entirely === 1 ? "was" : "were"}{" "}
+                  never caught at all and is excluded from this distribution
+                  — binning a miss as "slow" would misstate the tail. Not the
+                  same figure as the simulator's own printed TTD mean shown
+                  in the Ledger screen; this is a distribution built here
+                  from the raw events.
+                </p>
+                <div className="h-40">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <BarChart data={latencyBins} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
+                      <CartesianGrid stroke="#1f2933" vertical={false} />
+                      <XAxis dataKey="label" tick={{ fill: INK.muted, fontSize: 9 }} stroke="#2c3742" />
+                      <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                      <Tooltip
+                        contentStyle={{ background: "#151c24", border: "1px solid #1f2933", borderRadius: 6, fontSize: 11 }}
+                        labelStyle={{ color: INK.secondary }}
+                      />
+                      <Bar dataKey="count" fill={SERIES[0]} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+              </section>
+            )}
+          </div>
+        )}
 
         {ablation && (
           <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">

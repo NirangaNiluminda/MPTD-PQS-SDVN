@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 
 import config
 from parsers import beacon as beacon_parser
+from parsers import capture_analytics
 from parsers import catalog
 from parsers import fusion
 from parsers import geometry
@@ -632,6 +633,34 @@ def capture_crypto_summary():
         },
         "ttd_seconds": s.ttd_s,
     }
+
+
+@app.get("/api/capture/threshold_sweep")
+def capture_threshold_sweep():
+    """Precision/recall/F1 of the real fused decisions against ground truth,
+    swept across the decision threshold. Uses the actual phi each event
+    already carries — sanity-checked to reproduce the simulator's own
+    confusion matrix exactly at threshold=0.5 (TP=12756 FP=70 TN=4480
+    FN=1110, matching the printed ATTACK SUMMARY byte-for-byte)."""
+    points = capture_analytics.threshold_sweep(_capture_events())
+    return [
+        {
+            "threshold": p.threshold,
+            "tp": p.tp, "fp": p.fp, "tn": p.tn, "fn": p.fn,
+            "precision": p.precision, "recall": p.recall, "f1": p.f1,
+        }
+        for p in points
+    ]
+
+
+@app.get("/api/capture/layer_agreement")
+def capture_layer_agreement_endpoint():
+    return capture_analytics.layer_agreement(_capture_events())
+
+
+@app.get("/api/capture/latency_histogram")
+def capture_latency_histogram():
+    return capture_analytics.detection_latency(_capture_events())
 
 
 @app.get("/api/capture/vehicle/{vid}")

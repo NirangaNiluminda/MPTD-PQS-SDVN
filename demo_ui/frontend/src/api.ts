@@ -194,6 +194,29 @@ export interface CaptureVehicleRowDto {
   missed: number;
 }
 
+export interface SweepPointDto {
+  threshold: number;
+  tp: number;
+  fp: number;
+  tn: number;
+  fn: number;
+  precision: number | null;
+  recall: number | null;
+  f1: number | null;
+}
+
+export interface LayerAgreementDto {
+  n_events: number;
+  matrix: Record<string, Record<string, number | null>>;
+  flag_rates: Record<string, number>;
+}
+
+export interface LatencyHistogramDto {
+  vehicles_considered: number;
+  vehicles_missed_entirely: number;
+  latencies_seconds: number[];
+}
+
 export interface CryptoSummaryDto {
   ipfs: {
     windows_stored: number;
@@ -390,6 +413,9 @@ export const api = {
   captureVehicle: (vid: number) =>
     getJson<{ vid: number; events: FusionEventDto[] }>(`/api/capture/vehicle/${vid}`),
   captureCryptoSummary: () => getJson<CryptoSummaryDto>("/api/capture/crypto_summary"),
+  captureThresholdSweep: () => getJson<SweepPointDto[]>("/api/capture/threshold_sweep"),
+  captureLayerAgreement: () => getJson<LayerAgreementDto>("/api/capture/layer_agreement"),
+  captureLatencyHistogram: () => getJson<LatencyHistogramDto>("/api/capture/latency_histogram"),
 
   attacks: () => getJson<AttackInfoDto[]>("/api/attacks"),
 
