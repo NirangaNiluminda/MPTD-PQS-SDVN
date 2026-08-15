@@ -2,7 +2,7 @@ import { useEffect, useRef } from "react";
 import { usePlayback } from "../store/playback";
 import ScenarioPicker from "../components/ScenarioPicker";
 import NetworkMap from "../components/NetworkMap";
-import MapLegend from "../components/MapLegend";
+import MapControls from "../components/MapControls";
 import DetectionFeed from "../components/DetectionFeed";
 import PlaybackControls from "../components/PlaybackControls";
 import StatBar from "../components/StatBar";
@@ -53,7 +53,7 @@ export default function NetworkReplayScreen() {
       <div className="flex flex-1 overflow-hidden">
         <div className="relative flex-1 bg-surface-page">
           <NetworkMap />
-          <MapLegend />
+          <MapControls />
         </div>
         <div className="w-80 shrink-0">
           <DetectionFeed />

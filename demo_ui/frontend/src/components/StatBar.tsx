@@ -1,38 +1,9 @@
 import { usePlayback } from "../store/playback";
-
-function Stat({
-  label,
-  value,
-  tone = "neutral",
-  hint,
-}: {
-  label: string;
-  value: string | number;
-  tone?: "neutral" | "caught" | "missed" | "ghost";
-  hint?: string;
-}) {
-  const toneClass =
-    tone === "caught"
-      ? "text-status-caught"
-      : tone === "missed"
-      ? "text-status-missed"
-      : tone === "ghost"
-      ? "text-entity-ghost"
-      : "text-ink-primary";
-  return (
-    <div className="flex flex-col px-4 py-2" title={hint}>
-      <span className="text-[10px] uppercase tracking-wider text-ink-muted">
-        {label}
-      </span>
-      <span className={`text-lg font-semibold leading-tight ${toneClass}`}>
-        {value}
-      </span>
-    </div>
-  );
-}
+import KpiCard from "./KpiCard";
+import { STATUS, ENTITY } from "../design/tokens";
 
 export default function StatBar() {
-  const { stats, detail, topology } = usePlayback();
+  const { stats, detail, topology, t, scenarioId } = usePlayback();
 
   if (!stats || !detail) {
     return (
@@ -83,43 +54,68 @@ export default function StatBar() {
 
   const mccRaw = fullRan ? num("MCC_full") : num("MCC");
   const mccLabel = `MCC (${tier})`;
+  const mccCaveat = mccDefined
+    ? `Whole-run figure from metrics.csv (${tier} tier) — not windowed to t=${t.toFixed(0)}s.`
+    : `Undefined, not zero: empty confusion-matrix margin (TP=${cm.tp} FP=${cm.fp} TN=${cm.tn} FN=${cm.fn}). ` +
+      `Detection was actually ${cm.tp}/${(cm.tp ?? 0) + (cm.fn ?? 0)} caught, ${cm.fp} false alarms.`;
+
+  const upToT = `up to t=${t.toFixed(0)}s`;
 
   return (
     <div className="flex flex-wrap items-stretch divide-x divide-surface-hairline border-b border-surface-hairline bg-surface-panel">
-      <Stat label="Beacons so far" value={stats.beacons.toLocaleString()} />
-      <Stat
+      <KpiCard
+        label="Beacons so far"
+        value={stats.beacons.toLocaleString()}
+        provenance="replayed"
+        provenanceDetail={upToT}
+        basis={`Counted ${upToT} in ${scenarioId ?? "this recording"}`}
+      />
+      <KpiCard
         label="Attacks caught"
         value={stats.caught.toLocaleString()}
-        tone="caught"
-        hint="Poisoned beacons the system flagged"
+        color={STATUS.caught}
+        provenance="replayed"
+        provenanceDetail={upToT}
+        basis="Poisoned beacons the system flagged"
       />
-      <Stat
+      <KpiCard
         label="Attacks missed"
         value={stats.missed.toLocaleString()}
-        tone="missed"
-        hint="Poisoned beacons that slipped through (false negatives)"
+        color={STATUS.missed}
+        provenance="replayed"
+        provenanceDetail={upToT}
+        basis="Poisoned beacons that slipped through (false negatives)"
       />
-      <Stat
+      <KpiCard
         label="False alarms"
         value={stats.false_alarms.toLocaleString()}
-        hint="Honest beacons wrongly flagged (false positives)"
+        provenance="replayed"
+        provenanceDetail={upToT}
+        basis="Honest beacons wrongly flagged (false positives)"
       />
       {stats.ghosts_seen > 0 && (
-        <Stat label="Ghost IDs" value={stats.ghosts_seen} tone="ghost" />
+        <KpiCard
+          label="Ghost IDs"
+          value={stats.ghosts_seen}
+          color={ENTITY.ghost}
+          provenance="replayed"
+          provenanceDetail={upToT}
+        />
       )}
-      <Stat label="Hostile nodes" value={hostileCount} tone="missed" />
+      <KpiCard
+        label="Hostile nodes"
+        value={hostileCount}
+        color={STATUS.missed}
+        provenance="replayed"
+        provenanceDetail="ground truth for the whole scenario"
+      />
       {mccRaw != null && (
-        <Stat
+        <KpiCard
           label={mccLabel}
           value={mccDefined ? mccRaw.toFixed(3) : "n/a"}
-          hint={
-            mccDefined
-              ? `From the simulator's own metrics.csv for the FULL run (${tier} tier) — not recomputed here, and not windowed to the current playback time.`
-              : `MCC is undefined for this run, not zero: the confusion matrix has an empty margin ` +
-                `(TP=${cm.tp} FP=${cm.fp} TN=${cm.tn} FN=${cm.fn}), so its denominator is 0. ` +
-                `At 100% hostile there are no honest beacons, hence no TN/FP. ` +
-                `Detection itself was ${cm.tp}/${(cm.tp ?? 0) + (cm.fn ?? 0)} caught with ${cm.fp} false alarms.`
-          }
+          provenance="replayed"
+          provenanceDetail="whole run, not windowed"
+          basis={mccCaveat}
         />
       )}
     </div>

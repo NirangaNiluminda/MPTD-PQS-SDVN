@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { api, LaunchRunRequest, ModelCheckDto, RunRecordDto } from "../api";
+import ProvenanceChip from "../components/ProvenanceChip";
 
 const ATTACK_OPTIONS = [
   { n: 0, label: "Combined (all 7 at once)" },
@@ -73,26 +74,36 @@ function ModelCheckBanner({ check }: { check: ModelCheckDto | null }) {
 function ProgressBar({ run }: { run: RunRecordDto }) {
   const p = run.progress;
   if (!p) return null;
-  const color =
-    p.phase === "finished"
-      ? "bg-status-good"
-      : p.phase === "registering"
-      ? "bg-status-caught"
-      : "bg-entity-rsu";
+
+  // A run can be dead (stopped or crashed) without ever reaching "finished"
+  // — confirmed directly: a run stopped mid-sim showed "Simulating — t=7s/
+  // 15s" with a live-looking "~5m remaining" countdown forever after,
+  // because the progress text only checked p.phase, never run.alive. An ETA
+  // for a process that no longer exists is not an estimate, it's a lie.
+  const incomplete = !run.alive && p.phase !== "finished";
+
+  const color = incomplete
+    ? "bg-ink-muted"
+    : p.phase === "finished"
+    ? "bg-status-good"
+    : p.phase === "registering"
+    ? "bg-status-caught"
+    : "bg-entity-rsu";
   return (
     <div>
       <div className="flex items-center justify-between text-[11px] text-ink-secondary">
         <span>
+          {incomplete && "Stopped before completion — last seen: "}
           {p.phase === "registering" &&
             `Registering identities on-chain — ${p.registered}/${p.expected}`}
           {p.phase === "simulating" &&
-            `Simulating — t=${p.sim_time_reached ?? 0}s / ${run.config.sim_time}s`}
+            `simulating, t=${p.sim_time_reached ?? 0}s / ${run.config.sim_time}s`}
           {p.phase === "finished" &&
             `Finished — MCC_full ${p.mcc_full?.toFixed(3) ?? "n/a"}`}
-          {p.phase === "starting" && "Starting…"}
-          {p.stale && " (waiting for next log update…)"}
+          {p.phase === "starting" && (incomplete ? "starting" : "Starting…")}
+          {!incomplete && p.stale && " (waiting for next log update…)"}
         </span>
-        {p.phase !== "finished" && (
+        {p.phase !== "finished" && !incomplete && (
           <span>~{formatDuration(p.eta_seconds)} remaining</span>
         )}
       </div>
@@ -150,9 +161,16 @@ function RunCard({
           }`}
         />
         <div className="min-w-0 flex-1">
-          <div className="truncate text-xs font-medium text-ink-primary">
-            {attackLabel} · {c.attack_pct}% · seed {c.seed}
-            {c.enable_blockchain && " · blockchain"}
+          <div className="flex items-center gap-2 truncate text-xs font-medium text-ink-primary">
+            <span className="truncate">
+              {attackLabel} · {c.attack_pct}% · seed {c.seed}
+              {c.enable_blockchain && " · blockchain"}
+            </span>
+            <ProvenanceChip
+              kind={run.alive ? "live" : "replayed"}
+              detail={run.alive ? "process still running" : "process finished or was stopped"}
+              compact
+            />
           </div>
           <div className="mt-1">
             <ProgressBar run={run} />

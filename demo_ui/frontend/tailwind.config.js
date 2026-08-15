@@ -11,6 +11,7 @@ export default {
           panel: "#0f1419",
           raised: "#151c24",
           hairline: "#1f2933",
+          hairline2: "#2b3744",
         },
         ink: {
           primary: "#f2f5f8",
@@ -31,7 +32,12 @@ export default {
         },
       },
       fontFamily: {
-        sans: ['system-ui', '-apple-system', '"Segoe UI"', 'sans-serif'],
+        // "IBM Plex Sans" first, system-ui fallback if the CDN is unreachable.
+        sans: ['"IBM Plex Sans"', 'system-ui', '-apple-system', '"Segoe UI"', 'sans-serif'],
+        // Reserved for numeric/tabular data — timestamps, scores, hashes,
+        // IDs. Never for prose. Matches the mockup's convention: mono for
+        // anything a reader needs to scan/compare, sans for anything they read.
+        mono: ['"IBM Plex Mono"', 'ui-monospace', 'Menlo', 'monospace'],
       },
     },
   },

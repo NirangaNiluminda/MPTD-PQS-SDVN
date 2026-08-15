@@ -23,7 +23,20 @@ export const SURFACE = {
   panel: "#0f1419",
   raised: "#151c24",
   hairline: "#1f2933",
+  hairlineStrong: "#2b3744", // borders that need more presence: inputs, active tabs
 } as const;
+
+// Data provenance — every number on screen is one of these three. Not a
+// stylistic choice: a "live" figure can change under you, a "replayed" one
+// is fixed to a recording, and a "point-in-time" one is a snapshot that may
+// already be stale. Conflating them is how a demo accidentally lies.
+export const PROVENANCE = {
+  live: { glyph: "●", label: "LIVE", color: "#0ca30c" },
+  replayed: { glyph: "▶", label: "REPLAYED", color: "#3987e5" },
+  snapshot: { glyph: "◆", label: "POINT-IN-TIME", color: "#a8b3bf" },
+} as const;
+
+export type ProvenanceKind = keyof typeof PROVENANCE;
 
 export const INK = {
   primary: "#f2f5f8",
