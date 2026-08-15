@@ -30,6 +30,10 @@
       "detail": "The OR-path is ON unless you explicitly pass `--gat_det_flag_heads=0`. Reported runs pass 0."
     },
     {
+      "trap": "`routing_algorithm` defaults **0**, but blockchain needs **4**",
+      "detail": "Fabric bring-up sits inside `if (routing_algorithm == 4)` at `12_main.h:2094`, with the `skip_blockchain` check *nested inside* it. At the default 0 NEITHER branch runs -- so you get no blockchain AND no \"skip_blockchain=true -- Fabric init bypassed\" message. The silence is the trap: `--skip_blockchain=false` on its own looks like it worked and does nothing. Pass `--routing_algorithm=4` for any run that needs on-chain state. Also gates the vehicle->controller flow map and a detection path (`08_detection_engine.h:3936`), so it is not routing-only."
+    },
+    {
       "trap": "ns-3 CLI booleans",
       "detail": "Need `=0`/`=1`, not bare flags. A bare `--ring_detect` does not enable it."
     },
@@ -120,7 +124,7 @@
     "skip_blockchain": {
       "status": "used",
       "value": "true",
-      "why": "Detection runs do not need the Fabric round-trip. Turn OFF for the RQ5/RQ6 crypto-latency runs."
+      "why": "Detection runs do not need the Fabric round-trip. Turn OFF for the RQ5/RQ6 crypto-latency runs -- but NOT on its own: the check is nested inside `if (routing_algorithm == 4)` (12_main.h:2094), so `--skip_blockchain=false` with the default routing_algorithm=0 silently does nothing at all, with no message either way. Always pair it with `--routing_algorithm=4`."
     },
     "per_pid_results": {
       "status": "used",
@@ -204,7 +208,7 @@
     },
     "stealthy_control_plane": {
       "status": "used",
-      "value": "true (DEFAULT \u2014 never passed on the command line)",
+      "value": "true (DEFAULT — never passed on the command line)",
       "why": "Active in every reported run by default. TP-S3/MP-S4 inject small plausible controller falsification that the beacon detectors cannot see; only CP-DETECT catches them. Pass `=false` for the legacy LOUD variant. The paper must state which mode produced its results."
     },
     "hmac_fail_closed": {
@@ -367,43 +371,43 @@
     },
     "sybil_registration_pct": {
       "status": "used",
-      "value": "0 (DEFAULT \u2014 never passed)",
-      "why": "\u26a0\ufe0f 0 selects the ORIGINAL Sybil mode, where ghost IDs sit OUTSIDE the registered pool. The code's own comment (02_config_globals.h:155-163) says detection is then \"trivial\" and \"metrics are flat at 1.0 regardless of attack_percentage\", and recommends 30-50 for meaningful variation. MP-S1/MP-S2 results and the ring_detect ghost-recall figure were all obtained in this easy mode."
+      "value": "0 (DEFAULT — never passed)",
+      "why": "⚠️ 0 selects the ORIGINAL Sybil mode, where ghost IDs sit OUTSIDE the registered pool. The code's own comment (02_config_globals.h:155-163) says detection is then \"trivial\" and \"metrics are flat at 1.0 regardless of attack_percentage\", and recommends 30-50 for meaningful variation. MP-S1/MP-S2 results and the ring_detect ghost-recall figure were all obtained in this easy mode."
     },
     "faithful_mitm": {
       "status": "used",
-      "value": "false (DEFAULT \u2014 never passed)",
+      "value": "false (DEFAULT — never passed)",
       "why": "MP-S3 (attack 6) ran in the default MitM mode, not the faithful variant added in commit dad4bc6."
     },
     "mitm_stealth": {
       "status": "used",
-      "value": "false (DEFAULT \u2014 never passed)",
+      "value": "false (DEFAULT — never passed)",
       "why": "MP-S3 ran non-stealth. Paired with --faithful_mitm as the a6 MitM variants."
     },
     "honest_mp_s1": {
       "status": "used",
-      "value": "false (DEFAULT \u2014 never passed)",
+      "value": "false (DEFAULT — never passed)",
       "why": "MP-S1 ghost injection behaves adversarially, not honestly. Diagnostic control for isolating MP-S1's FP contribution."
     },
     "uniform_speed_trace": {
       "status": "used",
-      "value": "false (DEFAULT \u2014 never passed)",
+      "value": "false (DEFAULT — never passed)",
       "why": "Trace keeps its natural SUMO speed distribution. Set true for Experiment 2, where every vehicle must travel at exactly the target speed."
     },
     "rsu_seed": {
       "status": "used",
-      "value": "0 (DEFAULT \u2014 never passed)",
+      "value": "0 (DEFAULT — never passed)",
       "why": "0 does NOT mean non-reproducible here: when --seed>0 the RSU compromise RNG is derived as run_seed*2654435761+12345 (06a_attack_models.h:558), so the compromised-RSU set is deterministic at --seed=1. It only falls back to the system clock if --seed is also unset. Pass --rsu_seed=N to pin the RSU set independently of the run seed."
     },
     "N_Controllers": {
       "status": "used",
-      "value": "4 (DEFAULT \u2014 never passed)",
+      "value": "4 (DEFAULT — never passed)",
       "why": "Size of the registered controller set C. Relevant to the Eq 3.69 controller-quorum work: the SC-Revoke floor refuses an exclusion that would empty C_trusted, and with 4 controllers all four were once excluded in epoch E7 before that floor existed."
     },
     "data_transmission_frequency": {
       "status": "used",
       "value": "10.0 (DEFAULT)",
-      "why": "Beacon rate in Hz \u2014 10 Hz = the 100 ms interval T_b assumed throughout the paper. Changing it invalidates every per-beacon threshold and the N_b/detection-feasibility derivation."
+      "why": "Beacon rate in Hz — 10 Hz = the 100 ms interval T_b assumed throughout the paper. Changing it invalidates every per-beacon threshold and the N_b/detection-feasibility derivation."
     },
     "link_lifetime_threshold": {
       "status": "used",
@@ -418,7 +422,7 @@
     "lambda": {
       "status": "used",
       "value": "10 (DEFAULT)",
-      "why": "Routing/link parameter. NOT the fusion weights lambda_1..3 \u2014 those come from fusion_weights.json and are set via --lambda_gat/--lambda_ae. Name collision; do not confuse them."
+      "why": "Routing/link parameter. NOT the fusion weights lambda_1..3 — those come from fusion_weights.json and are set via --lambda_gat/--lambda_ae. Name collision; do not confuse them."
     },
     "experiment_number": {
       "status": "used",
@@ -428,7 +432,7 @@
     "routing_algorithm": {
       "status": "used",
       "value": "0 (DEFAULT)",
-      "why": "Routing protocol selector. Inert for detection runs \u2014 meaningful only when --routing_test=true."
+      "why": "Selects the SDN data-plane mode, and is NOT inert for detection runs (an earlier version of this entry claimed it was — that was wrong and cost a wasted blockchain run). Value 4 is the full-SDVN mode and gates three separate things: the entire Fabric/blockchain bring-up (12_main.h:2094), the vehicle→controller flow mapping node_controller_ID (02_config_globals.h:902), and a detection-engine path (08_detection_engine.h:3936). Because the default is 0, the reported D1/D4/D6 runs had NO blockchain — consistent with their --skip_blockchain=true. Any run that needs on-chain state must pass --routing_algorithm=4; --skip_blockchain=false alone does nothing."
     },
     "qf": {
       "status": "used",
