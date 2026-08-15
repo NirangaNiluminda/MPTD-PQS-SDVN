@@ -21,6 +21,7 @@ from parsers import fusion
 from parsers import geometry
 from parsers import ledger
 from parsers import roadmap
+from parsers import run_summary
 from parsers import sigmask
 from parsers import topology
 
@@ -511,6 +512,58 @@ def capture_vehicles():
         return (0 if r["missed"] > 0 else 1 if r["gt_poisoned"] > 0 else 2, -r["events"])
 
     return sorted(rows, key=rank)
+
+
+@app.get("/api/capture/crypto_summary")
+def capture_crypto_summary():
+    """PQ-crypto cost + off-chain (IPFS) storage numbers from the end-of-run
+    ATTACK SUMMARY block. See parsers/run_summary.py for why ipfs_is_real is
+    hardcoded False: this run's IPFS daemon connection was refused, and the
+    simulator latched to its deterministic FNV-1a fallback for every window."""
+    if not config.FUSION_CAPTURE_LOG.is_file():
+        raise HTTPException(404, f"no capture log at {config.FUSION_CAPTURE_LOG}")
+    text = config.FUSION_CAPTURE_LOG.read_text()
+    s = run_summary.parse_run_summary(text)
+    return {
+        "ipfs": {
+            "windows_stored": s.ipfs_windows,
+            "hashes_on_chain": s.ipfs_hashes,
+            "is_real_daemon": s.ipfs_is_real,
+            "note": (
+                "This run's IPFS connection to 127.0.0.1:5002 was refused; "
+                "the simulator fell back to its deterministic FNV-1a stub "
+                "for every window (04_state_globals.h:391). These hashes "
+                "are NOT real content-addressed IPFS CIDs."
+            ),
+        },
+        "pq_crypto_cost_ms": {
+            "epoch_total": s.coo_epoch_ms,
+            "trs_sign": s.coo_trs_ms,
+            "fhe_aggregate": s.coo_fhe_ms,
+            "dkg": s.coo_dkg_ms,
+            "epochs_sampled": s.coo_epochs_sampled,
+        },
+        "bandwidth_overhead": {
+            "ratio_vs_baseline": s.bwo_ratio,
+            "hmac_bytes": s.bwo_hmac_bytes,
+            "fhe_bytes": s.bwo_fhe_bytes,
+            "trs_bytes": s.bwo_trs_bytes,
+            "rekey_bytes": s.bwo_rekey_bytes,
+            "baseline_bytes": s.bwo_base_bytes,
+        },
+        "chaincode_latency_ms": {
+            "confirm": s.tcl_confirm_ms,
+            "confirm_invokes": s.tcl_confirm_invokes,
+            "reassign": s.tcl_reassign_ms,
+            "reassign_rollovers": s.tcl_reassign_rollovers,
+        },
+        "trs_verify": {"ok": s.trs_verify_ok, "fail": s.trs_verify_fail},
+        "cp_detect": {
+            "alerts": s.cp_detect_alerts,
+            "epochs_audited": s.cp_detect_epochs_audited,
+        },
+        "ttd_seconds": s.ttd_s,
+    }
 
 
 @app.get("/api/capture/vehicle/{vid}")

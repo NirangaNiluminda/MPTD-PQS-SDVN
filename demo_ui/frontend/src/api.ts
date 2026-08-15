@@ -194,6 +194,39 @@ export interface CaptureVehicleRowDto {
   missed: number;
 }
 
+export interface CryptoSummaryDto {
+  ipfs: {
+    windows_stored: number;
+    hashes_on_chain: number;
+    is_real_daemon: boolean;
+    note: string;
+  };
+  pq_crypto_cost_ms: {
+    epoch_total: number;
+    trs_sign: number;
+    fhe_aggregate: number;
+    dkg: number;
+    epochs_sampled: number;
+  };
+  bandwidth_overhead: {
+    ratio_vs_baseline: number;
+    hmac_bytes: number;
+    fhe_bytes: number;
+    trs_bytes: number;
+    rekey_bytes: number;
+    baseline_bytes: number;
+  };
+  chaincode_latency_ms: {
+    confirm: number;
+    confirm_invokes: number;
+    reassign: number;
+    reassign_rollovers: number;
+  };
+  trs_verify: { ok: number; fail: number };
+  cp_detect: { alerts: number; epochs_audited: number };
+  ttd_seconds: number;
+}
+
 export interface FusionEventDto {
   rsu_id: number;
   epoch: number;
@@ -274,4 +307,5 @@ export const api = {
   captureVehicles: () => getJson<CaptureVehicleRowDto[]>("/api/capture/vehicles"),
   captureVehicle: (vid: number) =>
     getJson<{ vid: number; events: FusionEventDto[] }>(`/api/capture/vehicle/${vid}`),
+  captureCryptoSummary: () => getJson<CryptoSummaryDto>("/api/capture/crypto_summary"),
 };
