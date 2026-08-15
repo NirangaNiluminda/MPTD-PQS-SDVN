@@ -172,3 +172,6 @@ demo_ui/frontend/vite.config.d.ts
 /DlRlcStats.txt
 /UlRlcStats.txt
 /UlSinrStats.txt
+
+# Simulation stdout captures for the demo UI (large, regeneratable)
+demo_ui/captures/

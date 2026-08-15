@@ -167,7 +167,7 @@ def scenario_trails(scenario_id: str, t: float, lookback: float = 6.0, max_vehic
 
 
 @app.get("/api/scenarios/{scenario_id:path}/stats")
-def scenario_stats(scenario_id: str, t: float | None = None):
+def scenario_stats(scenario_id: str, t: float | None = None, window: float = 0.15):
     """Live counters for the KPI header.
 
     Cumulative up to time t (or whole run if t is omitted). These are counted
@@ -176,8 +176,13 @@ def scenario_stats(scenario_id: str, t: float | None = None):
     simulator's reported MCC/FPR. Scenario-level MCC comes from metrics.csv
     via /api/scenarios/{id} and must not be recomputed here.
     """
+    # Inclusive of the frame currently on screen. /frame returns
+    # [t, t+window), so counting only sim_time <= t made the header read
+    # "1 beacon" while the feed beside it listed fifteen — the beacons in
+    # the live frame have sim_time fractionally greater than t.
     beacons = _beacons_for(scenario_id)
-    rows = [b for b in beacons if t is None or b.sim_time <= t]
+    cutoff = None if t is None else t + window
+    rows = [b for b in beacons if cutoff is None or b.sim_time < cutoff]
     tp = sum(1 for b in rows if b.is_poisoned and b.detected)
     fn = sum(1 for b in rows if b.is_poisoned and not b.detected)
     fp = sum(1 for b in rows if not b.is_poisoned and b.detected)
