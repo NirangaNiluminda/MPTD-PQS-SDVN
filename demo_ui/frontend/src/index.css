@@ -2,14 +2,68 @@
 @tailwind components;
 @tailwind utilities;
 
+/* RGB triplets (space-separated, no commas) so Tailwind's opacity modifier
+ * (bg-surface-panel/95) can compose them via rgb(var(--x) / <alpha-value>).
+ * Hex source of truth + palette validation results: src/design/tokens.ts —
+ * keep these two files in sync by hand; there is no build step that
+ * generates one from the other. Dark is the default (:root, no attribute)
+ * so the app renders correctly before React/the theme store hydrates. */
 :root {
   color-scheme: dark;
+
+  --c-surface-page: 11 15 20;
+  --c-surface-panel: 15 20 25;
+  --c-surface-raised: 21 28 36;
+  --c-surface-hairline: 31 41 51;
+  --c-surface-hairline2: 43 55 68;
+
+  --c-ink-primary: 242 245 248;
+  --c-ink-secondary: 168 179 191;
+  --c-ink-muted: 107 119 133;
+
+  --c-entity-rsu: 57 135 229;
+  --c-entity-controller: 25 158 112;
+  --c-entity-vehicle: 125 136 148;
+  --c-entity-ghost: 213 81 129;
+
+  --c-status-good: 12 163 12;
+  --c-status-caught: 250 178 25;
+  --c-status-serious: 236 131 90;
+  --c-status-missed: 208 59 59;
+
+  --c-axis-line: 44 55 66; /* recharts axis strokes — not a Tailwind colour, chart-only */
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --c-surface-page: 238 241 245;
+  --c-surface-panel: 255 255 255;
+  --c-surface-raised: 245 247 250;
+  --c-surface-hairline: 221 227 234;
+  --c-surface-hairline2: 199 208 218;
+
+  --c-ink-primary: 14 22 32;
+  --c-ink-secondary: 74 88 102;
+  --c-ink-muted: 120 132 143;
+
+  --c-entity-rsu: 31 102 192;
+  --c-entity-controller: 15 122 85;
+  --c-entity-vehicle: 95 107 120;
+  --c-entity-ghost: 178 53 102;
+
+  --c-status-good: 10 125 10;
+  --c-status-caught: 169 116 0;
+  --c-status-serious: 184 85 42;
+  --c-status-missed: 179 42 42;
+
+  --c-axis-line: 199 208 218;
 }
 
 body {
   margin: 0;
-  background: #0b0f14;
-  color: #f2f5f8;
+  background: rgb(var(--c-surface-page));
+  color: rgb(var(--c-ink-primary));
   font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
   -webkit-font-smoothing: antialiased;
 }
@@ -23,19 +77,19 @@ body {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: #1f2933;
+  background: rgb(var(--c-surface-hairline));
   border-radius: 4px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: #2c3742;
+  background: rgb(var(--c-surface-hairline2));
 }
 
 /* deck.gl injects its tooltip inline; restyle to match the panel language. */
 .deck-tooltip {
-  background: #151c24 !important;
-  border: 1px solid #1f2933 !important;
+  background: rgb(var(--c-surface-raised)) !important;
+  border: 1px solid rgb(var(--c-surface-hairline)) !important;
   border-radius: 6px !important;
-  color: #f2f5f8 !important;
+  color: rgb(var(--c-ink-primary)) !important;
   font-size: 11px !important;
   line-height: 1.45 !important;
   padding: 8px 10px !important;

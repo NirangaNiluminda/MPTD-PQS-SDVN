@@ -1,9 +1,10 @@
 import { usePlayback } from "../store/playback";
 import KpiCard from "./KpiCard";
-import { STATUS, ENTITY } from "../design/tokens";
+import { useTokens } from "../design/tokens";
 
 export default function StatBar() {
   const { stats, detail, topology, t, scenarioId } = usePlayback();
+  const { STATUS, ENTITY } = useTokens();
 
   if (!stats || !detail) {
     return (

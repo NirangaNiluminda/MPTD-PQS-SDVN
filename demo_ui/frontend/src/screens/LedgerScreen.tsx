@@ -8,6 +8,7 @@ import {
   RevocationDto,
   TrustRecordDto,
 } from "../api";
+import { useTokens } from "../design/tokens";
 
 function formatBytes(n: number): string {
   if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`;
@@ -42,8 +43,9 @@ function KpiCard({
 }
 
 function TrustBar({ score }: { score: number }) {
+  const { STATUS } = useTokens();
   const pct = Math.max(0, Math.min(1, score)) * 100;
-  const color = score < 0.3 ? "#d03b3b" : score < 0.7 ? "#fab219" : "#0ca30c";
+  const color = score < 0.3 ? STATUS.missed : score < 0.7 ? STATUS.caught : STATUS.good;
   return (
     <div className="h-1.5 w-24 overflow-hidden rounded-full bg-surface-page">
       <div className="h-full rounded-full" style={{ width: `${pct}%`, background: color }} />

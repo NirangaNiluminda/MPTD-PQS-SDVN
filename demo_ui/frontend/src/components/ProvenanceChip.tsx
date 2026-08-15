@@ -1,4 +1,4 @@
-import { PROVENANCE, ProvenanceKind } from "../design/tokens";
+import { useTokens, ProvenanceKind } from "../design/tokens";
 
 /**
  * Every number in this app is one of three things: LIVE (can change under
@@ -17,6 +17,7 @@ export default function ProvenanceChip({
   detail?: string;
   compact?: boolean;
 }) {
+  const { PROVENANCE } = useTokens();
   const p = PROVENANCE[kind];
   const title = detail ? `${p.label} — ${detail}` : p.label;
   return (

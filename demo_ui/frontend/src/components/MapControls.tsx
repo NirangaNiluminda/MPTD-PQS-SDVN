@@ -1,6 +1,6 @@
 import { useState } from "react";
 import { usePlayback, LayerToggles, MapDetail } from "../store/playback";
-import { ENTITY, STATUS } from "../design/tokens";
+import { useTokens } from "../design/tokens";
 
 const DETAIL_STEPS: { level: MapDetail; label: string; note: string }[] = [
   {
@@ -33,13 +33,13 @@ function Swatch({ color, shape }: { color: string; shape: "sq" | "di" | "ci" | "
   if (shape === "sq")
     return (
       <svg {...common} viewBox="0 0 12 12">
-        <rect x="1.5" y="1.5" width="9" height="9" fill={color} stroke="#fff3" />
+        <rect x="1.5" y="1.5" width="9" height="9" fill={color} stroke="rgb(var(--c-surface-panel) / 0.8)" />
       </svg>
     );
   if (shape === "di")
     return (
       <svg {...common} viewBox="0 0 12 12">
-        <polygon points="6,1 11,6 6,11 1,6" fill={color} stroke="#fff3" />
+        <polygon points="6,1 11,6 6,11 1,6" fill={color} stroke="rgb(var(--c-surface-panel) / 0.8)" />
       </svg>
     );
   if (shape === "x")
@@ -55,15 +55,20 @@ function Swatch({ color, shape }: { color: string; shape: "sq" | "di" | "ci" | "
   );
 }
 
-const LEGEND_ITEMS: { label: string; color: string; shape: "sq" | "di" | "ci" | "x" }[] = [
-  { label: "Roadside unit", color: ENTITY.rsu, shape: "sq" },
-  { label: "Controller", color: ENTITY.controller, shape: "di" },
-  { label: "Hijacked node", color: STATUS.missed, shape: "sq" },
-  { label: "Honest vehicle", color: ENTITY.vehicleClean, shape: "ci" },
-  { label: "Lie — caught", color: STATUS.caught, shape: "ci" },
-  { label: "Lie — missed", color: STATUS.missed, shape: "ci" },
-  { label: "Ghost identity", color: ENTITY.ghost, shape: "x" },
-];
+function buildLegendItems(
+  ENTITY: Record<string, string>,
+  STATUS: Record<string, string>
+): { label: string; color: string; shape: "sq" | "di" | "ci" | "x" }[] {
+  return [
+    { label: "Roadside unit", color: ENTITY.rsu, shape: "sq" },
+    { label: "Controller", color: ENTITY.controller, shape: "di" },
+    { label: "Hijacked node", color: STATUS.missed, shape: "sq" },
+    { label: "Honest vehicle", color: ENTITY.vehicleClean, shape: "ci" },
+    { label: "Lie — caught", color: STATUS.caught, shape: "ci" },
+    { label: "Lie — missed", color: STATUS.missed, shape: "ci" },
+    { label: "Ghost identity", color: ENTITY.ghost, shape: "x" },
+  ];
+}
 
 const LAYER_DEFAULTS: LayerToggles = {
   streets: true,
@@ -121,6 +126,8 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
 
 export default function MapControls() {
   const { layers, toggleLayer, mapDetail, setMapDetail } = usePlayback();
+  const { ENTITY, STATUS } = useTokens();
+  const legendItems = buildLegendItems(ENTITY, STATUS);
   const [controlsOpen, setControlsOpen] = useState(true);
   const [legendOpen, setLegendOpen] = useState(false);
   const activeStep = DETAIL_STEPS.find((s) => s.level === mapDetail) ?? DETAIL_STEPS[2];
@@ -192,7 +199,7 @@ export default function MapControls() {
             Shape = class · colour = state
           </div>
           <ul className="grid grid-cols-2 gap-x-4 gap-y-1">
-            {LEGEND_ITEMS.map((it) => (
+            {legendItems.map((it) => (
               <li key={it.label} className="flex items-center gap-2 whitespace-nowrap text-[10.5px] text-ink-secondary">
                 <Swatch color={it.color} shape={it.shape} />
                 {it.label}

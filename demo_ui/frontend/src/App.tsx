@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { usePlayback } from "./store/playback";
 import { useMode, CopyMode } from "./store/mode";
+import { useTheme } from "./store/theme";
 import NetworkReplayScreen from "./screens/NetworkReplayScreen";
 import DefenceInspectorScreen from "./screens/DefenceInspectorScreen";
 import LedgerScreen from "./screens/LedgerScreen";
@@ -105,6 +106,8 @@ export default function App() {
   const selectScenario = usePlayback((s) => s.selectScenario);
   const mode = useMode((s) => s.mode);
   const setMode = useMode((s) => s.setMode);
+  const theme = useTheme((s) => s.theme);
+  const toggleTheme = useTheme((s) => s.toggleTheme);
 
   // Loaded once here, not inside NetworkReplayScreen — that screen only
   // mounts when its tab is active, but "Show me this attack" (below) needs
@@ -112,6 +115,13 @@ export default function App() {
   useEffect(() => {
     loadScenarios();
   }, [loadScenarios]);
+
+  // data-theme drives every CSS custom property in index.css; set on <html>
+  // (not a wrapper div) so it also reaches components that portal outside
+  // the app root, e.g. deck.gl's tooltip.
+  useEffect(() => {
+    document.documentElement.dataset.theme = theme;
+  }, [theme]);
 
   // Attack Explainer's "Show me this attack" jumps into the replay screen
   // with that scenario already loaded — the store is global so this just
@@ -151,6 +161,15 @@ export default function App() {
             Expert
           </button>
         </div>
+
+        <button
+          onClick={toggleTheme}
+          title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
+          aria-label="Toggle light / dark theme"
+          className="flex h-7 w-7 items-center justify-center rounded-md border border-surface-hairline2 bg-surface-raised text-sm text-ink-secondary transition-colors hover:text-ink-primary"
+        >
+          {theme === "dark" ? "☀" : "☾"}
+        </button>
       </header>
 
       <div className="grid min-h-0 grid-cols-[188px_1fr]">

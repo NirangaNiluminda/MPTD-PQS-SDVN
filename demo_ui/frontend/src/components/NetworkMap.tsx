@@ -11,7 +11,8 @@ import {
 } from "@deck.gl/layers";
 import { usePlayback } from "../store/playback";
 import { BeaconDto } from "../api";
-import { ENTITY, STATUS, hexToRgba, Rgba } from "../design/tokens";
+import { useTokens, hexToRgba, Rgba, ThemeName } from "../design/tokens";
+import { useTheme } from "../store/theme";
 
 // Sim coordinates are plain metres on a local origin (not lon/lat), so this is
 // an OrthographicView, not a geo view.
@@ -22,38 +23,56 @@ const INITIAL_VIEW_STATE = {
   maxZoom: 4,
 };
 
-// Entity colours are validated (see design/tokens.ts). The CVD margin sits in
-// the 6-8 band, which is legal ONLY alongside secondary encoding — hence every
-// class below also differs in SHAPE and carries a text label in the legend.
-const C = {
-  // Street network — deliberately low-contrast greys. This is the base map;
-  // it must recede so the entity colours (which carry the meaning) stay
-  // dominant. Roads read as texture, not as data.
-  junction: [30, 38, 48, 255] as Rgba,
-  roadCasing: [22, 29, 38, 255] as Rgba,
-  roadSurface: [38, 47, 59, 255] as Rgba,
-
-  rsu: hexToRgba(ENTITY.rsu, 235),
-  rsuDim: hexToRgba(ENTITY.rsu, 120),
-  coverage: hexToRgba(ENTITY.rsu, 14),
-  controller: hexToRgba(ENTITY.controller, 240),
-  controllerLink: hexToRgba(ENTITY.controller, 55),
-  vehicle: hexToRgba(ENTITY.vehicleClean, 190),
-  vehicleDim: hexToRgba(ENTITY.vehicleClean, 90),
-  ghost: hexToRgba(ENTITY.ghost, 240),
-  caught: hexToRgba(STATUS.caught, 245),
-  missed: hexToRgba(STATUS.missed, 250),
-  hostile: hexToRgba(STATUS.missed, 235),
-  band: [255, 255, 255, 70] as Rgba,
-  bandMissed: hexToRgba(STATUS.missed, 130),
-  selected: [255, 255, 255, 255] as Rgba,
+// Street network base-map greys, deliberately NOT part of the validated data
+// palette (basemap chrome, not a categorical/status colour). Dark recedes
+// against a near-black page; light inverts to a near-white road on a soft
+// grey page — same "roads read as texture, not data" intent either way.
+const ROAD: Record<ThemeName, { junction: Rgba; roadCasing: Rgba; roadSurface: Rgba }> = {
+  dark: {
+    junction: [30, 38, 48, 255],
+    roadCasing: [22, 29, 38, 255],
+    roadSurface: [38, 47, 59, 255],
+  },
+  light: {
+    junction: [221, 227, 234, 255],
+    roadCasing: [199, 208, 218, 255],
+    roadSurface: [255, 255, 255, 255],
+  },
 };
 
-function beaconColor(b: BeaconDto): Color {
-  if (b.is_poisoned && !b.detected) return C.missed;
-  if (b.is_poisoned && b.detected) return C.caught;
-  if (b.is_ghost) return C.ghost;
-  return C.vehicle;
+// Entity colours are validated per-theme (see design/tokens.ts). The CVD
+// margin sits in the 6-8 band, which is legal ONLY alongside secondary
+// encoding — hence every class below also differs in SHAPE and carries a
+// text label in the legend.
+function buildColors(theme: ThemeName, ENTITY: Record<string, string>, STATUS: Record<string, string>) {
+  return {
+    ...ROAD[theme],
+    rsu: hexToRgba(ENTITY.rsu, 235),
+    rsuDim: hexToRgba(ENTITY.rsu, 120),
+    coverage: hexToRgba(ENTITY.rsu, 14),
+    controller: hexToRgba(ENTITY.controller, 240),
+    controllerLink: hexToRgba(ENTITY.controller, 55),
+    vehicle: hexToRgba(ENTITY.vehicleClean, 190),
+    vehicleDim: hexToRgba(ENTITY.vehicleClean, 90),
+    ghost: hexToRgba(ENTITY.ghost, 240),
+    caught: hexToRgba(STATUS.caught, 245),
+    missed: hexToRgba(STATUS.missed, 250),
+    hostile: hexToRgba(STATUS.missed, 235),
+    band: (theme === "dark" ? [255, 255, 255, 70] : [14, 22, 32, 90]) as Rgba,
+    bandMissed: hexToRgba(STATUS.missed, 130),
+    selected: (theme === "dark" ? [255, 255, 255, 255] : [14, 22, 32, 255]) as Rgba,
+  };
+}
+
+type MapColors = ReturnType<typeof buildColors>;
+
+function beaconColor(C: MapColors) {
+  return (b: BeaconDto): Color => {
+    if (b.is_poisoned && !b.detected) return C.missed;
+    if (b.is_poisoned && b.detected) return C.caught;
+    if (b.is_ghost) return C.ghost;
+    return C.vehicle;
+  };
 }
 
 interface RegionCell {
@@ -168,6 +187,13 @@ export default function NetworkMap() {
   // panned the network off-screen.
   const [viewKey, setViewKey] = useState(0);
   const resetView = useCallback(() => setViewKey((k) => k + 1), []);
+
+  const theme = useTheme((s) => s.theme);
+  const tokens = useTokens();
+  const C = useMemo(
+    () => buildColors(theme, tokens.ENTITY, tokens.STATUS),
+    [theme, tokens]
+  );
 
   const compromisedRsus = useMemo(
     () => new Set(topology?.compromised_rsus ?? []),
@@ -423,7 +449,7 @@ export default function NetworkMap() {
           radiusUnits: "meters",
           radiusMinPixels: 6,
           radiusMaxPixels: 16,
-          getFillColor: beaconColor,
+          getFillColor: beaconColor(C),
           stroked: true,
           getLineColor: (d: BeaconDto) =>
             d.vehicle_id === selectedVehicle ? C.selected : [0, 0, 0, 120],
@@ -512,6 +538,7 @@ export default function NetworkMap() {
     compromisedRsus,
     selectedVehicle,
     selectVehicle,
+    C,
   ]);
 
   if (!glOk || glError) {

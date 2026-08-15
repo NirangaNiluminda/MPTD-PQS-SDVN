@@ -18,7 +18,7 @@ import {
   CaptureVehicleRowDto,
   FusionEventDto,
 } from "../api";
-import { SERIES, STATUS, INK } from "../design/tokens";
+import { useTokens } from "../design/tokens";
 
 const GHOST_VID_BASE = 10000;
 const PHI_TH = 0.5; // fusion decision threshold, 08_detection_engine.h FusionParams default
@@ -65,6 +65,7 @@ function VehicleRow({
 }
 
 export default function DefenceInspectorScreen() {
+  const { SERIES, STATUS, INK, SURFACE } = useTokens();
   const [summary, setSummary] = useState<CaptureSummaryDto | null>(null);
   const [vehicles, setVehicles] = useState<CaptureVehicleRowDto[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
@@ -219,7 +220,7 @@ export default function DefenceInspectorScreen() {
                     <ContribBar
                       label="Φ (fused)"
                       value={current.phi}
-                      color={current.full_anom ? STATUS.caught : "#4a5563"}
+                      color={current.full_anom ? STATUS.caught : SURFACE.hairlineStrong}
                       threshold={PHI_TH}
                     />
                   </div>
@@ -273,11 +274,11 @@ export default function DefenceInspectorScreen() {
                   <div className="h-40">
                     <ResponsiveContainer width="100%" height="100%">
                       <LineChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                        <CartesianGrid stroke="#1f2933" vertical={false} />
-                        <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
-                        <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                        <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
+                        <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                        <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
                         <Tooltip
-                          contentStyle={{ background: "#151c24", border: "1px solid #1f2933", borderRadius: 6, fontSize: 11 }}
+                          contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
                           labelStyle={{ color: INK.secondary }}
                         />
                         <ReferenceLine y={PHI_TH} stroke={STATUS.caught} strokeDasharray="4 3" />
@@ -294,11 +295,11 @@ export default function DefenceInspectorScreen() {
                   <div className="h-44">
                     <ResponsiveContainer width="100%" height="100%">
                       <AreaChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                        <CartesianGrid stroke="#1f2933" vertical={false} />
-                        <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
-                        <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                        <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
+                        <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                        <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
                         <Tooltip
-                          contentStyle={{ background: "#151c24", border: "1px solid #1f2933", borderRadius: 6, fontSize: 11 }}
+                          contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
                           labelStyle={{ color: INK.secondary }}
                         />
                         <Legend wrapperStyle={{ fontSize: 11 }} />

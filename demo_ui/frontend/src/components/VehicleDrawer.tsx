@@ -10,7 +10,7 @@ import {
   CartesianGrid,
 } from "recharts";
 import { usePlayback } from "../store/playback";
-import { SERIES, STATUS, INK } from "../design/tokens";
+import { useTokens } from "../design/tokens";
 
 const PSI_TH = 0.09; // 08_detection_engine.h — the rule-signature decision line
 
@@ -26,6 +26,8 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 export default function VehicleDrawer() {
   const { selectedVehicle, vehicleTrack, loadingVehicle, selectVehicle, t } =
     usePlayback();
+  const { SERIES, STATUS, INK, SURFACE } = useTokens();
+  const axisStroke = SURFACE.hairlineStrong;
 
   const series = useMemo(
     () =>
@@ -166,17 +168,17 @@ export default function VehicleDrawer() {
             <div className="h-36">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={series} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                  <CartesianGrid stroke="#1f2933" vertical={false} />
+                  <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
                   <XAxis
                     dataKey="t"
                     tick={{ fill: INK.muted, fontSize: 10 }}
-                    stroke="#2c3742"
+                    stroke={axisStroke}
                   />
-                  <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                  <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke={axisStroke} />
                   <Tooltip
                     contentStyle={{
-                      background: "#151c24",
-                      border: "1px solid #1f2933",
+                      background: SURFACE.raised,
+                      border: `1px solid ${SURFACE.hairline}`,
                       borderRadius: 6,
                       fontSize: 11,
                     }}
@@ -187,7 +189,7 @@ export default function VehicleDrawer() {
                     stroke={STATUS.caught}
                     strokeDasharray="4 3"
                   />
-                  <ReferenceLine x={Number(t.toFixed(2))} stroke="#ffffff44" />
+                  <ReferenceLine x={Number(t.toFixed(2))} stroke={`${INK.primary}44`} />
                   <Line
                     type="monotone"
                     dataKey="psi"
@@ -211,23 +213,23 @@ export default function VehicleDrawer() {
               <div className="h-32">
                 <ResponsiveContainer width="100%" height="100%">
                   <LineChart data={series} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                    <CartesianGrid stroke="#1f2933" vertical={false} />
+                    <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
                     <XAxis
                       dataKey="t"
                       tick={{ fill: INK.muted, fontSize: 10 }}
-                      stroke="#2c3742"
+                      stroke={axisStroke}
                     />
-                    <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                    <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke={axisStroke} />
                     <Tooltip
                       contentStyle={{
-                        background: "#151c24",
-                        border: "1px solid #1f2933",
+                        background: SURFACE.raised,
+                        border: `1px solid ${SURFACE.hairline}`,
                         borderRadius: 6,
                         fontSize: 11,
                       }}
                       labelStyle={{ color: INK.secondary }}
                     />
-                    <ReferenceLine x={Number(t.toFixed(2))} stroke="#ffffff44" />
+                    <ReferenceLine x={Number(t.toFixed(2))} stroke={`${INK.primary}44`} />
                     <Line
                       type="monotone"
                       dataKey="drift"

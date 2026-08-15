@@ -13,7 +13,7 @@ import {
   YAxis,
 } from "recharts";
 import { api, AttackInfoDto, LayerAgreementDto, LatencyHistogramDto, SweepPointDto } from "../api";
-import { SERIES, INK, STATUS } from "../design/tokens";
+import { useTokens } from "../design/tokens";
 
 const LAYER_LABEL: Record<string, string> = { rules: "Rules", gat: "GAT", lstm_ae: "LSTM-AE" };
 const LAYER_ORDER = ["rules", "gat", "lstm_ae"];
@@ -38,6 +38,7 @@ function Callout({ children }: { children: React.ReactNode }) {
 }
 
 export default function ResultsScreen() {
+  const { SERIES, STATUS, INK, SURFACE } = useTokens();
   const [attacks, setAttacks] = useState<AttackInfoDto[] | null>(null);
   const [ablation, setAblation] = useState<AblationDto | null>(null);
   const [sweep, setSweep] = useState<SweepPointDto[] | null>(null);
@@ -125,11 +126,11 @@ export default function ResultsScreen() {
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
                 <BarChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                  <CartesianGrid stroke="#1f2933" vertical={false} />
-                  <XAxis dataKey="code" tick={{ fill: INK.muted, fontSize: 11 }} stroke="#2c3742" />
-                  <YAxis tick={{ fill: INK.muted, fontSize: 11 }} stroke="#2c3742" />
+                  <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
+                  <XAxis dataKey="code" tick={{ fill: INK.muted, fontSize: 11 }} stroke={SURFACE.hairlineStrong} />
+                  <YAxis tick={{ fill: INK.muted, fontSize: 11 }} stroke={SURFACE.hairlineStrong} />
                   <Tooltip
-                    contentStyle={{ background: "#151c24", border: "1px solid #1f2933", borderRadius: 6, fontSize: 11 }}
+                    contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
                     labelStyle={{ color: INK.secondary }}
                   />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
@@ -166,17 +167,17 @@ export default function ResultsScreen() {
             <div className="h-56">
               <ResponsiveContainer width="100%" height="100%">
                 <LineChart data={sweepChartData ?? []} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                  <CartesianGrid stroke="#1f2933" vertical={false} />
+                  <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
                   <XAxis
                     dataKey="threshold"
                     type="number"
                     domain={[0, 1]}
                     tick={{ fill: INK.muted, fontSize: 10 }}
-                    stroke="#2c3742"
+                    stroke={SURFACE.hairlineStrong}
                   />
-                  <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                  <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
                   <Tooltip
-                    contentStyle={{ background: "#151c24", border: "1px solid #1f2933", borderRadius: 6, fontSize: 11 }}
+                    contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
                     labelStyle={{ color: INK.secondary }}
                   />
                   <Legend wrapperStyle={{ fontSize: 11 }} />
@@ -263,11 +264,11 @@ export default function ResultsScreen() {
                 <div className="h-40">
                   <ResponsiveContainer width="100%" height="100%">
                     <BarChart data={latencyBins} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                      <CartesianGrid stroke="#1f2933" vertical={false} />
-                      <XAxis dataKey="label" tick={{ fill: INK.muted, fontSize: 9 }} stroke="#2c3742" />
-                      <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke="#2c3742" />
+                      <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
+                      <XAxis dataKey="label" tick={{ fill: INK.muted, fontSize: 9 }} stroke={SURFACE.hairlineStrong} />
+                      <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
                       <Tooltip
-                        contentStyle={{ background: "#151c24", border: "1px solid #1f2933", borderRadius: 6, fontSize: 11 }}
+                        contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
                         labelStyle={{ color: INK.secondary }}
                       />
                       <Bar dataKey="count" fill={SERIES[0]} radius={[2, 2, 0, 0]} isAnimationActive={false} />
