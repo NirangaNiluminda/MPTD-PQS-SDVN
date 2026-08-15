@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState, useCallback } from "react";
 import DeckGL from "@deck.gl/react";
 import { OrthographicView, Color } from "@deck.gl/core";
 import {
@@ -68,6 +68,22 @@ function diamondAt(x: number, y: number, r: number) {
   ];
 }
 
+/**
+ * deck.gl draws into a WebGL canvas. If WebGL is unavailable or the GPU
+ * process is blocklisted, deck renders NOTHING and throws no error — the
+ * surrounding React UI keeps working, so the app looks fine while the map is
+ * simply black. That silent mode cost a debugging round; detect it up front
+ * and say so instead.
+ */
+function webglAvailable(): boolean {
+  try {
+    const c = document.createElement("canvas");
+    return !!(c.getContext("webgl2") || c.getContext("webgl"));
+  } catch {
+    return false;
+  }
+}
+
 export default function NetworkMap() {
   const {
     geometry,
@@ -79,6 +95,14 @@ export default function NetworkMap() {
     selectedVehicle,
     selectVehicle,
   } = usePlayback();
+
+  const [glOk] = useState(webglAvailable);
+  const [glError, setGlError] = useState<string | null>(null);
+  // Bumping this key remounts DeckGL, which resets the view to
+  // INITIAL_VIEW_STATE — the escape hatch when a stray scroll/drag has
+  // panned the network off-screen.
+  const [viewKey, setViewKey] = useState(0);
+  const resetView = useCallback(() => setViewKey((k) => k + 1), []);
 
   const compromisedRsus = useMemo(
     () => new Set(topology?.compromised_rsus ?? []),
@@ -163,15 +187,23 @@ export default function NetworkMap() {
     );
 
     // Full fleet from the mobility trace — present even when no beacon fired.
+    // radiusMinPixels matters more than radius here: at the default zoom a
+    // 6 m car is ~2 px and reads as dust. The floor keeps every vehicle a
+    // legible dot at any zoom, which is the whole point of showing them.
     L.push(
       new ScatterplotLayer({
         id: "fleet",
         data: positions,
         getPosition: (d: any) => [d.x, d.y],
-        getRadius: 6,
+        getRadius: 14,
         radiusUnits: "meters",
-        radiusMinPixels: 2,
-        getFillColor: C.vehicleDim,
+        radiusMinPixels: 3.5,
+        radiusMaxPixels: 9,
+        getFillColor: C.vehicle,
+        stroked: true,
+        getLineColor: [8, 12, 18, 200],
+        getLineWidth: 1,
+        lineWidthUnits: "pixels",
         pickable: true,
         onClick: (info: any) =>
           info.object && selectVehicle(info.object.vehicle_id),
@@ -213,15 +245,17 @@ export default function NetworkMap() {
       );
     }
 
-    // Active beacons, coloured by ground truth vs detection outcome.
+    // Active beacons, coloured by ground truth vs detection outcome. These sit
+    // above the fleet dots and must stay clearly larger than them.
     L.push(
       new ScatterplotLayer({
         id: "beacons",
         data: beacons,
         getPosition: (d: BeaconDto) => [d.pos.x, d.pos.y],
-        getRadius: (d: BeaconDto) => (d.is_poisoned ? 12 : 8),
+        getRadius: (d: BeaconDto) => (d.is_poisoned ? 26 : 18),
         radiusUnits: "meters",
-        radiusMinPixels: 3,
+        radiusMinPixels: 6,
+        radiusMaxPixels: 16,
         getFillColor: beaconColor,
         stroked: true,
         getLineColor: (d: BeaconDto) =>
@@ -289,6 +323,40 @@ export default function NetworkMap() {
     selectVehicle,
   ]);
 
+  if (!glOk || glError) {
+    return (
+      <div className="flex h-full items-center justify-center p-8">
+        <div className="max-w-md rounded-lg border border-status-missed/40 bg-status-missed/10 p-5">
+          <h2 className="mb-2 text-sm font-semibold text-status-missed">
+            The map can’t draw — WebGL is unavailable in this browser
+          </h2>
+          <p className="mb-3 text-xs leading-relaxed text-ink-secondary">
+            Everything else on this page is live and correct; only the GPU-drawn
+            network view is affected. {glError && `(${glError})`}
+          </p>
+          <ol className="list-decimal space-y-1 pl-4 text-xs text-ink-secondary">
+            <li>
+              Open <code className="text-ink-primary">chrome://gpu</code> and
+              check whether WebGL is listed as “Hardware accelerated”.
+            </li>
+            <li>
+              In <code className="text-ink-primary">chrome://settings/system</code>,
+              enable “Use graphics acceleration when available”, then restart
+              Chrome.
+            </li>
+            <li>
+              Still stuck? Launch with{" "}
+              <code className="text-ink-primary">
+                google-chrome --enable-unsafe-swiftshader
+              </code>{" "}
+              to render in software.
+            </li>
+          </ol>
+        </div>
+      </div>
+    );
+  }
+
   if (!geometry) {
     return (
       <div className="flex h-full items-center justify-center text-ink-muted">
@@ -298,11 +366,21 @@ export default function NetworkMap() {
   }
 
   return (
+    <>
+    <button
+      onClick={resetView}
+      className="absolute right-3 top-3 z-10 rounded-md border border-surface-hairline bg-surface-panel/95 px-2.5 py-1.5 text-xs text-ink-secondary backdrop-blur transition-colors hover:text-ink-primary"
+      title="Re-centre the network if you have panned or zoomed away"
+    >
+      Reset view
+    </button>
     <DeckGL
+      key={viewKey}
       views={new OrthographicView({ id: "map" })}
       initialViewState={INITIAL_VIEW_STATE}
       controller={true}
       layers={deckLayers}
+      onError={(e: any) => setGlError(e?.message ?? String(e))}
       getCursor={({ isHovering }) => (isHovering ? "pointer" : "grab")}
       getTooltip={({ object }: any) => {
         if (!object) return null;
@@ -340,5 +418,6 @@ export default function NetworkMap() {
         return null;
       }}
     />
+    </>
   );
 }
