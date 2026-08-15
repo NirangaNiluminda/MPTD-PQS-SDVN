@@ -25,6 +25,13 @@ const INITIAL_VIEW_STATE = {
 // the 6-8 band, which is legal ONLY alongside secondary encoding — hence every
 // class below also differs in SHAPE and carries a text label in the legend.
 const C = {
+  // Street network — deliberately low-contrast greys. This is the base map;
+  // it must recede so the entity colours (which carry the meaning) stay
+  // dominant. Roads read as texture, not as data.
+  junction: [30, 38, 48, 255] as Rgba,
+  roadCasing: [22, 29, 38, 255] as Rgba,
+  roadSurface: [38, 47, 59, 255] as Rgba,
+
   rsu: hexToRgba(ENTITY.rsu, 235),
   rsuDim: hexToRgba(ENTITY.rsu, 120),
   coverage: hexToRgba(ENTITY.rsu, 14),
@@ -48,25 +55,34 @@ function beaconColor(b: BeaconDto): Color {
   return C.vehicle;
 }
 
-/** Square outline for RSUs — shape is load-bearing, not decoration. */
-function squareAt(x: number, y: number, r: number) {
-  return [
-    [x - r, y - r],
-    [x + r, y - r],
-    [x + r, y + r],
-    [x - r, y + r],
-  ];
-}
+// Infrastructure markers are drawn as ICONS sized in PIXELS, not polygons
+// sized in metres. A metre-sized marker looks right at the default zoom and
+// then swells to fill the screen the moment you zoom into a junction — which
+// is exactly what happened before this. Pixel sizing keeps RSUs and
+// controllers legible and proportionate at every zoom level.
+//
+// mask:true makes deck.gl treat the SVG's alpha as a stencil and tint it with
+// getColor, so one white glyph serves both the normal and hijacked states.
+const svgUri = (svg: string) =>
+  `data:image/svg+xml;charset=utf-8,${encodeURIComponent(svg)}`;
 
-/** Diamond for controllers — visually distinct from RSU squares at any zoom. */
-function diamondAt(x: number, y: number, r: number) {
-  return [
-    [x, y - r],
-    [x + r, y],
-    [x, y + r],
-    [x - r, y],
-  ];
-}
+const SQUARE_ICON = {
+  url: svgUri(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><rect x="4" y="4" width="24" height="24" rx="3" fill="#fff"/></svg>`
+  ),
+  width: 32,
+  height: 32,
+  mask: true,
+};
+
+const DIAMOND_ICON = {
+  url: svgUri(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 2 L30 16 L16 30 L2 16 Z" fill="#fff"/></svg>`
+  ),
+  width: 32,
+  height: 32,
+  mask: true,
+};
 
 /**
  * deck.gl draws into a WebGL canvas. If WebGL is unavailable or the GPU
@@ -92,6 +108,7 @@ export default function NetworkMap() {
     trails,
     topology,
     layers,
+    roadmap,
     selectedVehicle,
     selectVehicle,
   } = usePlayback();
@@ -112,6 +129,56 @@ export default function NetworkMap() {
   const deckLayers = useMemo(() => {
     if (!geometry) return [];
     const L: any[] = [];
+
+    // ── Street network, drawn first so everything else sits on top ─────────
+    // Geometry comes straight from the SUMO .net.xml the traces were
+    // generated on, in the same coordinate frame (verified: the net's
+    // convBoundary contains the trace extent), so vehicles land ON the roads
+    // with no transform applied.
+    if (layers.streets && roadmap) {
+      // Junction polygons fill intersections; SUMO's internal connector lanes
+      // are skipped server-side because these already cover that area.
+      L.push(
+        new PolygonLayer({
+          id: "junctions",
+          data: roadmap.junctions,
+          getPolygon: (d: any) => d,
+          getFillColor: C.junction,
+          stroked: false,
+          filled: true,
+          pickable: false,
+        })
+      );
+      // Casing under the surface gives roads a defined edge against the page.
+      L.push(
+        new PathLayer({
+          id: "road-casing",
+          data: roadmap.roads,
+          getPath: (d: any) => d.p,
+          getColor: C.roadCasing,
+          getWidth: (d: any) => d.w + 1.6,
+          widthUnits: "meters",
+          widthMinPixels: 1.5,
+          capRounded: true,
+          jointRounded: true,
+          pickable: false,
+        })
+      );
+      L.push(
+        new PathLayer({
+          id: "road-surface",
+          data: roadmap.roads,
+          getPath: (d: any) => d.p,
+          getColor: C.roadSurface,
+          getWidth: (d: any) => d.w,
+          widthUnits: "meters",
+          widthMinPixels: 1,
+          capRounded: true,
+          jointRounded: true,
+          pickable: false,
+        })
+      );
+    }
 
     if (layers.coverage) {
       L.push(
@@ -168,21 +235,19 @@ export default function NetworkMap() {
       );
     }
 
-    // RSUs as squares; hijacked ones filled with the critical status colour.
+    // RSUs as squares; hijacked ones take the critical status colour.
     L.push(
-      new PolygonLayer({
+      new IconLayer({
         id: "rsus",
         data: geometry.rsus,
-        getPolygon: (d: any) => squareAt(d.x, d.y, 26),
-        getFillColor: (d: any) =>
+        getPosition: (d: any) => [d.x, d.y],
+        getIcon: () => SQUARE_ICON,
+        getSize: 15,
+        sizeUnits: "pixels",
+        getColor: (d: any) =>
           compromisedRsus.has(d.rsu_id) ? C.hostile : C.rsu,
-        getLineColor: (d: any) =>
-          compromisedRsus.has(d.rsu_id) ? C.missed : C.rsuDim,
-        getLineWidth: 2,
-        lineWidthUnits: "pixels",
-        stroked: true,
-        filled: true,
         pickable: true,
+        updateTriggers: { getColor: compromisedRsus },
       })
     );
 
@@ -295,16 +360,14 @@ export default function NetworkMap() {
     // Controllers last so they sit above everything.
     if (topology) {
       L.push(
-        new PolygonLayer({
+        new IconLayer({
           id: "controllers",
           data: topology.controllers,
-          getPolygon: (d: any) => diamondAt(d.x, d.y, 58),
-          getFillColor: (d: any) => (d.hostile ? C.hostile : C.controller),
-          getLineColor: (d: any) => (d.hostile ? C.missed : [255, 255, 255, 110]),
-          getLineWidth: 2.5,
-          lineWidthUnits: "pixels",
-          stroked: true,
-          filled: true,
+          getPosition: (d: any) => [d.x, d.y],
+          getIcon: () => DIAMOND_ICON,
+          getSize: 30,
+          sizeUnits: "pixels",
+          getColor: (d: any) => (d.hostile ? C.hostile : C.controller),
           pickable: true,
         })
       );
@@ -318,6 +381,7 @@ export default function NetworkMap() {
     trails,
     topology,
     layers,
+    roadmap,
     compromisedRsus,
     selectedVehicle,
     selectVehicle,

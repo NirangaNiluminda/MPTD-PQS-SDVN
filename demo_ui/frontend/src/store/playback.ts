@@ -3,6 +3,7 @@ import {
   api,
   BeaconDto,
   GeometryDto,
+  RoadMapDto,
   ScenarioDetailDto,
   ScenarioSummary,
   StatsDto,
@@ -12,6 +13,7 @@ import {
 } from "../api";
 
 export interface LayerToggles {
+  streets: boolean;
   coverage: boolean;
   trails: boolean;
   rubberBands: boolean;
@@ -32,6 +34,7 @@ interface PlaybackState {
   speed: number;
 
   geometry: GeometryDto | null;
+  roadmap: RoadMapDto | null;
   positions: VehiclePositionDto[];
   beacons: BeaconDto[];
   trails: TrailDto[];
@@ -73,6 +76,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   speed: 1,
 
   geometry: null,
+  roadmap: null,
   positions: [],
   beacons: [],
   trails: [],
@@ -83,6 +87,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   loadingVehicle: false,
 
   layers: {
+    streets: true,
     coverage: true,
     trails: true,
     rubberBands: true,
@@ -120,6 +125,14 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
         api.detail(id),
         api.topology(id),
       ]);
+      // Street geometry is ~1 MB and road-type-scoped, so fetch it separately
+      // and never let a failure here block the rest of the scenario.
+      api
+        .roadmap(s.road)
+        .then((rm) => {
+          if (get().road === s.road) set({ roadmap: rm });
+        })
+        .catch(() => set({ roadmap: null }));
       set({
         tMin: tr.t_min,
         tMax: tr.t_max,

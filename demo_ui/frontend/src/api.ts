@@ -111,6 +111,14 @@ export interface StatsDto {
   note: string;
 }
 
+export interface RoadMapDto {
+  /** One polyline per lane: p = points, w = lane width in metres. */
+  roads: { p: [number, number][]; w: number }[];
+  junctions: [number, number][][];
+  bounds: { x_min: number; x_max: number; y_min: number; y_max: number };
+  source: string;
+}
+
 export interface ScenarioDetailDto {
   id: string;
   road: string;
@@ -157,4 +165,5 @@ export const api = {
     ),
   stats: (scenarioId: string, t: number) =>
     getJson<StatsDto>(`/api/scenarios/${scenarioId}/stats?t=${t}`),
+  roadmap: (road: string) => getJson<RoadMapDto>(`/api/roadmap/${road}`),
 };

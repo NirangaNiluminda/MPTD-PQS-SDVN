@@ -45,6 +45,7 @@ export default function MapLegend() {
   const { layers, toggleLayer } = usePlayback();
 
   const toggles: { k: keyof typeof layers; label: string }[] = [
+    { k: "streets", label: "Street map" },
     { k: "coverage", label: "Radio range" },
     { k: "trails", label: "Movement trails" },
     { k: "rubberBands", label: "Claim → truth" },

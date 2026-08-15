@@ -11,12 +11,14 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
 
 import config
 from parsers import beacon as beacon_parser
 from parsers import catalog
 from parsers import geometry
+from parsers import roadmap
 from parsers import sigmask
 from parsers import topology
 
@@ -30,6 +32,10 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# The road network is ~1 MB of repetitive coordinate JSON and compresses hard.
+# Matters because the demo is driven from a laptop over an SSH tunnel.
+app.add_middleware(GZipMiddleware, minimum_size=1024)
 
 
 @app.get("/api/health")
@@ -274,6 +280,27 @@ def road_geometry(road: str):
         "rsus": [{"rsu_id": r.rsu_id, "x": r.x, "y": r.y} for r in rsus],
         "vehicle_count": len(trace),
     }
+
+
+@lru_cache(maxsize=4)
+def _roadmap_for(road: str) -> dict:
+    rel = config.ROAD_NET_FILES.get(road)
+    if rel is None:
+        raise HTTPException(404, f"no SUMO network configured for road type: {road}")
+    net_path = config.SUMO_DIR / rel
+    if not net_path.is_file():
+        raise HTTPException(404, f"SUMO network file missing: {net_path}")
+    return roadmap.load_roadmap(net_path)
+
+
+@app.get("/api/roadmap/{road}")
+def road_map(road: str):
+    """Real street geometry from the SUMO network the traces were built on.
+
+    Drawn in the same coordinate frame as vehicles/RSUs — no transform. First
+    call parses the .net.xml (~0.3 s for urban) and caches to disk.
+    """
+    return _roadmap_for(road)
 
 
 @app.get("/api/geometry/{road}/positions")

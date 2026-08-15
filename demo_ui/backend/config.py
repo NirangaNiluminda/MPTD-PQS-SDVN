@@ -24,3 +24,14 @@ ROAD_TRACE_FILES = {
     "rural": {"rsu": "rsu_positions_rural.csv", "trace": "mobility_rural_60.tcl"},
     "highway": {"rsu": "rsu_positions_autobahn.csv", "trace": "mobility_autobahn_150.tcl"},
 }
+
+SUMO_DIR = REPO_ROOT / "sumo"
+
+# SUMO .net.xml per road type — the real street geometry the traces were
+# generated on. Same coordinate frame as the traces (verified via
+# convBoundary vs trace extent), so no transform is needed.
+ROAD_NET_FILES = {
+    "urban": "urban/urban.net.xml",
+    "rural": "rural/rural.net.xml",
+    "highway": "autobahn/autobahn.net.xml",
+}
