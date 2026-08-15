@@ -5,8 +5,9 @@ import DefenceInspectorScreen from "./screens/DefenceInspectorScreen";
 import LedgerScreen from "./screens/LedgerScreen";
 import AttackExplainerScreen from "./screens/AttackExplainerScreen";
 import ResultsScreen from "./screens/ResultsScreen";
+import RunConsoleScreen from "./screens/RunConsoleScreen";
 
-type Tab = "attacks" | "replay" | "inspector" | "ledger" | "results";
+type Tab = "attacks" | "replay" | "inspector" | "ledger" | "results" | "console";
 
 const TABS: { id: Tab; label: string }[] = [
   { id: "attacks", label: "Attack Explainer" },
@@ -14,6 +15,7 @@ const TABS: { id: Tab; label: string }[] = [
   { id: "inspector", label: "Defence Stack Inspector" },
   { id: "ledger", label: "Blockchain Ledger" },
   { id: "results", label: "Results & Ablation" },
+  { id: "console", label: "Run Console" },
 ];
 
 const SUBTITLE: Record<Tab, string> = {
@@ -22,6 +24,7 @@ const SUBTITLE: Record<Tab, string> = {
   inspector: "single captured run",
   ledger: "point-in-time snapshot",
   results: "reported figures",
+  console: "launches a real simulation",
 };
 
 export default function App() {
@@ -81,6 +84,7 @@ export default function App() {
         {tab === "inspector" && <DefenceInspectorScreen />}
         {tab === "ledger" && <LedgerScreen />}
         {tab === "results" && <ResultsScreen />}
+        {tab === "console" && <RunConsoleScreen />}
       </div>
     </div>
   );

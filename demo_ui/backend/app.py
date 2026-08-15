@@ -6,10 +6,15 @@ section 9 ("what this plan deliberately does not do"): no metric is
 recomputed or smoothed here, only decoded/aggregated for display.
 """
 
+import json
+import time
+from dataclasses import asdict
 from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -21,6 +26,7 @@ from parsers import fusion
 from parsers import geometry
 from parsers import ledger
 from parsers import roadmap
+from parsers import run_manager
 from parsers import run_summary
 from parsers import sigmask
 from parsers import topology
@@ -635,6 +641,113 @@ def capture_vehicle(vid: int):
         raise HTTPException(404, f"vehicle {vid} has no FUSION events in the capture")
     events.sort(key=lambda e: e.t)
     return {"vid": vid, "events": [_fusion_event_to_dict(e) for e in events]}
+
+
+# ── Run console: launch, track, and stream real simulation runs ────────────
+
+class LaunchRunRequest(BaseModel):
+    attack_number: int = 0
+    attack_pct: int = 40
+    sim_time: float = 30.0
+    mobility_scenario: int = 0
+    n_vehicles: int = 200
+    n_rsus: int = 64
+    enable_gat: bool = True
+    enable_lstm_ae: bool = True
+    enable_blockchain: bool = False
+    seed: int = 1
+    force: bool = False  # bypass a failed deployed-model check — not recommended
+
+
+@app.get("/api/runs/model-check")
+def runs_model_check():
+    """So the launch form can show model status before the user fills
+    anything in, not just as a rejection after they hit launch."""
+    return run_manager.verify_deployed_model()
+
+
+@app.post("/api/runs")
+def runs_launch(req: LaunchRunRequest):
+    rc = run_manager.RunConfig(
+        attack_number=req.attack_number,
+        attack_pct=req.attack_pct,
+        sim_time=req.sim_time,
+        mobility_scenario=req.mobility_scenario,
+        n_vehicles=req.n_vehicles,
+        n_rsus=req.n_rsus,
+        enable_gat=req.enable_gat,
+        enable_lstm_ae=req.enable_lstm_ae,
+        enable_blockchain=req.enable_blockchain,
+        seed=req.seed,
+    )
+    try:
+        record = run_manager.launch_run(rc, force=req.force)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except FileNotFoundError as e:
+        raise HTTPException(500, f"simulator binary not found: {e}")
+    return asdict(record)
+
+
+@app.get("/api/runs")
+def runs_list():
+    return run_manager.list_runs()
+
+
+# Measured 2026-08-15: a 200-vehicle run's [SIM] t=Ns heartbeat can be
+# ~400KB apart under real beacon volume. 2MB gives comfortable margin
+# without loading a log that reaches tens of MB (seen up to 93MB in this
+# session) fully into memory on every poll.
+_PROGRESS_TAIL_BYTES = 2_000_000
+
+
+@app.get("/api/runs/{run_id}")
+def runs_detail(run_id: str):
+    rec = run_manager.get_run(run_id)
+    if rec is None:
+        raise HTTPException(404, f"no run with id {run_id}")
+    log_path = Path(rec["log_path"])
+    tail = ""
+    if log_path.is_file():
+        size = log_path.stat().st_size
+        with open(log_path, "rb") as fh:
+            fh.seek(max(0, size - _PROGRESS_TAIL_BYTES))
+            tail = fh.read().decode(errors="replace")
+    progress = run_manager.parse_progress(tail, rec["config"], run_id=run_id)
+    return {**rec, "progress": progress}
+
+
+@app.post("/api/runs/{run_id}/stop")
+def runs_stop(run_id: str):
+    ok = run_manager.stop_run(run_id)
+    if not ok:
+        raise HTTPException(404, f"no running process for {run_id}")
+    return {"stopped": True}
+
+
+@app.get("/api/runs/{run_id}/stream")
+def runs_stream(run_id: str):
+    rec = run_manager.get_run(run_id)
+    if rec is None:
+        raise HTTPException(404, f"no run with id {run_id}")
+    log_path = Path(rec["log_path"])
+
+    def tail_generator():
+        # Start from the beginning — these logs are capped by simTime and
+        # stay small enough (tens of MB) that a fresh client replaying the
+        # whole thing is simpler and more honest than guessing an offset.
+        with open(log_path, "r", errors="replace") as fh:
+            while True:
+                line = fh.readline()
+                if line:
+                    yield f"data: {json.dumps(line.rstrip(chr(10)))}\n\n"
+                else:
+                    if not run_manager._is_alive(rec["pid"]):
+                        yield "event: done\ndata: {}\n\n"
+                        break
+                    time.sleep(0.5)
+
+    return StreamingResponse(tail_generator(), media_type="text/event-stream")
 
 
 # ── Results & ablation (E1/E2 figures as static images, E5 as data,

@@ -37,6 +37,21 @@ FUSION_CAPTURE_LOG = CAPTURES_DIR / "combined_bc_90s.log"
 # attack variant. Validated 2026-08-14 against the repo's own results dir.
 E5_RESULTS_FILE = REPO_ROOT / "results_e5_final" / "e5_final_table.json"
 
+# ns-3 root and the compiled binary. Paths from CLAUDE.md's own $NS3/$BIN.
+NS3_ROOT = Path(os.environ.get("MPTD_NS3_ROOT", "/home/sdvn_mobility_flooding/ns-allinone-3.35/ns-3.35"))
+SIM_BINARY = NS3_ROOT / "build" / "scratch" / "mptd_pqs_sdvn" / "mptd_pqs_sdvn"
+
+# Deployed-model sanity check (CLAUDE.md "Deployed model must stay reverted").
+# The Fix-A model swap once collapsed MCC to 0.036 — this is checked before
+# every UI-launched run, not just documented as a manual step.
+GAT_MODEL_DIR = NS3_ROOT / "analytics" / "ml" / "models" / "urban_combined"
+EXPECTED_GAT_LINK_TARGET = "../urban/gat_model.onnx"
+EXPECTED_THETA_S = 19.74
+EXPECTED_THETA_AE = 33.693885
+
+RUN_LOGS_DIR = CAPTURES_DIR / "runs"
+RUN_MANIFEST = RUN_LOGS_DIR / "manifest.json"
+
 # E1 (penetration/intensity sweep) and E2 (speed regime sweep): the raw CSVs
 # have no header row and no generating script survives in the repo, so their
 # ~13 numeric columns can't be safely re-derived — a wrong guess there would

@@ -271,6 +271,52 @@ export interface AttackInfoDto {
   sample_scenario_id: string | null;
 }
 
+// ── Run console (launches a REAL simulation process) ────────────────────────
+
+export interface ModelCheckDto {
+  ok: boolean;
+  gat_model_link: { actual: string | null; expected: string; ok: boolean };
+  theta_s: { actual: string | null; expected: string; ok: boolean };
+  theta_ae: { actual: string | null; expected: string; ok: boolean };
+}
+
+export interface LaunchRunRequest {
+  attack_number: number;
+  attack_pct: number;
+  sim_time: number;
+  mobility_scenario: number;
+  n_vehicles: number;
+  n_rsus: number;
+  enable_gat: boolean;
+  enable_lstm_ae: boolean;
+  enable_blockchain: boolean;
+  seed: number;
+  force?: boolean;
+}
+
+export interface RunProgressDto {
+  phase: "starting" | "registering" | "simulating" | "finished";
+  pct: number;
+  sim_time_reached?: number;
+  registered?: number;
+  expected?: number;
+  eta_seconds: number;
+  mcc_full?: number | null;
+  stale?: boolean;
+}
+
+export interface RunRecordDto {
+  run_id: string;
+  pid: number;
+  cmd: string[];
+  log_path: string;
+  config: LaunchRunRequest;
+  started_at: number;
+  model_check: ModelCheckDto;
+  alive: boolean;
+  progress?: RunProgressDto;
+}
+
 export interface ScenarioDetailDto {
   id: string;
   road: string;
@@ -286,6 +332,19 @@ async function getJson<T>(path: string): Promise<T> {
   const res = await fetch(BASE + path);
   if (!res.ok) {
     throw new Error(`${path} -> HTTP ${res.status}`);
+  }
+  return res.json() as Promise<T>;
+}
+
+async function postJson<T>(path: string, body: unknown): Promise<T> {
+  const res = await fetch(BASE + path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.json().catch(() => null);
+    throw new Error(detail?.detail ?? `${path} -> HTTP ${res.status}`);
   }
   return res.json() as Promise<T>;
 }
@@ -335,6 +394,14 @@ export const api = {
   attacks: () => getJson<AttackInfoDto[]>("/api/attacks"),
 
   resultsE5: () => getJson<Record<string, any>>("/api/results/e5"),
+  runsModelCheck: () => getJson<ModelCheckDto>("/api/runs/model-check"),
+  runsLaunch: (req: LaunchRunRequest) =>
+    postJson<RunRecordDto>("/api/runs", req),
+  runsList: () => getJson<RunRecordDto[]>("/api/runs"),
+  runsDetail: (runId: string) => getJson<RunRecordDto>(`/api/runs/${runId}`),
+  runsStop: (runId: string) => postJson<{ stopped: boolean }>(`/api/runs/${runId}/stop`, {}),
+  runStreamUrl: (runId: string) => `/api/runs/${runId}/stream`,
+
   resultsAblation: () =>
     getJson<{
       source: string;
