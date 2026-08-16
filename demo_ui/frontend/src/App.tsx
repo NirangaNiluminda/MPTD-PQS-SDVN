@@ -172,8 +172,8 @@ export default function App() {
         </button>
       </header>
 
-      <div className="grid min-h-0 grid-cols-[188px_1fr]">
-        <nav className="flex flex-col gap-4 overflow-y-auto border-r border-surface-hairline bg-surface-panel px-2.5 py-3">
+      <div className="grid min-h-0 grid-cols-[14rem_1fr]">
+        <nav className="flex min-w-0 flex-col gap-4 overflow-y-auto border-r border-surface-hairline bg-surface-panel px-2.5 py-3">
           {NAV_GROUPS.map((group) => (
             <div key={group.title} className="flex flex-col gap-0.5">
               <div className="px-2 pb-1 text-[9px] font-bold uppercase tracking-widest text-ink-muted">

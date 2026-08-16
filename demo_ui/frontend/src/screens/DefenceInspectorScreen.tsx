@@ -78,6 +78,7 @@ export default function DefenceInspectorScreen() {
   const [error, setError] = useState<string | null>(null);
   const [filter, setFilter] = useState("");
   const [openSignal, setOpenSignal] = useState<number | null>(null);
+  const [trendsOpen, setTrendsOpen] = useState(false);
 
   useEffect(() => {
     api
@@ -359,52 +360,65 @@ export default function DefenceInspectorScreen() {
                   </div>
                 </section>
 
-                <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
-                  <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-ink-muted">
-                    Fused decision Φ over time
-                  </h3>
-                  <p className="mb-2 text-[10px] text-ink-muted">
-                    Dashed line = decision threshold (Φ &gt; {PHI_TH})
-                  </p>
-                  <div className="h-40">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <LineChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                        <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
-                        <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
-                        <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
-                        <Tooltip
-                          contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
-                          labelStyle={{ color: INK.secondary }}
-                        />
-                        <ReferenceLine y={PHI_TH} stroke={STATUS.caught} strokeDasharray="4 3" />
-                        <Line type="monotone" dataKey="phi" name="Φ" stroke={SERIES[3]} strokeWidth={2} dot={false} isAnimationActive={false} />
-                      </LineChart>
-                    </ResponsiveContainer>
-                  </div>
-                </section>
+                <Accordion
+                  open={trendsOpen}
+                  onToggle={() => setTrendsOpen((v) => !v)}
+                  bodyMaxHeight={520}
+                  header={
+                    <span className="text-[11px] font-semibold uppercase tracking-wider text-ink-muted">
+                      Trends over time — Φ and the three signals
+                    </span>
+                  }
+                >
+                  <div className="flex flex-col gap-4 border-t border-surface-hairline p-4">
+                    <div>
+                      <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-ink-muted">
+                        Fused decision Φ over time
+                      </h3>
+                      <p className="mb-2 text-[10px] text-ink-muted">
+                        Dashed line = decision threshold (Φ &gt; {PHI_TH})
+                      </p>
+                      <div className="h-40">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <LineChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
+                            <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
+                            <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                            <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                            <Tooltip
+                              contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
+                              labelStyle={{ color: INK.secondary }}
+                            />
+                            <ReferenceLine y={PHI_TH} stroke={STATUS.caught} strokeDasharray="4 3" />
+                            <Line type="monotone" dataKey="phi" name="Φ" stroke={SERIES[3]} strokeWidth={2} dot={false} isAnimationActive={false} />
+                          </LineChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
 
-                <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
-                  <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-ink-muted">
-                    The three signals over time
-                  </h3>
-                  <div className="h-44">
-                    <ResponsiveContainer width="100%" height="100%">
-                      <AreaChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                        <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
-                        <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
-                        <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
-                        <Tooltip
-                          contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
-                          labelStyle={{ color: INK.secondary }}
-                        />
-                        <Legend wrapperStyle={{ fontSize: 11 }} />
-                        <Area type="monotone" dataKey="psi_fuse" name="ψ̂ rules" stroke={SERIES[0]} fill={SERIES[0]} fillOpacity={0.12} isAnimationActive={false} />
-                        <Area type="monotone" dataKey="S_norm" name="Ŝ GAT" stroke={SERIES[1]} fill={SERIES[1]} fillOpacity={0.12} isAnimationActive={false} />
-                        <Area type="monotone" dataKey="ae_norm" name="ε̂ LSTM-AE" stroke={SERIES[2]} fill={SERIES[2]} fillOpacity={0.12} isAnimationActive={false} />
-                      </AreaChart>
-                    </ResponsiveContainer>
+                    <div>
+                      <h3 className="mb-1 text-[11px] font-semibold uppercase tracking-wider text-ink-muted">
+                        The three signals over time
+                      </h3>
+                      <div className="h-44">
+                        <ResponsiveContainer width="100%" height="100%">
+                          <AreaChart data={chartData} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
+                            <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
+                            <XAxis dataKey="t" tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                            <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                            <Tooltip
+                              contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
+                              labelStyle={{ color: INK.secondary }}
+                            />
+                            <Legend wrapperStyle={{ fontSize: 11 }} />
+                            <Area type="monotone" dataKey="psi_fuse" name="ψ̂ rules" stroke={SERIES[0]} fill={SERIES[0]} fillOpacity={0.12} isAnimationActive={false} />
+                            <Area type="monotone" dataKey="S_norm" name="Ŝ GAT" stroke={SERIES[1]} fill={SERIES[1]} fillOpacity={0.12} isAnimationActive={false} />
+                            <Area type="monotone" dataKey="ae_norm" name="ε̂ LSTM-AE" stroke={SERIES[2]} fill={SERIES[2]} fillOpacity={0.12} isAnimationActive={false} />
+                          </AreaChart>
+                        </ResponsiveContainer>
+                      </div>
+                    </div>
                   </div>
-                </section>
+                </Accordion>
               </>
             )}
           </div>

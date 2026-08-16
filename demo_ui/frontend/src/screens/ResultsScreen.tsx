@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Bar,
   BarChart,
@@ -22,6 +22,8 @@ import {
 } from "../api";
 import { useTokens } from "../design/tokens";
 import Accordion from "../components/Accordion";
+import SummaryCard from "../components/SummaryCard";
+import DrillModal, { originFromEvent } from "../components/DrillModal";
 
 const LAYER_LABEL: Record<string, string> = { rules: "Rules", gat: "GAT", lstm_ae: "LSTM-AE" };
 const LAYER_ORDER = ["rules", "gat", "lstm_ae"];
@@ -51,6 +53,8 @@ function Callout({ children }: { children: React.ReactNode }) {
   );
 }
 
+type Section = "e5" | "sweep" | "agreement" | "latency" | "ablation" | "cost" | "sweeps-e1e2";
+
 export default function ResultsScreen() {
   const { SERIES, STATUS, INK, SURFACE } = useTokens();
   const [attacks, setAttacks] = useState<AttackInfoDto[] | null>(null);
@@ -61,6 +65,13 @@ export default function ResultsScreen() {
   const [crypto, setCrypto] = useState<CryptoSummaryDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openWindow, setOpenWindow] = useState<number | null>(0);
+  const [openSection, setOpenSection] = useState<Section | null>(null);
+  const originRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
+
+  const openCard = (section: Section) => (e: React.MouseEvent<HTMLButtonElement>) => {
+    originRef.current = originFromEvent(e);
+    setOpenSection(section);
+  };
 
   useEffect(() => {
     Promise.all([api.attacks(), api.resultsAblation()])
@@ -111,6 +122,10 @@ export default function ResultsScreen() {
     "best baseline": a.best_baseline_mcc ?? 0,
   }));
 
+  const winCount = attacks?.filter((a) => !a.baseline_wins).length ?? null;
+  const caughtCount = latency ? latency.vehicles_considered - latency.vehicles_missed_entirely : null;
+  const holdsCount = ablation ? ablation.windows.filter((w) => w.ordering_holds).length : null;
+
   return (
     <div className="h-full overflow-y-auto p-5">
       <div className="mx-auto max-w-5xl space-y-6">
@@ -121,6 +136,8 @@ export default function ResultsScreen() {
           <p className="mt-1 text-xs text-ink-secondary">
             Reported figures with their evaluation windows stated explicitly
             — an MCC without a window attached is not comparable to another.
+            Each card below is a headline number; open it for the full
+            figure, the method, and the caveats.
           </p>
         </header>
 
@@ -130,15 +147,61 @@ export default function ResultsScreen() {
           </div>
         )}
 
-        <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-          <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-            SENTINEL vs. best baseline, per attack (E5)
-          </h2>
-          <p className="mb-3 text-[11px] text-ink-secondary">
-            From <code className="text-ink-primary">results_e5_final/e5_final_table.json</code>.
-            Baselines beat SENTINEL on 3 of 7 variants — bars below zero on
-            the baseline series where that happens are shown, not clipped.
-          </p>
+        <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3">
+          <SummaryCard
+            label="SENTINEL vs. best baseline (E5)"
+            value={winCount != null ? `${winCount} / 7` : "…"}
+            valueColor={STATUS.good}
+            caption="Attack variants where SENTINEL beats the strongest baseline"
+            onClick={openCard("e5")}
+          />
+          <SummaryCard
+            label="Threshold sweep"
+            value={peakF1?.f1 != null ? peakF1.f1.toFixed(3) : "…"}
+            caption={peakF1 ? `Peak F1 at threshold ${peakF1.threshold.toFixed(2)} (deployed: 0.5)` : "Loading…"}
+            onClick={openCard("sweep")}
+          />
+          <SummaryCard
+            label="Layer agreement"
+            value={agreement ? `${((agreement.matrix.rules?.gat ?? 0) * 100).toFixed(0)}%` : "…"}
+            caption="Rules vs. GAT agreement on their own binary calls"
+            onClick={openCard("agreement")}
+          />
+          <SummaryCard
+            label="Detection latency"
+            value={caughtCount != null && latency ? `${caughtCount}/${latency.vehicles_considered}` : "…"}
+            caption="Poisoned vehicles caught at all in the capture"
+            onClick={openCard("latency")}
+          />
+          <SummaryCard
+            label="Ablation: does more ML help?"
+            value={holdsCount != null && ablation ? `${holdsCount}/${ablation.windows.length}` : "…"}
+            valueColor={holdsCount === ablation?.windows.length ? STATUS.good : STATUS.caught}
+            caption="Evaluation windows where D1 < D4 < D6 holds"
+            onClick={openCard("ablation")}
+          />
+          <SummaryCard
+            label="Cost of the defence"
+            value={crypto ? `${crypto.bandwidth_overhead.ratio_vs_baseline.toFixed(1)}×` : "…"}
+            caption="Bandwidth overhead vs. plain beacons, plus per-attack processing cost"
+            onClick={openCard("cost")}
+          />
+          <SummaryCard
+            label="E1 / E2 — sweep figures"
+            value="2 figures"
+            caption="Penetration × intensity, and speed-regime sweep (pre-generated)"
+            onClick={openCard("sweeps-e1e2")}
+          />
+        </div>
+
+        <DrillModal
+          open={openSection === "e5"}
+          onClose={() => setOpenSection(null)}
+          origin={originRef.current}
+          title="SENTINEL vs. best baseline, per attack (E5)"
+          subtitle="From results_e5_final/e5_final_table.json. Baselines beat SENTINEL on 3 of 7 variants — bars below zero on the baseline series where that happens are shown, not clipped."
+          maxWidth="max-w-3xl"
+        >
           {chartData && (
             <div className="h-72">
               <ResponsiveContainer width="100%" height="100%">
@@ -157,155 +220,152 @@ export default function ResultsScreen() {
               </ResponsiveContainer>
             </div>
           )}
-        </section>
+        </DrillModal>
 
-        {sweep && (
-          <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-            <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-              Threshold sweep — precision, recall, F1 vs. decision threshold
-            </h2>
-            <p className="mb-3 text-[11px] text-ink-secondary">
-              Computed post-hoc from the real fused score (Φ) each event in
-              one blockchain-enabled capture run already carries — sweeping
-              the decision threshold re-slices existing data, no
-              re-simulation. Sanity-checked: at threshold 0.5 this exactly
-              reproduces the simulator's own printed confusion matrix
-              (TP=12756 FP=70 TN=4480 FN=1110).
-              {peakF1 && (
-                <>
-                  {" "}
-                  Peak F1 ({peakF1.f1?.toFixed(3)}) falls at threshold{" "}
-                  {peakF1.threshold.toFixed(2)} — the deployed operating
-                  point is 0.5, so the peak and the actual choice do not
-                  coincide here.
-                </>
-              )}
-            </p>
+        <DrillModal
+          open={openSection === "sweep"}
+          onClose={() => setOpenSection(null)}
+          origin={originRef.current}
+          title="Threshold sweep — precision, recall, F1 vs. decision threshold"
+          subtitle="Computed post-hoc from the real fused score (Φ) each event in one blockchain-enabled capture run already carries — sweeping the decision threshold re-slices existing data, no re-simulation."
+          maxWidth="max-w-3xl"
+        >
+          <p className="text-[11px] text-ink-secondary">
+            Sanity-checked: at threshold 0.5 this exactly reproduces the
+            simulator's own printed confusion matrix (TP=12756 FP=70
+            TN=4480 FN=1110).
+            {peakF1 && (
+              <>
+                {" "}
+                Peak F1 ({peakF1.f1?.toFixed(3)}) falls at threshold{" "}
+                {peakF1.threshold.toFixed(2)} — the deployed operating point
+                is 0.5, so the peak and the actual choice do not coincide
+                here.
+              </>
+            )}
+          </p>
+          <div className="h-56">
+            <ResponsiveContainer width="100%" height="100%">
+              <LineChart data={sweepChartData ?? []} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
+                <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
+                <XAxis
+                  dataKey="threshold"
+                  type="number"
+                  domain={[0, 1]}
+                  tick={{ fill: INK.muted, fontSize: 10 }}
+                  stroke={SURFACE.hairlineStrong}
+                />
+                <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                <Tooltip
+                  contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
+                  labelStyle={{ color: INK.secondary }}
+                />
+                <Legend wrapperStyle={{ fontSize: 11 }} />
+                <ReferenceLine x={0.5} stroke={STATUS.caught} strokeDasharray="4 3" label={{ value: "deployed (0.5)", fill: STATUS.caught, fontSize: 10, position: "top" }} />
+                <Line type="monotone" dataKey="precision" stroke={SERIES[0]} strokeWidth={2} dot={false} isAnimationActive={false} />
+                <Line type="monotone" dataKey="recall" stroke={SERIES[1]} strokeWidth={2} dot={false} isAnimationActive={false} />
+                <Line type="monotone" dataKey="f1" stroke={SERIES[2]} strokeWidth={2.5} dot={false} isAnimationActive={false} />
+              </LineChart>
+            </ResponsiveContainer>
+          </div>
+        </DrillModal>
+
+        <DrillModal
+          open={openSection === "agreement"}
+          onClose={() => setOpenSection(null)}
+          origin={originRef.current}
+          title="Layer agreement — are the three tiers redundant?"
+          subtitle={
+            agreement
+              ? `Pairwise agreement on each layer's own binary decision, from ${agreement.n_events.toLocaleString()} real events. High agreement is the case for dropping a layer; low agreement is the case for keeping both. Agreement is not accuracy — two layers can agree and both be wrong.`
+              : undefined
+          }
+        >
+          {agreement && (
+            <>
+              <div className="overflow-hidden rounded border border-surface-hairline">
+                <div className="grid grid-cols-4 bg-surface-raised text-center text-[10px] font-semibold text-ink-muted">
+                  <div className="p-1.5" />
+                  {LAYER_ORDER.map((l) => (
+                    <div key={l} className="p-1.5">{LAYER_LABEL[l]}</div>
+                  ))}
+                </div>
+                {LAYER_ORDER.map((row) => (
+                  <div key={row} className="grid grid-cols-4 border-t border-surface-hairline text-center text-xs">
+                    <div className="flex items-center justify-center bg-surface-raised p-1.5 font-semibold text-ink-muted">
+                      {LAYER_LABEL[row]}
+                    </div>
+                    {LAYER_ORDER.map((col) => {
+                      const v = agreement.matrix[row]?.[col];
+                      return (
+                        <div
+                          key={col}
+                          className="flex items-center justify-center p-1.5 font-mono"
+                          style={
+                            v == null
+                              ? undefined
+                              : { background: `rgba(57,135,229,${Math.min(v, 0.9) * 0.35})` }
+                          }
+                        >
+                          {v == null ? "—" : v.toFixed(2)}
+                        </div>
+                      );
+                    })}
+                  </div>
+                ))}
+              </div>
+              <div className="flex gap-4 text-[10px] text-ink-muted">
+                {LAYER_ORDER.map((l) => (
+                  <span key={l}>
+                    {LAYER_LABEL[l]} flags {(agreement.flag_rates[l] * 100).toFixed(0)}%
+                  </span>
+                ))}
+              </div>
+            </>
+          )}
+        </DrillModal>
+
+        <DrillModal
+          open={openSection === "latency"}
+          onClose={() => setOpenSection(null)}
+          origin={originRef.current}
+          title="Detection latency — onset to first catch"
+          subtitle={
+            latency
+              ? `${latency.vehicles_considered} vehicles were poisoned at some point in the capture; ${latency.vehicles_missed_entirely} ${latency.vehicles_missed_entirely === 1 ? "was" : "were"} never caught at all and is excluded from this distribution — binning a miss as "slow" would misstate the tail. Not the same figure as the simulator's own printed TTD mean shown in the Ledger screen; this is a distribution built here from the raw events.`
+              : undefined
+          }
+        >
+          {latencyBins && (
             <div className="h-56">
               <ResponsiveContainer width="100%" height="100%">
-                <LineChart data={sweepChartData ?? []} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
+                <BarChart data={latencyBins} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
                   <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
-                  <XAxis
-                    dataKey="threshold"
-                    type="number"
-                    domain={[0, 1]}
-                    tick={{ fill: INK.muted, fontSize: 10 }}
-                    stroke={SURFACE.hairlineStrong}
-                  />
-                  <YAxis domain={[0, 1]} tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
+                  <XAxis dataKey="label" tick={{ fill: INK.muted, fontSize: 9 }} stroke={SURFACE.hairlineStrong} />
+                  <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
                   <Tooltip
                     contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
                     labelStyle={{ color: INK.secondary }}
                   />
-                  <Legend wrapperStyle={{ fontSize: 11 }} />
-                  <ReferenceLine x={0.5} stroke={STATUS.caught} strokeDasharray="4 3" label={{ value: "deployed (0.5)", fill: STATUS.caught, fontSize: 10, position: "top" }} />
-                  <Line type="monotone" dataKey="precision" stroke={SERIES[0]} strokeWidth={2} dot={false} isAnimationActive={false} />
-                  <Line type="monotone" dataKey="recall" stroke={SERIES[1]} strokeWidth={2} dot={false} isAnimationActive={false} />
-                  <Line type="monotone" dataKey="f1" stroke={SERIES[2]} strokeWidth={2.5} dot={false} isAnimationActive={false} />
-                </LineChart>
+                  <Bar dataKey="count" fill={SERIES[0]} radius={[2, 2, 0, 0]} isAnimationActive={false} />
+                </BarChart>
               </ResponsiveContainer>
             </div>
-          </section>
-        )}
+          )}
+        </DrillModal>
 
-        {(agreement || latencyBins) && (
-          <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-            {agreement && (
-              <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-                <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-                  Layer agreement — are the three tiers redundant?
-                </h2>
-                <p className="mb-3 text-[11px] text-ink-secondary">
-                  Pairwise agreement on each layer's own binary decision,
-                  from {agreement.n_events.toLocaleString()} real events.
-                  High agreement is the case for dropping a layer; low
-                  agreement is the case for keeping both. Agreement is not
-                  accuracy — two layers can agree and both be wrong.
-                </p>
-                <div className="overflow-hidden rounded border border-surface-hairline">
-                  <div className="grid grid-cols-4 bg-surface-raised text-center text-[10px] font-semibold text-ink-muted">
-                    <div className="p-1.5" />
-                    {LAYER_ORDER.map((l) => (
-                      <div key={l} className="p-1.5">{LAYER_LABEL[l]}</div>
-                    ))}
-                  </div>
-                  {LAYER_ORDER.map((row) => (
-                    <div key={row} className="grid grid-cols-4 border-t border-surface-hairline text-center text-xs">
-                      <div className="flex items-center justify-center bg-surface-raised p-1.5 font-semibold text-ink-muted">
-                        {LAYER_LABEL[row]}
-                      </div>
-                      {LAYER_ORDER.map((col) => {
-                        const v = agreement.matrix[row]?.[col];
-                        return (
-                          <div
-                            key={col}
-                            className="flex items-center justify-center p-1.5 font-mono"
-                            style={
-                              v == null
-                                ? undefined
-                                : { background: `rgba(57,135,229,${Math.min(v, 0.9) * 0.35})` }
-                            }
-                          >
-                            {v == null ? "—" : v.toFixed(2)}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  ))}
-                </div>
-                <div className="mt-2 flex gap-4 text-[10px] text-ink-muted">
-                  {LAYER_ORDER.map((l) => (
-                    <span key={l}>
-                      {LAYER_LABEL[l]} flags {(agreement.flag_rates[l] * 100).toFixed(0)}%
-                    </span>
-                  ))}
-                </div>
-              </section>
-            )}
-
-            {latencyBins && latency && (
-              <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-                <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-                  Detection latency — onset to first catch
-                </h2>
-                <p className="mb-3 text-[11px] text-ink-secondary">
-                  {latency.vehicles_considered} vehicles were poisoned at some
-                  point in the capture; {latency.vehicles_missed_entirely}{" "}
-                  {latency.vehicles_missed_entirely === 1 ? "was" : "were"}{" "}
-                  never caught at all and is excluded from this distribution
-                  — binning a miss as "slow" would misstate the tail. Not the
-                  same figure as the simulator's own printed TTD mean shown
-                  in the Ledger screen; this is a distribution built here
-                  from the raw events.
-                </p>
-                <div className="h-40">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <BarChart data={latencyBins} margin={{ top: 4, right: 8, bottom: 4, left: -12 }}>
-                      <CartesianGrid stroke={SURFACE.hairline} vertical={false} />
-                      <XAxis dataKey="label" tick={{ fill: INK.muted, fontSize: 9 }} stroke={SURFACE.hairlineStrong} />
-                      <YAxis tick={{ fill: INK.muted, fontSize: 10 }} stroke={SURFACE.hairlineStrong} />
-                      <Tooltip
-                        contentStyle={{ background: SURFACE.raised, border: `1px solid ${SURFACE.hairline}`, borderRadius: 6, fontSize: 11 }}
-                        labelStyle={{ color: INK.secondary }}
-                      />
-                      <Bar dataKey="count" fill={SERIES[0]} radius={[2, 2, 0, 0]} isAnimationActive={false} />
-                    </BarChart>
-                  </ResponsiveContainer>
-                </div>
-              </section>
-            )}
-          </div>
-        )}
-
-        {ablation && (
-          <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-            <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-              Ablation: does more machine learning help?
-            </h2>
-            <p className="mb-3 text-[11px] text-ink-secondary">
-              D1 = rule signatures only. D4 = + GAT spatial. D6 = + LSTM-AE
-              temporal. {ablation.config}. Source: {ablation.source}.
-            </p>
+        <DrillModal
+          open={openSection === "ablation"}
+          onClose={() => setOpenSection(null)}
+          origin={originRef.current}
+          title="Ablation: does more machine learning help?"
+          subtitle={
+            ablation
+              ? `D1 = rule signatures only. D4 = + GAT spatial. D6 = + LSTM-AE temporal. ${ablation.config}. Source: ${ablation.source}.`
+              : undefined
+          }
+        >
+          {ablation && (
             <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
               {ablation.windows.map((w, i) => (
                 <Accordion
@@ -350,21 +410,19 @@ export default function ResultsScreen() {
                 </Accordion>
               ))}
             </div>
-          </section>
-        )}
+          )}
+        </DrillModal>
 
-        <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-          <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-            Cost of the defence
-          </h2>
-          <p className="mb-3 text-[11px] text-ink-secondary">
-            Accuracy numbers above say nothing about what this costs to run.
-            Every figure here is measured, not estimated — the same capture
-            and E5 sources used everywhere else in this app.
-          </p>
-
+        <DrillModal
+          open={openSection === "cost"}
+          onClose={() => setOpenSection(null)}
+          origin={originRef.current}
+          title="Cost of the defence"
+          subtitle="Accuracy numbers say nothing about what this costs to run. Every figure here is measured, not estimated — the same capture and E5 sources used everywhere else in this app."
+          maxWidth="max-w-3xl"
+        >
           {attacks && (
-            <div className="mb-4 overflow-hidden rounded border border-surface-hairline">
+            <div className="overflow-hidden rounded border border-surface-hairline">
               <table className="w-full text-left text-xs">
                 <thead>
                   <tr className="bg-surface-raised text-[10px] uppercase tracking-wider text-ink-muted">
@@ -527,35 +585,35 @@ export default function ResultsScreen() {
               </div>
             </div>
           )}
-        </section>
+        </DrillModal>
 
-        <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-          <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-            E1 — penetration rate × combined-attack intensity
-          </h2>
-          <p className="mb-3 text-[11px] text-ink-secondary">
-            Pre-generated figure, shown as originally produced — the source
-            CSV's ~13 unlabeled numeric columns and generating script
-            weren't recoverable, so this is served as-is rather than
-            re-plotted from a guess at column meaning.
-          </p>
-          <img
-            src="/static/results_e1/e1_penetration_intensity.png"
-            alt="E1 — SENTINEL MCC across attack penetration rate and intensity"
-            className="w-full rounded border border-surface-hairline bg-white"
-          />
-        </section>
-
-        <section className="rounded-lg border border-surface-hairline bg-surface-panel p-4">
-          <h2 className="mb-1 text-xs font-semibold uppercase tracking-wider text-ink-muted">
-            E2 — speed regime sweep
-          </h2>
-          <img
-            src="/static/results_e2/e2_speed_regime.png"
-            alt="E2 — speed regime sweep"
-            className="w-full rounded border border-surface-hairline bg-white"
-          />
-        </section>
+        <DrillModal
+          open={openSection === "sweeps-e1e2"}
+          onClose={() => setOpenSection(null)}
+          origin={originRef.current}
+          title="E1 / E2 — sweep figures"
+          subtitle="Pre-generated figures, shown as originally produced — the source CSVs' unlabeled numeric columns and generating scripts weren't recoverable, so these are served as-is rather than re-plotted from a guess at column meaning."
+          maxWidth="max-w-3xl"
+        >
+          <div>
+            <h3 className="mb-2 text-[11px] font-medium text-ink-secondary">
+              E1 — penetration rate × combined-attack intensity
+            </h3>
+            <img
+              src="/static/results_e1/e1_penetration_intensity.png"
+              alt="E1 — SENTINEL MCC across attack penetration rate and intensity"
+              className="w-full rounded border border-surface-hairline bg-white"
+            />
+          </div>
+          <div>
+            <h3 className="mb-2 text-[11px] font-medium text-ink-secondary">E2 — speed regime sweep</h3>
+            <img
+              src="/static/results_e2/e2_speed_regime.png"
+              alt="E2 — speed regime sweep"
+              className="w-full rounded border border-surface-hairline bg-white"
+            />
+          </div>
+        </DrillModal>
       </div>
     </div>
   );
