@@ -85,7 +85,7 @@ export default function VehicleDrawer() {
   ).length;
 
   return (
-    <aside className="flex w-[420px] shrink-0 flex-col overflow-hidden border-l border-surface-hairline bg-surface-panel">
+    <aside className="anim-rise pointer-events-auto absolute bottom-3 right-3 top-14 z-10 flex w-[400px] flex-col overflow-hidden rounded-lg border border-surface-hairline2 bg-surface-panel shadow-2xl">
       <header className="flex items-center justify-between border-b border-surface-hairline px-4 py-3">
         <div>
           <h2 className="text-sm font-semibold text-ink-primary">

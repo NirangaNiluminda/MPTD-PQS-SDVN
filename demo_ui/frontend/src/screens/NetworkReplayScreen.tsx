@@ -54,11 +54,15 @@ export default function NetworkReplayScreen() {
         <div className="relative flex-1 bg-surface-page">
           <NetworkMap />
           <MapControls />
+          {/* Floats over the map rather than docking as a side panel — the
+              map keeps its full width, and the overlays this vehicle draws
+              (rubber band, LSTM-AE expected path, GAT attention lines) stay
+              visible right next to the detail that explains them. */}
+          <VehicleDrawer />
         </div>
         <div className="w-80 shrink-0">
           <DetectionFeed />
         </div>
-        <VehicleDrawer />
       </div>
 
       <PlaybackControls />
