@@ -2,7 +2,6 @@ import { useEffect, useState } from "react";
 import {
   api,
   ControllerFlagDto,
-  CryptoSummaryDto,
   LedgerSummaryDto,
   ReassignmentDto,
   RevocationDto,
@@ -14,12 +13,6 @@ import Accordion from "../components/Accordion";
 function fmtTime(iso: string): string {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? iso : d.toLocaleString();
-}
-
-function formatBytes(n: number): string {
-  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)} MB`;
-  if (n >= 1_000) return `${(n / 1_000).toFixed(1)} KB`;
-  return `${n} B`;
 }
 
 function KpiCard({
@@ -90,7 +83,6 @@ export default function LedgerScreen() {
   const [revocations, setRevocations] = useState<RevocationDto[]>([]);
   const [flags, setFlags] = useState<ControllerFlagDto[]>([]);
   const [reassignments, setReassignments] = useState<ReassignmentDto[]>([]);
-  const [crypto, setCrypto] = useState<CryptoSummaryDto | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openRsu, setOpenRsu] = useState<string | null>(null);
   const [openVeh, setOpenVeh] = useState<string | null>(null);
@@ -116,10 +108,6 @@ export default function LedgerScreen() {
         setReassignments(ra);
       })
       .catch((e) => setError(String(e)));
-    // Separate call, separate failure domain: the crypto/IPFS panel is a
-    // bonus on top of the core ledger view, not a reason to blank the page
-    // if the capture log happens to be unavailable.
-    api.captureCryptoSummary().then(setCrypto).catch(() => setCrypto(null));
   }, []);
 
   if (error) {
@@ -185,138 +173,6 @@ export default function LedgerScreen() {
               tone={summary.reassignments > 0 ? "caught" : "neutral"}
             />
           </div>
-        )}
-
-        {crypto && (
-          <section className="rounded-lg border border-surface-hairline bg-surface-panel">
-            <header className="border-b border-surface-hairline px-4 py-2.5">
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-ink-muted">
-                Post-quantum crypto cost &amp; off-chain storage
-              </h2>
-            </header>
-            <div className="grid grid-cols-1 gap-4 p-4 sm:grid-cols-2">
-              <div>
-                <h3 className="mb-2 text-[11px] font-medium text-ink-secondary">
-                  Per-epoch crypto latency ({crypto.pq_crypto_cost_ms.epochs_sampled} epochs)
-                </h3>
-                <dl className="space-y-1.5 text-xs">
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">Ring signature (TRS)</dt>
-                    <dd className="font-mono text-ink-primary">
-                      {crypto.pq_crypto_cost_ms.trs_sign.toFixed(2)} ms
-                    </dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">Homomorphic aggregate (FHE)</dt>
-                    <dd className="font-mono text-ink-primary">
-                      {crypto.pq_crypto_cost_ms.fhe_aggregate.toFixed(1)} ms
-                    </dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">Key distribution (DKG)</dt>
-                    <dd className="font-mono text-ink-primary">
-                      {crypto.pq_crypto_cost_ms.dkg.toFixed(1)} ms
-                    </dd>
-                  </div>
-                  <div className="flex justify-between border-t border-surface-hairline pt-1.5">
-                    <dt className="text-ink-secondary">Epoch total</dt>
-                    <dd className="font-mono font-medium text-ink-primary">
-                      {crypto.pq_crypto_cost_ms.epoch_total.toFixed(0)} ms
-                    </dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">TRS signature verification</dt>
-                    <dd className="font-mono text-status-good">
-                      {crypto.trs_verify.ok} ok / {crypto.trs_verify.fail} fail
-                    </dd>
-                  </div>
-                </dl>
-              </div>
-
-              <div>
-                <h3 className="mb-2 text-[11px] font-medium text-ink-secondary">
-                  Bandwidth overhead — {crypto.bandwidth_overhead.ratio_vs_baseline.toFixed(1)}×
-                  baseline
-                </h3>
-                <dl className="space-y-1.5 text-xs">
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">Baseline (plain beacons)</dt>
-                    <dd className="font-mono text-ink-primary">
-                      {formatBytes(crypto.bandwidth_overhead.baseline_bytes)}
-                    </dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">+ HMAC auth</dt>
-                    <dd className="font-mono text-ink-primary">
-                      {formatBytes(crypto.bandwidth_overhead.hmac_bytes)}
-                    </dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">+ FHE ciphertext</dt>
-                    <dd className="font-mono text-status-caught">
-                      {formatBytes(crypto.bandwidth_overhead.fhe_bytes)}
-                    </dd>
-                  </div>
-                  <div className="flex justify-between">
-                    <dt className="text-ink-muted">+ TRS signatures</dt>
-                    <dd className="font-mono text-ink-primary">
-                      {formatBytes(crypto.bandwidth_overhead.trs_bytes)}
-                    </dd>
-                  </div>
-                </dl>
-                <p className="mt-2 text-[10px] leading-relaxed text-ink-muted">
-                  FHE ciphertext dominates the overhead — this is the
-                  measured cost of computing regional aggregates (e.g. mean
-                  speed) without any RSU ever decrypting an individual
-                  vehicle's data.
-                </p>
-              </div>
-            </div>
-
-            <div className="border-t border-surface-hairline p-4">
-              <div className="flex items-start justify-between gap-4">
-                <div>
-                  <h3 className="text-[11px] font-medium text-ink-secondary">
-                    Off-chain beacon-window store (IPFS)
-                  </h3>
-                  <p className="mt-1 text-xs text-ink-primary">
-                    {crypto.ipfs.windows_stored.toLocaleString()} windows
-                    stored off-chain, {crypto.ipfs.hashes_on_chain.toLocaleString()}{" "}
-                    hashes committed on-chain
-                  </p>
-                </div>
-                <span className="shrink-0 rounded bg-status-serious/20 px-2 py-1 text-[10px] font-medium text-status-serious">
-                  SIMULATED — not a real IPFS daemon
-                </span>
-              </div>
-              <p className="mt-2 rounded bg-surface-page px-2.5 py-2 text-[10px] leading-relaxed text-ink-muted">
-                {crypto.ipfs.note}
-              </p>
-            </div>
-
-            <div className="border-t border-surface-hairline p-4 text-xs">
-              <div className="flex justify-between">
-                <span className="text-ink-muted">Chaincode confirm latency</span>
-                <span className="font-mono text-ink-primary">
-                  {crypto.chaincode_latency_ms.confirm.toFixed(0)} ms (
-                  {crypto.chaincode_latency_ms.confirm_invokes} invokes)
-                </span>
-              </div>
-              <div className="mt-1 flex justify-between">
-                <span className="text-ink-muted">Controller reassign latency</span>
-                <span className="font-mono text-ink-primary">
-                  {crypto.chaincode_latency_ms.reassign.toFixed(0)} ms (
-                  {crypto.chaincode_latency_ms.reassign_rollovers} rollovers)
-                </span>
-              </div>
-              <div className="mt-1 flex justify-between">
-                <span className="text-ink-muted">Time-to-detect (mean)</span>
-                <span className="font-mono text-ink-primary">
-                  {crypto.ttd_seconds.toFixed(2)} s
-                </span>
-              </div>
-            </div>
-          </section>
         )}
 
         <Section title="RSU trust — demoted / under suspicion" count={demotedRsu.length}>

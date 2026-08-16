@@ -74,7 +74,7 @@ const SCREEN_META: Record<Tab, ScreenMeta> = {
       plain:
         "A permanent, tamper-proof record. Cars and roadside sensors that keep misbehaving lose trust over time and eventually get removed from the network; a compromised controller can be voted out by the honest ones.",
       expert:
-        "Point-in-time snapshot of the Hyperledger Fabric ledger: RSU/vehicle/controller trust-score decay, the append-only revocation and CP-DETECT flag log, and measured PQ-crypto cost (TRS/FHE/DKG latency, bandwidth overhead).",
+        "Point-in-time snapshot of the Hyperledger Fabric ledger: RSU/vehicle/controller trust-score decay and the append-only revocation and CP-DETECT flag log. PQ-crypto cost and bandwidth overhead now live on Results & Ablation, alongside the rest of what this defence costs to run.",
     },
     provenance: "snapshot",
   },
@@ -82,9 +82,9 @@ const SCREEN_META: Record<Tab, ScreenMeta> = {
     title: "Results & Ablation",
     blurb: {
       plain:
-        "What happens to accuracy if pieces of the defence are removed, one at a time. Every number here states exactly how it was measured and what its limits are — not just the figure that looks best.",
+        "What happens to accuracy if pieces of the defence are removed, one at a time — and what the defence actually costs to run. Every number here states exactly how it was measured and what its limits are, not just the figure that looks best.",
       expert:
-        "D1/D4/D6 ablation (rules-only / +GAT / +GAT+LSTM-AE) at both a 90 s and 300 s window, the E1 penetration-intensity and E2 speed-regime sweeps, and the E5 baseline comparison — every figure states its window and caveat inline.",
+        "D1/D4/D6 ablation (rules-only / +GAT / +GAT+LSTM-AE) at both a 90 s and 300 s window, the E1 penetration-intensity and E2 speed-regime sweeps, the E5 baseline comparison, and a cost section: per-attack overhead (PBPO/CDER/TTD), measured PQ-crypto latency, and bandwidth overhead — every figure states its window and caveat inline.",
     },
     provenance: "snapshot",
   },
