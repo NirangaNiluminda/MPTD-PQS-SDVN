@@ -38,6 +38,35 @@ export interface BeaconDto {
   accusations: Accusation[];
 }
 
+// Real offline LSTM-AE reconstruction — see demo_ui/backend/ml_scripts/
+// lstm_reconstruct.py. Runs the exact deployed ONNX artifact against this
+// vehicle's real trailing beacon window; nothing here is simulated or
+// estimated beyond the model's own forward pass.
+export interface LstmReconstructionBeaconDto {
+  t: number;
+  pos_x: number;
+  pos_y: number;
+  speed: number;
+  heading: number;
+  is_poisoned: boolean;
+  detected: boolean;
+  /** [res_x, res_y, dspeed, dheading, accel, tau_i] — real residual units. */
+  actual_raw: number[];
+  reconstructed_raw: number[];
+}
+
+export interface LstmReconstructionDto {
+  vehicle_id: number;
+  window: number;
+  theta_ae: number;
+  ae_raw_estimate: number;
+  flagged: boolean;
+  feature_names: string[];
+  per_channel_mse_z: number[];
+  expected_trajectory: { t: number; pos_x: number; pos_y: number }[];
+  beacons: LstmReconstructionBeaconDto[];
+}
+
 export interface FrameDto {
   t: number;
   window: number;
@@ -407,6 +436,11 @@ export const api = {
   vehicle: (scenarioId: string, vehicleId: number) =>
     getJson<{ vehicle_id: number; is_ghost: boolean; track: BeaconDto[] }>(
       `/api/scenarios/${scenarioId}/vehicle/${vehicleId}`
+    ),
+  lstmReconstruction: (scenarioId: string, vehicleId: number, endTime?: number) =>
+    getJson<LstmReconstructionDto>(
+      `/api/scenarios/${scenarioId}/lstm_reconstruction/${vehicleId}` +
+        (endTime != null ? `?end_time=${endTime}` : "")
     ),
   geometry: (road: string) => getJson<GeometryDto>(`/api/geometry/${road}`),
   positions: (road: string, t: number) =>

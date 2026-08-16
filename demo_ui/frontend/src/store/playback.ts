@@ -3,6 +3,7 @@ import {
   api,
   BeaconDto,
   GeometryDto,
+  LstmReconstructionDto,
   RoadMapDto,
   ScenarioDetailDto,
   ScenarioSummary,
@@ -51,6 +52,15 @@ interface PlaybackState {
   vehicleTrack: BeaconDto[] | null;
   loadingVehicle: boolean;
 
+  // Real offline LSTM-AE reconstruction for the selected vehicle — fetched
+  // on demand (it runs a real inference subprocess, not free), never
+  // automatically on every vehicle click. Cleared whenever the selected
+  // vehicle changes so a stale result can't be shown against a new one.
+  lstmReconstruction: LstmReconstructionDto | null;
+  lstmLoading: boolean;
+  lstmError: string | null;
+  loadLstmReconstruction: () => Promise<void>;
+
   layers: LayerToggles;
   mapDetail: MapDetail;
   setMapDetail: (d: MapDetail) => void;
@@ -94,6 +104,25 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   selectedVehicle: null,
   vehicleTrack: null,
   loadingVehicle: false,
+
+  lstmReconstruction: null,
+  lstmLoading: false,
+  lstmError: null,
+  loadLstmReconstruction: async () => {
+    const { scenarioId, selectedVehicle, t } = get();
+    if (!scenarioId || selectedVehicle === null) return;
+    const forVehicle = selectedVehicle;
+    set({ lstmLoading: true, lstmError: null });
+    try {
+      const res = await api.lstmReconstruction(scenarioId, forVehicle, t);
+      if (get().selectedVehicle !== forVehicle) return; // vehicle changed mid-flight
+      set({ lstmReconstruction: res, lstmLoading: false });
+    } catch (e) {
+      if (get().selectedVehicle === forVehicle) {
+        set({ lstmError: (e as Error).message, lstmLoading: false });
+      }
+    }
+  },
 
   layers: {
     streets: true,
@@ -205,10 +234,16 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   selectVehicle: async (vid: number | null) => {
     const { scenarioId } = get();
     if (vid === null || !scenarioId) {
-      set({ selectedVehicle: null, vehicleTrack: null });
+      set({ selectedVehicle: null, vehicleTrack: null, lstmReconstruction: null, lstmError: null });
       return;
     }
-    set({ selectedVehicle: vid, loadingVehicle: true, vehicleTrack: null });
+    set({
+      selectedVehicle: vid,
+      loadingVehicle: true,
+      vehicleTrack: null,
+      lstmReconstruction: null,
+      lstmError: null,
+    });
     try {
       const res = await api.vehicle(scenarioId, vid);
       if (get().selectedVehicle !== vid) return;

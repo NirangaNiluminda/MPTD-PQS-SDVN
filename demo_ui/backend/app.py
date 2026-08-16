@@ -7,6 +7,7 @@ recomputed or smoothed here, only decoded/aggregated for display.
 """
 
 import json
+import subprocess
 import time
 from dataclasses import asdict
 from functools import lru_cache
@@ -152,6 +153,50 @@ def vehicle_trajectory(scenario_id: str, vehicle_id: int):
         "ground_truth_attack_number": track[0].attack_number,
         "track": [_beacon_to_dict(b) for b in track],
     }
+
+
+@app.get("/api/scenarios/{scenario_id:path}/lstm_reconstruction/{vehicle_id}")
+def lstm_reconstruction(scenario_id: str, vehicle_id: int, end_time: float | None = None):
+    """Real LSTM-AE reconstruction for one vehicle's trailing beacon window,
+    computed by ml_scripts/lstm_reconstruct.py against the EXACT deployed
+    ONNX artifact (never a separately-tracked checkpoint — this project has
+    repeatedly found those drift from what's actually deployed). Offline and
+    read-only: no simulator code, exported model, or threshold is touched.
+
+    Runs in gat_detector/.venv (has onnxruntime; this backend's own venv
+    does not) via a short-lived subprocess — see config.ML_VENV_PYTHON.
+    """
+    s = _scenario_or_404(scenario_id)
+    beacon_log = s.dir / "beacon_log.csv"
+    if not beacon_log.is_file():
+        raise HTTPException(404, f"beacon_log.csv missing for {scenario_id}")
+    model_dir = config.ML_MODEL_ROOT / s.road
+    if not (model_dir / "lstm_ae_model.onnx").is_file():
+        raise HTTPException(404, f"no deployed LSTM-AE model for road type {s.road}")
+
+    args = [
+        str(config.ML_VENV_PYTHON),
+        str(config.ML_SCRIPTS_DIR / "lstm_reconstruct.py"),
+        "--beacon-log", str(beacon_log),
+        "--vehicle-id", str(vehicle_id),
+        "--model-dir", str(model_dir),
+    ]
+    if end_time is not None:
+        args += ["--end-time", str(end_time)]
+
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "LSTM-AE reconstruction timed out")
+    if proc.returncode != 0:
+        raise HTTPException(500, f"lstm_reconstruct.py failed: {proc.stderr[-2000:]}")
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise HTTPException(500, f"lstm_reconstruct.py produced non-JSON output: {proc.stdout[-2000:]}")
+    if "error" in out:
+        raise HTTPException(404, out["error"])
+    return out
 
 
 @app.get("/api/scenarios/{scenario_id:path}/trails")

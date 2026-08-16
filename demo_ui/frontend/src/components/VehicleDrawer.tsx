@@ -1,4 +1,4 @@
-import { useMemo } from "react";
+import { useMemo, useState } from "react";
 import {
   Line,
   LineChart,
@@ -11,8 +11,19 @@ import {
 } from "recharts";
 import { usePlayback } from "../store/playback";
 import { useTokens } from "../design/tokens";
+import Accordion from "./Accordion";
 
 const PSI_TH = 0.09; // 08_detection_engine.h — the rule-signature decision line
+
+// scaler.json feature order — see demo_ui/backend/ml_scripts/lstm_reconstruct.py.
+const CHANNEL_LABEL: Record<string, string> = {
+  res_x: "sideways drift",
+  res_y: "forward drift",
+  dspeed: "speed change",
+  dheading: "turn rate",
+  accel: "acceleration",
+  tau_i: "trust signal",
+};
 
 function Row({ label, value }: { label: string; value: React.ReactNode }) {
   return (
@@ -24,10 +35,20 @@ function Row({ label, value }: { label: string; value: React.ReactNode }) {
 }
 
 export default function VehicleDrawer() {
-  const { selectedVehicle, vehicleTrack, loadingVehicle, selectVehicle, t } =
-    usePlayback();
+  const {
+    selectedVehicle,
+    vehicleTrack,
+    loadingVehicle,
+    selectVehicle,
+    t,
+    lstmReconstruction,
+    lstmLoading,
+    lstmError,
+    loadLstmReconstruction,
+  } = usePlayback();
   const { SERIES, STATUS, INK, SURFACE } = useTokens();
   const axisStroke = SURFACE.hairlineStrong;
+  const [lstmOpen, setLstmOpen] = useState(false);
 
   const series = useMemo(
     () =>
@@ -157,6 +178,67 @@ export default function VehicleDrawer() {
               </p>
             )}
           </section>
+
+          {!current?.is_ghost && (
+            <Accordion
+              open={lstmOpen}
+              onToggle={() => {
+                if (!lstmOpen && !lstmReconstruction && !lstmLoading) loadLstmReconstruction();
+                setLstmOpen((v) => !v);
+              }}
+              bodyMaxHeight={340}
+              header={
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-muted">
+                  LSTM-AE reconstruction — real, offline
+                </span>
+              }
+            >
+              <div className="border-t border-surface-hairline p-3">
+                {lstmLoading && (
+                  <p className="text-xs text-ink-muted">
+                    Running real inference against the deployed model…
+                  </p>
+                )}
+                {lstmError && <p className="text-xs text-status-missed">{lstmError}</p>}
+                {lstmReconstruction && (
+                  <>
+                    <div className="mb-2.5 flex items-baseline justify-between">
+                      <span className="text-[11px] text-ink-muted">Reconstruction error</span>
+                      <span
+                        className={`font-mono text-sm font-semibold ${
+                          lstmReconstruction.flagged ? "text-status-missed" : "text-status-good"
+                        }`}
+                      >
+                        {lstmReconstruction.ae_raw_estimate.toFixed(2)} / θ=
+                        {lstmReconstruction.theta_ae.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="space-y-1.5">
+                      {lstmReconstruction.feature_names.map((name, i) => {
+                        const v = lstmReconstruction.per_channel_mse_z[i];
+                        const tone = v > 10 ? "text-status-missed" : v > 1 ? "text-status-caught" : "text-status-good";
+                        return (
+                          <div key={name} className="flex items-center justify-between gap-2 text-[10.5px]">
+                            <span className="text-ink-secondary">{CHANNEL_LABEL[name] ?? name}</span>
+                            <span className={`font-mono ${tone}`}>{v.toFixed(3)}</span>
+                          </div>
+                        );
+                      })}
+                    </div>
+                    <p className="mt-2.5 text-[10px] leading-relaxed text-ink-muted">
+                      Per-channel MSE (z-scaled residual units) from the
+                      deployed ONNX model's reconstruction of this vehicle's
+                      last {lstmReconstruction.window} beacons — the same
+                      artifact the simulator loads, run offline and read-only.
+                      An "expected trajectory" line — same reported
+                      speed/heading, model-reconstructed deviation — is drawn
+                      on the map alongside the real one.
+                    </p>
+                  </>
+                )}
+              </div>
+            </Accordion>
+          )}
 
           <section className="rounded-lg border border-surface-hairline bg-surface-raised p-3">
             <h3 className="mb-1 text-[10px] font-semibold uppercase tracking-wider text-ink-muted">

@@ -49,6 +49,16 @@ EXPECTED_GAT_LINK_TARGET = "../urban/gat_model.onnx"
 EXPECTED_THETA_S = 19.74
 EXPECTED_THETA_AE = 33.693885
 
+# Offline LSTM-AE reconstruction (ml_scripts/lstm_reconstruct.py) runs the
+# exact deployed ONNX artifact via onnxruntime, which isn't installed in
+# this backend's own venv — gat_detector/.venv has torch+onnx+onnxruntime
+# already, so the script is invoked as a short-lived subprocess in THAT
+# interpreter rather than adding a heavy ML dependency to the always-running
+# API server.
+ML_SCRIPTS_DIR = REPO_ROOT / "demo_ui" / "backend" / "ml_scripts"
+ML_VENV_PYTHON = REPO_ROOT / "gat_detector" / ".venv" / "bin" / "python3"
+ML_MODEL_ROOT = NS3_ROOT / "analytics" / "ml" / "models"
+
 RUN_LOGS_DIR = CAPTURES_DIR / "runs"
 RUN_MANIFEST = RUN_LOGS_DIR / "manifest.json"
 

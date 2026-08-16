@@ -61,6 +61,9 @@ function buildColors(theme: ThemeName, ENTITY: Record<string, string>, STATUS: R
     band: (theme === "dark" ? [255, 255, 255, 70] : [14, 22, 32, 90]) as Rgba,
     bandMissed: hexToRgba(STATUS.missed, 130),
     selected: (theme === "dark" ? [255, 255, 255, 255] : [14, 22, 32, 255]) as Rgba,
+    // LSTM-AE "expected trajectory" overlay — reuses the validated caught/
+    // caution colour rather than introducing an unvalidated new hue.
+    aeExpected: hexToRgba(STATUS.caught, 230),
   };
 }
 
@@ -178,6 +181,7 @@ export default function NetworkMap() {
     mapDetail,
     selectedVehicle,
     selectVehicle,
+    lstmReconstruction,
   } = usePlayback();
 
   const [glOk] = useState(webglAvailable);
@@ -509,6 +513,44 @@ export default function NetworkMap() {
       }
     }
 
+    // LSTM-AE "expected trajectory" — real reported speed/heading, but the
+    // model's own reconstructed residual instead of the vehicle's actual
+    // one. Only drawn for the vehicle it was computed for (selectVehicle
+    // clears the reconstruction on any change, but this guard also covers
+    // the one-frame window before that clear lands).
+    if (lstmReconstruction && lstmReconstruction.vehicle_id === selectedVehicle) {
+      const pts = lstmReconstruction.expected_trajectory;
+      L.push(
+        new PathLayer({
+          id: "ae-expected-trajectory",
+          data: [{ path: pts.map((p) => [p.pos_x, p.pos_y]) }],
+          getPath: (d: any) => d.path,
+          getColor: C.aeExpected,
+          getWidth: 2.5,
+          widthUnits: "pixels",
+          capRounded: true,
+          jointRounded: true,
+          pickable: false,
+        })
+      );
+      L.push(
+        new ScatterplotLayer({
+          id: "ae-expected-endpoint",
+          data: [pts[pts.length - 1]],
+          getPosition: (d: any) => [d.pos_x, d.pos_y],
+          getRadius: 6,
+          radiusUnits: "meters",
+          radiusMinPixels: 4,
+          filled: false,
+          stroked: true,
+          getLineColor: C.aeExpected,
+          getLineWidth: 2,
+          lineWidthUnits: "pixels",
+          pickable: false,
+        })
+      );
+    }
+
     // Controllers last so they sit above everything.
     if (topology) {
       L.push(
@@ -538,6 +580,7 @@ export default function NetworkMap() {
     compromisedRsus,
     selectedVehicle,
     selectVehicle,
+    lstmReconstruction,
     C,
   ]);
 
