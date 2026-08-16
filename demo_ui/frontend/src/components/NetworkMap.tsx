@@ -64,6 +64,10 @@ function buildColors(theme: ThemeName, ENTITY: Record<string, string>, STATUS: R
     // LSTM-AE "expected trajectory" overlay — reuses the validated caught/
     // caution colour rather than introducing an unvalidated new hue.
     aeExpected: hexToRgba(STATUS.caught, 230),
+    // GAT attention lines — reuses the validated controller colour (aqua),
+    // distinct from the AE overlay's amber and from every entity colour
+    // already on the map.
+    gatLine: hexToRgba(ENTITY.controller, 200),
   };
 }
 
@@ -182,6 +186,7 @@ export default function NetworkMap() {
     selectedVehicle,
     selectVehicle,
     lstmReconstruction,
+    gatAttention,
   } = usePlayback();
 
   const [glOk] = useState(webglAvailable);
@@ -551,6 +556,41 @@ export default function NetworkMap() {
       );
     }
 
+    // GAT attention lines — real per-neighbour attention weight from the
+    // deployed model's first layer, one line per neighbour the target
+    // vehicle's embedding actually drew from. Width carries the weight so
+    // the strongest influence is visually obvious without reading numbers.
+    if (gatAttention && gatAttention.vehicle_id === selectedVehicle && gatAttention.neighbours.length > 0) {
+      L.push(
+        new LineLayer({
+          id: "gat-attention-lines",
+          data: gatAttention.neighbours,
+          getSourcePosition: (d: any) => [gatAttention.target_pos.x, gatAttention.target_pos.y],
+          getTargetPosition: (d: any) => [d.pos_x, d.pos_y],
+          getColor: C.gatLine,
+          getWidth: (d: any) => 1 + d.attention_weight * 6,
+          widthUnits: "pixels",
+          pickable: false,
+        })
+      );
+      L.push(
+        new ScatterplotLayer({
+          id: "gat-attention-neighbours",
+          data: gatAttention.neighbours,
+          getPosition: (d: any) => [d.pos_x, d.pos_y],
+          getRadius: 5,
+          radiusUnits: "meters",
+          radiusMinPixels: 3,
+          filled: false,
+          stroked: true,
+          getLineColor: C.gatLine,
+          getLineWidth: 2,
+          lineWidthUnits: "pixels",
+          pickable: false,
+        })
+      );
+    }
+
     // Controllers last so they sit above everything.
     if (topology) {
       L.push(
@@ -581,6 +621,7 @@ export default function NetworkMap() {
     selectedVehicle,
     selectVehicle,
     lstmReconstruction,
+    gatAttention,
     C,
   ]);
 

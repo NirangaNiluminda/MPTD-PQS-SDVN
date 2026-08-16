@@ -2,6 +2,7 @@ import { create } from "zustand";
 import {
   api,
   BeaconDto,
+  GatAttentionDto,
   GeometryDto,
   LstmReconstructionDto,
   RoadMapDto,
@@ -60,6 +61,13 @@ interface PlaybackState {
   lstmLoading: boolean;
   lstmError: string | null;
   loadLstmReconstruction: () => Promise<void>;
+
+  // Real offline GAT attention weights — same on-demand/cleared-on-change
+  // discipline as the LSTM-AE reconstruction above.
+  gatAttention: GatAttentionDto | null;
+  gatLoading: boolean;
+  gatError: string | null;
+  loadGatAttention: () => Promise<void>;
 
   layers: LayerToggles;
   mapDetail: MapDetail;
@@ -120,6 +128,25 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     } catch (e) {
       if (get().selectedVehicle === forVehicle) {
         set({ lstmError: (e as Error).message, lstmLoading: false });
+      }
+    }
+  },
+
+  gatAttention: null,
+  gatLoading: false,
+  gatError: null,
+  loadGatAttention: async () => {
+    const { scenarioId, selectedVehicle, t } = get();
+    if (!scenarioId || selectedVehicle === null) return;
+    const forVehicle = selectedVehicle;
+    set({ gatLoading: true, gatError: null });
+    try {
+      const res = await api.gatAttention(scenarioId, forVehicle, t);
+      if (get().selectedVehicle !== forVehicle) return;
+      set({ gatAttention: res, gatLoading: false });
+    } catch (e) {
+      if (get().selectedVehicle === forVehicle) {
+        set({ gatError: (e as Error).message, gatLoading: false });
       }
     }
   },
@@ -234,7 +261,14 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   selectVehicle: async (vid: number | null) => {
     const { scenarioId } = get();
     if (vid === null || !scenarioId) {
-      set({ selectedVehicle: null, vehicleTrack: null, lstmReconstruction: null, lstmError: null });
+      set({
+        selectedVehicle: null,
+        vehicleTrack: null,
+        lstmReconstruction: null,
+        lstmError: null,
+        gatAttention: null,
+        gatError: null,
+      });
       return;
     }
     set({
@@ -243,6 +277,8 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
       vehicleTrack: null,
       lstmReconstruction: null,
       lstmError: null,
+      gatAttention: null,
+      gatError: null,
     });
     try {
       const res = await api.vehicle(scenarioId, vid);

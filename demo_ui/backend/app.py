@@ -199,6 +199,53 @@ def lstm_reconstruction(scenario_id: str, vehicle_id: int, end_time: float | Non
     return out
 
 
+@app.get("/api/scenarios/{scenario_id:path}/gat_attention/{vehicle_id}")
+def gat_attention(scenario_id: str, vehicle_id: int, end_time: float | None = None, window_s: float = 10.0):
+    """Real GAT attention weights for one vehicle's neighbour graph,
+    computed by ml_scripts/gat_attention.py. The deployed ONNX never
+    exposes attention (verified: the graph's own node list routes the GAT
+    layers straight into the next op, no attention tensor reaches an
+    output), so this loads weights from the ONNX file's own initializers —
+    NOT gat_model.pt, a different, out-of-date checkpoint in the same
+    directory — and asks torch_geometric's GATConv for
+    return_attention_weights=True. Cross-checked against the real ONNX
+    output for the identical input on every call (score_onnx_cross_check_
+    max_abs_diff in the response). Offline and read-only.
+    """
+    s = _scenario_or_404(scenario_id)
+    beacon_log = s.dir / "beacon_log.csv"
+    if not beacon_log.is_file():
+        raise HTTPException(404, f"beacon_log.csv missing for {scenario_id}")
+    model_dir = config.ML_MODEL_ROOT / s.road
+    if not (model_dir / "gat_model.onnx").is_file():
+        raise HTTPException(404, f"no deployed GAT model for road type {s.road}")
+
+    args = [
+        str(config.ML_VENV_PYTHON),
+        str(config.ML_SCRIPTS_DIR / "gat_attention.py"),
+        "--beacon-log", str(beacon_log),
+        "--vehicle-id", str(vehicle_id),
+        "--model-dir", str(model_dir),
+        "--window-s", str(window_s),
+    ]
+    if end_time is not None:
+        args += ["--end-time", str(end_time)]
+
+    try:
+        proc = subprocess.run(args, capture_output=True, text=True, timeout=30)
+    except subprocess.TimeoutExpired:
+        raise HTTPException(504, "GAT attention extraction timed out")
+    if proc.returncode != 0:
+        raise HTTPException(500, f"gat_attention.py failed: {proc.stderr[-2000:]}")
+    try:
+        out = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        raise HTTPException(500, f"gat_attention.py produced non-JSON output: {proc.stdout[-2000:]}")
+    if "error" in out:
+        raise HTTPException(404, out["error"])
+    return out
+
+
 @app.get("/api/scenarios/{scenario_id:path}/trails")
 def scenario_trails(scenario_id: str, t: float, lookback: float = 6.0, max_vehicles: int = 400):
     """Recent movement history per vehicle, for motion trails on the map.

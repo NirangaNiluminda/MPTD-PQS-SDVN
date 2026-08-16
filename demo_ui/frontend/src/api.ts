@@ -67,6 +67,35 @@ export interface LstmReconstructionDto {
   beacons: LstmReconstructionBeaconDto[];
 }
 
+// Real offline GAT attention weights — see demo_ui/backend/ml_scripts/
+// gat_attention.py. The deployed ONNX never exposes attention (verified:
+// nothing routes it to an output), so this loads weights from the ONNX
+// file's own initializers and asks torch_geometric directly. Cross-checked
+// against the real ONNX score for the identical input on every call —
+// score_verified/score_onnx_cross_check_max_abs_diff below.
+export interface GatNeighbourDto {
+  vehicle_id: number;
+  attention_weight: number;
+  pos_x: number;
+  pos_y: number;
+  is_poisoned: boolean;
+  detected: boolean;
+  distance_m: number;
+}
+
+export interface GatAttentionDto {
+  vehicle_id: number;
+  snapshot_size: number;
+  edge_count: number;
+  score: number;
+  score_onnx_cross_check_max_abs_diff: number;
+  score_verified: boolean;
+  is_poisoned: boolean;
+  detected: boolean;
+  target_pos: { x: number; y: number };
+  neighbours: GatNeighbourDto[];
+}
+
 export interface FrameDto {
   t: number;
   window: number;
@@ -440,6 +469,11 @@ export const api = {
   lstmReconstruction: (scenarioId: string, vehicleId: number, endTime?: number) =>
     getJson<LstmReconstructionDto>(
       `/api/scenarios/${scenarioId}/lstm_reconstruction/${vehicleId}` +
+        (endTime != null ? `?end_time=${endTime}` : "")
+    ),
+  gatAttention: (scenarioId: string, vehicleId: number, endTime?: number) =>
+    getJson<GatAttentionDto>(
+      `/api/scenarios/${scenarioId}/gat_attention/${vehicleId}` +
         (endTime != null ? `?end_time=${endTime}` : "")
     ),
   geometry: (road: string) => getJson<GeometryDto>(`/api/geometry/${road}`),

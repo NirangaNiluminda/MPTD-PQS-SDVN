@@ -45,10 +45,15 @@ export default function VehicleDrawer() {
     lstmLoading,
     lstmError,
     loadLstmReconstruction,
+    gatAttention,
+    gatLoading,
+    gatError,
+    loadGatAttention,
   } = usePlayback();
   const { SERIES, STATUS, INK, SURFACE } = useTokens();
   const axisStroke = SURFACE.hairlineStrong;
   const [lstmOpen, setLstmOpen] = useState(false);
+  const [gatOpen, setGatOpen] = useState(false);
 
   const series = useMemo(
     () =>
@@ -233,6 +238,97 @@ export default function VehicleDrawer() {
                       An "expected trajectory" line — same reported
                       speed/heading, model-reconstructed deviation — is drawn
                       on the map alongside the real one.
+                    </p>
+                  </>
+                )}
+              </div>
+            </Accordion>
+          )}
+
+          {!current?.is_ghost && (
+            <Accordion
+              open={gatOpen}
+              onToggle={() => {
+                if (!gatOpen && !gatAttention && !gatLoading) loadGatAttention();
+                setGatOpen((v) => !v);
+              }}
+              bodyMaxHeight={340}
+              header={
+                <span className="text-[10px] font-semibold uppercase tracking-wider text-ink-muted">
+                  GAT attention — real, offline
+                </span>
+              }
+            >
+              <div className="border-t border-surface-hairline p-3">
+                {gatLoading && (
+                  <p className="text-xs text-ink-muted">
+                    Running real inference against the deployed model…
+                  </p>
+                )}
+                {gatError && <p className="text-xs text-status-missed">{gatError}</p>}
+                {gatAttention && (
+                  <>
+                    <div className="mb-1 flex items-baseline justify-between">
+                      <span className="text-[11px] text-ink-muted">Spatial anomaly score</span>
+                      <span className="font-mono text-sm font-semibold text-ink-primary">
+                        {gatAttention.score.toFixed(2)}
+                      </span>
+                    </div>
+                    <div className="mb-2.5 flex items-center gap-1.5 text-[10px]">
+                      <span
+                        className={gatAttention.score_verified ? "text-status-good" : "text-status-missed"}
+                      >
+                        {gatAttention.score_verified ? "✓ verified against deployed model" : "⚠ NOT verified"}
+                      </span>
+                      <span className="text-ink-muted">
+                        (Δ{gatAttention.score_onnx_cross_check_max_abs_diff.toExponential(1)})
+                      </span>
+                    </div>
+                    {gatAttention.neighbours.length === 0 ? (
+                      <p className="text-xs text-ink-muted">
+                        No other vehicle was within range and heading-aligned in this
+                        snapshot — this vehicle's embedding came from itself alone.
+                      </p>
+                    ) : (
+                      <>
+                        <p className="mb-1.5 text-[10px] uppercase tracking-wider text-ink-muted">
+                          Who it attended to ({gatAttention.snapshot_size - 1} in range)
+                        </p>
+                        <div className="space-y-1.5">
+                          {gatAttention.neighbours.map((n) => (
+                            <div key={n.vehicle_id} className="flex items-center gap-2 text-[10.5px]">
+                              <span className="w-12 shrink-0 font-mono text-ink-primary">
+                                V{n.vehicle_id}
+                              </span>
+                              <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-surface-page">
+                                <div
+                                  className="h-full rounded-full"
+                                  style={{
+                                    width: `${n.attention_weight * 100}%`,
+                                    background: n.is_poisoned ? STATUS.missed : SERIES[0],
+                                  }}
+                                />
+                              </div>
+                              <span className="w-10 shrink-0 text-right font-mono text-ink-secondary">
+                                {(n.attention_weight * 100).toFixed(0)}%
+                              </span>
+                              <span className="w-14 shrink-0 text-right text-ink-muted">
+                                {n.distance_m.toFixed(0)}m
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </>
+                    )}
+                    <p className="mt-2.5 text-[10px] leading-relaxed text-ink-muted">
+                      Real attention weights from the deployed GAT's first
+                      layer, extracted by re-running its own weights (not a
+                      separately-tracked checkpoint) with attention output
+                      requested — the ONNX file never exposes this itself.
+                      Neighbour set approximates this vehicle's real-time RSU
+                      window; the score above is illustrative of scale, not
+                      calibrated to θ_S. Lines to each neighbour are drawn on
+                      the map, weighted by attention share.
                     </p>
                   </>
                 )}
