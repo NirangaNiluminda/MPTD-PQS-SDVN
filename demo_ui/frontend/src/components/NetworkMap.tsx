@@ -1,6 +1,6 @@
-import { useMemo, useState, useCallback } from "react";
+import { useMemo, useState, useCallback, useEffect, useRef } from "react";
 import DeckGL from "@deck.gl/react";
-import { OrthographicView, Color } from "@deck.gl/core";
+import { OrthographicView, Color, LinearInterpolator } from "@deck.gl/core";
 import {
   ScatterplotLayer,
   LineLayer,
@@ -24,6 +24,12 @@ const INITIAL_VIEW_STATE = {
   minZoom: -3,
   maxZoom: 4,
 };
+
+// FlyToInterpolator assumes a geospatial (longitude/latitude) view and
+// throws on a plain OrthographicView; LinearInterpolator just tweens the
+// listed viewState props directly, which is what a metres-on-a-plane map
+// needs for a smooth pan-to-selection.
+const PAN_INTERPOLATOR = new LinearInterpolator({ transitionProps: ["target", "zoom"] });
 
 // Street network base-map greys, deliberately NOT part of the validated data
 // palette (basemap chrome, not a categorical/status colour). Dark recedes
@@ -193,17 +199,29 @@ export default function NetworkMap() {
     mapDetail,
     selectedVehicle,
     selectVehicle,
+    hoveredVehicle,
+    setHoveredVehicle,
     lstmReconstruction,
     gatAttention,
   } = usePlayback();
 
   const [glOk] = useState(webglAvailable);
   const [glError, setGlError] = useState<string | null>(null);
-  // Bumping this key remounts DeckGL, which resets the view to
-  // INITIAL_VIEW_STATE — the escape hatch when a stray scroll/drag has
-  // panned the network off-screen.
-  const [viewKey, setViewKey] = useState(0);
-  const resetView = useCallback(() => setViewKey((k) => k + 1), []);
+
+  // Controlled view state so a panel-side selection can pan/centre the map
+  // on that vehicle — the escape hatch for a stray scroll/drag is the Reset
+  // view button, which now just re-applies INITIAL_VIEW_STATE in place
+  // rather than remounting DeckGL.
+  const [viewState, setViewState] = useState<any>(INITIAL_VIEW_STATE);
+  const resetView = useCallback(
+    () =>
+      setViewState((v: any) => ({
+        ...INITIAL_VIEW_STATE,
+        transitionDuration: 450,
+        transitionInterpolator: PAN_INTERPOLATOR,
+      })),
+    []
+  );
 
   const theme = useTheme((s) => s.theme);
   const tokens = useTokens();
@@ -216,6 +234,54 @@ export default function NetworkMap() {
     () => new Set(topology?.compromised_rsus ?? []),
     [topology]
   );
+
+  // A single lookup used both to pan the camera and to draw the selection
+  // pulse/hover ring at the right spot — prefers the live beacon (fresher,
+  // carries state) and falls back to the raw mobility-trace position.
+  const findPos = useCallback(
+    (vid: number): [number, number] | null => {
+      const b = beacons.find((x) => x.vehicle_id === vid);
+      if (b) return [b.pos.x, b.pos.y];
+      const p = positions.find((x) => x.vehicle_id === vid);
+      return p ? [p.x, p.y] : null;
+    },
+    [beacons, positions]
+  );
+
+  const showIndividual = mapDetail === "street" || mapDetail === "entity";
+
+  // Panel -> map: centre the camera on a newly selected vehicle. Guarded to
+  // individual-detail levels only — region/district never draw a marker to
+  // centre on. A map-originated click re-centres on the same spot it was
+  // already at, which is a harmless no-op animation.
+  useEffect(() => {
+    if (selectedVehicle == null || !showIndividual) return;
+    const pos = findPos(selectedVehicle);
+    if (!pos) return;
+    setViewState((v: any) => ({
+      ...v,
+      target: [pos[0], pos[1], 0],
+      transitionDuration: 500,
+      transitionInterpolator: PAN_INTERPOLATOR,
+    }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedVehicle]);
+
+  // Selection pulse: a soft ring that grows and fades on a ~1.1s loop,
+  // visually distinct from (and layered outside) the marker's own severity
+  // colour — the pulse never touches getFillColor, only a separate layer.
+  const [pulseT, setPulseT] = useState(0);
+  useEffect(() => {
+    if (selectedVehicle == null || !showIndividual) return;
+    let raf = 0;
+    const start = performance.now();
+    const step = (now: number) => {
+      setPulseT(((now - start) % 1100) / 1100);
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [selectedVehicle, showIndividual]);
 
   const deckLayers = useMemo(() => {
     if (!geometry) return [];
@@ -270,7 +336,8 @@ export default function NetworkMap() {
 
     // District hides per-vehicle state (colour, trails, rubber bands) — only
     // street level and above show WHO is lying, not just THAT traffic exists.
-    const showIndividual = mapDetail === "street" || mapDetail === "entity";
+    // (showIndividual itself is computed once in component scope above, so
+    // the pan/pulse effects can share the same value.)
 
     // ── Street network, drawn first so everything else sits on top ─────────
     // Geometry comes straight from the SUMO .net.xml the traces were
@@ -476,6 +543,76 @@ export default function NetworkMap() {
       }
     }
 
+    // Hover ring: a lightweight, non-pulsing outline on whatever vehicle the
+    // pointer or the panel is currently over. Never drawn on top of the
+    // selection (the pulse below already owns that vehicle's ring) so the
+    // two states can't visually collide.
+    if (showIndividual && hoveredVehicle != null && hoveredVehicle !== selectedVehicle) {
+      const pos = findPos(hoveredVehicle);
+      if (pos) {
+        L.push(
+          new ScatterplotLayer({
+            id: "hover-ring",
+            data: [{ pos }],
+            getPosition: (d: any) => d.pos,
+            getRadius: 24,
+            radiusUnits: "meters",
+            radiusMinPixels: 13,
+            filled: false,
+            stroked: true,
+            getLineColor: C.selected,
+            getLineWidth: 1.5,
+            lineWidthUnits: "pixels",
+            pickable: false,
+          })
+        );
+      }
+    }
+
+    // Selection pulse: an expanding, fading ring around the selected vehicle
+    // — deliberately a SEPARATE layer from the marker's own severity colour
+    // (getFillColor on "beacons" below), never overwriting it. This is what
+    // makes "currently selected" visually distinct from "flagged/suspicious".
+    if (showIndividual && selectedVehicle != null) {
+      const pos = findPos(selectedVehicle);
+      if (pos) {
+        L.push(
+          new ScatterplotLayer({
+            id: "selection-pulse",
+            data: [{ pos }],
+            getPosition: (d: any) => d.pos,
+            getRadius: 20 + pulseT * 26,
+            radiusUnits: "meters",
+            radiusMinPixels: 11 + pulseT * 16,
+            filled: false,
+            stroked: true,
+            getLineColor: [C.selected[0], C.selected[1], C.selected[2], Math.round(220 * (1 - pulseT))] as Color,
+            getLineWidth: 2,
+            lineWidthUnits: "pixels",
+            pickable: false,
+          })
+        );
+        // A steady inner ring keeps the selection visible between pulse
+        // cycles (the animated ring above fades to zero every loop).
+        L.push(
+          new ScatterplotLayer({
+            id: "selection-ring",
+            data: [{ pos }],
+            getPosition: (d: any) => d.pos,
+            getRadius: 16,
+            radiusUnits: "meters",
+            radiusMinPixels: 9,
+            filled: false,
+            stroked: true,
+            getLineColor: C.selected,
+            getLineWidth: 2,
+            lineWidthUnits: "pixels",
+            pickable: false,
+          })
+        );
+      }
+    }
+
     // Active beacons, coloured by ground truth vs detection outcome. These sit
     // above the fleet dots and must stay clearly larger than them. Hidden
     // below street level: per-vehicle state IS the individual identity that
@@ -649,9 +786,13 @@ export default function NetworkMap() {
     layers,
     roadmap,
     mapDetail,
+    showIndividual,
     compromisedRsus,
     selectedVehicle,
     selectVehicle,
+    hoveredVehicle,
+    findPos,
+    pulseT,
     lstmReconstruction,
     gatAttention,
     C,
@@ -709,13 +850,19 @@ export default function NetworkMap() {
       Reset view
     </button>
     <DeckGL
-      key={viewKey}
       views={new OrthographicView({ id: "map" })}
-      initialViewState={INITIAL_VIEW_STATE}
+      viewState={viewState}
+      onViewStateChange={({ viewState: v }: any) => setViewState(v)}
       controller={true}
       layers={deckLayers}
       onError={(e: any) => setGlError(e?.message ?? String(e))}
       getCursor={({ isHovering }) => (isHovering ? "pointer" : "grab")}
+      onHover={({ object }: any) => {
+        // Map -> panel hover sync: any pickable object carrying a
+        // vehicle_id (fleet dot or live beacon) highlights its detection
+        // row; anything else (RSU/controller/empty canvas) clears it.
+        setHoveredVehicle(object && "vehicle_id" in object ? object.vehicle_id : null);
+      }}
       getTooltip={({ object }: any) => {
         if (!object) return null;
         if ("controller_id" in object) {
@@ -743,6 +890,7 @@ export default function NetworkMap() {
               `${b.is_poisoned ? "LYING" : "honest"} · ${
                 b.detected ? "flagged" : b.is_poisoned ? "MISSED" : "not flagged"
               }` +
+              `\nψ = ${b.psi_score.toFixed(3)}` +
               (b.drift_m != null && b.drift_m > 1
                 ? `\noff by ${b.drift_m.toFixed(0)} m`
                 : "") +

@@ -6,7 +6,6 @@ import MapControls from "../components/MapControls";
 import DetectionFeed from "../components/DetectionFeed";
 import PlaybackControls from "../components/PlaybackControls";
 import StatBar from "../components/StatBar";
-import VehicleDrawer from "../components/VehicleDrawer";
 
 export default function NetworkReplayScreen() {
   // loadScenarios() is called once at the app root (App.tsx), not here.
@@ -18,7 +17,6 @@ export default function NetworkReplayScreen() {
   const tick = usePlayback((s) => s.tick);
   const playing = usePlayback((s) => s.playing);
   const error = usePlayback((s) => s.error);
-  const selectedVehicle = usePlayback((s) => s.selectedVehicle);
   const lastFrameRef = useRef<number | null>(null);
 
   // Wall-clock-driven playback: each frame advances sim time by the real
@@ -56,11 +54,11 @@ export default function NetworkReplayScreen() {
           <NetworkMap />
           <MapControls />
         </div>
-        {/* Docked, not floated over the map: a selected vehicle's detail
-            replaces the detection feed in this same column rather than
-            covering map content — the map stays fully visible either way. */}
+        {/* One persistent, synchronized detection panel — a selected event
+            expands inline within this same list rather than swapping to a
+            separate screen, and the map stays fully visible at all times. */}
         <div className="w-[360px] shrink-0">
-          {selectedVehicle !== null ? <VehicleDrawer /> : <DetectionFeed />}
+          <DetectionFeed />
         </div>
       </div>
 

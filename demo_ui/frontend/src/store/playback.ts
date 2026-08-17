@@ -53,6 +53,12 @@ interface PlaybackState {
   vehicleTrack: BeaconDto[] | null;
   loadingVehicle: boolean;
 
+  // Lighter-weight than selection: sets a temporary map<->panel highlight
+  // without fetching a track or touching selectedVehicle. Cleared on
+  // pointer-leave by whichever side set it.
+  hoveredVehicle: number | null;
+  setHoveredVehicle: (vid: number | null) => void;
+
   // Real offline LSTM-AE reconstruction for the selected vehicle — fetched
   // on demand (it runs a real inference subprocess, not free), never
   // automatically on every vehicle click. Cleared whenever the selected
@@ -112,6 +118,9 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   selectedVehicle: null,
   vehicleTrack: null,
   loadingVehicle: false,
+
+  hoveredVehicle: null,
+  setHoveredVehicle: (vid) => set({ hoveredVehicle: vid }),
 
   lstmReconstruction: null,
   lstmLoading: false,
