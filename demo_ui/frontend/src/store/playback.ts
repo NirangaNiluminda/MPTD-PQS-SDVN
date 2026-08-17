@@ -294,7 +294,15 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
       if (get().selectedVehicle !== vid) return;
       set({ vehicleTrack: res.track, loadingVehicle: false });
     } catch {
-      if (get().selectedVehicle === vid) set({ loadingVehicle: false });
+      // Overwhelmingly a 404: this vehicle is in the mobility trace (still
+      // drawn on the map from /positions) but never appears in this
+      // capture's beacon log — most often because its route never came
+      // within an RSU's range during the recorded window. That's confirmed
+      // "no data," not a failed fetch, so record it as an empty track
+      // rather than leaving vehicleTrack stuck at null (indistinguishable
+      // from "still loading") — the panel needs the distinction to show an
+      // honest empty state instead of silently showing nothing.
+      if (get().selectedVehicle === vid) set({ vehicleTrack: [], loadingVehicle: false });
     }
   },
 

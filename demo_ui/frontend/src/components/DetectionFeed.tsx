@@ -1,4 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { CircleSlash } from "lucide-react";
 import { usePlayback } from "../store/playback";
 import { BeaconDto } from "../api";
 import StatusPill, { SemanticStatus } from "./StatusPill";
@@ -74,6 +75,17 @@ export default function DetectionFeed() {
     return base;
   }, [sorted, filter, synthetic]);
 
+  // Not every vehicle in the mobility trace ever transmits a beacon this
+  // capture recorded — most never come within an RSU's range during the
+  // window that was captured. Selecting one of those from the map (the grey
+  // "fleet" dots are clickable too) used to leave the panel showing nothing
+  // at all once the empty track came back, which reads as broken rather than
+  // "no data." Surface it as its own honest state instead, pinned above the
+  // real rows so it's never lost among them. Filter-scoped to "all" since it
+  // doesn't belong to any caught/missed/honest bucket.
+  const selectedHasNoTrack =
+    selectedVehicle != null && !selectedInWindow && vehicleTrack != null && vehicleTrack.length === 0;
+
   // Keep the selected row in view whenever selection changes, from either side.
   useEffect(() => {
     if (selectedVehicle == null) return;
@@ -117,9 +129,39 @@ export default function DetectionFeed() {
       </div>
 
       <div className="flex-1 overflow-y-auto">
-        {displayList.length === 0 && (
+        {displayList.length === 0 && !selectedHasNoTrack && (
           <div className="px-3 py-6 text-center text-body text-ink-muted">
             {filter === "all" ? "No radio traffic at this instant." : `No ${filter} events at this instant.`}
+          </div>
+        )}
+        {selectedHasNoTrack && filter === "all" && (
+          <div
+            ref={(el) => {
+              if (el) rowRefs.current.set(selectedVehicle!, el);
+              else rowRefs.current.delete(selectedVehicle!);
+            }}
+            className="border-b border-surface-hairline/60 bg-surface-raised"
+            style={{ borderLeft: "3px solid rgb(var(--c-entity-rsu))" }}
+          >
+            <button onClick={() => toggle(selectedVehicle!)} className="block w-full px-3.5 py-3 text-left">
+              <span className="font-mono text-body font-semibold text-ink-primary">V{selectedVehicle}</span>
+              <div className="mt-1.5 flex items-center gap-2">
+                <StatusPill status="inactive" compact>
+                  NO DATA
+                </StatusPill>
+                <span className="truncate text-badge text-ink-secondary">Never beaconed in this capture</span>
+              </div>
+            </button>
+            <div className="space-y-3 border-t border-surface-hairline bg-surface-page/60 p-3.5">
+              <div className="flex items-start gap-2.5 rounded-lg border border-dashed border-surface-hairline2 bg-surface-raised p-3.5">
+                <CircleSlash size={16} className="mt-0.5 shrink-0 text-ink-muted" aria-hidden />
+                <p className="text-xs leading-relaxed text-ink-secondary">
+                  This vehicle has no recorded radio activity in this capture — most likely because its route never
+                  came within an RSU's ~270 m range during the recorded window. It's still part of the underlying
+                  mobility trace, which is why it's visible on the map.
+                </p>
+              </div>
+            </div>
           </div>
         )}
         {displayList.map((b) => {
