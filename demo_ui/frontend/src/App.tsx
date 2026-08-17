@@ -224,28 +224,18 @@ export default function App() {
             </div>
           ))}
 
-          <div className="mt-auto flex flex-col gap-2 border-t border-surface-hairline pt-4">
-            <div className="px-2.5 text-badge uppercase tracking-widest text-ink-muted">
-              Data state key
-            </div>
-            <div className="flex flex-col gap-1.5 px-2.5">
-              <ProvenanceChip kind="live" compact />
-              <ProvenanceChip kind="replayed" compact />
-              <ProvenanceChip kind="snapshot" compact />
-            </div>
-          </div>
         </nav>
 
         <main className="grid min-h-0 min-w-0 grid-rows-[auto_1fr]">
           <div className="flex items-start justify-between gap-4 border-b border-surface-hairline bg-surface-panel px-5 py-3.5">
             <div className="min-w-0">
-              <h2 className="text-page-title text-ink-primary">{meta.title}</h2>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <h2 className="text-page-title text-ink-primary">{meta.title}</h2>
+                <ProvenanceChip kind={meta.provenance} />
+              </div>
               <p className="mt-1 max-w-[70ch] text-body leading-relaxed text-ink-secondary">
                 {meta.blurb[mode]}
               </p>
-            </div>
-            <div className="shrink-0 pt-1">
-              <ProvenanceChip kind={meta.provenance} />
             </div>
           </div>
 

@@ -1,7 +1,10 @@
 import { useEffect, useMemo, useRef, useState } from "react";
+import { ChevronDown, ChevronLeft, ChevronRight, Radar, X } from "lucide-react";
 import { api, AttackEvidenceDto, AttackInfoDto } from "../api";
-import { useTokens } from "../design/tokens";
+import { useSemanticTokens, useTokens } from "../design/tokens";
+import { useMode } from "../store/mode";
 import Accordion from "../components/Accordion";
+import StatusPill, { SemanticStatus } from "../components/StatusPill";
 
 const ACTOR_LABEL: Record<string, string> = {
   compromised_rsu: "Hijacked roadside unit",
@@ -25,6 +28,12 @@ const VERDICT_LABEL: Record<Verdict, string> = {
   baseline: "BASELINE WINS",
 };
 
+const VERDICT_SEMANTIC: Record<Verdict, SemanticStatus> = {
+  sentinel: "safe",
+  close: "warning",
+  baseline: "compromised",
+};
+
 function verdictOf(a: AttackInfoDto): Verdict {
   if (a.baseline_wins) return "baseline";
   const gap =
@@ -39,12 +48,6 @@ function verdictOf(a: AttackInfoDto): Verdict {
   return "sentinel";
 }
 
-function verdictColorKey(v: Verdict): "good" | "caught" | "missed" {
-  if (v === "sentinel") return "good";
-  if (v === "close") return "caught";
-  return "missed";
-}
-
 function pct01(mcc: number | null | undefined): number {
   // MCC ranges [-1,1]; clamp to [0,1] for a bar width — the raw signed value
   // is always shown alongside as text, so nothing is hidden by the clamp.
@@ -52,13 +55,111 @@ function pct01(mcc: number | null | undefined): number {
   return Math.max(0, Math.min(1, mcc)) * 100;
 }
 
+// Plain-English metric labels (refinement #3) — Greek/mathematical notation
+// is Expert-mode only. The three metrics are exactly the three fusion
+// layers (rules / GAT / LSTM-AE) this app names the same way everywhere
+// else, so the plain labels stay consistent with the rest of the app.
+const METRIC_LABEL = {
+  psi: { expert: "Mean ψ̂", plain: "Rule Confidence" },
+  gat: { expert: "Mean Ŝ", plain: "Spatial Anomaly" },
+  ae: { expert: "Mean ε̂", plain: "Time-Pattern Anomaly" },
+} as const;
+
+function AttackLegend() {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    document.addEventListener("mousedown", onClick);
+    return () => document.removeEventListener("mousedown", onClick);
+  }, [open]);
+
+  return (
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen((v) => !v)}
+        onMouseEnter={() => setOpen(true)}
+        className="flex items-center gap-1.5 rounded-md border border-surface-hairline2 bg-surface-raised px-3 py-1.5 text-badge font-semibold text-ink-secondary transition-colors hover:text-ink-primary"
+      >
+        Key
+        <ChevronDown size={14} className={`transition-transform ${open ? "rotate-180" : ""}`} aria-hidden />
+      </button>
+      {open && (
+        <div
+          onMouseLeave={() => setOpen(false)}
+          className="anim-rise absolute right-0 top-full z-20 mt-1.5 w-72 rounded-lg border border-surface-hairline2 bg-surface-panel p-3.5 shadow-2xl"
+        >
+          <p className="mb-2 text-badge font-semibold uppercase tracking-wider text-ink-muted">
+            Shape = attacker type
+          </p>
+          <div className="flex flex-col gap-1.5">
+            {Object.entries(ACTOR_GLYPH).map(([actor, glyph]) => (
+              <div key={actor} className="flex items-center gap-2.5 text-body text-ink-secondary">
+                <span className="w-5 text-center font-mono text-ink-primary">{glyph}</span>
+                {ACTOR_LABEL[actor]}
+              </div>
+            ))}
+          </div>
+          <p className="mb-2 mt-3.5 text-badge font-semibold uppercase tracking-wider text-ink-muted">
+            Color = outcome
+          </p>
+          <div className="flex flex-col gap-1.5">
+            {(["sentinel", "close", "baseline"] as Verdict[]).map((v) => (
+              <StatusPill key={v} status={VERDICT_SEMANTIC[v]} compact>
+                {VERDICT_LABEL[v]}
+              </StatusPill>
+            ))}
+          </div>
+          <p className="mt-3 text-badge leading-relaxed text-ink-muted">
+            Shape and color are never the only signal — every tile also
+            carries the attack name and outcome as text.
+          </p>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function MetricCard({
+  metricKey,
+  value,
+}: {
+  metricKey: keyof typeof METRIC_LABEL;
+  value: number | undefined;
+}) {
+  const mode = useMode((s) => s.mode);
+  const label = METRIC_LABEL[metricKey][mode];
+  // Qualitative read only — these are AGGREGATE means across every event of
+  // this type, not a single event's score, so there's no exact threshold
+  // line to draw here the way there is per-event elsewhere in the app. The
+  // banding communicates "how strongly this layer engaged on average", not
+  // a pass/fail crossing.
+  const tone: SemanticStatus = value == null ? "inactive" : value > 0.6 ? "compromised" : value > 0.3 ? "warning" : "safe";
+  const toneLabel = value == null ? "No data" : tone === "compromised" ? "Strong signal" : tone === "warning" ? "Moderate signal" : "Weak signal";
+  return (
+    <div className="flex flex-col items-center gap-2.5 rounded-lg border border-surface-hairline bg-surface-page p-4 text-center">
+      <span className="text-badge font-semibold uppercase tracking-wide text-ink-muted">{label}</span>
+      <span className="font-mono text-3xl font-bold text-ink-primary">
+        {value != null ? value.toFixed(3) : "—"}
+      </span>
+      <StatusPill status={tone} compact>
+        {toneLabel}
+      </StatusPill>
+    </div>
+  );
+}
+
 function EvidenceBody({ evidence }: { evidence: AttackEvidenceDto | null | undefined }) {
   if (evidence === undefined) {
-    return <p className="text-[11px] text-ink-muted">Loading…</p>;
+    return <p className="text-body text-ink-secondary">Loading…</p>;
   }
   if (!evidence || evidence.n_events === 0) {
     return (
-      <p className="text-[11px] leading-relaxed text-ink-secondary">
+      <p className="text-body leading-relaxed text-ink-secondary">
         This variant has no per-event trace in the single captured
         blockchain-enabled recording (
         <code className="text-ink-primary">captures/combined_bc_90s.log</code>
@@ -69,51 +170,51 @@ function EvidenceBody({ evidence }: { evidence: AttackEvidenceDto | null | undef
     );
   }
   return (
-    <div className="flex flex-col gap-2.5 text-[11px] text-ink-secondary">
-      <p>
+    <div className="flex flex-col gap-4">
+      <p className="text-body leading-relaxed text-ink-secondary">
         {evidence.n_events.toLocaleString()} poisoned events with this ground
         truth in the capture, {evidence.n_caught?.toLocaleString()} caught
         ({((evidence.detection_rate ?? 0) * 100).toFixed(1)}%),{" "}
         {evidence.n_missed?.toLocaleString()} missed.
       </p>
-      <div className="grid grid-cols-3 gap-2 text-center">
-        <div className="rounded bg-surface-raised p-1.5">
-          <div className="text-[9px] uppercase tracking-wide text-ink-muted">mean ψ̂</div>
-          <div className="font-mono text-xs text-ink-primary">{evidence.mean_psi_fuse?.toFixed(3)}</div>
-        </div>
-        <div className="rounded bg-surface-raised p-1.5">
-          <div className="text-[9px] uppercase tracking-wide text-ink-muted">mean Ŝ</div>
-          <div className="font-mono text-xs text-ink-primary">{evidence.mean_gat_score?.toFixed(3)}</div>
-        </div>
-        <div className="rounded bg-surface-raised p-1.5">
-          <div className="text-[9px] uppercase tracking-wide text-ink-muted">mean ε̂</div>
-          <div className="font-mono text-xs text-ink-primary">{evidence.mean_ae_norm?.toFixed(3)}</div>
-        </div>
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
+        <MetricCard metricKey="psi" value={evidence.mean_psi_fuse} />
+        <MetricCard metricKey="gat" value={evidence.mean_gat_score} />
+        <MetricCard metricKey="ae" value={evidence.mean_ae_norm} />
       </div>
       {evidence.top_signatures && evidence.top_signatures.length > 0 && (
         <div>
-          <p className="mb-1 text-[10px] uppercase tracking-wider text-ink-muted">
+          <p className="mb-2 text-badge font-semibold uppercase tracking-wider text-ink-muted">
             Most-tripped rule signatures
           </p>
-          <ul className="space-y-1">
+          <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
             {evidence.top_signatures.map((s) => (
-              <li key={s.code} className="flex items-baseline justify-between gap-2">
-                <span>
-                  {s.name} <span className="text-ink-muted">— {s.detail}</span>
-                </span>
-                <span className="shrink-0 font-mono text-ink-primary">
-                  {(s.pct * 100).toFixed(0)}%
-                </span>
-              </li>
+              <div
+                key={s.code}
+                className="flex flex-col gap-1.5 rounded-lg border border-surface-hairline bg-surface-page p-3"
+              >
+                <div className="flex items-start justify-between gap-2">
+                  <span className="text-body font-semibold leading-tight text-ink-primary">{s.name}</span>
+                  <span className="shrink-0 font-mono text-xl font-bold text-entity-rsu">
+                    {(s.pct * 100).toFixed(0)}%
+                  </span>
+                </div>
+                <StatusPill status="warning" compact>
+                  Signature matched
+                </StatusPill>
+                <p className="text-badge leading-relaxed text-ink-secondary">
+                  {s.detail} Fired in {(s.pct * 100).toFixed(0)}% of this attack's real events.
+                </p>
+              </div>
             ))}
-          </ul>
+          </div>
         </div>
       )}
     </div>
   );
 }
 
-function CaveatsBody({ attack, evidence }: { attack: AttackInfoDto; evidence: AttackEvidenceDto | null | undefined }) {
+function TechnicalDataBody({ attack, evidence }: { attack: AttackInfoDto; evidence: AttackEvidenceDto | null | undefined }) {
   const rows: { glyph: string; text: string }[] = [];
   if (attack.baseline_wins) {
     rows.push({
@@ -139,18 +240,42 @@ function CaveatsBody({ attack, evidence }: { attack: AttackInfoDto; evidence: At
       text: "No per-event trace exists for this variant in the current recording — the evidence tab above cannot say anything this number doesn't already.",
     });
   }
-  if (rows.length === 0) {
-    return <p className="text-[11px] text-ink-muted">No caveats flagged for this variant.</p>;
-  }
+  const full = attack.sentinel_full;
   return (
-    <ul className="flex flex-col gap-2">
-      {rows.map((r, i) => (
-        <li key={i} className="flex items-start gap-2 text-[11px] leading-relaxed text-ink-secondary">
-          <span className="mt-0.5 shrink-0 text-ink-muted">{r.glyph}</span>
-          <span>{r.text}</span>
-        </li>
-      ))}
-    </ul>
+    <div className="flex flex-col gap-4">
+      {rows.length > 0 ? (
+        <ul className="flex flex-col gap-2">
+          {rows.map((r, i) => (
+            <li key={i} className="flex items-start gap-2 text-body leading-relaxed text-ink-secondary">
+              <span className="mt-0.5 shrink-0 text-ink-muted">{r.glyph}</span>
+              <span>{r.text}</span>
+            </li>
+          ))}
+        </ul>
+      ) : (
+        <p className="text-body text-ink-secondary">No caveats flagged for this variant.</p>
+      )}
+      {(full?.CDER != null || full?.PBPO_ms != null) && (
+        <div className="grid grid-cols-2 gap-3 border-t border-surface-hairline pt-3.5 text-center">
+          {full?.CDER != null && (
+            <div>
+              <div className="text-badge uppercase tracking-wide text-ink-muted">CDER</div>
+              <div className="font-mono text-body text-ink-primary">{full.CDER.toFixed(3)}</div>
+            </div>
+          )}
+          {full?.PBPO_ms != null && (
+            <div>
+              <div className="text-badge uppercase tracking-wide text-ink-muted">per-beacon overhead</div>
+              <div className="font-mono text-body text-ink-primary">{full.PBPO_ms.toFixed(2)} ms</div>
+            </div>
+          )}
+        </div>
+      )}
+      <p className="border-t border-surface-hairline pt-3 font-mono text-badge text-ink-muted">
+        Source: results_e5_final/e5_final_table.json
+        {evidence && evidence.n_events > 0 && " · captures/combined_bc_90s.log"}
+      </p>
+    </div>
   );
 }
 
@@ -159,13 +284,12 @@ export default function AttackExplainerScreen({
 }: {
   onShowScenario: (scenarioId: string) => void;
 }) {
-  const { STATUS } = useTokens();
+  const semantic = useSemanticTokens();
   const [attacks, setAttacks] = useState<AttackInfoDto[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [openIndex, setOpenIndex] = useState<number | null>(null);
   const [evidenceByAttack, setEvidenceByAttack] = useState<Record<number, AttackEvidenceDto | null>>({});
-  const [evidenceOpen, setEvidenceOpen] = useState(true);
-  const [caveatsOpen, setCaveatsOpen] = useState(false);
+  const [technicalOpen, setTechnicalOpen] = useState(false);
   const openOrigin = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
 
   useEffect(() => {
@@ -183,6 +307,7 @@ export default function AttackExplainerScreen({
   }, [attacks]);
 
   const openAttack = attacks && openIndex != null ? attacks[openIndex] : null;
+  const openEvidence = openAttack ? evidenceByAttack[openAttack.attack_number] : undefined;
 
   const loadEvidence = (attackNumber: number) => {
     if (attackNumber in evidenceByAttack) return;
@@ -199,8 +324,7 @@ export default function AttackExplainerScreen({
       dy: r.top + r.height / 2 - window.innerHeight / 2,
     };
     setOpenIndex(index);
-    setEvidenceOpen(true);
-    setCaveatsOpen(false);
+    setTechnicalOpen(false);
     if (attacks) loadEvidence(attacks[index].attack_number);
   };
 
@@ -210,23 +334,22 @@ export default function AttackExplainerScreen({
     if (!attacks || openIndex == null) return;
     const next = (openIndex + delta + attacks.length) % attacks.length;
     setOpenIndex(next);
-    setEvidenceOpen(true);
-    setCaveatsOpen(false);
+    setTechnicalOpen(false);
     loadEvidence(attacks[next].attack_number);
   };
 
   const winCount = attacks?.filter((a) => a.baseline_wins).length ?? 0;
 
   return (
-    <div className="h-full overflow-y-auto p-5">
+    <div className="h-full overflow-y-auto p-6">
       <div className="mx-auto max-w-6xl">
-        <header className="mb-5 flex flex-wrap items-end justify-between gap-5">
+        <header className="mb-6 flex flex-wrap items-end justify-between gap-5">
           <div className="max-w-2xl">
-            <h1 className="text-lg font-semibold text-ink-primary">
+            <h1 className="text-section-title text-ink-primary">
               Seven ways to poison this network
             </h1>
-            <p className="mt-1 text-xs leading-relaxed text-ink-secondary">
-              Each tile is one attack. Colour and shape say how it ended;
+            <p className="mt-1.5 text-body leading-relaxed text-ink-secondary">
+              Each tile is one attack. Color and shape say how it ended;
               nothing else is shown yet. Open one for the evidence, the
               caveats, and what produced the number. Every figure comes
               straight from{" "}
@@ -236,69 +359,60 @@ export default function AttackExplainerScreen({
               )}
             </p>
           </div>
-          {tallies && (
-            <div className="flex gap-5">
-              {(["sentinel", "close", "baseline"] as Verdict[]).map((v) => (
-                <div key={v} className="flex flex-col gap-0.5">
-                  <span
-                    className="font-mono text-2xl font-semibold leading-none"
-                    style={{
-                      color:
-                        verdictColorKey(v) === "good"
-                          ? STATUS.good
-                          : verdictColorKey(v) === "caught"
-                          ? STATUS.caught
-                          : STATUS.missed,
-                    }}
-                  >
-                    {tallies[v]}
-                  </span>
-                  <span className="text-[9px] font-bold uppercase tracking-widest text-ink-muted">
-                    {VERDICT_LABEL[v]}
-                  </span>
-                </div>
-              ))}
-            </div>
-          )}
+          <div className="flex items-center gap-5">
+            {tallies && (
+              <div className="flex gap-5">
+                {(["sentinel", "close", "baseline"] as Verdict[]).map((v) => (
+                  <div key={v} className="flex flex-col gap-0.5">
+                    <span
+                      className="font-mono text-hero leading-none"
+                      style={{ color: semantic[VERDICT_SEMANTIC[v]] }}
+                    >
+                      {tallies[v]}
+                    </span>
+                    <span className="text-badge font-bold uppercase tracking-widest text-ink-muted">
+                      {VERDICT_LABEL[v]}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <AttackLegend />
+          </div>
         </header>
 
         {error && (
-          <div className="rounded border border-status-missed/40 bg-status-missed/10 p-4 text-xs text-status-missed">
+          <div className="rounded border border-status-missed/40 bg-status-missed/10 p-4 text-body text-status-missed">
             {error}
           </div>
         )}
 
-        {!attacks && !error && <div className="text-xs text-ink-muted">Loading…</div>}
+        {!attacks && !error && <div className="text-body text-ink-secondary">Loading…</div>}
 
         {attacks && (
           <div className="grid grid-cols-1 gap-3.5 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {attacks.map((a, i) => {
               const v = verdictOf(a);
-              const color =
-                verdictColorKey(v) === "good"
-                  ? STATUS.good
-                  : verdictColorKey(v) === "caught"
-                  ? STATUS.caught
-                  : STATUS.missed;
+              const color = semantic[VERDICT_SEMANTIC[v]];
               return (
                 <button
                   key={a.attack_number}
                   onClick={(e) => open(i, e)}
-                  className="flex flex-col gap-3 rounded-lg border border-surface-hairline bg-surface-panel p-3.5 text-left transition-all hover:-translate-y-0.5 hover:border-surface-hairline2 hover:shadow-lg"
+                  className="flex flex-col gap-3 rounded-lg border border-surface-hairline bg-surface-panel p-4 text-left transition-all hover:-translate-y-0.5 hover:border-surface-hairline2 hover:shadow-lg"
                 >
                   <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono text-xl leading-none" style={{ color: ACTOR_GLYPH[a.actor] ? color : color }}>
+                    <span className="font-mono text-xl leading-none" style={{ color }}>
                       {ACTOR_GLYPH[a.actor] ?? "●"}
                     </span>
-                    <span className="text-[9px] font-bold tracking-wider" style={{ color }}>
+                    <StatusPill status={VERDICT_SEMANTIC[v]} compact>
                       {VERDICT_LABEL[v]}
-                    </span>
+                    </StatusPill>
                   </div>
                   <div className="mt-auto flex flex-col gap-0.5">
-                    <span className="text-sm font-semibold leading-tight text-ink-primary">
+                    <span className="text-body font-semibold leading-tight text-ink-primary">
                       {a.human_name}
                     </span>
-                    <span className="text-[11px] text-ink-muted">
+                    <span className="text-badge text-ink-secondary">
                       {ACTOR_LABEL[a.actor] ?? a.actor}
                     </span>
                   </div>
@@ -311,6 +425,12 @@ export default function AttackExplainerScreen({
                 </button>
               );
             })}
+            {/* Refinement #2: 7 tiles leave a dangling gap in a 4-col grid —
+                an explicit placeholder reads as intentional, not broken. */}
+            <div className="flex flex-col items-center justify-center gap-2 rounded-lg border border-dashed border-surface-hairline2 p-4 text-center text-ink-muted">
+              <span className="text-2xl leading-none">+</span>
+              <span className="text-badge">More attack variants coming</span>
+            </div>
           </div>
         )}
       </div>
@@ -332,71 +452,60 @@ export default function AttackExplainerScreen({
               }
             >
               <div className="anim-panel-in">
-                <DrillHeader attack={openAttack} onClose={close} />
-                <div className="flex flex-col gap-3.5 p-5">
-                  <AccuracyPanel attack={openAttack} />
-
-                  <Accordion
-                    open={evidenceOpen}
-                    onToggle={() => setEvidenceOpen((v) => !v)}
-                    bodyMaxHeight={420}
-                    header={
-                      <div className="flex flex-1 items-center gap-2">
-                        <span className="text-xs font-semibold text-ink-primary">
-                          How the system knew
-                        </span>
-                      </div>
-                    }
-                  >
-                    <div className="border-t border-surface-hairline p-3.5">
-                      <EvidenceBody evidence={evidenceByAttack[openAttack.attack_number]} />
-                    </div>
-                  </Accordion>
-
-                  <Accordion
-                    open={caveatsOpen}
-                    onToggle={() => setCaveatsOpen((v) => !v)}
-                    bodyMaxHeight={420}
-                    header={
-                      <div className="flex flex-1 items-center gap-2">
-                        <span className="text-xs font-semibold text-ink-primary">
-                          What this number does not say
-                        </span>
-                      </div>
-                    }
-                  >
-                    <div className="border-t border-surface-hairline p-3.5">
-                      <CaveatsBody
-                        attack={openAttack}
-                        evidence={evidenceByAttack[openAttack.attack_number]}
-                      />
-                    </div>
-                  </Accordion>
-
-                  <div className="flex flex-wrap gap-2 pt-1">
-                    {openAttack.sample_scenario_id && (
-                      <button
-                        onClick={() => {
+                <DrillHeader
+                  attack={openAttack}
+                  evidence={openEvidence}
+                  onClose={close}
+                  onWatch={
+                    openAttack.sample_scenario_id
+                      ? () => {
                           onShowScenario(openAttack.sample_scenario_id!);
                           close();
-                        }}
-                        className="flex items-center gap-2 rounded-md border border-entity-rsu bg-entity-rsu px-3.5 py-2 text-xs font-semibold text-white transition-opacity hover:opacity-90"
-                      >
-                        <span className="font-mono text-[11px]">◉</span>
-                        Watch it happen on the map
-                      </button>
-                    )}
+                        }
+                      : undefined
+                  }
+                />
+                <div className="flex flex-col gap-4 p-5">
+                  <AccuracyPanel attack={openAttack} />
+
+                  <div className="rounded-lg border border-surface-hairline bg-surface-panel">
+                    <div className="px-3.5 pt-3.5">
+                      <p className="text-badge font-semibold uppercase tracking-wider text-ink-muted">
+                        How the system knew
+                      </p>
+                    </div>
+                    <div className="p-3.5">
+                      <EvidenceBody evidence={openEvidence} />
+                    </div>
+                  </div>
+
+                  <Accordion
+                    open={technicalOpen}
+                    onToggle={() => setTechnicalOpen((v) => !v)}
+                    bodyMaxHeight={480}
+                    header={
+                      <span className="text-body font-semibold text-ink-primary">
+                        Caveats &amp; Technical Data
+                      </span>
+                    }
+                  >
+                    <div className="border-t border-surface-hairline p-3.5">
+                      <TechnicalDataBody attack={openAttack} evidence={openEvidence} />
+                    </div>
+                  </Accordion>
+
+                  <div className="flex items-center justify-between border-t border-surface-hairline pt-3.5">
                     <button
                       onClick={() => step(-1)}
-                      className="rounded-md border border-surface-hairline2 bg-surface-raised px-3.5 py-2 text-xs text-ink-secondary transition-colors hover:text-ink-primary"
+                      className="flex items-center gap-1 text-badge font-medium text-ink-secondary transition-colors hover:text-ink-primary"
                     >
-                      ← previous
+                      <ChevronLeft size={15} aria-hidden /> Previous attack
                     </button>
                     <button
                       onClick={() => step(1)}
-                      className="rounded-md border border-surface-hairline2 bg-surface-raised px-3.5 py-2 text-xs text-ink-secondary transition-colors hover:text-ink-primary"
+                      className="flex items-center gap-1 text-badge font-medium text-ink-secondary transition-colors hover:text-ink-primary"
                     >
-                      next →
+                      Next attack <ChevronRight size={15} aria-hidden />
                     </button>
                   </div>
                 </div>
@@ -409,104 +518,115 @@ export default function AttackExplainerScreen({
   );
 }
 
-function DrillHeader({ attack, onClose }: { attack: AttackInfoDto; onClose: () => void }) {
-  const { STATUS } = useTokens();
+function DrillHeader({
+  attack,
+  evidence,
+  onClose,
+  onWatch,
+}: {
+  attack: AttackInfoDto;
+  evidence: AttackEvidenceDto | null | undefined;
+  onClose: () => void;
+  onWatch?: () => void;
+}) {
+  const semantic = useSemanticTokens();
   const v = verdictOf(attack);
-  const color =
-    verdictColorKey(v) === "good" ? STATUS.good : verdictColorKey(v) === "caught" ? STATUS.caught : STATUS.missed;
+  const color = semantic[VERDICT_SEMANTIC[v]];
+  const detectionRate = evidence && evidence.n_events > 0 ? evidence.detection_rate ?? null : null;
+
   return (
-    <div className="sticky top-0 z-10 flex items-start gap-3.5 border-b border-surface-hairline bg-surface-panel p-5">
-      <span className="font-mono text-2xl leading-none" style={{ color }}>
-        {ACTOR_GLYPH[attack.actor] ?? "●"}
-      </span>
-      <div className="min-w-0 flex-1">
-        <div className="flex flex-wrap items-center gap-2.5">
-          <h2 className="text-base font-semibold text-ink-primary">{attack.human_name}</h2>
-          <span
-            className="rounded-full border px-2 py-0.5 text-[9px] font-bold tracking-wider"
-            style={{ color, borderColor: color }}
-          >
-            {VERDICT_LABEL[v]}
-          </span>
+    <div className="sticky top-0 z-10 border-b border-surface-hairline bg-surface-panel p-5">
+      <div className="flex items-start gap-3.5">
+        <span className="font-mono text-2xl leading-none" style={{ color }}>
+          {ACTOR_GLYPH[attack.actor] ?? "●"}
+        </span>
+        <div className="min-w-0 flex-1">
+          <div className="flex flex-wrap items-center gap-2.5">
+            <h2 className="text-section-title text-ink-primary">{attack.human_name}</h2>
+            <StatusPill status={VERDICT_SEMANTIC[v]}>{VERDICT_LABEL[v]}</StatusPill>
+          </div>
+          <p className="mt-1.5 text-body leading-relaxed text-ink-secondary">{attack.description}</p>
         </div>
-        <p className="mt-1.5 text-xs leading-relaxed text-ink-secondary">{attack.description}</p>
+        {/* Refinement #6: only the primary CTA and close live in the header —
+            previous/next moved to a lighter nav row at the bottom. */}
+        <div className="flex shrink-0 items-center gap-2">
+          {onWatch && (
+            <button
+              onClick={onWatch}
+              className="flex items-center gap-1.5 rounded-md border border-entity-rsu bg-entity-rsu px-3.5 py-2 text-badge font-semibold text-white transition-all hover:opacity-90 active:scale-[0.97]"
+            >
+              <Radar size={14} aria-hidden />
+              Watch on live map
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            className="flex h-8 w-8 items-center justify-center rounded-md border border-surface-hairline2 bg-surface-raised text-ink-secondary transition-colors hover:text-ink-primary"
+            aria-label="Close"
+          >
+            <X size={15} aria-hidden />
+          </button>
+        </div>
       </div>
-      <button
-        onClick={onClose}
-        className="flex h-7 w-7 shrink-0 items-center justify-center rounded-md border border-surface-hairline2 bg-surface-raised text-sm text-ink-secondary hover:text-ink-primary"
-      >
-        ✕
-      </button>
+      {/* Refinement #7: the attack summary should communicate impact at a
+          glance — a real, evidence-derived detection rate, not a decorative
+          number. Only shown once the evidence fetch has actually resolved. */}
+      {detectionRate != null && (
+        <div className="mt-3.5">
+          <StatusPill status={detectionRate >= 0.995 ? "safe" : detectionRate >= 0.5 ? "warning" : "compromised"}>
+            {(detectionRate * 100).toFixed(detectionRate >= 0.995 || detectionRate === 0 ? 0 : 1)}% caught in this capture
+          </StatusPill>
+        </div>
+      )}
     </div>
   );
 }
 
 function AccuracyPanel({ attack }: { attack: AttackInfoDto }) {
-  const { SERIES, STATUS } = useTokens();
+  const { SERIES } = useTokens();
   const full = attack.sentinel_full;
   return (
-    <div className="anim-rise flex flex-col gap-3 rounded-lg border border-surface-hairline bg-surface-raised p-4">
-      <div className="flex flex-wrap items-baseline gap-2">
-        <span className="text-[11.5px] font-semibold text-ink-primary">
-          Accuracy against the published baseline
-        </span>
-        <span className="ml-auto font-mono text-[10px] text-ink-muted">
-          MCC, results_e5_final/e5_final_table.json
-        </span>
-      </div>
+    <div className="anim-rise flex flex-col gap-3.5 rounded-lg border border-surface-hairline bg-surface-raised p-4">
+      <span className="text-body font-semibold text-ink-primary">
+        Accuracy against the published baseline
+      </span>
       <div className="flex items-center gap-3">
-        <span className="w-16 text-[10.5px] text-ink-muted">SENTINEL</span>
-        <div className="h-5 flex-1 overflow-hidden rounded bg-surface-page">
+        <span className="w-20 text-body font-medium text-ink-secondary">SENTINEL</span>
+        <div className="h-7 flex-1 overflow-hidden rounded-md bg-surface-page">
           <div
             className="anim-sweep h-full"
             style={{ width: `${pct01(full?.MCC)}%`, background: SERIES[0] }}
           />
         </div>
-        <span className="w-14 shrink-0 text-right font-mono text-sm font-semibold" style={{ color: SERIES[0] }}>
+        <span className="w-16 shrink-0 text-right font-mono text-xl font-bold" style={{ color: SERIES[0] }}>
           {full ? full.MCC.toFixed(3) : "n/a"}
         </span>
       </div>
       <div className="flex items-center gap-3">
-        <span className="w-16 text-[10.5px] text-ink-muted">baseline</span>
-        <div className="h-5 flex-1 overflow-hidden rounded bg-surface-page">
+        <span className="w-20 text-body font-medium text-ink-secondary">Baseline</span>
+        <div className="h-7 flex-1 overflow-hidden rounded-md bg-surface-page">
           <div
             className="anim-sweep h-full"
             style={{ width: `${pct01(attack.best_baseline_mcc)}%`, background: SERIES[1] }}
           />
         </div>
-        <span className="w-14 shrink-0 text-right font-mono text-sm font-semibold text-ink-secondary">
+        <span className="w-16 shrink-0 text-right font-mono text-xl font-bold text-ink-secondary">
           {attack.best_baseline_mcc != null ? attack.best_baseline_mcc.toFixed(3) : "n/a"}
         </span>
       </div>
-      <div className="flex items-start gap-2 border-t border-surface-hairline pt-2.5 text-xs">
-        <span className="text-ink-muted">
+      <div className="flex items-start gap-2 border-t border-surface-hairline pt-3">
+        <span className="text-body text-ink-secondary">
           {attack.baseline_wins ? (
-            <span className="text-status-missed">
+            <span className="font-medium text-status-missed">
               ⚠ {attack.best_baseline_code} outperforms SENTINEL here — shown as measured.
             </span>
           ) : (
-            <span className="text-status-good">SENTINEL leads on this variant.</span>
+            <span className="font-medium text-status-good">SENTINEL leads on this variant.</span>
           )}
-          {full?.MCC_std != null && ` MCC std across seeds: ±${full.MCC_std.toFixed(3)}.`}
           {full?.TTD != null && ` Mean time to detect: ${full.TTD.toFixed(2)}s.`}
         </span>
       </div>
-      {(full?.CDER != null || full?.PBPO_ms != null) && (
-        <div className="grid grid-cols-2 gap-2 border-t border-surface-hairline pt-2.5 text-center">
-          {full?.CDER != null && (
-            <div>
-              <div className="text-[9px] uppercase tracking-wide text-ink-muted">CDER</div>
-              <div className="font-mono text-xs text-ink-primary">{full.CDER.toFixed(3)}</div>
-            </div>
-          )}
-          {full?.PBPO_ms != null && (
-            <div>
-              <div className="text-[9px] uppercase tracking-wide text-ink-muted">per-beacon overhead</div>
-              <div className="font-mono text-xs text-ink-primary">{full.PBPO_ms.toFixed(2)} ms</div>
-            </div>
-          )}
-        </div>
-      )}
+      <p className="font-mono text-badge text-ink-muted">MCC, results_e5_final/e5_final_table.json</p>
     </div>
   );
 }
