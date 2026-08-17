@@ -83,7 +83,45 @@ function buildColors(theme: ThemeName, ENTITY: Record<string, string>, STATUS: R
     // distinct from the AE overlay's amber and from every entity colour
     // already on the map.
     gatLine: hexToRgba(ENTITY.controller, 200),
+    // Traffic-signal phase colours — reuses the validated status quartet
+    // (never a new hue) for a completely different meaning (light phase,
+    // not detection outcome). Kept visually separable from the security
+    // language by shape (triangle, used nowhere else) and by being opt-in.
+    signalGreen: hexToRgba(STATUS.good, 235),
+    signalAmber: hexToRgba(STATUS.caught, 235),
+    signalRed: hexToRgba(STATUS.missed, 235),
   };
+}
+
+/**
+ * Real, fixed-cycle SUMO phase lookup — t mod (sum of phase durations) tells
+ * you which phase you're in, exactly how the simulator's own static traffic-
+ * light programs work. No live SUMO/TraCI connection, no interpolation.
+ */
+function signalStateAt(phases: { duration: number; state: string }[], t: number): string {
+  const cycle = phases.reduce((s, p) => s + p.duration, 0);
+  if (cycle <= 0) return "";
+  let clock = ((t % cycle) + cycle) % cycle;
+  for (const p of phases) {
+    if (clock < p.duration) return p.state;
+    clock -= p.duration;
+  }
+  return phases[phases.length - 1].state;
+}
+
+/** A phase's state string is one char per controlled approach — reduce a
+ * possibly-mixed intersection to one representative colour: any yellow
+ * anywhere means "transitioning" (amber); otherwise majority green/red. */
+function signalPhaseColor(state: string, C: MapColors): Color {
+  if (!state) return C.signalRed;
+  let green = 0,
+    red = 0;
+  for (const ch of state) {
+    if (ch === "y" || ch === "Y") return C.signalAmber;
+    if (ch === "G" || ch === "g") green++;
+    else if (ch === "r" || ch === "R") red++;
+  }
+  return green >= red ? C.signalGreen : C.signalRed;
 }
 
 type MapColors = ReturnType<typeof buildColors>;
@@ -172,6 +210,15 @@ const DIAMOND_ICON = {
   mask: true,
 };
 
+const TRIANGLE_ICON = {
+  url: svgUri(
+    `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32"><path d="M16 3 L29 28 L3 28 Z" fill="#fff"/></svg>`
+  ),
+  width: 32,
+  height: 32,
+  mask: true,
+};
+
 /**
  * deck.gl draws into a WebGL canvas. If WebGL is unavailable or the GPU
  * process is blocklisted, deck renders NOTHING and throws no error — the
@@ -197,6 +244,8 @@ export default function NetworkMap() {
     topology,
     layers,
     roadmap,
+    signals,
+    t,
     mapDetail,
     selectedVehicle,
     selectVehicle,
@@ -386,6 +435,26 @@ export default function NetworkMap() {
           capRounded: true,
           jointRounded: true,
           pickable: false,
+        })
+      );
+    }
+
+    // Real, fixed-cycle SUMO traffic-light state — explains WHY a vehicle is
+    // stopped (red phase) instead of leaving it unexplained. Opt-in and
+    // small/triangular so it never competes with the security-status
+    // language (colour+shape) the rest of the map is built around.
+    if (layers.trafficSignals && signals && signals.length) {
+      L.push(
+        new IconLayer({
+          id: "traffic-signals",
+          data: signals,
+          getPosition: (d: any) => [d.x, d.y],
+          getIcon: () => TRIANGLE_ICON,
+          getSize: 11,
+          sizeUnits: "pixels",
+          getColor: (d: any) => signalPhaseColor(signalStateAt(d.phases, t), C),
+          pickable: true,
+          updateTriggers: { getColor: t },
         })
       );
     }
@@ -792,6 +861,8 @@ export default function NetworkMap() {
     topology,
     layers,
     roadmap,
+    signals,
+    t,
     mapDetail,
     showIndividual,
     compromisedRsus,

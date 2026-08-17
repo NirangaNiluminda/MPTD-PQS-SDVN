@@ -177,6 +177,14 @@ export interface RoadMapDto {
   source: string;
 }
 
+export interface TrafficSignalDto {
+  id: string;
+  x: number;
+  y: number;
+  /** Fixed-cycle program — real, from the SUMO net, never a live TraCI feed. */
+  phases: { duration: number; state: string }[];
+}
+
 // ── Blockchain ledger (point-in-time snapshot, see scripts/snapshot_ledger.py)
 
 export interface LedgerSummaryDto {
@@ -492,6 +500,8 @@ export const api = {
   stats: (scenarioId: string, t: number) =>
     getJson<StatsDto>(`/api/scenarios/${scenarioId}/stats?t=${t}`),
   roadmap: (road: string) => getJson<RoadMapDto>(`/api/roadmap/${road}`),
+  trafficSignals: (road: string) =>
+    getJson<{ signals: TrafficSignalDto[] }>(`/api/roadmap/${road}/signals`),
 
   ledgerSummary: () => getJson<LedgerSummaryDto>("/api/ledger/summary"),
   ledgerTrust: (entity: "rsu" | "vehicle" | "controller") =>

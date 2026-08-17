@@ -472,6 +472,28 @@ def road_map(road: str):
     return _roadmap_for(road)
 
 
+@lru_cache(maxsize=4)
+def _signals_for(road: str) -> list[dict]:
+    rel = config.ROAD_NET_FILES.get(road)
+    if rel is None:
+        raise HTTPException(404, f"no SUMO network configured for road type: {road}")
+    net_path = config.SUMO_DIR / rel
+    if not net_path.is_file():
+        raise HTTPException(404, f"SUMO network file missing: {net_path}")
+    return roadmap.load_traffic_signals(net_path)
+
+
+@app.get("/api/roadmap/{road}/signals")
+def road_signals(road: str):
+    """Real, fixed-cycle traffic-light programs from the SUMO network.
+
+    Static (non-adaptive) programs only — phase at any time t is
+    deterministic (t mod cycle length), computed client-side from this
+    one-time payload. No live SUMO/TraCI connection involved.
+    """
+    return {"signals": _signals_for(road)}
+
+
 @app.get("/api/geometry/{road}/positions")
 def road_positions(road: str, t: float):
     """All vehicle positions at time t (step-hold model) — used to draw the

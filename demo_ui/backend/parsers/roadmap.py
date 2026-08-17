@@ -111,6 +111,91 @@ def parse_net(net_path: str | Path) -> RoadMap:
     return RoadMap(roads=roads, junctions=junctions, bounds=bounds)
 
 
+@dataclass
+class TrafficSignal:
+    id: str
+    x: float
+    y: float
+    phases: list[dict]  # [{"duration": float, "state": str}, ...]
+
+
+def _junction_from_via(via: str) -> str:
+    """':<junction_id>_<linkIndex>_<pathIndex>' -> junction_id.
+
+    A joined/clustered traffic light (netconvert --tls.join) has no junction
+    of its own — its tlLogic id names the cluster, not a point. Every
+    <connection tl="..."> it governs names an internal lane in `via` that
+    DOES start at that light's real junction, so stripping the trailing
+    "_<linkIndex>_<pathIndex>" recovers it. Verified against this net: all
+    20 joined tlLogic ids resolve this way, 0 left unresolved.
+    """
+    body = via[1:] if via.startswith(":") else via
+    return body.rsplit("_", 2)[0]
+
+
+def parse_traffic_signals(net_path: str | Path) -> list[TrafficSignal]:
+    """Real, static (fixed-cycle) traffic-light programs from a SUMO net.
+
+    "static" means the phase at time t is deterministic — t mod (sum of
+    phase durations) — so the frontend can compute current signal state
+    from this one-time payload without a live SUMO/TraCI connection.
+    Actuated/other program types are skipped rather than guessed.
+    """
+    root = ET.parse(str(net_path)).getroot()
+    junctions = {j.get("id"): j for j in root.findall("junction")}
+
+    first_via_by_tl: dict[str, str] = {}
+    for c in root.findall("connection"):
+        tl = c.get("tl")
+        if tl and tl not in first_via_by_tl and c.get("via"):
+            first_via_by_tl[tl] = c.get("via")
+
+    signals: list[TrafficSignal] = []
+    for tl in root.findall("tlLogic"):
+        if tl.get("type") != "static":
+            continue
+        tl_id = tl.get("id")
+        j = junctions.get(tl_id)
+        if j is None:
+            via = first_via_by_tl.get(tl_id)
+            j = junctions.get(_junction_from_via(via)) if via else None
+        if j is None:
+            continue  # unresolvable — skip rather than guess a position
+        phases = [
+            {"duration": float(p.get("duration")), "state": p.get("state")}
+            for p in tl.findall("phase")
+            if p.get("duration") and p.get("state")
+        ]
+        if not phases:
+            continue
+        signals.append(TrafficSignal(id=tl_id, x=float(j.get("x")), y=float(j.get("y")), phases=phases))
+    return signals
+
+
+def load_traffic_signals(net_path: str | Path, cache_dir: str | Path | None = None) -> list[dict]:
+    """Parsed traffic signals as a JSON-ready list, cached beside the source net."""
+    net_path = Path(net_path)
+    cache = Path(cache_dir or net_path.parent) / f".{net_path.stem}.signals.json"
+
+    if cache.is_file() and cache.stat().st_mtime >= net_path.stat().st_mtime:
+        try:
+            with open(cache) as fh:
+                return json.load(fh)
+        except (json.JSONDecodeError, OSError):
+            pass
+
+    signals = parse_traffic_signals(net_path)
+    payload = [{"id": s.id, "x": s.x, "y": s.y, "phases": s.phases} for s in signals]
+    try:
+        tmp = cache.with_suffix(".tmp")
+        with open(tmp, "w") as fh:
+            json.dump(payload, fh, separators=(",", ":"))
+        os.replace(tmp, cache)
+    except OSError:
+        pass
+    return payload
+
+
 def load_roadmap(net_path: str | Path, cache_dir: str | Path | None = None) -> dict:
     """Parsed roadmap as a JSON-ready dict, cached beside the source net."""
     net_path = Path(net_path)

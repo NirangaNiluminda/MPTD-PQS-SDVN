@@ -29,7 +29,7 @@ const DETAIL_STEPS: { level: MapDetail; label: string; note: string }[] = [
 // Shape is part of the encoding, not decoration: the validated palette clears
 // the normal-vision floor but sits in the CVD warn band, which is only
 // permitted with a secondary channel. These glyphs are that channel.
-function Swatch({ color, shape }: { color: string; shape: "sq" | "di" | "ci" | "x" }) {
+function Swatch({ color, shape }: { color: string; shape: "sq" | "di" | "ci" | "x" | "tri" }) {
   const common = { width: 12, height: 12 } as const;
   if (shape === "sq")
     return (
@@ -49,6 +49,12 @@ function Swatch({ color, shape }: { color: string; shape: "sq" | "di" | "ci" | "
         <path d="M2 2 L10 10 M10 2 L2 10" stroke={color} strokeWidth="2" fill="none" />
       </svg>
     );
+  if (shape === "tri")
+    return (
+      <svg {...common} viewBox="0 0 12 12">
+        <polygon points="6,1.5 10.8,10 1.2,10" fill={color} stroke="rgb(var(--c-surface-panel) / 0.8)" />
+      </svg>
+    );
   return (
     <svg {...common} viewBox="0 0 12 12">
       <circle cx="6" cy="6" r="4.5" fill={color} />
@@ -59,7 +65,7 @@ function Swatch({ color, shape }: { color: string; shape: "sq" | "di" | "ci" | "
 function buildLegendItems(
   ENTITY: Record<string, string>,
   STATUS: Record<string, string>
-): { label: string; color: string; shape: "sq" | "di" | "ci" | "x" }[] {
+): { label: string; color: string; shape: "sq" | "di" | "ci" | "x" | "tri" }[] {
   return [
     { label: "Roadside unit", color: ENTITY.rsu, shape: "sq" },
     { label: "Controller", color: ENTITY.controller, shape: "di" },
@@ -68,6 +74,7 @@ function buildLegendItems(
     { label: "Lie — caught", color: STATUS.caught, shape: "ci" },
     { label: "Lie — missed", color: STATUS.missed, shape: "ci" },
     { label: "Ghost identity", color: ENTITY.ghost, shape: "x" },
+    { label: "Traffic signal (colour = live phase)", color: STATUS.caught, shape: "tri" },
   ];
 }
 
@@ -78,6 +85,7 @@ const LAYER_DEFAULTS: LayerToggles = {
   rubberBands: true,
   controllerLinks: false,
   hideIdle: false,
+  trafficSignals: false,
 };
 
 const LAYER_CHIPS: { k: keyof LayerToggles; label: string }[] = [
@@ -87,6 +95,7 @@ const LAYER_CHIPS: { k: keyof LayerToggles; label: string }[] = [
   { k: "rubberBands", label: "Claim → truth" },
   { k: "controllerLinks", label: "Controller links" },
   { k: "hideIdle", label: "Hide idle vehicles" },
+  { k: "trafficSignals", label: "Traffic signals" },
 ];
 
 function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {

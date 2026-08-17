@@ -6,6 +6,7 @@ import {
   GeometryDto,
   LstmReconstructionDto,
   RoadMapDto,
+  TrafficSignalDto,
   ScenarioDetailDto,
   ScenarioSummary,
   StatsDto,
@@ -25,6 +26,10 @@ export interface LayerToggles {
   // vehicles). Never touches the underlying trace or any captured result;
   // off by default so it can't be mistaken for the map's normal behaviour.
   hideIdle: boolean;
+  // Real, fixed-cycle SUMO traffic-light state at junctions — explains WHY
+  // a vehicle is stopped (red phase) rather than leaving it unexplained.
+  // Off by default: supplementary detail, not core to the default map read.
+  trafficSignals: boolean;
 }
 
 // Level of detail: separate from continuous camera zoom (deck.gl still
@@ -49,6 +54,11 @@ interface PlaybackState {
 
   geometry: GeometryDto | null;
   roadmap: RoadMapDto | null;
+  // Real, fixed-cycle traffic-light programs from the SUMO net — fetched
+  // once per road type, same "never block the scenario" discipline as
+  // roadmap. Client computes each light's current phase from `t` locally;
+  // no live SUMO/TraCI connection involved.
+  signals: TrafficSignalDto[] | null;
   positions: VehiclePositionDto[];
   beacons: BeaconDto[];
   trails: TrailDto[];
@@ -115,6 +125,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
 
   geometry: null,
   roadmap: null,
+  signals: null,
   positions: [],
   beacons: [],
   trails: [],
@@ -172,6 +183,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     rubberBands: true,
     controllerLinks: false,
     hideIdle: false,
+    trafficSignals: false,
   },
   mapDetail: "street",
   setMapDetail: (d) => set({ mapDetail: d }),
@@ -215,6 +227,12 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
           if (get().road === s.road) set({ roadmap: rm });
         })
         .catch(() => set({ roadmap: null }));
+      api
+        .trafficSignals(s.road)
+        .then((res) => {
+          if (get().road === s.road) set({ signals: res.signals });
+        })
+        .catch(() => set({ signals: null }));
       set({
         tMin: tr.t_min,
         tMax: tr.t_max,
