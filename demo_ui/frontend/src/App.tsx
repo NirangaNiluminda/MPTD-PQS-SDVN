@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   BarChart3,
   Blocks,
+  Info,
   Radar,
   ScanSearch,
   ShieldAlert,
@@ -38,6 +39,52 @@ interface ScreenMeta {
   title: string;
   blurb: Record<CopyMode, string>;
   provenance: ProvenanceKind;
+  /**
+   * Network Replay is the one screen redesigned for a map-dominant, abstract
+   * -first landing state — the blurb moves behind an (i) icon there instead
+   * of sitting permanently under the title. Every other screen keeps the
+   * always-visible paragraph; this is opt-in, not a header-wide redesign.
+   */
+  descriptionBehindIcon?: boolean;
+}
+
+function InfoTip({ text }: { text: string }) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setOpen(false);
+    };
+    document.addEventListener("mousedown", onClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open]);
+
+  return (
+    <div ref={ref} className="relative">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        aria-label="About this screen"
+        aria-expanded={open}
+        className="flex h-5 w-5 items-center justify-center rounded-full text-ink-muted transition-colors hover:text-ink-primary"
+      >
+        <Info size={15} strokeWidth={2} aria-hidden />
+      </button>
+      {open && (
+        <div className="absolute left-0 top-full z-30 mt-2 w-80 rounded-lg border border-surface-hairline2 bg-surface-panel p-3 text-body leading-relaxed text-ink-secondary shadow-2xl">
+          {text}
+        </div>
+      )}
+    </div>
+  );
 }
 
 // Grouped by what a viewer is trying to DO, not by implementation — matches
@@ -78,6 +125,7 @@ const SCREEN_META: Record<Tab, ScreenMeta> = {
         "Entity-level replay of a completed simulation over the real Shinjuku street graph. Claim-vs-ground-truth vectors, RSU coverage discs (R_max_comm = 270 m), and derived controller-cluster assignment, filtered by class and detection outcome.",
     },
     provenance: "replayed",
+    descriptionBehindIcon: true,
   },
   inspector: {
     title: "Defence Stack Inspector",
@@ -232,10 +280,13 @@ export default function App() {
               <div className="flex flex-wrap items-center gap-2.5">
                 <h2 className="text-page-title text-ink-primary">{meta.title}</h2>
                 <ProvenanceChip kind={meta.provenance} />
+                {meta.descriptionBehindIcon && <InfoTip text={meta.blurb[mode]} />}
               </div>
-              <p className="mt-1 max-w-[70ch] text-body leading-relaxed text-ink-secondary">
-                {meta.blurb[mode]}
-              </p>
+              {!meta.descriptionBehindIcon && (
+                <p className="mt-1 max-w-[70ch] text-body leading-relaxed text-ink-secondary">
+                  {meta.blurb[mode]}
+                </p>
+              )}
             </div>
           </div>
 

@@ -18,6 +18,7 @@ export default function NetworkReplayScreen() {
   const tick = usePlayback((s) => s.tick);
   const playing = usePlayback((s) => s.playing);
   const error = usePlayback((s) => s.error);
+  const selectedVehicle = usePlayback((s) => s.selectedVehicle);
   const lastFrameRef = useRef<number | null>(null);
 
   // Wall-clock-driven playback: each frame advances sim time by the real
@@ -54,14 +55,12 @@ export default function NetworkReplayScreen() {
         <div className="relative flex-1 bg-surface-page">
           <NetworkMap />
           <MapControls />
-          {/* Floats over the map rather than docking as a side panel — the
-              map keeps its full width, and the overlays this vehicle draws
-              (rubber band, LSTM-AE expected path, GAT attention lines) stay
-              visible right next to the detail that explains them. */}
-          <VehicleDrawer />
         </div>
-        <div className="w-80 shrink-0">
-          <DetectionFeed />
+        {/* Docked, not floated over the map: a selected vehicle's detail
+            replaces the detection feed in this same column rather than
+            covering map content — the map stays fully visible either way. */}
+        <div className="w-[360px] shrink-0">
+          {selectedVehicle !== null ? <VehicleDrawer /> : <DetectionFeed />}
         </div>
       </div>
 

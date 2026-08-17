@@ -1,4 +1,5 @@
 import { useMemo, useState } from "react";
+import { ChevronLeft } from "lucide-react";
 import {
   Line,
   LineChart,
@@ -12,6 +13,7 @@ import {
 import { usePlayback } from "../store/playback";
 import { useTokens } from "../design/tokens";
 import Accordion from "./Accordion";
+import StatusPill, { SemanticStatus } from "./StatusPill";
 
 const PSI_TH = 0.09; // 08_detection_engine.h — the rule-signature decision line
 
@@ -84,29 +86,44 @@ export default function VehicleDrawer() {
     (b) => b.is_poisoned && !b.detected
   ).length;
 
+  // The decision itself, foregrounded above every other detail — plain
+  // language first, technical evidence only on request below.
+  const decision: { status: SemanticStatus; label: string } | null = current
+    ? current.is_poisoned
+      ? current.detected
+        ? { status: "warning", label: "LYING — CAUGHT" }
+        : { status: "compromised", label: "LYING — MISSED" }
+      : { status: "safe", label: "HONEST" }
+    : null;
+
   return (
-    <aside className="anim-rise pointer-events-auto absolute bottom-3 right-3 top-14 z-10 flex w-[400px] flex-col overflow-hidden rounded-lg border border-surface-hairline2 bg-surface-panel shadow-2xl">
-      <header className="flex items-center justify-between border-b border-surface-hairline px-4 py-3">
-        <div>
-          <h2 className="text-sm font-semibold text-ink-primary">
-            Vehicle {selectedVehicle}
-            {current?.is_ghost && (
-              <span className="ml-2 rounded bg-entity-ghost/20 px-1.5 py-0.5 text-[10px] font-medium text-entity-ghost">
-                GHOST IDENTITY
-              </span>
-            )}
-          </h2>
-          <p className="text-[11px] text-ink-muted">
-            {vehicleTrack?.length ?? 0} beacons in this run
-          </p>
-        </div>
+    <aside className="flex h-full w-full flex-col overflow-hidden border-l border-surface-hairline bg-surface-panel">
+      <div className="flex items-center gap-2 border-b border-surface-hairline px-3 py-2">
         <button
-          className="rounded px-2 py-1 text-lg leading-none text-ink-muted hover:bg-surface-raised hover:text-ink-primary"
           onClick={() => selectVehicle(null)}
-          aria-label="Close"
+          className="flex items-center gap-1 rounded px-1 py-0.5 text-badge font-semibold text-ink-secondary transition-colors hover:text-ink-primary"
         >
-          ×
+          <ChevronLeft size={13} aria-hidden />
+          Back to detection feed
         </button>
+      </div>
+      <header className="border-b border-surface-hairline px-4 py-3">
+        <div className="flex items-center gap-2">
+          <h2 className="text-section-title text-ink-primary">Vehicle {selectedVehicle}</h2>
+          {current?.is_ghost && (
+            <span className="rounded bg-entity-ghost/20 px-1.5 py-0.5 text-[10px] font-medium text-entity-ghost">
+              GHOST IDENTITY
+            </span>
+          )}
+        </div>
+        {decision && (
+          <div className="mt-2">
+            <StatusPill status={decision.status}>{decision.label}</StatusPill>
+          </div>
+        )}
+        <p className="mt-2 text-[11px] text-ink-muted">
+          {vehicleTrack?.length ?? 0} beacons in this run
+        </p>
       </header>
 
       {loadingVehicle && (
@@ -117,24 +134,10 @@ export default function VehicleDrawer() {
         <div className="flex-1 space-y-4 overflow-y-auto p-4">
           <section className="rounded-lg border border-surface-hairline bg-surface-raised p-3">
             <h3 className="mb-2 text-[10px] font-semibold uppercase tracking-wider text-ink-muted">
-              At t = {t.toFixed(1)}s
+              Vehicle status at t = {t.toFixed(1)}s
             </h3>
             {current ? (
               <>
-                <Row
-                  label="Status"
-                  value={
-                    current.is_poisoned ? (
-                      current.detected ? (
-                        <span className="text-status-caught">Lying — caught</span>
-                      ) : (
-                        <span className="text-status-missed">Lying — MISSED</span>
-                      )
-                    ) : (
-                      <span className="text-status-good">Honest</span>
-                    )
-                  }
-                />
                 <Row label="Attacker type" value={current.attacker_class_plain} />
                 <Row label="Reported by" value={`RSU ${current.rsu_id}`} />
                 <Row label="Speed" value={`${current.speed.toFixed(1)} m/s`} />

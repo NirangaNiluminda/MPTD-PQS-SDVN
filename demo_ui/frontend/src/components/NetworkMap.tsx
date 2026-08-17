@@ -14,6 +14,8 @@ import { BeaconDto } from "../api";
 import { useTokens, hexToRgba, Rgba, ThemeName } from "../design/tokens";
 import { useTheme } from "../store/theme";
 
+const PSI_TH = 0.09; // 08_detection_engine.h — the rule-signature decision line, same constant VehicleDrawer plots against
+
 // Sim coordinates are plain metres on a local origin (not lon/lat), so this is
 // an OrthographicView, not a geo view.
 const INITIAL_VIEW_STATE = {
@@ -61,6 +63,12 @@ function buildColors(theme: ThemeName, ENTITY: Record<string, string>, STATUS: R
     band: (theme === "dark" ? [255, 255, 255, 70] : [14, 22, 32, 90]) as Rgba,
     bandMissed: hexToRgba(STATUS.missed, 130),
     selected: (theme === "dark" ? [255, 255, 255, 255] : [14, 22, 32, 255]) as Rgba,
+    // Suspicion halos — soft, low-alpha rings behind a beacon dot, sized by
+    // psi_score rather than the binary caught/missed outcome the dot itself
+    // already encodes. Reuses the validated caught/missed hues at low alpha
+    // instead of introducing a new "glow" colour.
+    haloAmber: hexToRgba(STATUS.caught, 55),
+    haloRed: hexToRgba(STATUS.missed, 70),
     // LSTM-AE "expected trajectory" overlay — reuses the validated caught/
     // caution colour rather than introducing an unvalidated new hue.
     aeExpected: hexToRgba(STATUS.caught, 230),
@@ -442,6 +450,30 @@ export default function NetworkMap() {
           pickable: false,
         })
       );
+    }
+
+    // Suspicion halos: a soft ring sized by psi_score magnitude, independent
+    // of ground truth — this is what surfaces an elevated-but-unresolved
+    // reading (including a near-miss on an honest vehicle) that the binary
+    // caught/missed dot colour below can't show on its own.
+    if (showIndividual) {
+      const suspicious = beacons.filter((b) => b.psi_score > PSI_TH);
+      if (suspicious.length) {
+        L.push(
+          new ScatterplotLayer({
+            id: "suspicion-halos",
+            data: suspicious,
+            getPosition: (d: BeaconDto) => [d.pos.x, d.pos.y],
+            getRadius: (d: BeaconDto) => (d.psi_score > 0.3 ? 46 : 32),
+            radiusUnits: "meters",
+            radiusMinPixels: 10,
+            radiusMaxPixels: 28,
+            getFillColor: (d: BeaconDto) => (d.psi_score > 0.3 ? C.haloRed : C.haloAmber),
+            stroked: false,
+            pickable: false,
+          })
+        );
+      }
     }
 
     // Active beacons, coloured by ground truth vs detection outcome. These sit

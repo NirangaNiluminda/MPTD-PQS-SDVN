@@ -1,4 +1,5 @@
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
+import { SlidersHorizontal, X } from "lucide-react";
 import { usePlayback, LayerToggles, MapDetail } from "../store/playback";
 import { useTokens } from "../design/tokens";
 
@@ -86,29 +87,6 @@ const LAYER_CHIPS: { k: keyof LayerToggles; label: string }[] = [
   { k: "controllerLinks", label: "Controller links" },
 ];
 
-function TabButton({
-  open,
-  label,
-  badge,
-  onClick,
-}: {
-  open: boolean;
-  label: string;
-  badge?: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      onClick={onClick}
-      className="flex items-center gap-1.5 rounded-md border border-surface-hairline2 bg-surface-panel/95 px-2.5 py-1.5 font-mono text-[10px] font-medium text-ink-secondary shadow-lg backdrop-blur transition-colors hover:text-ink-primary"
-    >
-      <span aria-hidden>{open ? "▾" : "▸"}</span>
-      {label}
-      {badge && <span className="text-ink-muted">{badge}</span>}
-    </button>
-  );
-}
-
 function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
   return (
     <button
@@ -124,14 +102,33 @@ function Chip({ active, onClick, children }: { active: boolean; onClick: () => v
   );
 }
 
-export default function MapControls() {
-  const { layers, toggleLayer, mapDetail, setMapDetail } = usePlayback();
-  const { ENTITY, STATUS } = useTokens();
-  const legendItems = buildLegendItems(ENTITY, STATUS);
-  const [controlsOpen, setControlsOpen] = useState(true);
-  const [legendOpen, setLegendOpen] = useState(false);
-  const activeStep = DETAIL_STEPS.find((s) => s.level === mapDetail) ?? DETAIL_STEPS[2];
+/** Closes on outside click / Escape — the same popover discipline as ScenarioPicker. */
+function useDismiss(open: boolean, close: () => void) {
+  const ref = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) close();
+    };
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") close();
+    };
+    document.addEventListener("mousedown", onClick);
+    document.addEventListener("keydown", onKey);
+    return () => {
+      document.removeEventListener("mousedown", onClick);
+      document.removeEventListener("keydown", onKey);
+    };
+  }, [open, close]);
+  return ref;
+}
 
+function MapSettings() {
+  const { layers, toggleLayer, mapDetail, setMapDetail } = usePlayback();
+  const [open, setOpen] = useState(false);
+  const close = () => setOpen(false);
+  const ref = useDismiss(open, close);
+  const activeStep = DETAIL_STEPS.find((s) => s.level === mapDetail) ?? DETAIL_STEPS[2];
   const changedCount = LAYER_CHIPS.filter((c) => layers[c.k] !== LAYER_DEFAULTS[c.k]).length;
 
   const resetLayers = () => {
@@ -141,27 +138,25 @@ export default function MapControls() {
   };
 
   return (
-    <div className="pointer-events-auto absolute left-3 top-3 z-10 flex max-w-[min(90%,380px)] flex-col gap-1.5">
-      <div className="flex gap-1.5">
-        <TabButton open={controlsOpen} label="Controls" onClick={() => setControlsOpen((v) => !v)} />
-        <TabButton open={legendOpen} label="Legend" onClick={() => setLegendOpen((v) => !v)} />
-        {changedCount > 0 && (
-          <button
-            onClick={resetLayers}
-            className="rounded-md border border-surface-hairline2 bg-surface-panel/95 px-2.5 py-1.5 font-mono text-[10px] font-medium text-ink-secondary shadow-lg backdrop-blur hover:text-ink-primary"
-          >
-            ↺ reset ({changedCount})
-          </button>
-        )}
-      </div>
+    <div ref={ref} className="pointer-events-auto absolute left-3 top-3 z-10">
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-1.5 rounded-md border border-surface-hairline2 bg-surface-panel/95 px-2.5 py-1.5 font-mono text-[10px] font-medium text-ink-secondary shadow-lg backdrop-blur transition-colors hover:text-ink-primary"
+      >
+        <SlidersHorizontal size={12} aria-hidden />
+        Map Settings
+        {changedCount > 0 && <span className="text-ink-muted">({changedCount})</span>}
+      </button>
 
-      {controlsOpen && (
-        <div className="rounded-lg border border-surface-hairline2 bg-surface-panel/95 p-2.5 shadow-lg backdrop-blur">
+      {open && (
+        <div className="anim-rise mt-1.5 w-[300px] rounded-lg border border-surface-hairline2 bg-surface-panel/95 p-3 shadow-2xl backdrop-blur">
           <div className="mb-1.5 flex items-center justify-between">
             <span className="text-[9px] font-bold uppercase tracking-widest text-ink-muted">
               Detail level
             </span>
-            <span className="font-mono text-[10px] text-ink-muted">{activeStep.label}</span>
+            <button onClick={close} aria-label="Close map settings" className="text-ink-muted hover:text-ink-primary">
+              <X size={13} />
+            </button>
           </div>
           <div className="flex gap-1">
             {DETAIL_STEPS.map((s) => (
@@ -180,8 +175,13 @@ export default function MapControls() {
           </div>
           <p className="mb-1.5 mt-1.5 text-[10px] leading-relaxed text-ink-muted">{activeStep.note}</p>
 
-          <div className="mb-1.5 border-t border-surface-hairline pt-2 text-[9px] font-bold uppercase tracking-widest text-ink-muted">
-            Layers
+          <div className="mb-1.5 flex items-center justify-between border-t border-surface-hairline pt-2">
+            <span className="text-[9px] font-bold uppercase tracking-widest text-ink-muted">Layers</span>
+            {changedCount > 0 && (
+              <button onClick={resetLayers} className="font-mono text-[9.5px] text-ink-muted hover:text-ink-primary">
+                ↺ reset
+              </button>
+            )}
           </div>
           <div className="flex flex-wrap gap-1.5">
             {LAYER_CHIPS.map((c) => (
@@ -192,9 +192,21 @@ export default function MapControls() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
 
-      {legendOpen && (
-        <div className="rounded-lg border border-surface-hairline2 bg-surface-panel/95 p-2.5 shadow-lg backdrop-blur">
+function MapLegend() {
+  const { ENTITY, STATUS } = useTokens();
+  const legendItems = buildLegendItems(ENTITY, STATUS);
+  const [open, setOpen] = useState(false);
+  const close = () => setOpen(false);
+  const ref = useDismiss(open, close);
+
+  return (
+    <div ref={ref} className="pointer-events-auto absolute bottom-3 left-3 z-10">
+      {open && (
+        <div className="anim-rise mb-1.5 rounded-lg border border-surface-hairline2 bg-surface-panel/95 p-2.5 shadow-2xl backdrop-blur">
           <div className="mb-1.5 text-[9px] font-bold uppercase tracking-widest text-ink-muted">
             Shape = class · colour = state
           </div>
@@ -208,6 +220,30 @@ export default function MapControls() {
           </ul>
         </div>
       )}
+      <button
+        onClick={() => setOpen((v) => !v)}
+        className="flex items-center gap-2.5 rounded-md border border-surface-hairline2 bg-surface-panel/95 px-2.5 py-1.5 font-mono text-[10px] font-medium text-ink-secondary shadow-lg backdrop-blur transition-colors hover:text-ink-primary"
+      >
+        <span className="flex items-center gap-1">
+          <Swatch color={ENTITY.vehicleClean} shape="ci" /> Vehicle
+        </span>
+        <span className="flex items-center gap-1">
+          <Swatch color={ENTITY.rsu} shape="sq" /> Sensor
+        </span>
+        <span className="flex items-center gap-1">
+          <Swatch color={ENTITY.controller} shape="di" /> Controller
+        </span>
+        <span className="text-ink-muted">━ Position gap</span>
+      </button>
     </div>
+  );
+}
+
+export default function MapControls() {
+  return (
+    <>
+      <MapSettings />
+      <MapLegend />
+    </>
   );
 }
