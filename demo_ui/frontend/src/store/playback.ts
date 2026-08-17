@@ -20,6 +20,11 @@ export interface LayerToggles {
   trails: boolean;
   rubberBands: boolean;
   controllerLinks: boolean;
+  // Purely a rendering filter — hides fleet dots reporting near-zero speed
+  // in the current mobility-trace sample (parked/idling/waiting-to-depart
+  // vehicles). Never touches the underlying trace or any captured result;
+  // off by default so it can't be mistaken for the map's normal behaviour.
+  hideIdle: boolean;
 }
 
 // Level of detail: separate from continuous camera zoom (deck.gl still
@@ -166,6 +171,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     trails: true,
     rubberBands: true,
     controllerLinks: false,
+    hideIdle: false,
   },
   mapDetail: "street",
   setMapDetail: (d) => set({ mapDetail: d }),

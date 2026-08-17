@@ -15,6 +15,7 @@ import { useTokens, hexToRgba, Rgba, ThemeName } from "../design/tokens";
 import { useTheme } from "../store/theme";
 
 const PSI_TH = 0.09; // 08_detection_engine.h — the rule-signature decision line, same constant VehicleDrawer plots against
+const IDLE_SPEED_MPS = 0.3; // "Hide idle vehicles" threshold — well below walking pace, clears sensor/GPS jitter
 
 // Sim coordinates are plain metres on a local origin (not lon/lat), so this is
 // an OrthographicView, not a geo view.
@@ -464,10 +465,16 @@ export default function NetworkMap() {
     // radiusMinPixels matters more than radius here: at the default zoom a
     // 6 m car is ~2 px and reads as dust. The floor keeps every vehicle a
     // legible dot at any zoom, which is the whole point of showing them.
+    //
+    // "Hide idle vehicles" is a presentation filter only — it drops dots
+    // whose CURRENT sampled speed is near zero (parked/idling/waiting to
+    // depart, real mobility-trace behaviour, not a bug). It never touches
+    // positions data or any captured result; off by default.
+    const fleetData = layers.hideIdle ? positions.filter((p: any) => p.speed > IDLE_SPEED_MPS) : positions;
     L.push(
       new ScatterplotLayer({
         id: "fleet",
-        data: positions,
+        data: fleetData,
         getPosition: (d: any) => [d.x, d.y],
         getRadius: 14,
         radiusUnits: "meters",

@@ -77,6 +77,7 @@ const LAYER_DEFAULTS: LayerToggles = {
   trails: true,
   rubberBands: true,
   controllerLinks: false,
+  hideIdle: false,
 };
 
 const LAYER_CHIPS: { k: keyof LayerToggles; label: string }[] = [
@@ -85,6 +86,7 @@ const LAYER_CHIPS: { k: keyof LayerToggles; label: string }[] = [
   { k: "trails", label: "Movement trails" },
   { k: "rubberBands", label: "Claim → truth" },
   { k: "controllerLinks", label: "Controller links" },
+  { k: "hideIdle", label: "Hide idle vehicles" },
 ];
 
 function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
