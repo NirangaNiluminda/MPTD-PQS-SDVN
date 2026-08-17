@@ -1,4 +1,5 @@
 import { ReactNode } from "react";
+import { ArrowRight } from "lucide-react";
 
 /**
  * A landing-view tile: headline stat + one line of context, click to open
@@ -22,14 +23,16 @@ export default function SummaryCard({
   return (
     <button
       onClick={onClick}
-      className="flex flex-col gap-1.5 rounded-lg border border-surface-hairline bg-surface-panel p-4 text-left transition-all hover:-translate-y-0.5 hover:border-surface-hairline2 hover:shadow-lg"
+      className="flex flex-col gap-2 rounded-xl border border-surface-hairline bg-surface-panel p-5 text-left transition-all hover:-translate-y-0.5 hover:border-surface-hairline2 hover:shadow-lg"
     >
-      <span className="text-[10px] font-bold uppercase tracking-widest text-ink-muted">{label}</span>
-      <span className="font-mono text-2xl font-semibold text-ink-primary" style={valueColor ? { color: valueColor } : undefined}>
+      <span className="text-badge uppercase tracking-widest text-ink-muted">{label}</span>
+      <span className="font-mono text-3xl font-semibold text-ink-primary" style={valueColor ? { color: valueColor } : undefined}>
         {value}
       </span>
-      {caption && <span className="text-[11px] leading-relaxed text-ink-secondary">{caption}</span>}
-      <span className="mt-1 text-[10px] font-medium text-entity-rsu">View details →</span>
+      {caption && <span className="text-body leading-relaxed text-ink-secondary">{caption}</span>}
+      <span className="mt-1 inline-flex items-center gap-1 text-badge font-semibold text-entity-rsu">
+        View Details <ArrowRight size={13} strokeWidth={2.5} aria-hidden />
+      </span>
     </button>
   );
 }

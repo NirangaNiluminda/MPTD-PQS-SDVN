@@ -148,6 +148,43 @@ export const PROVENANCE = DARK.PROVENANCE;
 
 export type ProvenanceKind = keyof PaletteTokens["PROVENANCE"];
 
+// Five-role semantic system (safe/compromised/warning/informational/
+// inactive) for the unified StatusPill/icon language — deliberately NOT new
+// hex values. Every role is an alias onto a colour already validated above
+// (STATUS.good/missed/caught, ENTITY.rsu, ENTITY.vehicleClean), computed
+// from those objects rather than re-typed, so the two can never drift apart.
+// A status colour is still never shown without the paired icon + text label
+// — that requirement doesn't go away just because the naming is friendlier.
+export interface SemanticTokens {
+  safe: string;
+  compromised: string;
+  warning: string;
+  informational: string;
+  inactive: string;
+}
+
+function semanticFrom(t: PaletteTokens): SemanticTokens {
+  return {
+    safe: t.STATUS.good,
+    compromised: t.STATUS.missed,
+    warning: t.STATUS.caught,
+    informational: t.ENTITY.rsu,
+    inactive: t.ENTITY.vehicleClean,
+  };
+}
+
+export const SEMANTIC_PALETTE: Record<ThemeName, SemanticTokens> = {
+  dark: semanticFrom(DARK),
+  light: semanticFrom(LIGHT),
+};
+
+export const SEMANTIC = SEMANTIC_PALETTE.dark;
+
+export function useSemanticTokens(): SemanticTokens {
+  const theme = useTheme((s) => s.theme);
+  return SEMANTIC_PALETTE[theme];
+}
+
 // Theme-reactive accessor. Components that colour SVG/canvas output directly
 // (recharts stroke/fill props, deck.gl RGBA arrays) can't be re-themed by
 // CSS alone — they must read this hook instead of the static exports above.

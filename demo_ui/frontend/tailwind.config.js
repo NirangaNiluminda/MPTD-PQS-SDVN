@@ -44,6 +44,18 @@ export default {
         // anything a reader needs to scan/compare, sans for anything they read.
         mono: ['"IBM Plex Mono"', 'ui-monospace', 'Menlo', 'monospace'],
       },
+      // Named scale for the SOC-dashboard redesign (Datadog/Grafana/Linear-
+      // style density: fewer, bigger sizes used consistently, not a dozen
+      // one-off text-[Npx] values). Applies to screens as they're rolled
+      // onto this scale — older un-migrated screens keep their existing
+      // text-xs/text-[Npx] usage until their turn.
+      fontSize: {
+        hero: ["2.5rem", { lineHeight: "1.1", fontWeight: "700" }], // 40px
+        "page-title": ["1.625rem", { lineHeight: "1.25", fontWeight: "600" }], // 26px
+        "section-title": ["1.0625rem", { lineHeight: "1.35", fontWeight: "600" }], // 17px
+        body: ["0.875rem", { lineHeight: "1.6" }], // 14px
+        badge: ["0.75rem", { lineHeight: "1.4", fontWeight: "600" }], // 12px
+      },
     },
   },
   plugins: [],

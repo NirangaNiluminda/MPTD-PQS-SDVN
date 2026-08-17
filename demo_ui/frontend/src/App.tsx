@@ -1,4 +1,16 @@
 import { useEffect, useState } from "react";
+import {
+  BarChart3,
+  Blocks,
+  Radar,
+  ScanSearch,
+  ShieldAlert,
+  ShieldHalf,
+  Sun,
+  Moon,
+  Terminal,
+  LucideIcon,
+} from "lucide-react";
 import { usePlayback } from "./store/playback";
 import { useMode, CopyMode } from "./store/mode";
 import { useTheme } from "./store/theme";
@@ -12,6 +24,15 @@ import ProvenanceChip from "./components/ProvenanceChip";
 import { ProvenanceKind } from "./design/tokens";
 
 type Tab = "attacks" | "replay" | "inspector" | "ledger" | "results" | "console";
+
+const TAB_ICON: Record<Tab, LucideIcon> = {
+  attacks: ShieldAlert,
+  replay: Radar,
+  inspector: ScanSearch,
+  ledger: Blocks,
+  results: BarChart3,
+  console: Terminal,
+};
 
 interface ScreenMeta {
   title: string;
@@ -135,18 +156,21 @@ export default function App() {
 
   return (
     <div className="grid h-screen grid-rows-[auto_1fr] bg-surface-page">
-      <header className="flex items-center gap-3 border-b border-surface-hairline bg-surface-page px-4 py-2.5">
-        <h1 className="text-sm font-semibold tracking-wide text-ink-primary">
-          SENTINEL
-        </h1>
-        <span className="hidden text-xs text-ink-muted lg:inline">
+      <header className="flex items-center gap-4 border-b border-surface-hairline bg-surface-page px-5 py-3.5">
+        <div className="flex items-center gap-2">
+          <ShieldHalf className="text-entity-rsu" size={24} strokeWidth={2.25} aria-hidden />
+          <h1 className="text-lg font-bold tracking-wide text-ink-primary">
+            SENTINEL
+          </h1>
+        </div>
+        <span className="hidden text-body text-ink-muted lg:inline">
           Trajectory-poisoning defence for software-defined vehicle networks
         </span>
 
-        <div className="ml-auto flex items-center gap-0.5 rounded-md border border-surface-hairline2 bg-surface-raised p-0.5">
+        <div className="ml-auto flex items-center gap-1 rounded-lg border border-surface-hairline2 bg-surface-raised p-1">
           <button
             onClick={() => setMode("plain")}
-            className={`rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${
+            className={`rounded-md px-3 py-1.5 text-badge font-medium transition-colors ${
               mode === "plain" ? "bg-entity-rsu text-white" : "text-ink-secondary hover:text-ink-primary"
             }`}
           >
@@ -154,7 +178,7 @@ export default function App() {
           </button>
           <button
             onClick={() => setMode("expert")}
-            className={`rounded px-2.5 py-1 text-[11px] font-medium transition-colors ${
+            className={`rounded-md px-3 py-1.5 text-badge font-medium transition-colors ${
               mode === "expert" ? "bg-entity-rsu text-white" : "text-ink-secondary hover:text-ink-primary"
             }`}
           >
@@ -166,40 +190,45 @@ export default function App() {
           onClick={toggleTheme}
           title={theme === "dark" ? "Switch to light theme" : "Switch to dark theme"}
           aria-label="Toggle light / dark theme"
-          className="flex h-7 w-7 items-center justify-center rounded-md border border-surface-hairline2 bg-surface-raised text-sm text-ink-secondary transition-colors hover:text-ink-primary"
+          className="flex h-9 w-9 items-center justify-center rounded-lg border border-surface-hairline2 bg-surface-raised text-ink-secondary transition-colors hover:text-ink-primary"
         >
-          {theme === "dark" ? "☀" : "☾"}
+          {theme === "dark" ? <Sun size={17} strokeWidth={2} /> : <Moon size={17} strokeWidth={2} />}
         </button>
       </header>
 
-      <div className="grid min-h-0 grid-cols-[14rem_1fr]">
-        <nav className="flex min-w-0 flex-col gap-4 overflow-y-auto border-r border-surface-hairline bg-surface-panel px-2.5 py-3">
+      <div className="grid min-h-0 grid-cols-[15rem_1fr]">
+        <nav className="flex min-w-0 flex-col gap-6 overflow-y-auto border-r border-surface-hairline bg-surface-panel px-3 py-4">
           {NAV_GROUPS.map((group) => (
-            <div key={group.title} className="flex flex-col gap-0.5">
-              <div className="px-2 pb-1 text-[9px] font-bold uppercase tracking-widest text-ink-muted">
+            <div key={group.title} className="flex flex-col gap-1">
+              <div className="px-2.5 pb-1.5 text-badge uppercase tracking-widest text-ink-muted">
                 {group.title}
               </div>
-              {group.tabs.map((t) => (
-                <button
-                  key={t}
-                  onClick={() => setTab(t)}
-                  className={`rounded px-2.5 py-1.5 text-left text-xs font-medium transition-colors ${
-                    tab === t
-                      ? "border border-surface-hairline2 bg-surface-raised text-ink-primary"
-                      : "border border-transparent text-ink-secondary hover:bg-surface-raised hover:text-ink-primary"
-                  }`}
-                >
-                  {TAB_LABEL[t]}
-                </button>
-              ))}
+              {group.tabs.map((t) => {
+                const Icon = TAB_ICON[t];
+                const active = tab === t;
+                return (
+                  <button
+                    key={t}
+                    onClick={() => setTab(t)}
+                    className={`flex items-center gap-2.5 rounded-md border-l-[3px] py-2.5 pl-2.5 pr-2.5 text-left text-body font-medium transition-colors ${
+                      active
+                        ? "border-entity-rsu bg-surface-raised text-ink-primary"
+                        : "border-transparent text-ink-secondary hover:bg-surface-raised/60 hover:text-ink-primary"
+                    }`}
+                  >
+                    <Icon size={20} strokeWidth={active ? 2.25 : 1.75} className="shrink-0" aria-hidden />
+                    {TAB_LABEL[t]}
+                  </button>
+                );
+              })}
             </div>
           ))}
 
-          <div className="mt-auto flex flex-col gap-1.5 border-t border-surface-hairline pt-3">
-            <div className="px-2 text-[9px] font-bold uppercase tracking-widest text-ink-muted">
+          <div className="mt-auto flex flex-col gap-2 border-t border-surface-hairline pt-4">
+            <div className="px-2.5 text-badge uppercase tracking-widest text-ink-muted">
               Data state key
             </div>
-            <div className="flex flex-col gap-1 px-2">
+            <div className="flex flex-col gap-1.5 px-2.5">
               <ProvenanceChip kind="live" compact />
               <ProvenanceChip kind="replayed" compact />
               <ProvenanceChip kind="snapshot" compact />
@@ -208,14 +237,14 @@ export default function App() {
         </nav>
 
         <main className="grid min-h-0 min-w-0 grid-rows-[auto_1fr]">
-          <div className="flex items-start justify-between gap-4 border-b border-surface-hairline bg-surface-panel px-4 py-2.5">
+          <div className="flex items-start justify-between gap-4 border-b border-surface-hairline bg-surface-panel px-5 py-3.5">
             <div className="min-w-0">
-              <h2 className="text-base font-semibold text-ink-primary">{meta.title}</h2>
-              <p className="mt-0.5 max-w-[70ch] text-[11px] leading-relaxed text-ink-secondary">
+              <h2 className="text-page-title text-ink-primary">{meta.title}</h2>
+              <p className="mt-1 max-w-[70ch] text-body leading-relaxed text-ink-secondary">
                 {meta.blurb[mode]}
               </p>
             </div>
-            <div className="shrink-0 pt-0.5">
+            <div className="shrink-0 pt-1">
               <ProvenanceChip kind={meta.provenance} />
             </div>
           </div>

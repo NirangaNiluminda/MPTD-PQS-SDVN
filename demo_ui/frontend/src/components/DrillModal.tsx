@@ -58,7 +58,7 @@ export default function DrillModal({
             <div className="sticky top-0 z-10 flex items-start gap-3 border-b border-surface-hairline bg-surface-panel p-5">
               <div className="min-w-0 flex-1">
                 <div className="flex flex-wrap items-center gap-2.5">
-                  <h2 className="text-base font-semibold text-ink-primary">{title}</h2>
+                  <h2 className="text-section-title text-ink-primary">{title}</h2>
                   {badge}
                 </div>
                 {subtitle && (

@@ -11,6 +11,8 @@ import { useTokens } from "../design/tokens";
 import Accordion from "../components/Accordion";
 import SummaryCard from "../components/SummaryCard";
 import DrillModal, { originFromEvent } from "../components/DrillModal";
+import StatusPill, { SemanticStatus } from "../components/StatusPill";
+import StatusLegend from "../components/StatusLegend";
 
 function fmtTime(iso: string): string {
   const d = new Date(iso);
@@ -21,24 +23,25 @@ function KpiCard({
   label,
   value,
   sub,
-  tone = "neutral",
+  status,
 }: {
   label: string;
   value: string | number;
   sub?: string;
-  tone?: "neutral" | "missed" | "caught";
+  status?: SemanticStatus;
 }) {
-  const toneClass =
-    tone === "missed"
-      ? "text-status-missed"
-      : tone === "caught"
-      ? "text-status-caught"
-      : "text-ink-primary";
   return (
-    <div className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
-      <div className="text-[10px] uppercase tracking-wider text-ink-muted">{label}</div>
-      <div className={`mt-1 text-2xl font-semibold ${toneClass}`}>{value}</div>
-      {sub && <div className="mt-0.5 text-[11px] text-ink-secondary">{sub}</div>}
+    <div className="flex flex-col gap-2 rounded-xl border border-surface-hairline bg-surface-raised p-5">
+      <div className="text-badge uppercase tracking-wider text-ink-muted">{label}</div>
+      <div className="text-hero text-ink-primary">{value}</div>
+      {sub && <div className="text-body text-ink-secondary">{sub}</div>}
+      {status && (
+        <div>
+          <StatusPill status={status} compact>
+            {status === "compromised" ? "Action taken" : status === "warning" ? "Under watch" : "Clean"}
+          </StatusPill>
+        </div>
+      )}
     </div>
   );
 }
@@ -120,48 +123,51 @@ export default function LedgerScreen() {
   const demotedRsu = rsuTrust.filter((r) => r.State !== "TRUSTED");
 
   return (
-    <div className="h-full overflow-y-auto p-5">
-      <div className="mx-auto max-w-5xl space-y-5">
-        <header>
-          <h1 className="text-lg font-semibold text-ink-primary">
-            Blockchain ledger
-          </h1>
-          <p className="text-xs text-ink-secondary">
-            A point-in-time snapshot of the Hyperledger Fabric ledger
-            {summary && (
-              <> — captured {new Date(summary.captured_at).toLocaleString()}</>
-            )}
-            . Not live: re-run{" "}
-            <code className="text-ink-primary">snapshot_ledger.py</code> to
-            refresh, so the demo never depends on Fabric being reachable at
-            presentation time.
-          </p>
+    <div className="h-full overflow-y-auto p-6">
+      <div className="mx-auto max-w-5xl space-y-6">
+        <header className="flex flex-wrap items-start justify-between gap-3">
+          <div>
+            <h1 className="text-page-title text-ink-primary">
+              Blockchain ledger
+            </h1>
+            <p className="mt-1 text-body text-ink-secondary">
+              A point-in-time snapshot of the Hyperledger Fabric ledger
+              {summary && (
+                <> — captured {new Date(summary.captured_at).toLocaleString()}</>
+              )}
+              . Not live: re-run{" "}
+              <code className="text-ink-primary">snapshot_ledger.py</code> to
+              refresh, so the demo never depends on Fabric being reachable at
+              presentation time.
+            </p>
+          </div>
+          <StatusLegend only={["safe", "warning", "compromised"]} />
         </header>
 
         {summary && (
-          <div className="grid grid-cols-2 gap-3 sm:grid-cols-4">
+          <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">
             <KpiCard
               label="RSUs demoted"
               value={summary.rsus.demoted}
               sub={`of ${summary.rsus.total}`}
-              tone={summary.rsus.demoted > 0 ? "missed" : "neutral"}
+              status={summary.rsus.demoted > 0 ? "compromised" : "safe"}
             />
             <KpiCard
               label="Vehicles trust-decayed"
               value={summary.vehicles.decayed}
               sub={`of ${summary.vehicles.total}`}
-              tone={summary.vehicles.decayed > 0 ? "missed" : "neutral"}
+              status={summary.vehicles.decayed > 0 ? "compromised" : "safe"}
             />
             <KpiCard
               label="Revocation votes"
               value={summary.revocations}
-              tone={summary.revocations > 0 ? "caught" : "neutral"}
+              status={summary.revocations > 0 ? "warning" : "safe"}
             />
             <KpiCard
               label="Controller reassignments"
               value={summary.reassignments}
               sub={`${summary.controller_flags} flags raised`}
-              tone={summary.reassignments > 0 ? "caught" : "neutral"}
+              status={summary.reassignments > 0 ? "warning" : "safe"}
             />
           </div>
         )}
@@ -221,9 +227,7 @@ export default function LedgerScreen() {
                 header={
                   <div className="flex flex-1 items-center gap-3 text-xs">
                     <span className="w-20 font-mono text-ink-primary">{r.RSUID}</span>
-                    <span className="rounded bg-status-missed/20 px-1.5 py-0.5 text-[10px] font-medium text-status-missed">
-                      {r.State}
-                    </span>
+                    <StatusPill status="compromised" compact>{r.State}</StatusPill>
                     <TrustBar score={r.TrustScore} />
                     <span className="font-mono text-ink-secondary">{r.TrustScore.toFixed(4)}</span>
                     <span className="ml-auto text-ink-muted">
@@ -264,9 +268,7 @@ export default function LedgerScreen() {
                     <div className="flex flex-1 items-center gap-3 text-xs">
                       <span className="w-20 font-mono text-ink-primary">{v.VehicleID}</span>
                       {v.Probationary && (
-                        <span className="rounded bg-status-caught/20 px-1.5 py-0.5 text-[10px] font-medium text-status-caught">
-                          PROBATION
-                        </span>
+                        <StatusPill status="warning" compact>PROBATION</StatusPill>
                       )}
                       <TrustBar score={v.TrustScore} />
                       <span className="font-mono text-ink-secondary">{v.TrustScore.toFixed(3)}</span>
@@ -338,6 +340,7 @@ export default function LedgerScreen() {
                 header={
                   <div className="flex flex-1 items-center gap-3 text-xs">
                     <span className="w-16 font-mono text-ink-primary">{f.ControllerID}</span>
+                    <StatusPill status="warning" compact>flagged</StatusPill>
                     <span className="text-ink-secondary">re: {f.VehicleID}</span>
                     <span className="rounded bg-surface-raised px-1.5 py-0.5 text-[10px] text-ink-muted">
                       {f.Epoch}
@@ -375,9 +378,9 @@ export default function LedgerScreen() {
                 bodyMaxHeight={100}
                 header={
                   <div className="flex flex-1 items-center gap-3 text-xs">
-                    <span className="font-mono text-status-missed">{r.ExcludedController}</span>
+                    <StatusPill status="compromised" compact>{r.ExcludedController}</StatusPill>
                     <span className="text-ink-muted">excluded →</span>
-                    <span className="font-mono text-status-good">{r.SuccessorController}</span>
+                    <StatusPill status="safe" compact>{r.SuccessorController}</StatusPill>
                     <span className="rounded bg-surface-raised px-1.5 py-0.5 text-[10px] text-ink-muted">
                       {r.Epoch}
                     </span>
