@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ChevronDown, ChevronLeft, ChevronRight, Radar, X } from "lucide-react";
+import { ChevronDown, ChevronLeft, ChevronRight, Radar, TriangleAlert, X } from "lucide-react";
 import { api, AttackEvidenceDto, AttackInfoDto } from "../api";
 import { useSemanticTokens, useTokens } from "../design/tokens";
 import { useMode } from "../store/mode";
@@ -138,8 +138,11 @@ function MetricCard({
   // line to draw here the way there is per-event elsewhere in the app. The
   // banding communicates "how strongly this layer engaged on average", not
   // a pass/fail crossing.
-  const tone: SemanticStatus = value == null ? "inactive" : value > 0.6 ? "compromised" : value > 0.3 ? "warning" : "safe";
-  const toneLabel = value == null ? "No data" : tone === "compromised" ? "Strong signal" : tone === "warning" ? "Moderate signal" : "Weak signal";
+  // "compromised" (red) is reserved app-wide for failure/negative outcomes —
+  // a strong signal here is a good thing (the layer engaged), so it reads as
+  // "informational" (blue) rather than red.
+  const tone: SemanticStatus = value == null ? "inactive" : value > 0.6 ? "informational" : value > 0.3 ? "warning" : "safe";
+  const toneLabel = value == null ? "No data" : tone === "informational" ? "Strong signal" : tone === "warning" ? "Moderate signal" : "Weak signal";
   return (
     <div className="flex flex-col items-center gap-2.5 rounded-lg border border-surface-hairline bg-surface-page p-4 text-center">
       <span className="text-badge font-semibold uppercase tracking-wide text-ink-muted">{label}</span>
@@ -188,10 +191,13 @@ function EvidenceBody({ evidence }: { evidence: AttackEvidenceDto | null | undef
             Most-tripped rule signatures
           </p>
           <div className="grid grid-cols-1 gap-2.5 sm:grid-cols-2">
-            {evidence.top_signatures.map((s) => (
+            {evidence.top_signatures.map((s, i) => {
+              const spanFull =
+                i === evidence.top_signatures!.length - 1 && evidence.top_signatures!.length % 2 === 1;
+              return (
               <div
                 key={s.code}
-                className="flex flex-col gap-1.5 rounded-lg border border-surface-hairline bg-surface-page p-3"
+                className={`flex flex-col gap-1.5 rounded-lg border border-surface-hairline bg-surface-page p-3 ${spanFull ? "sm:col-span-2" : ""}`}
               >
                 <div className="flex items-start justify-between gap-2">
                   <span className="text-body font-semibold leading-tight text-ink-primary">{s.name}</span>
@@ -206,7 +212,8 @@ function EvidenceBody({ evidence }: { evidence: AttackEvidenceDto | null | undef
                   {s.detail} Fired in {(s.pct * 100).toFixed(0)}% of this attack's real events.
                 </p>
               </div>
-            ))}
+              );
+            })}
           </div>
         </div>
       )}
@@ -247,7 +254,7 @@ function TechnicalDataBody({ attack, evidence }: { attack: AttackInfoDto; eviden
         <ul className="flex flex-col gap-2">
           {rows.map((r, i) => (
             <li key={i} className="flex items-start gap-2 text-body leading-relaxed text-ink-secondary">
-              <span className="mt-0.5 shrink-0 text-ink-muted">{r.glyph}</span>
+              <span className={`mt-0.5 shrink-0 font-semibold ${r.glyph === "⚠" ? "text-status-caught" : "text-ink-secondary"}`}>{r.glyph}</span>
               <span>{r.text}</span>
             </li>
           ))}
@@ -479,20 +486,23 @@ export default function AttackExplainerScreen({
                     </div>
                   </div>
 
-                  <Accordion
-                    open={technicalOpen}
-                    onToggle={() => setTechnicalOpen((v) => !v)}
-                    bodyMaxHeight={480}
-                    header={
-                      <span className="text-body font-semibold text-ink-primary">
-                        Caveats &amp; Technical Data
-                      </span>
-                    }
-                  >
-                    <div className="border-t border-surface-hairline p-3.5">
-                      <TechnicalDataBody attack={openAttack} evidence={openEvidence} />
-                    </div>
-                  </Accordion>
+                  <div className="overflow-hidden rounded-lg border-l-4 border-status-caught shadow-md">
+                    <Accordion
+                      open={technicalOpen}
+                      onToggle={() => setTechnicalOpen((v) => !v)}
+                      bodyMaxHeight={480}
+                      header={
+                        <span className="flex items-center gap-2 text-body font-semibold text-ink-primary">
+                          <TriangleAlert size={16} className="shrink-0 text-status-caught" aria-hidden />
+                          Caveats &amp; Technical Data
+                        </span>
+                      }
+                    >
+                      <div className="border-t border-surface-hairline p-3.5">
+                        <TechnicalDataBody attack={openAttack} evidence={openEvidence} />
+                      </div>
+                    </Accordion>
+                  </div>
 
                   <div className="flex items-center justify-between border-t border-surface-hairline pt-3.5">
                     <button
