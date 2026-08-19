@@ -302,7 +302,36 @@ export default function NetworkMap() {
     gatAttention,
   } = usePlayback();
 
-  const smoothedPositions = useSmoothedPositions(positions, playing);
+  // The mobility trace (200 vehicles) and RSU grid (64 positions) are the
+  // full network topology, drawn for spatial context regardless of whether
+  // a given recording ever used them. Verified against this corpus: most
+  // scenarios only ever route real traffic through a fraction of that
+  // topology (e.g. 25 vehicles / 15 RSUs for two checked urban scenarios) —
+  // shown at face value, that reads as full-network activity when most of
+  // it never sent or received a beacon. "Active participants only" filters
+  // both down to whichever positions this scenario's beacon_log.csv
+  // actually names at least once (topology's active_vehicle_ids/
+  // active_rsu_ids) — a presentation filter, same discipline as "hide idle
+  // vehicles": never touches the underlying trace or any captured result.
+  const activeVehicleIds = useMemo(
+    () => (topology ? new Set(topology.active_vehicle_ids) : null),
+    [topology]
+  );
+  const activeRsuIds = useMemo(
+    () => (topology ? new Set(topology.active_rsu_ids) : null),
+    [topology]
+  );
+  const filteredPositions = useMemo(() => {
+    if (!layers.activeOnly || !activeVehicleIds) return positions;
+    return positions.filter((p) => activeVehicleIds.has(p.vehicle_id));
+  }, [positions, layers.activeOnly, activeVehicleIds]);
+  const filteredRsus = useMemo(() => {
+    if (!geometry) return [];
+    if (!layers.activeOnly || !activeRsuIds) return geometry.rsus;
+    return geometry.rsus.filter((r) => activeRsuIds.has(r.rsu_id));
+  }, [geometry, layers.activeOnly, activeRsuIds]);
+
+  const smoothedPositions = useSmoothedPositions(filteredPositions, playing);
 
   const [glOk] = useState(webglAvailable);
   const [glError, setGlError] = useState<string | null>(null);
@@ -393,7 +422,7 @@ export default function NetworkMap() {
     // even one missed poisoning renders as missed, so this can't visually
     // launder a real detection failure into "looks clean from far away."
     if (mapDetail === "region") {
-      const cells = buildRegionCells(geometry.bounds, positions, beacons);
+      const cells = buildRegionCells(geometry.bounds, filteredPositions, beacons);
       L.push(
         new ScatterplotLayer({
           id: "region-cells",
@@ -514,7 +543,7 @@ export default function NetworkMap() {
       L.push(
         new ScatterplotLayer({
           id: "rsu-coverage",
-          data: geometry.rsus,
+          data: filteredRsus,
           getPosition: (d: any) => [d.x, d.y],
           getRadius: geometry.r_max_comm,
           radiusUnits: "meters",
@@ -530,7 +559,7 @@ export default function NetworkMap() {
       const links: any[] = [];
       for (const c of topology.controllers) {
         for (const rid of c.rsu_ids) {
-          const r = geometry.rsus.find((x) => x.rsu_id === rid);
+          const r = filteredRsus.find((x) => x.rsu_id === rid);
           if (r) links.push({ from: [c.x, c.y], to: [r.x, r.y], hostile: c.hostile });
         }
       }
@@ -569,7 +598,7 @@ export default function NetworkMap() {
     L.push(
       new IconLayer({
         id: "rsus",
-        data: geometry.rsus,
+        data: filteredRsus,
         getPosition: (d: any) => [d.x, d.y],
         getIcon: () => SQUARE_ICON,
         getSize: 15,
@@ -912,6 +941,8 @@ export default function NetworkMap() {
   }, [
     geometry,
     positions,
+    filteredPositions,
+    filteredRsus,
     smoothedPositions,
     beacons,
     trails,

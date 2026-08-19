@@ -340,6 +340,12 @@ def scenario_topology(scenario_id: str):
             r.rsu_id: topology.controller_for_rsu(r.rsu_id, len(rsus), topology.DEFAULT_N_CONTROLLERS)
             for r in rsus
         },
+        # The mobility trace and RSU grid are the full TOPOLOGY (used for map
+        # geometry/coverage regardless of scenario); these are which of those
+        # positions actually produced/received a beacon anywhere in this
+        # scenario's whole recording — real vs merely-present-on-the-map.
+        "active_vehicle_ids": sorted({b.vehicle_id for b in beacons}),
+        "active_rsu_ids": sorted({b.rsu_id for b in beacons}),
     }
 
 

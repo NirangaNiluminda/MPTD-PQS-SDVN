@@ -149,6 +149,12 @@ export interface TopologyDto {
   mitm_relays: number[];
   hostile_controllers: number[];
   rsu_controller_map: Record<string, number>;
+  /** Which mobility-trace vehicles / RSU-grid positions actually produced or
+   * received a beacon anywhere in this scenario's recording — real
+   * participants, distinct from every position drawn on the map for
+   * topology context. */
+  active_vehicle_ids: number[];
+  active_rsu_ids: number[];
 }
 
 export interface TrailDto {

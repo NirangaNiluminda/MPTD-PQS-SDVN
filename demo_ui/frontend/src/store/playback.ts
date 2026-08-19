@@ -30,6 +30,14 @@ export interface LayerToggles {
   // a vehicle is stopped (red phase) rather than leaving it unexplained.
   // Off by default: supplementary detail, not core to the default map read.
   trafficSignals: boolean;
+  // The mobility trace (200 vehicles) and RSU grid (64 positions) are the
+  // full network TOPOLOGY, drawn for spatial context regardless of whether
+  // a given recording ever used them — most captures only actually route
+  // traffic through a subset (verified: 25 vehicles / 15 RSUs for this
+  // corpus's scenarios). Left on, that reads as full-network activity when
+  // most of what's drawn never sent or received a real beacon. On by
+  // default per that finding — toggle off to see the full raw topology.
+  activeOnly: boolean;
 }
 
 // Level of detail: separate from continuous camera zoom (deck.gl still
@@ -227,6 +235,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     controllerLinks: false,
     hideIdle: true,
     trafficSignals: false,
+    activeOnly: true,
   },
   mapDetail: "district",
   setMapDetail: (d) => set({ mapDetail: d }),

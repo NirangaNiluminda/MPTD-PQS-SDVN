@@ -86,6 +86,7 @@ const LAYER_DEFAULTS: LayerToggles = {
   controllerLinks: false,
   hideIdle: true,
   trafficSignals: false,
+  activeOnly: true,
 };
 
 const LAYER_CHIPS: { k: keyof LayerToggles; label: string }[] = [
@@ -96,6 +97,7 @@ const LAYER_CHIPS: { k: keyof LayerToggles; label: string }[] = [
   { k: "controllerLinks", label: "Controller links" },
   { k: "hideIdle", label: "Hide idle vehicles" },
   { k: "trafficSignals", label: "Traffic signals" },
+  { k: "activeOnly", label: "Active participants only" },
 ];
 
 function Chip({ active, onClick, children }: { active: boolean; onClick: () => void; children: React.ReactNode }) {
