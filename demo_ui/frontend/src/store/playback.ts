@@ -228,7 +228,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     hideIdle: true,
     trafficSignals: false,
   },
-  mapDetail: "street",
+  mapDetail: "district",
   setMapDetail: (d) => set({ mapDetail: d }),
   loading: false,
   error: null,

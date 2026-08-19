@@ -745,14 +745,17 @@ export default function NetworkMap() {
     // Active beacons, coloured by ground truth vs detection outcome. These sit
     // above the fleet dots and must stay clearly larger than them. Hidden
     // below street level: per-vehicle state IS the individual identity that
-    // district is meant to withhold.
+    // district is meant to withhold. Fixed radius for every outcome —
+    // colour alone carries honest/caught/missed; a bigger dot for poisoned
+    // vehicles read as a second, redundant severity signal competing with
+    // colour instead of reinforcing it.
     if (showIndividual) {
       L.push(
         new ScatterplotLayer({
           id: "beacons",
           data: beacons,
           getPosition: (d: BeaconDto) => [d.pos.x, d.pos.y],
-          getRadius: (d: BeaconDto) => (d.is_poisoned ? 26 : 18),
+          getRadius: 20,
           radiusUnits: "meters",
           radiusMinPixels: 6,
           radiusMaxPixels: 16,
