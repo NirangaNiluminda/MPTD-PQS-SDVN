@@ -84,7 +84,7 @@ const LAYER_DEFAULTS: LayerToggles = {
   trails: true,
   rubberBands: true,
   controllerLinks: false,
-  hideIdle: false,
+  hideIdle: true,
   trafficSignals: false,
 };
 

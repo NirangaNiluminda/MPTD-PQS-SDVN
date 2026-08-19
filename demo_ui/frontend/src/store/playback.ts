@@ -225,7 +225,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     trails: true,
     rubberBands: true,
     controllerLinks: false,
-    hideIdle: false,
+    hideIdle: true,
     trafficSignals: false,
   },
   mapDetail: "street",
