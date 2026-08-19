@@ -110,6 +110,41 @@ interface PlaybackState {
 // Monotonic token so a slow in-flight seek can never overwrite a newer one.
 let seekToken = 0;
 
+// Caps how often wall-clock playback actually hits the network (see tick()'s
+// own comment for why). 120ms = ~8 fetches/sec — well above what a human eye
+// needs once NetworkMap is smoothing the gaps between updates client-side.
+const SEEK_THROTTLE_MS = 120;
+let lastSeekDispatch = 0;
+
+async function fetchFrame(
+  set: (partial: Partial<PlaybackState>) => void,
+  get: () => PlaybackState,
+  clamped: number
+) {
+  const { scenarioId, road, layers } = get();
+  if (!scenarioId || !road) return;
+  const token = ++seekToken;
+  try {
+    const [frame, pos, stats, trails] = await Promise.all([
+      api.frame(scenarioId, clamped, 0.15),
+      api.positions(road, clamped),
+      api.stats(scenarioId, clamped),
+      layers.trails
+        ? api.trails(scenarioId, clamped, 6)
+        : Promise.resolve({ t: clamped, lookback: 0, trails: [] as TrailDto[] }),
+    ]);
+    if (token !== seekToken) return; // a newer fetch already landed
+    set({
+      beacons: frame.beacons,
+      positions: pos.positions,
+      stats,
+      trails: trails.trails,
+    });
+  } catch (e) {
+    if (token === seekToken) set({ error: (e as Error).message });
+  }
+}
+
 export const usePlayback = create<PlaybackState>((set, get) => ({
   scenarios: [],
   scenarioId: null,
@@ -249,46 +284,46 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   },
 
   seek: async (t: number) => {
-    const { scenarioId, road, tMin, tMax, layers } = get();
+    const { scenarioId, road, tMin, tMax } = get();
     if (!scenarioId || !road) return;
     const clamped = Math.min(Math.max(t, tMin), tMax);
-    const token = ++seekToken;
     set({ t: clamped });
-    try {
-      const [frame, pos, stats, trails] = await Promise.all([
-        api.frame(scenarioId, clamped, 0.15),
-        api.positions(road, clamped),
-        api.stats(scenarioId, clamped),
-        layers.trails
-          ? api.trails(scenarioId, clamped, 6)
-          : Promise.resolve({ t: clamped, lookback: 0, trails: [] as TrailDto[] }),
-      ]);
-      if (token !== seekToken) return; // a newer seek already landed
-      set({
-        beacons: frame.beacons,
-        positions: pos.positions,
-        stats,
-        trails: trails.trails,
-      });
-    } catch (e) {
-      if (token === seekToken) set({ error: (e as Error).message });
-    }
+    await fetchFrame(set, get, clamped);
   },
 
   play: () => set({ playing: true }),
   pause: () => set({ playing: false }),
   setSpeed: (s: number) => set({ speed: s }),
 
+  // Wall-clock playback used to call seek() — which fetches a fresh frame
+  // over the network — on EVERY requestAnimationFrame, i.e. up to ~60
+  // times/sec, each firing 4 parallel HTTP requests. That flooded the
+  // browser's per-origin connection limit and the backend, so responses
+  // queued up and arrived in bursts: the clock (t) advanced smoothly but
+  // the map only visibly updated when a request finally won the race —
+  // exactly the "smooth number, laggy/popping map" symptom this was built
+  // to fix. The clock still advances every frame (cheap, local); the
+  // actual network fetch is capped to SEEK_THROTTLE_MS regardless of frame
+  // rate. NetworkMap smooths the resulting lower-frequency position
+  // updates into continuous motion client-side (see displayedPos there),
+  // so ~8 fetches/sec still reads as fluid movement on screen.
   tick: async (dtRealSeconds: number) => {
-    const { playing, t, tMax, speed, seek, pause } = get();
+    const { playing, t, tMin, tMax, speed, pause } = get();
     if (!playing) return;
     const next = t + dtRealSeconds * speed;
     if (next >= tMax) {
       pause();
-      await seek(tMax);
+      set({ t: tMax });
+      await fetchFrame(set, get, tMax);
       return;
     }
-    await seek(next);
+    const clamped = Math.min(Math.max(next, tMin), tMax);
+    set({ t: clamped });
+    const now = performance.now();
+    if (now - lastSeekDispatch >= SEEK_THROTTLE_MS) {
+      lastSeekDispatch = now;
+      await fetchFrame(set, get, clamped);
+    }
   },
 
   selectVehicle: async (vid: number | null) => {

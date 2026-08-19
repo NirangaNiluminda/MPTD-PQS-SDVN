@@ -10,7 +10,7 @@ import {
   TextLayer,
 } from "@deck.gl/layers";
 import { usePlayback } from "../store/playback";
-import { BeaconDto } from "../api";
+import { BeaconDto, VehiclePositionDto } from "../api";
 import { useTokens, hexToRgba, Rgba, ThemeName } from "../design/tokens";
 import { useTheme } from "../store/theme";
 
@@ -235,6 +235,52 @@ function webglAvailable(): boolean {
   }
 }
 
+/**
+ * Wall-clock playback throttles network fetches to ~8/sec (store's tick())
+ * instead of one per animation frame — necessary to stop flooding the
+ * connection pool, but on its own that would make the fleet visibly step
+ * between snapshots. This closes the gap back up: every rAF frame, each
+ * vehicle's DISPLAYED position eases a fraction of the way toward its
+ * latest FETCHED position, so motion reads as continuous even though new
+ * data only arrives ~8 times a second. Paused/scrubbed views skip the
+ * animation loop and snap straight to the fetched value — there is nothing
+ * to glide between when playback isn't running.
+ */
+function useSmoothedPositions(positions: VehiclePositionDto[], active: boolean): VehiclePositionDto[] {
+  const [display, setDisplay] = useState(positions);
+  const current = useRef<Map<number, { x: number; y: number }>>(new Map());
+
+  useEffect(() => {
+    if (!active) {
+      current.current = new Map(positions.map((p) => [p.vehicle_id, { x: p.x, y: p.y }]));
+      setDisplay(positions);
+      return;
+    }
+    let raf = 0;
+    const SMOOTH = 0.22; // fraction of the remaining gap closed per frame
+    const step = () => {
+      const next: VehiclePositionDto[] = [];
+      for (const p of positions) {
+        let c = current.current.get(p.vehicle_id);
+        if (!c) {
+          c = { x: p.x, y: p.y };
+          current.current.set(p.vehicle_id, c);
+        } else {
+          c.x += (p.x - c.x) * SMOOTH;
+          c.y += (p.y - c.y) * SMOOTH;
+        }
+        next.push({ ...p, x: c.x, y: c.y });
+      }
+      setDisplay(next);
+      raf = requestAnimationFrame(step);
+    };
+    raf = requestAnimationFrame(step);
+    return () => cancelAnimationFrame(raf);
+  }, [positions, active]);
+
+  return active ? display : positions;
+}
+
 export default function NetworkMap() {
   const {
     geometry,
@@ -246,6 +292,7 @@ export default function NetworkMap() {
     roadmap,
     signals,
     t,
+    playing,
     mapDetail,
     selectedVehicle,
     selectVehicle,
@@ -254,6 +301,8 @@ export default function NetworkMap() {
     lstmReconstruction,
     gatAttention,
   } = usePlayback();
+
+  const smoothedPositions = useSmoothedPositions(positions, playing);
 
   const [glOk] = useState(webglAvailable);
   const [glError, setGlError] = useState<string | null>(null);
@@ -292,10 +341,12 @@ export default function NetworkMap() {
     (vid: number): [number, number] | null => {
       const b = beacons.find((x) => x.vehicle_id === vid);
       if (b) return [b.pos.x, b.pos.y];
-      const p = positions.find((x) => x.vehicle_id === vid);
+      // Smoothed, not raw: keeps the selection ring glued to where the dot
+      // is actually drawn mid-glide, rather than jumping ahead of it.
+      const p = smoothedPositions.find((x) => x.vehicle_id === vid);
       return p ? [p.x, p.y] : null;
     },
-    [beacons, positions]
+    [beacons, smoothedPositions]
   );
 
   const showIndividual = mapDetail === "street" || mapDetail === "entity";
@@ -539,7 +590,9 @@ export default function NetworkMap() {
     // whose CURRENT sampled speed is near zero (parked/idling/waiting to
     // depart, real mobility-trace behaviour, not a bug). It never touches
     // positions data or any captured result; off by default.
-    const fleetData = layers.hideIdle ? positions.filter((p: any) => p.speed > IDLE_SPEED_MPS) : positions;
+    const fleetData = layers.hideIdle
+      ? smoothedPositions.filter((p: any) => p.speed > IDLE_SPEED_MPS)
+      : smoothedPositions;
     L.push(
       new ScatterplotLayer({
         id: "fleet",
@@ -856,6 +909,7 @@ export default function NetworkMap() {
   }, [
     geometry,
     positions,
+    smoothedPositions,
     beacons,
     trails,
     topology,
