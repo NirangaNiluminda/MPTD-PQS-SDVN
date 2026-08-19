@@ -111,10 +111,18 @@ interface PlaybackState {
 let seekToken = 0;
 
 // Caps how often wall-clock playback actually hits the network (see tick()'s
-// own comment for why). 120ms = ~8 fetches/sec — well above what a human eye
-// needs once NetworkMap is smoothing the gaps between updates client-side.
+// own comment for why). 120ms = ~8 fetches/sec on a fast (e.g. localhost)
+// connection — well above what a human eye needs once NetworkMap is
+// smoothing the gaps between updates client-side. This is a ceiling, not a
+// guarantee: seekInFlight (below) is what actually keeps it safe once
+// round-trip time exceeds this interval, e.g. over a tunnel/VPN where a
+// single request can take 500ms+ — without it, a new fetch would still be
+// dispatched every 120ms regardless of whether earlier ones had returned,
+// reproducing the exact request pile-up this was built to fix, just paced
+// by latency instead of raw frequency.
 const SEEK_THROTTLE_MS = 120;
 let lastSeekDispatch = 0;
+let seekInFlight = false;
 
 async function fetchFrame(
   set: (partial: Partial<PlaybackState>) => void,
@@ -320,9 +328,14 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
     const clamped = Math.min(Math.max(next, tMin), tMax);
     set({ t: clamped });
     const now = performance.now();
-    if (now - lastSeekDispatch >= SEEK_THROTTLE_MS) {
+    if (!seekInFlight && now - lastSeekDispatch >= SEEK_THROTTLE_MS) {
       lastSeekDispatch = now;
-      await fetchFrame(set, get, clamped);
+      seekInFlight = true;
+      try {
+        await fetchFrame(set, get, clamped);
+      } finally {
+        seekInFlight = false;
+      }
     }
   },
 
