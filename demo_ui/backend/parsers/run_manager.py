@@ -27,6 +27,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import config
+from parsers import fusion
 
 SIM_SLOWDOWN_FACTOR = 40.5  # wall-seconds per sim-second, measured
 SEC_PER_REGISTRATION = 2.7  # wall-seconds per SC-Register call, measured
@@ -126,6 +127,7 @@ def launch_run(rc: RunConfig, force: bool = False) -> RunRecord:
         raise ValueError(f"deployed model verification failed: {model_check}")
 
     run_id = f"{int(time.time())}_{uuid.uuid4().hex[:6]}"
+    reset_live_metrics(run_id)
     config.RUN_LOGS_DIR.mkdir(parents=True, exist_ok=True)
     log_path = config.RUN_LOGS_DIR / f"{run_id}.log"
 
@@ -244,7 +246,17 @@ def stop_run(run_id: str) -> bool:
 
 # ── Progress parsing ─────────────────────────────────────────────────────
 
-_SC_REGISTER_RE = re.compile(r"\[SC-REGISTER\]")
+# Must match ONLY a per-identity confirmation line (e.g. "[SC-REGISTER]
+# VEH_197 VEHICLE OK (endorsers=3 pk=..)" or "[SC-REGISTER] RSU_12 bootstrap
+# OK (pk=..)"), not the three per-category summary lines the real binary
+# also prints ("RSUs registered: 64/64", "vehicles registered: 200/200",
+# "controllers registered: 4/4") or the one-time "starting boot-time
+# registration" banner — a bare `\[SC-REGISTER\]` matched all of those too,
+# confirmed directly on a live 200-vehicle/64-RSU run: true count was
+# 268 (200+64+4) but the naive regex reported 272, i.e. "272/268" in the
+# UI — a registration count that can never reach 100% because it overshoots
+# its own denominator.
+_SC_REGISTER_RE = re.compile(r"\[SC-REGISTER\].* OK \(")
 _REGISTER_DONE_RE = re.compile(r"\[SC-REGISTER\] boot-time registration complete")
 # The source (07_socket_layer.h:446) streams a raw double with no fixed
 # format: cout << "[SIM] t=" << Simulator::Now().GetSeconds() << "s". C++
@@ -286,6 +298,8 @@ def parse_progress(log_tail: str, rc: dict, run_id: str | None = None) -> dict:
             "pct": 100,
             "eta_seconds": 0,
             "mcc_full": float(mcc_m.group(1)) if mcc_m else None,
+            # "Finished" means the full configured duration was reached.
+            "sim_time_reached": sim_time,
         })
 
     sim_matches = _SIM_T_RE.findall(log_tail)
@@ -329,3 +343,136 @@ def parse_progress(log_tail: str, rc: dict, run_id: str | None = None) -> dict:
         return remember({**prior, "stale": True})
 
     return remember({"phase": "starting", "pct": 0, "eta_seconds": round(sim_time * SIM_SLOWDOWN_FACTOR)})
+
+
+# ── Live performance / confusion-matrix metrics ─────────────────────────────
+# [FUSION-RSU*] lines print for every UI-launched run regardless of the
+# blockchain toggle — confirmed in source: run_gat_fusion_for_rsu()
+# (08_detection_engine.h) is gated on ablation_mode (never 1 or 6, and
+# resolve_args() above always sends ablation_mode=0), not on
+# enable_blockchain/routing_algorithm. So this works for every run this
+# module can launch. Reuses fusion.parse_line() — the exact same parser
+# already validated against the offline capture log, applied here to a
+# still-growing file instead of a finished one.
+#
+# Per-run state tracks a BYTE OFFSET, not a fixed tail window like
+# parse_progress above — a confusion matrix must count each real event
+# exactly once. A fixed-size tail re-read (like the progress parser uses)
+# would double-count events that appear in two overlapping windows, or drop
+# events that scroll out of the window between polls in a dense log. Only
+# bytes up to the last complete newline are consumed each call; any trailing
+# partial line is left for the next read so a line split across two reads
+# is never parsed twice or parsed truncated.
+_live_metrics: dict[str, dict] = {}
+
+
+def _fresh_metrics_state() -> dict:
+    return {"offset": 0, "tp": 0, "fp": 0, "tn": 0, "fn": 0, "n_events": 0}
+
+
+def _metrics_view(state: dict) -> dict:
+    tp, fp, tn, fn = state["tp"], state["fp"], state["tn"], state["fn"]
+    eps = 1e-12
+    num = (tp + eps) * (tn + eps) - (fp + eps) * (fn + eps)
+    den = ((tp + fp + eps) * (tp + fn + eps) * (tn + fp + eps) * (tn + fn + eps)) ** 0.5
+    return {
+        "tp": tp, "fp": fp, "tn": tn, "fn": fn,
+        "n_events": state["n_events"],
+        "mcc": round(num / den, 4),
+        "fpr": round(fp / (fp + tn), 4) if (fp + tn) else 0.0,
+    }
+
+
+def update_live_metrics(run_id: str, log_path: str, sim_time_total: float | None = None) -> dict:
+    state = _live_metrics.setdefault(run_id, _fresh_metrics_state())
+    p = Path(log_path)
+    if not p.is_file():
+        return _metrics_view(state)
+
+    with open(p, "rb") as fh:
+        fh.seek(state["offset"])
+        chunk = fh.read()
+
+    last_nl = chunk.rfind(b"\n")
+    if last_nl == -1:
+        return _metrics_view(state)  # no complete line since last read yet
+
+    complete = chunk[: last_nl + 1]
+    state["offset"] += len(complete)
+
+    # History used to be recorded once per HTTP poll (in the old
+    # record_metrics_point, now removed) — that made the trend chart's
+    # resolution depend on how often a browser tab happened to be polling,
+    # not on the log itself. A run that finished while nobody had this
+    # screen open would have its ENTIRE evolution collapse into the single
+    # catch-up point taken on the next poll (confirmed directly: a finished
+    # blockchain run showed "1 point" / "too little data to draw a trend"
+    # despite 3,100 real fusion events and a full log of heartbeats behind
+    # it). Building history HERE instead, one point per "[SIM] t=Ns"
+    # heartbeat actually crossed while scanning this chunk, means a single
+    # catch-up read after a run finishes replays its whole real timeline in
+    # one shot — history granularity now depends on the log, not on poll
+    # timing.
+    hist = _metrics_history.setdefault(run_id, [])
+    for line in complete.decode(errors="replace").splitlines():
+        ev = fusion.parse_line(line)
+        if ev is not None:
+            state["n_events"] += 1
+            if ev.full_anom and ev.gt_pois:
+                state["tp"] += 1
+            elif ev.full_anom and not ev.gt_pois:
+                state["fp"] += 1
+            elif not ev.full_anom and ev.gt_pois:
+                state["fn"] += 1
+            else:
+                state["tn"] += 1
+            continue
+
+        t_m = _SIM_T_RE.search(line)
+        if t_m:
+            t = float(t_m.group(1))
+            point = {"t": t, **_metrics_view(state)}
+            if hist and hist[-1]["t"] == t:
+                hist[-1] = point
+            else:
+                hist.append(point)
+            continue
+
+        if sim_time_total is not None and _SUMMARY_RE.search(line):
+            # The run's very last events (between the final heartbeat and
+            # ATTACK SUMMARY) would otherwise never land a point of their
+            # own — this closes that gap with the true final tally at the
+            # run's configured duration.
+            point = {"t": sim_time_total, **_metrics_view(state)}
+            if hist and hist[-1]["t"] == sim_time_total:
+                hist[-1] = point
+            else:
+                hist.append(point)
+
+    if len(hist) > _MAX_HISTORY_POINTS:
+        del hist[: len(hist) - _MAX_HISTORY_POINTS]
+
+    return _metrics_view(state)
+
+
+def reset_live_metrics(run_id: str):
+    """Called at launch so a reused run_id (should never happen given the
+    uuid suffix, but cheap insurance) never inherits a previous run's tally."""
+    _live_metrics[run_id] = _fresh_metrics_state()
+    _metrics_history[run_id] = []
+
+
+# ── Metrics-over-time history — so the panel can show the attack actually
+#    happening (a growing line), not just the current cumulative snapshot.
+#    One real point per poll, keyed by the run's own SIMULATED time (from
+#    parse_progress's sim_time_reached), not wall-clock — a viewer watching
+#    two runs at different speeds still sees both timelines on the same
+#    sim-time axis. Deduplicates on unchanged sim_time (a poll landing
+#    between two [SIM] heartbeats) so the line doesn't get a run of
+#    identical-x points. ─────────────────────────────────────────────────
+_metrics_history: dict[str, list[dict]] = {}
+_MAX_HISTORY_POINTS = 2000  # generous; a 300s run polled every 4s is ~75 points
+
+
+def get_metrics_history(run_id: str) -> list[dict]:
+    return _metrics_history.get(run_id, [])

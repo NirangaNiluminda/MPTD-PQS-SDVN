@@ -2,14 +2,17 @@ import { useEffect, useRef, useState } from "react";
 import {
   BarChart3,
   Blocks,
+  Car,
   Info,
   Radar,
   ScanSearch,
   ShieldAlert,
   ShieldHalf,
+  Skull,
   Sun,
   Moon,
   Terminal,
+  Workflow,
   LucideIcon,
 } from "lucide-react";
 import { usePlayback } from "./store/playback";
@@ -19,15 +22,21 @@ import NetworkReplayScreen from "./screens/NetworkReplayScreen";
 import DefenceInspectorScreen from "./screens/DefenceInspectorScreen";
 import LedgerScreen from "./screens/LedgerScreen";
 import AttackExplainerScreen from "./screens/AttackExplainerScreen";
+import AttackModelExplorerScreen from "./screens/AttackModelExplorerScreen";
+import PhysicalTestbedScreen from "./screens/PhysicalTestbedScreen";
 import ResultsScreen from "./screens/ResultsScreen";
 import RunConsoleScreen from "./screens/RunConsoleScreen";
+import ArchitectureExplorerScreen from "./screens/ArchitectureExplorerScreen";
 import ProvenanceChip from "./components/ProvenanceChip";
 import { ProvenanceKind } from "./design/tokens";
 
-type Tab = "attacks" | "replay" | "inspector" | "ledger" | "results" | "console";
+type Tab = "architecture" | "testbed" | "attacks" | "threatmodel" | "replay" | "inspector" | "ledger" | "results" | "console";
 
 const TAB_ICON: Record<Tab, LucideIcon> = {
+  architecture: Workflow,
+  testbed: Car,
   attacks: ShieldAlert,
+  threatmodel: Skull,
   replay: Radar,
   inspector: ScanSearch,
   ledger: Blocks,
@@ -91,13 +100,16 @@ function InfoTip({ text }: { text: string }) {
 // how someone actually approaches this system: learn what the attacks are,
 // then watch the defence work, then check the evidence behind it.
 const NAV_GROUPS: { title: string; tabs: Tab[] }[] = [
-  { title: "Understand", tabs: ["attacks"] },
+  { title: "Understand", tabs: ["architecture", "testbed", "attacks", "threatmodel"] },
   { title: "Observe", tabs: ["replay", "inspector", "ledger"] },
   { title: "Evaluate", tabs: ["results", "console"] },
 ];
 
 const TAB_LABEL: Record<Tab, string> = {
+  architecture: "Architecture Explorer",
+  testbed: "Physical Testbed",
   attacks: "Attack Explainer",
+  threatmodel: "Attack Model Explorer",
   replay: "Network Replay",
   inspector: "Defence Stack Inspector",
   ledger: "Blockchain Ledger",
@@ -106,6 +118,27 @@ const TAB_LABEL: Record<Tab, string> = {
 };
 
 const SCREEN_META: Record<Tab, ScreenMeta> = {
+  architecture: {
+    title: "Architecture Explorer",
+    blurb: {
+      plain:
+        "How the defence actually fits together — click into the RSU cluster, the controller, or the blockchain layer to see each one's own pipeline, then step through a beacon's journey under five different scenarios.",
+      expert:
+        "Multi-level architecture diagram (System → Lightweight Mode / Full Mode / Blockchain layer → individual algorithm flowcharts) with a scripted per-scenario walkthrough. Algorithm/equation numbers verified against report/main.tex (the compiled thesis), not the .h/.go source comments, which carry stale numbers from earlier drafts.",
+    },
+    provenance: "snapshot",
+    descriptionBehindIcon: true,
+  },
+  testbed: {
+    title: "Physical Testbed",
+    blurb: {
+      plain:
+        "A guide for the toy-car / rigifoam-and-bristle-board prototype that sits next to this laptop — what each prop represents, and a one-click jump into the real recording for each staged attack.",
+      expert:
+        "Prop legend and staging notes for the physical SDVN testbed, plus attack_number-linked scenario jumps sourced from the same results_e5_final/e5_final_table.json attack list Attack Explainer reads.",
+    },
+    provenance: "snapshot",
+  },
   attacks: {
     title: "Attack Explainer",
     blurb: {
@@ -113,6 +146,16 @@ const SCREEN_META: Record<Tab, ScreenMeta> = {
         "Seven ways someone can try to fool this network, and whether our defence actually catches each one — compared with a simpler existing method. Every result is shown, even the ones where the simpler method wins.",
       expert:
         "Threat taxonomy across 7 attack variants with hostile-entity assignment and measured MCC against the strongest of three baselines (B1/B2/B3), from results_e5_final/e5_final_table.json — including variants where a baseline outperforms SENTINEL_Full.",
+    },
+    provenance: "snapshot",
+  },
+  threatmodel: {
+    title: "Attack Model Explorer",
+    blurb: {
+      plain:
+        "How each of the 7 attacks actually moves through the network — an animated, step-by-step walkthrough of which entity lies, what gets falsified, and whether a warning gets suppressed or the controller just gets quietly misled.",
+      expert:
+        "Threat-model topology (Controller / RSU / 3-vehicle row) with a scripted per-variant packet-flow animation across the 7 real attack_number variants — trajectory-poisoning variants (a1/a2/a5, impact metric TPE) end in a suppressed collision warning; mobility-pattern-poisoning variants (a3/a4/a6/a7, impact metric TDEE) end in a delivered but corrupted control packet. Actor/description text is the same catalog.ATTACK_INFO data /api/attacks and Attack Explainer both use.",
     },
     provenance: "snapshot",
   },
@@ -133,7 +176,7 @@ const SCREEN_META: Record<Tab, ScreenMeta> = {
       plain:
         "Click any car to see exactly why it was trusted or not. Three separate checks — hard rules, a pattern-matching AI, and a memory-based AI — each form their own opinion, and those combine into one final decision.",
       expert:
-        "Per-vehicle decomposition of the fused decision Φ (Eq 3.46) into its three normalised inputs — rule signatures (ψ̂), GAT spatial score (Ŝ), LSTM-AE reconstruction (ε̂) — against the 0.5 threshold, from one blockchain-enabled capture run's [FUSION-RSU*] output.",
+        "Per-vehicle decomposition of the fused decision Φ (Eq 3.48) into its three normalised inputs — rule signatures (ψ̂), GAT spatial score (Ŝ), LSTM-AE reconstruction (ε̂) — against the 0.5 threshold, from one blockchain-enabled capture run's [FUSION-RSU*] output.",
     },
     provenance: "replayed",
   },
@@ -170,7 +213,7 @@ const SCREEN_META: Record<Tab, ScreenMeta> = {
 };
 
 export default function App() {
-  const [tab, setTab] = useState<Tab>("attacks");
+  const [tab, setTab] = useState<Tab>("testbed");
   const loadScenarios = usePlayback((s) => s.loadScenarios);
   const selectScenario = usePlayback((s) => s.selectScenario);
   const mode = useMode((s) => s.mode);
@@ -208,11 +251,11 @@ export default function App() {
         <div className="flex items-center gap-2">
           <ShieldHalf className="text-entity-rsu" size={24} strokeWidth={2.25} aria-hidden />
           <h1 className="text-lg font-bold tracking-wide text-ink-primary">
-            SENTINEL
+            MPTD-PQS
           </h1>
         </div>
         <span className="hidden text-body text-ink-muted lg:inline">
-          Trajectory-poisoning defence for software-defined vehicle networks
+          Blockchain + GAT/LSTM-AE mitigation for mobility-pattern &amp; trajectory-poisoning attacks in SDVN
         </span>
 
         <div className="ml-auto flex items-center gap-1 rounded-lg border border-surface-hairline2 bg-surface-raised p-1">
@@ -291,7 +334,10 @@ export default function App() {
           </div>
 
           <div className="min-h-0 overflow-hidden">
+            {tab === "architecture" && <ArchitectureExplorerScreen />}
+            {tab === "testbed" && <PhysicalTestbedScreen onShowScenario={showScenario} />}
             {tab === "attacks" && <AttackExplainerScreen onShowScenario={showScenario} />}
+            {tab === "threatmodel" && <AttackModelExplorerScreen />}
             {tab === "replay" && <NetworkReplayScreen />}
             {tab === "inspector" && <DefenceInspectorScreen />}
             {tab === "ledger" && <LedgerScreen />}

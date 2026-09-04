@@ -59,6 +59,7 @@ interface PlaybackState {
   t: number;
   playing: boolean;
   speed: number;
+  loop: boolean;
 
   geometry: GeometryDto | null;
   roadmap: RoadMapDto | null;
@@ -75,6 +76,15 @@ interface PlaybackState {
   selectedVehicle: number | null;
   vehicleTrack: BeaconDto[] | null;
   loadingVehicle: boolean;
+
+  // Cross-screen selection hint, deliberately separate from selectedVehicle:
+  // selectVehicle() below is coupled to scenarioId and fetches a replay-corpus
+  // track, which doesn't make sense to trigger from a screen with no scenario
+  // loaded (e.g. Defence Stack Inspector, which reads a different capture
+  // entirely). This has no fetch side effects — it's just "the last vehicle id
+  // a human picked, anywhere," for another screen to adopt as its own default.
+  lastSelectedVehicleId: number | null;
+  setLastSelectedVehicleId: (vid: number | null) => void;
 
   // Lighter-weight than selection: sets a temporary map<->panel highlight
   // without fetching a track or touching selectedVehicle. Cleared on
@@ -110,6 +120,7 @@ interface PlaybackState {
   play: () => void;
   pause: () => void;
   setSpeed: (s: number) => void;
+  toggleLoop: () => void;
   tick: (dtRealSeconds: number) => Promise<void>;
   selectVehicle: (vid: number | null) => Promise<void>;
   toggleLayer: (k: keyof LayerToggles) => void;
@@ -173,6 +184,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   t: 0,
   playing: false,
   speed: 1,
+  loop: false,
 
   geometry: null,
   roadmap: null,
@@ -185,6 +197,9 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   selectedVehicle: null,
   vehicleTrack: null,
   loadingVehicle: false,
+
+  lastSelectedVehicleId: null,
+  setLastSelectedVehicleId: (vid) => set({ lastSelectedVehicleId: vid }),
 
   hoveredVehicle: null,
   setHoveredVehicle: (vid) => set({ hoveredVehicle: vid }),
@@ -311,6 +326,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   play: () => set({ playing: true }),
   pause: () => set({ playing: false }),
   setSpeed: (s: number) => set({ speed: s }),
+  toggleLoop: () => set((s) => ({ loop: !s.loop })),
 
   // Wall-clock playback used to call seek() — which fetches a fresh frame
   // over the network — on EVERY requestAnimationFrame, i.e. up to ~60
@@ -325,10 +341,18 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
   // updates into continuous motion client-side (see displayedPos there),
   // so ~8 fetches/sec still reads as fluid movement on screen.
   tick: async (dtRealSeconds: number) => {
-    const { playing, t, tMin, tMax, speed, pause } = get();
+    const { playing, t, tMin, tMax, speed, loop, pause } = get();
     if (!playing) return;
     const next = t + dtRealSeconds * speed;
     if (next >= tMax) {
+      if (loop) {
+        // Wrap to the start and keep playing — same fetch-on-arrival
+        // discipline as a normal tick, just restarting the clock instead
+        // of pausing it.
+        set({ t: tMin });
+        await fetchFrame(set, get, tMin);
+        return;
+      }
       pause();
       set({ t: tMax });
       await fetchFrame(set, get, tMax);
@@ -358,6 +382,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
         lstmError: null,
         gatAttention: null,
         gatError: null,
+        lastSelectedVehicleId: vid,
       });
       return;
     }
@@ -369,6 +394,7 @@ export const usePlayback = create<PlaybackState>((set, get) => ({
       lstmError: null,
       gatAttention: null,
       gatError: null,
+      lastSelectedVehicleId: vid,
     });
     try {
       const res = await api.vehicle(scenarioId, vid);

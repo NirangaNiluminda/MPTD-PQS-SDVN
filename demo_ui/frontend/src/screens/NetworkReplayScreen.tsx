@@ -1,4 +1,5 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
+import { Maximize, Minimize } from "lucide-react";
 import { usePlayback } from "../store/playback";
 import ScenarioPicker from "../components/ScenarioPicker";
 import NetworkMap from "../components/NetworkMap";
@@ -7,7 +8,34 @@ import DetectionFeed from "../components/DetectionFeed";
 import PlaybackControls from "../components/PlaybackControls";
 import StatBar from "../components/StatBar";
 
+function FullscreenToggle({ targetRef }: { targetRef: React.RefObject<HTMLElement> }) {
+  const [isFullscreen, setIsFullscreen] = useState(false);
+
+  useEffect(() => {
+    const onChange = () => setIsFullscreen(document.fullscreenElement === targetRef.current);
+    document.addEventListener("fullscreenchange", onChange);
+    return () => document.removeEventListener("fullscreenchange", onChange);
+  }, [targetRef]);
+
+  const toggle = () => {
+    if (document.fullscreenElement) document.exitFullscreen();
+    else targetRef.current?.requestFullscreen();
+  };
+
+  return (
+    <button
+      onClick={toggle}
+      title={isFullscreen ? "Exit full screen" : "Full screen"}
+      className="pointer-events-auto absolute right-3 top-3 z-10 flex items-center gap-1.5 rounded-md border border-surface-hairline2 bg-surface-panel/95 px-2.5 py-1.5 font-mono text-[10px] font-medium text-ink-secondary shadow-lg backdrop-blur transition-colors hover:text-ink-primary"
+    >
+      {isFullscreen ? <Minimize size={12} aria-hidden /> : <Maximize size={12} aria-hidden />}
+      {isFullscreen ? "Exit full screen" : "Full screen"}
+    </button>
+  );
+}
+
 export default function NetworkReplayScreen() {
+  const rootRef = useRef<HTMLDivElement>(null);
   // loadScenarios() is called once at the app root (App.tsx), not here.
   // This screen only mounts when its tab is active, but the Attack
   // Explainer's "Show me this attack" needs to call selectScenario()
@@ -39,7 +67,7 @@ export default function NetworkReplayScreen() {
   }, [playing, tick]);
 
   return (
-    <div className="flex h-full flex-col">
+    <div ref={rootRef} className="flex h-full flex-col bg-surface-page">
       {error && (
         <div className="border-b border-status-missed/40 bg-status-missed/10 px-4 py-2 text-xs text-status-missed">
           {error}
@@ -53,6 +81,7 @@ export default function NetworkReplayScreen() {
         <div className="relative flex-1 bg-surface-page">
           <NetworkMap />
           <MapControls />
+          <FullscreenToggle targetRef={rootRef} />
         </div>
         {/* One persistent, synchronized detection panel — a selected event
             expands inline within this same list rather than swapping to a

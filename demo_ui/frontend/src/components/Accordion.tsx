@@ -24,7 +24,7 @@ export default function Accordion({
   className?: string;
 }) {
   return (
-    <div className={`overflow-hidden rounded-lg border border-surface-hairline bg-surface-panel ${className}`}>
+    <div className={`shrink-0 overflow-hidden rounded-lg border border-surface-hairline bg-surface-panel ${className}`}>
       <button
         onClick={onToggle}
         className="flex w-full items-center gap-2.5 px-3.5 py-3 text-left font-sans text-ink-primary transition-colors hover:bg-surface-raised/60"

@@ -33,6 +33,18 @@ CAPTURES_DIR = Path(__file__).resolve().parents[1] / "captures"
 LEDGER_SNAPSHOT = CAPTURES_DIR / "ledger_snapshot.json"
 FUSION_CAPTURE_LOG = CAPTURES_DIR / "combined_bc_90s.log"
 
+# Hyperledger Explorer runs on its own port (8888) and is NOT behind this
+# app's Cloudflare quick tunnel (that tunnel only forwards this backend's own
+# port) — a bare "localhost:8888" link in the UI would silently fail for
+# anyone viewing the demo through the tunnel from another machine. A SECOND
+# quick tunnel (`cloudflared tunnel --url http://localhost:8888`) gives
+# Explorer its own public URL; that URL gets written here so the frontend can
+# link to it without a rebuild. Read fresh on every request (not cached at
+# import time) because quick-tunnel URLs are ephemeral and change if that
+# second tunnel process ever restarts — missing file/stale process just
+# means the button hides itself rather than link somewhere dead.
+EXPLORER_TUNNEL_URL_FILE = CAPTURES_DIR / "explorer_tunnel_url.txt"
+
 # results_e5_final/e5_final_table.json: SENTINEL vs B1/B2/B3 baselines, per
 # attack variant. Validated 2026-08-14 against the repo's own results dir.
 E5_RESULTS_FILE = REPO_ROOT / "results_e5_final" / "e5_final_table.json"

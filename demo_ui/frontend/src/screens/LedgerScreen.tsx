@@ -1,7 +1,9 @@
 import { useEffect, useRef, useState } from "react";
+import { ExternalLink } from "lucide-react";
 import {
   api,
   ControllerFlagDto,
+  LedgerRefreshStatusDto,
   LedgerSummaryDto,
   ReassignmentDto,
   RevocationDto,
@@ -9,6 +11,7 @@ import {
 } from "../api";
 import { useTokens } from "../design/tokens";
 import Accordion from "../components/Accordion";
+import BlockFeedPanel from "../components/BlockFeedPanel";
 import SummaryCard from "../components/SummaryCard";
 import DrillModal, { originFromEvent } from "../components/DrillModal";
 import StatusPill, { SemanticStatus } from "../components/StatusPill";
@@ -78,13 +81,19 @@ export default function LedgerScreen() {
   const [openReassign, setOpenReassign] = useState<string | null>(null);
   const [openSection, setOpenSection] = useState<Section | null>(null);
   const originRef = useRef<{ dx: number; dy: number }>({ dx: 0, dy: 0 });
+  const [refreshState, setRefreshState] = useState<LedgerRefreshStatusDto | null>(null);
+  const pollRef = useRef<number | null>(null);
+  // Explorer runs on its own port/tunnel, separate from this app's — see
+  // /api/explorer_url's own docstring. null just means "no link configured
+  // right now" (file missing or that second tunnel isn't up), not an error.
+  const [explorerUrl, setExplorerUrl] = useState<string | null>(null);
 
   const openCard = (section: Section) => (e: React.MouseEvent<HTMLButtonElement>) => {
     originRef.current = originFromEvent(e);
     setOpenSection(section);
   };
 
-  useEffect(() => {
+  const loadAll = () =>
     Promise.all([
       api.ledgerSummary(),
       api.ledgerTrust("rsu"),
@@ -92,16 +101,43 @@ export default function LedgerScreen() {
       api.ledgerRevocations(),
       api.ledgerFlags(),
       api.ledgerReassignments(),
-    ])
-      .then(([s, rsu, veh, rev, fl, ra]) => {
-        setSummary(s);
-        setRsuTrust(rsu);
-        setVehicleTrust(veh.filter((v) => v.UpdateCount > 0));
-        setRevocations(rev);
-        setFlags(fl);
-        setReassignments(ra);
+    ]).then(([s, rsu, veh, rev, fl, ra]) => {
+      setSummary(s);
+      setRsuTrust(rsu);
+      setVehicleTrust(veh.filter((v) => v.UpdateCount > 0));
+      setRevocations(rev);
+      setFlags(fl);
+      setReassignments(ra);
+    });
+
+  useEffect(() => {
+    loadAll().catch((e) => setError(String(e)));
+    api.ledgerRefreshStatus().then(setRefreshState).catch(() => {});
+    api.explorerUrl().then((r) => setExplorerUrl(r.url)).catch(() => {});
+  }, []);
+
+  const startLiveRefresh = () => {
+    if (refreshState?.status === "running") return;
+    api
+      .ledgerRefresh()
+      .then(() => {
+        const startedFinishedAt = refreshState?.finished_at ?? null;
+        pollRef.current = window.setInterval(() => {
+          api.ledgerRefreshStatus().then((st) => {
+            setRefreshState(st);
+            if (st.status === "idle" && st.finished_at !== startedFinishedAt) {
+              if (pollRef.current) window.clearInterval(pollRef.current);
+              pollRef.current = null;
+              if (!st.error) loadAll().catch((e) => setError(String(e)));
+            }
+          });
+        }, 1500);
       })
-      .catch((e) => setError(String(e)));
+      .catch(() => {});
+  };
+
+  useEffect(() => () => {
+    if (pollRef.current) window.clearInterval(pollRef.current);
   }, []);
 
   if (error) {
@@ -131,18 +167,50 @@ export default function LedgerScreen() {
               Blockchain ledger
             </h1>
             <p className="mt-1 text-body text-ink-secondary">
-              A point-in-time snapshot of the Hyperledger Fabric ledger
-              {summary && (
-                <> — captured {new Date(summary.captured_at).toLocaleString()}</>
+              {summary?.is_live ? (
+                <>
+                  A <span className="font-medium text-status-good">live</span> query against the real Hyperledger
+                  Fabric ledger — queried {new Date(summary.captured_at).toLocaleString()}.
+                </>
+              ) : (
+                <>
+                  A point-in-time snapshot of the Hyperledger Fabric ledger
+                  {summary && <> — captured {new Date(summary.captured_at).toLocaleString()}</>}. Defaults to this
+                  file so the demo never depends on Fabric being reachable at presentation time — click "Refresh
+                  live" for the real current state.
+                </>
               )}
-              . Not live: re-run{" "}
-              <code className="text-ink-primary">snapshot_ledger.py</code> to
-              refresh, so the demo never depends on Fabric being reachable at
-              presentation time.
             </p>
           </div>
-          <StatusLegend only={["safe", "warning", "compromised"]} />
+          <div className="flex flex-col items-end gap-2">
+            <StatusLegend only={["safe", "warning", "compromised"]} />
+            <div className="flex items-center gap-2">
+              {refreshState?.error && (
+                <span className="max-w-xs text-right text-[10px] text-status-missed">{refreshState.error}</span>
+              )}
+              {explorerUrl && (
+                <a
+                  href={explorerUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  title="Opens the full Hyperledger Explorer dashboard in a new tab — its own tunnel, separate from this demo's"
+                  className="flex items-center gap-1.5 rounded border border-surface-hairline bg-surface-raised px-3 py-1.5 text-xs font-medium text-ink-secondary transition-colors hover:text-ink-primary"
+                >
+                  <ExternalLink size={13} /> Hyperledger Explorer
+                </a>
+              )}
+              <button
+                onClick={startLiveRefresh}
+                disabled={refreshState?.status === "running"}
+                className="rounded bg-entity-rsu px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-entity-rsu/90 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {refreshState?.status === "running" ? "Querying the live ledger…" : "Refresh live"}
+              </button>
+            </div>
+          </div>
         </header>
+
+        <BlockFeedPanel />
 
         {summary && (
           <div className="grid grid-cols-2 gap-4 sm:grid-cols-4">

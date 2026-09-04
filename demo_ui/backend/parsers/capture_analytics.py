@@ -24,6 +24,7 @@ from collections import Counter
 from dataclasses import dataclass
 
 from .fusion import FusionEvent
+from .revoke_votes import RevokeVote
 from .sigmask import PSI_TH, decode as decode_sigmask
 
 THETA_AE = 33.693885  # this run's constant, confirmed via [AI-INIT] θ_ae loaded: 33.6939
@@ -181,4 +182,41 @@ def attack_evidence(events: list[FusionEvent], attack_number: int) -> dict:
         "mean_gat_score": round(sum(e.S_over_thetaS_clamped for e in filtered) / n, 4),
         "mean_ae_norm": round(sum(e.ae_norm for e in filtered) / n, 4),
         "top_signatures": top_signatures,
+    }
+
+
+def mitigation_for_attack(events: list[FusionEvent], votes: list[RevokeVote], attack_number: int) -> dict:
+    """Real BFT revocation-vote activity against THIS SAME attack's real
+    poisoned vehicles, from THIS SAME capture log — [SC-REVOKE-VOTE-RSU*]
+    lines cross-referenced by vehicle ID against [FUSION-RSU*]'s own
+    gt_atk==attack_number, gt_pois==1 events. Deliberately not correlated
+    against the separate ledger_snapshot.json (a standalone, independently-
+    timed script run with no run ID tying it to this capture) — every number
+    here comes from one file, so it's provably self-consistent.
+
+    Most votes in a short window never reach the 2f+1 threshold (paper
+    Sec 3.5.5 Eq 3.65) — vehicles_with_votes==0 or any_crossed_threshold==
+    False is the expected, honest outcome for most attacks here, not a bug.
+    """
+    poisoned_vids = {e.vid for e in events if e.gt_atk == attack_number and e.gt_pois}
+    relevant = [v for v in votes if v.vehicle_id in poisoned_vids]
+    if not relevant:
+        return {"vehicles_with_votes": 0, "total_votes_cast": 0, "any_crossed_threshold": False, "sample": []}
+
+    by_vehicle: dict[int, list[RevokeVote]] = {}
+    for v in relevant:
+        by_vehicle.setdefault(v.vehicle_id, []).append(v)
+
+    sample = []
+    for vid, vv in list(by_vehicle.items())[:5]:
+        latest = max(vv, key=lambda x: x.t)
+        sample.append(
+            {"vehicle_id": vid, "votes": latest.votes, "threshold": latest.threshold, "revoked": latest.revoked}
+        )
+
+    return {
+        "vehicles_with_votes": len(by_vehicle),
+        "total_votes_cast": len(relevant),
+        "any_crossed_threshold": any(v.revoked for v in relevant),
+        "sample": sample,
     }

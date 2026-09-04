@@ -14,11 +14,13 @@ import {
   CartesianGrid,
 } from "recharts";
 import { CircleSlash } from "lucide-react";
+import { api, IpfsPinResultDto } from "../api";
 import { usePlayback } from "../store/playback";
 import { useTokens } from "../design/tokens";
 import { currentBeaconAt } from "./vehicleTrack";
 import Accordion from "./Accordion";
 import DrillModal from "./DrillModal";
+import EgoGraph from "./EgoGraph";
 import StatusPill, { SemanticStatus } from "./StatusPill";
 
 const PSI_TH = 0.09; // 08_detection_engine.h — the rule-signature decision line
@@ -90,6 +92,7 @@ export default function VehicleAnalysisModal({
   origin: { dx: number; dy: number };
 }) {
   const {
+    scenarioId,
     selectedVehicle,
     vehicleTrack,
     t,
@@ -106,8 +109,38 @@ export default function VehicleAnalysisModal({
   const axisStroke = SURFACE.hairlineStrong;
   const [ruleOpen, setRuleOpen] = useState(false);
   const [summaryOpen, setSummaryOpen] = useState(false);
+  const [ipfsPinning, setIpfsPinning] = useState(false);
+  const [ipfsResult, setIpfsResult] = useState<IpfsPinResultDto | null>(null);
+  const [ipfsPinError, setIpfsPinError] = useState<string | null>(null);
 
   const current = useMemo(() => currentBeaconAt(vehicleTrack, t), [vehicleTrack, t]);
+
+  // A pin from a previous vehicle/track shouldn't linger once the selection
+  // changes underneath this modal.
+  useEffect(() => {
+    setIpfsResult(null);
+    setIpfsPinError(null);
+    setIpfsPinning(false);
+  }, [selectedVehicle]);
+
+  const pinToIpfs = async () => {
+    if (!vehicleTrack || selectedVehicle == null) return;
+    setIpfsPinning(true);
+    setIpfsPinError(null);
+    try {
+      const result = await api.ipfsPin(`${(scenarioId ?? "scenario").replace(/\//g, "_")}_veh${selectedVehicle}`, {
+        scenario_id: scenarioId,
+        vehicle_id: selectedVehicle,
+        beacon_count: vehicleTrack.length,
+        beacons: vehicleTrack,
+      });
+      setIpfsResult(result);
+    } catch (e) {
+      setIpfsPinError(String(e));
+    } finally {
+      setIpfsPinning(false);
+    }
+  };
 
   // The moment the modal opens is the "on demand" trigger for both real
   // model inferences — they used to be gated behind expanding an accordion
@@ -161,6 +194,33 @@ export default function VehicleAnalysisModal({
         weight: Number((n.attention_weight * 100).toFixed(1)),
         poisoned: n.is_poisoned,
         distance: n.distance_m,
+      }))
+    : [];
+
+  // Same beacons already fetched for the bar chart above, re-shaped into one
+  // real actual-vs-reconstructed series per channel (feature_names order).
+  const lstmChannelSeries = lstmReconstruction
+    ? lstmReconstruction.feature_names.map((name, i) => ({
+        key: name,
+        label: CHANNEL_LABEL[name] ?? name,
+        points: lstmReconstruction.beacons.map((b) => ({
+          t: Number(b.t.toFixed(2)),
+          actual: b.actual_raw[i],
+          reconstructed: b.reconstructed_raw[i],
+        })),
+      }))
+    : [];
+
+  // Same neighbours already fetched for the bar chart above, laid out at
+  // their real position relative to the target instead of ranked by weight.
+  const gatNodes = gatAttention
+    ? gatAttention.neighbours.map((n) => ({
+        id: n.vehicle_id,
+        dx: n.pos_x - gatAttention.target_pos.x,
+        dy: n.pos_y - gatAttention.target_pos.y,
+        weight: n.attention_weight,
+        distance: n.distance_m,
+        poisoned: n.is_poisoned,
       }))
     : [];
 
@@ -272,6 +332,71 @@ export default function VehicleAnalysisModal({
         )}
       </section>
 
+      {lstmState === "ready" && lstmReconstruction && lstmReconstruction.beacons.length > 0 && (
+        <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
+          <h3 className="mb-1 text-body font-semibold text-ink-primary">
+            LSTM-AE reconstruction — actual vs. reconstructed
+          </h3>
+          <p className="mb-3 text-[11px] text-ink-muted">
+            Same real reconstruction as above, per channel over the last {lstmReconstruction.window} beacons —
+            solid is what was reported, dashed is what the autoencoder expected.
+          </p>
+          <div className="mb-2 flex items-center justify-center gap-4 text-[10px] text-ink-muted">
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-0.5 w-4" style={{ background: SERIES[0] }} /> actual
+            </span>
+            <span className="flex items-center gap-1.5">
+              <span className="inline-block h-0.5 w-4 border-t-2 border-dashed" style={{ borderColor: SERIES[1] }} />{" "}
+              reconstructed
+            </span>
+          </div>
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+            {lstmChannelSeries.map((ch) => (
+              <div key={ch.key} className="rounded-md border border-surface-hairline bg-surface-page p-2">
+                <p className="mb-1 text-center text-[10px] font-medium text-ink-secondary">{ch.label}</p>
+                <div className="h-24">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <LineChart data={ch.points} margin={{ top: 4, right: 4, bottom: 0, left: 4 }}>
+                      <XAxis dataKey="t" hide />
+                      <YAxis hide domain={["auto", "auto"]} />
+                      <Tooltip
+                        contentStyle={{
+                          background: SURFACE.raised,
+                          border: `1px solid ${SURFACE.hairline}`,
+                          borderRadius: 6,
+                          fontSize: 11,
+                        }}
+                        labelStyle={{ color: INK.secondary }}
+                        labelFormatter={(v) => `t=${v}s`}
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="actual"
+                        stroke={SERIES[0]}
+                        strokeWidth={1.75}
+                        dot={false}
+                        isAnimationActive={false}
+                        name="actual"
+                      />
+                      <Line
+                        type="monotone"
+                        dataKey="reconstructed"
+                        stroke={SERIES[1]}
+                        strokeWidth={1.75}
+                        strokeDasharray="3 2"
+                        dot={false}
+                        isAnimationActive={false}
+                        name="reconstructed"
+                      />
+                    </LineChart>
+                  </ResponsiveContainer>
+                </div>
+              </div>
+            ))}
+          </div>
+        </section>
+      )}
+
       <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
         <h3 className="mb-3 text-body font-semibold text-ink-primary">GAT spatial analysis — real, offline</h3>
         {gatState === "not_applicable" && (
@@ -347,6 +472,17 @@ export default function VehicleAnalysisModal({
           </>
         )}
       </section>
+
+      {gatState === "ready" && gatAttention && (
+        <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
+          <h3 className="mb-1 text-body font-semibold text-ink-primary">GAT spatial analysis — ego-graph</h3>
+          <p className="mb-3 text-[11px] text-ink-muted">
+            Same real attention weights as above, laid out at each neighbour's actual relative position — edge
+            thickness is attention share, node colour is honest/poisoned.
+          </p>
+          <EgoGraph centerLabel={`V${selectedVehicle} (this vehicle)`} nodes={gatNodes} edgeUnit="attention" />
+        </section>
+      )}
 
       <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
         <h3 className="mb-1 text-body font-semibold text-ink-primary">Suspicion score over time</h3>
@@ -440,6 +576,48 @@ export default function VehicleAnalysisModal({
                 />
               </LineChart>
             </ResponsiveContainer>
+          </div>
+        )}
+      </section>
+
+      <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
+        <h3 className="mb-1 text-body font-semibold text-ink-primary">Off-chain evidence — pin to IPFS (live)</h3>
+        <p className="mb-3 text-[11px] leading-relaxed text-ink-muted">
+          Every captured run so far hit connection-refused against the IPFS daemon and fell back to a
+          deterministic stand-in hash (see Results &amp; Ablation's IPFS card). This talks to the real daemon
+          running right now — pinning this vehicle's actual beacon window and returning a genuine
+          content-addressed CID, not a simulated one.
+        </p>
+        {!ipfsResult && (
+          <button
+            onClick={pinToIpfs}
+            disabled={ipfsPinning}
+            className="rounded-md bg-entity-rsu px-3 py-1.5 text-xs font-semibold text-white transition-opacity hover:opacity-90 disabled:opacity-50"
+          >
+            {ipfsPinning ? "Pinning…" : `Pin this vehicle's beacon window (${vehicleTrack.length} beacons)`}
+          </button>
+        )}
+        {ipfsPinError && (
+          <p className="mt-2 text-[11px] text-status-missed">{ipfsPinError}</p>
+        )}
+        {ipfsResult && (
+          <div className="flex flex-col gap-1.5 rounded-md border border-surface-hairline bg-surface-page p-3 text-[11px]">
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-ink-muted">CID</span>
+              <span className="font-mono text-ink-primary">{ipfsResult.cid}</span>
+            </div>
+            <div className="flex items-baseline justify-between gap-2">
+              <span className="text-ink-muted">Size</span>
+              <span className="font-mono text-ink-secondary">{ipfsResult.size_bytes.toLocaleString()} bytes</span>
+            </div>
+            <a
+              href={ipfsResult.gateway_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="mt-1 font-medium text-entity-rsu hover:underline"
+            >
+              Open on the real IPFS gateway →
+            </a>
           </div>
         )}
       </section>

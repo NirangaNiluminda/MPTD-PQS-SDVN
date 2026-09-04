@@ -195,12 +195,45 @@ export interface TrafficSignalDto {
 
 export interface LedgerSummaryDto {
   captured_at: string;
+  is_live: boolean;
   rsus: { total: number; trusted: number; demoted: number };
   vehicles: { total: number; decayed: number };
   controllers: { total: number; decayed: number };
   revocations: number;
   controller_flags: number;
   reassignments: number;
+}
+
+export interface LedgerRefreshStatusDto {
+  status: "idle" | "running";
+  started_at: number | null;
+  finished_at: number | null;
+  error: string | null;
+  captured_at: string | null;
+  is_live: boolean;
+}
+
+/** One real "Committed block [N]" line off the Fabric peer container's own
+ * log — see backend parsers/block_feed.py. */
+export interface BlockCommitDto {
+  block: number;
+  channel: string;
+  tx_count: number;
+  commit_ms: number;
+  hash: string;
+  log_ts: string | null;
+}
+
+export interface ChainHeightDto {
+  height: number;
+  currentBlockHash: string;
+  previousBlockHash: string;
+}
+
+export interface BlocksRecentDto {
+  container: string;
+  height: ChainHeightDto | null;
+  recent: BlockCommitDto[];
 }
 
 export interface TrustRecordDto {
@@ -264,6 +297,11 @@ export interface CaptureVehicleRowDto {
   gt_poisoned: number;
   flagged: number;
   missed: number;
+  /** Real attack_number(s) (1-7) this vehicle was actually poisoned under in
+   * this combined-attack capture — empty if never poisoned. Usually one
+   * value; more than one means the vehicle was hit by different attack
+   * mechanisms at different points in the same 90s run. */
+  attack_types: number[];
 }
 
 export interface SweepPointDto {
@@ -301,6 +339,18 @@ export interface AttackSignatureHitDto {
 // captured recording this endpoint reads from (TP-S3, MP-S4) — every other
 // field is then absent, not zero-filled, so the UI can't mistake "not
 // captured" for "measured and zero".
+// Real [SC-REVOKE-VOTE-RSU*] activity against this attack's real poisoned
+// vehicles, from the SAME capture file the rest of AttackEvidenceDto reads —
+// deliberately not cross-referenced against the separate ledger snapshot
+// (no run ID ties the two together). Most votes never cross the 2f+1
+// threshold in a short window; vehicles_with_votes: 0 is an honest outcome.
+export interface AttackMitigationDto {
+  vehicles_with_votes: number;
+  total_votes_cast: number;
+  any_crossed_threshold: boolean;
+  sample: { vehicle_id: number; votes: number; threshold: number; revoked: boolean }[];
+}
+
 export interface AttackEvidenceDto {
   attack_number: number;
   n_events: number;
@@ -311,6 +361,7 @@ export interface AttackEvidenceDto {
   mean_gat_score?: number;
   mean_ae_norm?: number;
   top_signatures?: AttackSignatureHitDto[];
+  mitigation?: AttackMitigationDto;
 }
 
 export interface CryptoSummaryDto {
@@ -367,6 +418,45 @@ export interface FusionEventDto {
   accusations: Accusation[];
 }
 
+// Real [METRICS] positions from the capture log — NOT attention weights.
+// This capture never re-ran the GAT with attention output requested (only
+// the replay corpus's gat_attention does that); this is a real but
+// distance-only "who was nearby" view. See app.py's capture_vehicle_neighbours.
+export interface CaptureNeighbourDto {
+  vehicle_id: number;
+  pos_x: number;
+  pos_y: number;
+  distance_m: number;
+  is_poisoned: boolean;
+}
+
+export interface CaptureNeighboursDto {
+  vehicle_id: number;
+  t: number;
+  target_pos: { x: number; y: number };
+  neighbours: CaptureNeighbourDto[];
+}
+
+// Real local IPFS daemon, queried/used live and on demand — NOT the
+// simulator's own IPFS calls (those only happen during a run, and every
+// captured run so far hit connection-refused and fell back to a fabricated
+// FNV-1a hash; see CryptoSummaryDto's ipfs.note). A pin here is a genuine
+// add against whatever daemon is actually reachable right now.
+export interface IpfsStatusDto {
+  reachable: boolean;
+  peer_id?: string;
+  addresses?: string[];
+  version?: string;
+  error?: string;
+}
+
+export interface IpfsPinResultDto {
+  label: string;
+  cid: string;
+  size_bytes: number;
+  gateway_url: string;
+}
+
 export interface AttackResultDto {
   MCC: number;
   MCC_std?: number;
@@ -388,6 +478,24 @@ export interface AttackInfoDto {
   best_baseline_mcc: number | null;
   baseline_wins: boolean;
   sample_scenario_id: string | null;
+}
+
+// The paper's own 11-variant ablation study (report/main.tex \subsection{AB1
+// ..AB11}) — distinct from resultsAblation() above, which is a separate
+// D1/D4/D6 time-cutoff analysis under one fixed scenario. AB8 has
+// has_results=false: the paper itself discloses that ablation was never
+// completed experimentally.
+export interface AblationStudyDto {
+  number: number;
+  category: "Detection" | "Cryptography" | "Trust" | "Key Management";
+  title: string;
+  ablates: string;
+  swept: string | null;
+  headline: string | null;
+  finding: string | null;
+  caveat: string | null;
+  citation: string;
+  has_results: boolean;
 }
 
 // ── Run console (launches a REAL simulation process) ────────────────────────
@@ -424,6 +532,28 @@ export interface RunProgressDto {
   stale?: boolean;
 }
 
+// Live confusion matrix, accumulated from this run's own [FUSION-RSU*]
+// lines as they're printed — real-time, not a final summary. See
+// run_manager.py's update_live_metrics for why it tracks a byte offset
+// instead of re-scanning a tail window (exactly-once counting).
+export interface LiveMetricsDto {
+  tp: number;
+  fp: number;
+  tn: number;
+  fn: number;
+  n_events: number;
+  mcc: number;
+  fpr: number;
+}
+
+// One real point per poll, keyed by the run's own simulated time — see
+// run_manager.py's record_metrics_point. Grows live while a run is alive;
+// this IS the "watch the attack actually happening" timeline, not a
+// post-hoc file.
+export interface MetricsHistoryPointDto extends LiveMetricsDto {
+  t: number;
+}
+
 export interface RunRecordDto {
   run_id: string;
   pid: number;
@@ -434,6 +564,28 @@ export interface RunRecordDto {
   model_check: ModelCheckDto;
   alive: boolean;
   progress?: RunProgressDto;
+  live_metrics?: LiveMetricsDto;
+  metrics_history?: MetricsHistoryPointDto[];
+}
+
+export interface CsvSourceDto {
+  id: string;
+  label: string;
+  exists: boolean;
+}
+
+export interface CsvColumnsDto {
+  columns: string[];
+  row_count: number;
+  preview: string[][];
+  has_header: boolean;
+}
+
+export interface CsvDataDto {
+  x: number[];
+  y: number[];
+  n_total: number;
+  n_returned: number;
 }
 
 export interface ScenarioDetailDto {
@@ -515,11 +667,20 @@ export const api = {
   ledgerRevocations: () => getJson<RevocationDto[]>("/api/ledger/revocations"),
   ledgerFlags: () => getJson<ControllerFlagDto[]>("/api/ledger/flags"),
   ledgerReassignments: () => getJson<ReassignmentDto[]>("/api/ledger/reassignments"),
+  ledgerRefresh: () => postJson<{ status: string }>("/api/ledger/refresh", {}),
+  ledgerRefreshStatus: () => getJson<LedgerRefreshStatusDto>("/api/ledger/refresh_status"),
+  blocksRecent: () => getJson<BlocksRecentDto>("/api/ledger/blocks/recent"),
+  explorerUrl: () => getJson<{ url: string | null }>("/api/explorer_url"),
 
   captureSummary: () => getJson<CaptureSummaryDto>("/api/capture/summary"),
   captureVehicles: () => getJson<CaptureVehicleRowDto[]>("/api/capture/vehicles"),
   captureVehicle: (vid: number) =>
     getJson<{ vid: number; events: FusionEventDto[] }>(`/api/capture/vehicle/${vid}`),
+  ipfsStatus: () => getJson<IpfsStatusDto>("/api/ipfs/status"),
+  ipfsPin: (label: string, payload: unknown) =>
+    postJson<IpfsPinResultDto>("/api/ipfs/pin", { label, payload }),
+  captureNeighbours: (vid: number, t: number) =>
+    getJson<CaptureNeighboursDto>(`/api/capture/vehicle/${vid}/neighbours?t=${t}`),
   captureCryptoSummary: () => getJson<CryptoSummaryDto>("/api/capture/crypto_summary"),
   captureThresholdSweep: () => getJson<SweepPointDto[]>("/api/capture/threshold_sweep"),
   captureLayerAgreement: () => getJson<LayerAgreementDto>("/api/capture/layer_agreement"),
@@ -536,7 +697,15 @@ export const api = {
   runsList: () => getJson<RunRecordDto[]>("/api/runs"),
   runsDetail: (runId: string) => getJson<RunRecordDto>(`/api/runs/${runId}`),
   runsStop: (runId: string) => postJson<{ stopped: boolean }>(`/api/runs/${runId}/stop`, {}),
-  runStreamUrl: (runId: string) => `/api/runs/${runId}/stream`,
+  runLog: (runId: string, offset: number) =>
+    getJson<{ lines: string[]; next_offset: number; done: boolean }>(
+      `/api/runs/${runId}/log?offset=${offset}`
+    ),
+
+  csvSources: () => getJson<CsvSourceDto[]>("/api/csv_sources"),
+  csvColumns: (sourceId: string) => getJson<CsvColumnsDto>(`/api/csv_sources/${sourceId}/columns`),
+  csvData: (sourceId: string, x: string, y: string) =>
+    getJson<CsvDataDto>(`/api/csv_sources/${sourceId}/data?x=${encodeURIComponent(x)}&y=${encodeURIComponent(y)}`),
 
   resultsAblation: () =>
     getJson<{
@@ -549,4 +718,6 @@ export const api = {
         note?: string;
       }[];
     }>("/api/results/ablation"),
+
+  resultsAblationStudies: () => getJson<AblationStudyDto[]>("/api/results/ablation_studies"),
 };

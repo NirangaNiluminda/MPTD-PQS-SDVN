@@ -7,6 +7,11 @@ type Road = (typeof ROADS)[number];
 
 const ROAD_LABEL: Record<Road, string> = { urban: "Urban", rural: "Rural", highway: "Highway" };
 
+// Rural and highway maps have known rendering issues — disabled for the demo
+// rather than removed, so the corpus counts and the fact that these road
+// types exist stay visible instead of silently disappearing.
+const ROAD_DISABLED: Record<Road, boolean> = { urban: false, rural: true, highway: true };
+
 /** "TP-S1:MaliciousRSU-TrajectoryPoisoning" -> readable pieces. */
 function splitName(attackName: string) {
   const [code, rest = ""] = attackName.split(":");
@@ -70,6 +75,7 @@ export default function ScenarioPicker() {
     const q = query.trim().toLowerCase();
     if (!q) return [];
     return scenarios
+      .filter((s) => !ROAD_DISABLED[s.road as Road])
       .filter((s) => {
         const n = splitName(s.attack_name);
         return (
@@ -188,12 +194,17 @@ export default function ScenarioPicker() {
                 {ROADS.map((r) => (
                   <button
                     key={r}
+                    disabled={ROAD_DISABLED[r]}
                     onClick={() => {
+                      if (ROAD_DISABLED[r]) return;
                       setRoad(r);
                       setAttackNumber(null);
                     }}
+                    title={ROAD_DISABLED[r] ? `${ROAD_LABEL[r]} map is temporarily disabled for this demo` : undefined}
                     className={`flex-1 rounded px-2 py-1.5 text-xs font-semibold transition-colors ${
-                      road === r
+                      ROAD_DISABLED[r]
+                        ? "cursor-not-allowed bg-surface-raised text-ink-muted opacity-40"
+                        : road === r
                         ? "bg-entity-rsu text-white"
                         : "bg-surface-raised text-ink-secondary hover:text-ink-primary"
                     }`}

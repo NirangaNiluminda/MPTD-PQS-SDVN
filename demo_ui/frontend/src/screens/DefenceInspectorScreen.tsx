@@ -14,12 +14,16 @@ import {
 } from "recharts";
 import {
   api,
+  AttackInfoDto,
   CaptureSummaryDto,
   CaptureVehicleRowDto,
+  CaptureNeighboursDto,
   FusionEventDto,
 } from "../api";
 import { useTokens } from "../design/tokens";
+import { usePlayback } from "../store/playback";
 import Accordion from "../components/Accordion";
+import EgoGraph from "../components/EgoGraph";
 
 const GHOST_VID_BASE = 10000;
 const PHI_TH = 0.5; // fusion decision threshold, 08_detection_engine.h FusionParams default
@@ -31,38 +35,49 @@ const THETA_AE = 33.693885;
 function VehicleRow({
   row,
   selected,
+  attackByNumber,
   onClick,
 }: {
   row: CaptureVehicleRowDto;
   selected: boolean;
+  attackByNumber: Map<number, AttackInfoDto>;
   onClick: () => void;
 }) {
   const isGhost = row.vid >= GHOST_VID_BASE;
   return (
     <button
       onClick={onClick}
-      className={`flex w-full items-center gap-2 border-b border-surface-hairline/60 px-3 py-2 text-left text-xs transition-colors hover:bg-surface-raised ${
+      className={`flex w-full flex-col gap-1 border-b border-surface-hairline/60 px-3 py-2 text-left text-xs transition-colors hover:bg-surface-raised ${
         selected ? "bg-surface-raised" : ""
       }`}
     >
-      <span className="font-mono text-ink-primary">V{row.vid}</span>
-      {isGhost && (
-        <span className="rounded bg-entity-ghost/20 px-1.5 py-0.5 text-[10px] text-entity-ghost">
-          GHOST
-        </span>
-      )}
-      <span className="ml-auto text-ink-muted">{row.events} ev</span>
-      {row.missed > 0 ? (
-        <span className="rounded bg-status-missed/20 px-1.5 py-0.5 text-[10px] font-medium text-status-missed">
-          {row.missed} missed
-        </span>
-      ) : row.gt_poisoned > 0 ? (
-        <span className="rounded bg-status-caught/20 px-1.5 py-0.5 text-[10px] font-medium text-status-caught">
-          all caught
-        </span>
-      ) : (
-        <span className="rounded bg-status-good/15 px-1.5 py-0.5 text-[10px] text-status-good">
-          clean
+      <div className="flex w-full items-center gap-2">
+        <span className="font-mono text-ink-primary">V{row.vid}</span>
+        {isGhost && (
+          <span className="rounded bg-entity-ghost/20 px-1.5 py-0.5 text-[10px] text-entity-ghost">
+            GHOST
+          </span>
+        )}
+        <span className="ml-auto text-ink-muted">{row.events} ev</span>
+        {row.missed > 0 ? (
+          <span className="rounded bg-status-missed/20 px-1.5 py-0.5 text-[10px] font-medium text-status-missed">
+            {row.missed} missed
+          </span>
+        ) : row.gt_poisoned > 0 ? (
+          <span className="rounded bg-status-caught/20 px-1.5 py-0.5 text-[10px] font-medium text-status-caught">
+            all caught
+          </span>
+        ) : (
+          <span className="rounded bg-status-good/15 px-1.5 py-0.5 text-[10px] text-status-good">
+            clean
+          </span>
+        )}
+      </div>
+      {row.attack_types.length > 0 && (
+        <span className="truncate text-[10px] text-ink-muted">
+          {row.attack_types
+            .map((n) => attackByNumber.get(n)?.code ?? `attack ${n}`)
+            .join(" + ")}
         </span>
       )}
     </button>
@@ -71,6 +86,7 @@ function VehicleRow({
 
 export default function DefenceInspectorScreen() {
   const { SERIES, STATUS, INK, SURFACE } = useTokens();
+  const { lastSelectedVehicleId, setLastSelectedVehicleId } = usePlayback();
   const [summary, setSummary] = useState<CaptureSummaryDto | null>(null);
   const [vehicles, setVehicles] = useState<CaptureVehicleRowDto[]>([]);
   const [selected, setSelected] = useState<number | null>(null);
@@ -79,29 +95,75 @@ export default function DefenceInspectorScreen() {
   const [filter, setFilter] = useState("");
   const [openSignal, setOpenSignal] = useState<number | null>(null);
   const [trendsOpen, setTrendsOpen] = useState(false);
+  const [neighbours, setNeighbours] = useState<CaptureNeighboursDto | null>(null);
+  const [attacks, setAttacks] = useState<AttackInfoDto[]>([]);
+
+  // This capture is a combined-attack recording (real, verified: gt_atk
+  // values 1/3/4 etc. coexist across different vehicles in the same run,
+  // not one attack type) — this lookup is what turns that raw number into
+  // the same code/human_name the Attack Explainer tab already uses.
+  const attackByNumber = useMemo(
+    () => new Map(attacks.map((a) => [a.attack_number, a])),
+    [attacks]
+  );
+
+  const presentAttackCodes = useMemo(() => {
+    const nums = new Set<number>();
+    for (const v of vehicles) for (const n of v.attack_types) nums.add(n);
+    return Array.from(nums)
+      .sort((a, b) => a - b)
+      .map((n) => attackByNumber.get(n)?.code ?? `attack ${n}`);
+  }, [vehicles, attackByNumber]);
 
   useEffect(() => {
     api
       .captureSummary()
       .then(setSummary)
       .catch((e) => setError(String(e)));
+    api.attacks().then(setAttacks).catch(() => setAttacks([]));
     api
       .captureVehicles()
       .then((rows) => {
         setVehicles(rows);
-        if (rows.length) setSelected(rows[0].vid);
+        // A vehicle picked on Network Replay's map carries over here as the
+        // default, so switching tabs to dig into the same vehicle doesn't
+        // mean re-finding it in a 56-row list — but only if this capture
+        // (a different recorded run) actually has data for it.
+        const carriedOver = rows.find((r) => r.vid === lastSelectedVehicleId);
+        if (carriedOver) setSelected(carriedOver.vid);
+        else if (rows.length) setSelected(rows[0].vid);
       })
       .catch((e) => setError(String(e)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   useEffect(() => {
     if (selected === null) return;
     setEvents(null);
+    setNeighbours(null);
     api
       .captureVehicle(selected)
       .then((r) => setEvents(r.events))
       .catch((e) => setError(String(e)));
   }, [selected]);
+
+  const latestT = events && events.length ? events[events.length - 1].t : null;
+
+  useEffect(() => {
+    if (selected === null || latestT === null) return;
+    setNeighbours(null);
+    api
+      .captureNeighbours(selected, latestT)
+      .then(setNeighbours)
+      // No [METRICS] sample within tolerance, or this vehicle wasn't in the
+      // corpus at all — a quiet miss, not a screen-level error.
+      .catch(() => setNeighbours(null));
+  }, [selected, latestT]);
+
+  const selectVehicleRow = (vid: number) => {
+    setSelected(vid);
+    setLastSelectedVehicleId(vid);
+  };
 
   const filtered = useMemo(
     () =>
@@ -127,6 +189,19 @@ export default function DefenceInspectorScreen() {
 
   const isGhost = selected != null && selected >= GHOST_VID_BASE;
   const current = events && events.length ? events[events.length - 1] : null;
+
+  // Real [METRICS] positions, not attention weights — this capture never
+  // re-ran the GAT with attention output requested, so there's no weight to
+  // show here the way Network Replay's ego-graph has one.
+  const egoNodes = neighbours
+    ? neighbours.neighbours.map((n) => ({
+        id: n.vehicle_id,
+        dx: n.pos_x - neighbours.target_pos.x,
+        dy: n.pos_y - neighbours.target_pos.y,
+        distance: n.distance_m,
+        poisoned: n.is_poisoned,
+      }))
+    : [];
 
   if (error) {
     return (
@@ -155,8 +230,12 @@ export default function DefenceInspectorScreen() {
             <p className="mt-1 text-[11px] leading-relaxed text-ink-secondary">
               {summary.events.toLocaleString()} fusion decisions across{" "}
               {summary.vehicles} vehicles, t=[{summary.t_min.toFixed(0)}–
-              {summary.t_max.toFixed(0)}s]. This is a single captured run —
-              not the replay corpus.
+              {summary.t_max.toFixed(0)}s]. A single captured run — not the
+              replay corpus — and a{" "}
+              <span className="font-medium text-ink-primary">combined-attack</span> recording: multiple real
+              attack types coexist in it
+              {presentAttackCodes.length > 0 && <> ({presentAttackCodes.join(", ")})</>}, not one. Each
+              vehicle's own attack type is shown next to it below and in its detail view.
             </p>
           )}
           <input
@@ -172,7 +251,8 @@ export default function DefenceInspectorScreen() {
               key={row.vid}
               row={row}
               selected={row.vid === selected}
-              onClick={() => setSelected(row.vid)}
+              attackByNumber={attackByNumber}
+              onClick={() => selectVehicleRow(row.vid)}
             />
           ))}
         </div>
@@ -214,7 +294,7 @@ export default function DefenceInspectorScreen() {
                   </h3>
                   <p className="mb-3 text-[11px] text-ink-secondary">
                     Φ = λ<sub>ψ</sub>·ψ̂ + λ<sub>gat</sub>·Ŝ + λ<sub>ae</sub>·ε̂
-                    (Eq 3.46) — the three components below are each already
+                    (Eq 3.48) — the three components below are each already
                     normalised to [0,1], the exact terms the simulator sums.
                     Per-attack λ weights aren't carried in this log line, so
                     the bars show the normalised signals feeding the sum,
@@ -233,7 +313,12 @@ export default function DefenceInspectorScreen() {
                     </span>
                     <span className="text-ink-muted">·</span>
                     <span className="text-ink-muted">
-                      ground truth: {current.gt_pois ? "poisoned" : "honest"}
+                      ground truth:{" "}
+                      {current.gt_pois
+                        ? `poisoned — ${attackByNumber.get(current.gt_atk)?.code ?? `attack ${current.gt_atk}`} (${
+                            attackByNumber.get(current.gt_atk)?.human_name ?? "unknown"
+                          })`
+                        : "honest"}
                     </span>
                     {current.gt_pois && !current.full_anom && (
                       <span className="rounded bg-status-missed/20 px-1.5 py-0.5 font-medium text-status-missed">
@@ -311,7 +396,7 @@ export default function DefenceInspectorScreen() {
                         body: (
                           <p className="text-[11px] text-ink-secondary">
                             Φ = λ<sub>ψ</sub>·ψ̂ + λ<sub>gat</sub>·Ŝ + λ<sub>ae</sub>·ε̂
-                            (Eq 3.46) = {current.phi.toFixed(3)}, decision
+                            (Eq 3.48) = {current.phi.toFixed(3)}, decision
                             threshold 0.5. Predicted class k̂={current.khat}
                             {current.khat >= 0 ? ` (attack ${current.khat + 1})` : " (none)"}.
                           </p>
@@ -359,6 +444,27 @@ export default function DefenceInspectorScreen() {
                     ))}
                   </div>
                 </section>
+
+                {!isGhost && (
+                  <section className="rounded-lg border border-surface-hairline bg-surface-raised p-4">
+                    <h3 className="mb-1 text-body font-semibold text-ink-primary">
+                      Nearby vehicles — real positions
+                    </h3>
+                    <p className="mb-3 text-[11px] leading-relaxed text-ink-muted">
+                      From this capture's own [METRICS] lines at t={current.t.toFixed(2)}s — real ground-truth
+                      positions, but this run never re-ran the GAT with attention output requested, so edges
+                      here mean "was within {"≤"}300m," not "attended to this much" the way Network
+                      Replay's ego-graph does.
+                    </p>
+                    {neighbours ? (
+                      <EgoGraph centerLabel={`V${selected}`} nodes={egoNodes} />
+                    ) : (
+                      <p className="text-xs text-ink-muted">
+                        No [METRICS] position sample within 1s of t={current.t.toFixed(2)}s for this vehicle.
+                      </p>
+                    )}
+                  </section>
+                )}
 
                 <Accordion
                   open={trendsOpen}

@@ -176,3 +176,6 @@ demo_ui/frontend/vite.config.d.ts
 
 # Simulation stdout captures for the demo UI (large, regeneratable)
 demo_ui/captures/
+
+# graphify knowledge-graph cache (large, regeneratable via `graphify update .`)
+graphify-out/

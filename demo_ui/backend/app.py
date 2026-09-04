@@ -8,13 +8,16 @@ recomputed or smoothed here, only decoded/aggregated for display.
 
 import json
 import subprocess
+import threading
 import time
 from dataclasses import asdict
+from datetime import datetime, timezone
+import bisect
+import math
 from functools import lru_cache
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -22,10 +25,15 @@ from fastapi.staticfiles import StaticFiles
 
 import config
 from parsers import beacon as beacon_parser
+from parsers import block_feed
 from parsers import capture_analytics
 from parsers import catalog
+from parsers import csv_explorer
 from parsers import fusion
+from parsers import metrics
+from parsers import revoke_votes
 from parsers import geometry
+from parsers import ipfs_client
 from parsers import ledger
 from parsers import roadmap
 from parsers import run_manager
@@ -384,9 +392,15 @@ def list_attacks():
         )
         # Point the "show me" link at a mid-intensity urban recording if one
         # exists in the corpus, so the card can jump straight into a replay.
+        # Deliberately urban-only, no fallback to rural/highway: those maps
+        # have known rendering issues and are disabled in Network Replay's
+        # own picker (ScenarioPicker.tsx) — a "show me" link must not offer a
+        # jump target that screen won't actually let a user reach on its own.
+        # No urban sample for this attack number means no link, not a broken
+        # one.
         sample = next(
             (s.id for s in scenarios if s.road == "urban" and s.attack_number == n and s.attack_pct == 40),
-            next((s.id for s in scenarios if s.attack_number == n), None),
+            next((s.id for s in scenarios if s.road == "urban" and s.attack_number == n), None),
         )
         out.append(
             {
@@ -544,18 +558,84 @@ def scenario_detail(scenario_id: str):
     }
 
 
-# ── Blockchain ledger (from a snapshot, not a live query — see
-#    scripts/snapshot_ledger.py and parsers/ledger.py for why) ──────────────
+# ── Blockchain ledger. Defaults to the on-disk snapshot (see
+#    scripts/snapshot_ledger.py and parsers/ledger.py for why the demo
+#    doesn't depend on Fabric being reachable at presentation time), but
+#    /api/ledger/refresh can replace it in-memory with a live query against
+#    the real gateway daemon — same shape, so every existing endpoint below
+#    picks up live data for free once a refresh has run. ────────────────────
 
-@lru_cache(maxsize=1)
+_current_ledger_snapshot: dict | None = None
+_ledger_refresh_state = {"status": "idle", "started_at": None, "finished_at": None, "error": None}
+
+
 def _ledger_snapshot() -> dict:
+    global _current_ledger_snapshot
+    if _current_ledger_snapshot is not None:
+        return _current_ledger_snapshot
     if not config.LEDGER_SNAPSHOT.is_file():
         raise HTTPException(
             404,
             "No ledger snapshot yet. Run: cd demo_ui/backend && "
             "python3 scripts/snapshot_ledger.py",
         )
-    return ledger.load_snapshot(config.LEDGER_SNAPSHOT)
+    _current_ledger_snapshot = ledger.load_snapshot(config.LEDGER_SNAPSHOT)
+    return _current_ledger_snapshot
+
+
+def _run_ledger_refresh():
+    global _current_ledger_snapshot
+    _ledger_refresh_state.update(status="running", started_at=time.time(), error=None)
+    try:
+        data = ledger.build_snapshot()
+        _current_ledger_snapshot = {
+            "captured_at": datetime.now(timezone.utc).isoformat(),
+            "live": True,
+            "data": data,
+        }
+        _ledger_refresh_state.update(status="idle", finished_at=time.time())
+    except Exception as e:  # noqa: BLE001 — surfaced to the UI, not swallowed
+        _ledger_refresh_state.update(status="idle", finished_at=time.time(), error=str(e))
+
+
+@app.post("/api/ledger/refresh")
+def ledger_refresh():
+    """Kicks off a real, live query against every chaincode function the
+    demo shows. ledger.py's own docstring: a single call can legitimately
+    take up to ~20-30s under load, and there are 7 of them here — this runs
+    in a background thread and the UI polls /api/ledger/refresh_status
+    rather than holding a request open for minutes."""
+    if _ledger_refresh_state["status"] == "running":
+        return {"status": "already_running"}
+    threading.Thread(target=_run_ledger_refresh, daemon=True).start()
+    return {"status": "started"}
+
+
+@app.get("/api/ledger/refresh_status")
+def ledger_refresh_status():
+    snap = None
+    try:
+        snap = _ledger_snapshot()
+    except HTTPException:
+        pass
+    return {
+        **_ledger_refresh_state,
+        "captured_at": snap["captured_at"] if snap else None,
+        "is_live": bool(snap and snap.get("live")),
+    }
+
+
+@app.get("/api/explorer_url")
+def explorer_url():
+    # Read fresh, not at import time — see config.EXPLORER_TUNNEL_URL_FILE's
+    # own comment: this second tunnel's URL is ephemeral and the file is
+    # whatever a human last wrote there, so a missing/empty file must mean
+    # "no link" rather than serving a stale one baked in at server start.
+    try:
+        url = config.EXPLORER_TUNNEL_URL_FILE.read_text().strip()
+    except FileNotFoundError:
+        url = ""
+    return {"url": url or None}
 
 
 def _ledger_data(key: str) -> list:
@@ -573,6 +653,7 @@ def ledger_summary():
     ctrl = _ledger_data("controller_trust")
     return {
         "captured_at": snap["captured_at"],
+        "is_live": bool(snap.get("live")),
         "rsus": {
             "total": len(rsu),
             "trusted": sum(1 for r in rsu if r.get("State") == "TRUSTED"),
@@ -615,6 +696,29 @@ def ledger_flags():
 @app.get("/api/ledger/reassignments")
 def ledger_reassignments():
     return _ledger_data("reassignments")
+
+
+# ── Live block feed — real "Committed block [N]" lines tailed straight off
+#    the peer container's own log, see parsers/block_feed.py for why this
+#    (not the ns-3 process) is the one honest source for block creation.
+#
+#    Plain polled REST, not SSE: Cloudflare Quick Tunnels (trycloudflare.com,
+#    what this demo gets shared through) do not stream SSE-over-GET in real
+#    time — cloudflared buffers the whole response until the connection
+#    closes, which for an infinite live stream never happens (tracked
+#    upstream: github.com/cloudflare/cloudflared/issues/1449). Confirmed
+#    directly: the old SSE endpoint answered instantly on localhost and
+#    returned zero bytes over the tunnel even after 8s. Polling has no such
+#    dependency on how the transport handles a long-lived connection. ───────
+
+@app.get("/api/ledger/blocks/recent")
+def ledger_blocks_recent():
+    height = block_feed.chain_height()
+    try:
+        recent = block_feed.fetch_recent(tail=400)[-30:]
+    except block_feed.BlockFeedError as e:
+        raise HTTPException(502, str(e))
+    return {"container": block_feed.PEER_CONTAINER, "height": height, "recent": recent}
 
 
 # ── FUSION capture: the [FUSION-RSU*] stdout from one blockchain-enabled
@@ -687,6 +791,12 @@ def capture_vehicles():
     for vid, evs in by_vid.items():
         poisoned = sum(1 for e in evs if e.gt_pois)
         flagged = sum(1 for e in evs if e.gt_pois and e.full_anom)
+        # This capture is a COMBINED-attack recording — different vehicles
+        # (and occasionally the same vehicle at different times) carry
+        # different real attack_number ground truth. gt_atk IS attack_number
+        # directly (1-7), 0 = honest at that instant — confirmed against the
+        # simulator's own [FUSION-RSU*] print, not a derived/offset value.
+        attack_types = sorted({e.gt_atk for e in evs if e.gt_pois and e.gt_atk > 0})
         rows.append(
             {
                 "vid": vid,
@@ -694,6 +804,7 @@ def capture_vehicles():
                 "gt_poisoned": poisoned,
                 "flagged": flagged,
                 "missed": poisoned - flagged,
+                "attack_types": attack_types,
             }
         )
 
@@ -783,13 +894,30 @@ def capture_latency_histogram():
     return capture_analytics.detection_latency(_capture_events())
 
 
+@lru_cache(maxsize=1)
+def _revoke_votes() -> list["revoke_votes.RevokeVote"]:
+    if not config.FUSION_CAPTURE_LOG.is_file():
+        raise HTTPException(404, f"no capture log at {config.FUSION_CAPTURE_LOG}")
+    with open(config.FUSION_CAPTURE_LOG) as fh:
+        return list(revoke_votes.iter_votes(fh))
+
+
 @app.get("/api/capture/attack_evidence/{attack_number}")
 def capture_attack_evidence(attack_number: int):
     """Real per-layer detection profile for one attack variant (1-7),
     filtered from the capture on the simulator's own gt_atk ground-truth
     label. Two variants (TP-S3, MP-S4) have zero events in this particular
-    90s recording — n_events==0 in the response, not a fabricated figure."""
-    return capture_analytics.attack_evidence(_capture_events(), attack_number)
+    90s recording — n_events==0 in the response, not a fabricated figure.
+
+    mitigation is real [SC-REVOKE-VOTE-RSU*] activity against this same
+    attack's real poisoned vehicles, from this same file — see
+    capture_analytics.mitigation_for_attack's docstring for why it's never
+    cross-referenced against the separate ledger snapshot."""
+    events = _capture_events()
+    result = capture_analytics.attack_evidence(events, attack_number)
+    if result.get("n_events", 0) > 0:
+        result["mitigation"] = capture_analytics.mitigation_for_attack(events, _revoke_votes(), attack_number)
+    return result
 
 
 @app.get("/api/capture/vehicle/{vid}")
@@ -799,6 +927,133 @@ def capture_vehicle(vid: int):
         raise HTTPException(404, f"vehicle {vid} has no FUSION events in the capture")
     events.sort(key=lambda e: e.t)
     return {"vid": vid, "events": [_fusion_event_to_dict(e) for e in events]}
+
+
+# ── [METRICS] positions: this capture has no per-neighbour GAT re-inference
+#    available (unlike the replay corpus — see gat_attention.py), but it DOES
+#    print real per-vehicle pos_x/pos_y on every processed beacon. That's
+#    enough for a real (not fabricated) "who was nearby" proximity view —
+#    explicitly NOT attention weights, since those were never computed here. ─
+
+_NEIGHBOUR_T_TOLERANCE_S = 1.0  # ignore a vehicle whose nearest sample is older/newer than this
+
+
+@lru_cache(maxsize=1)
+def _metrics_samples() -> list["metrics.MetricsSample"]:
+    if not config.FUSION_CAPTURE_LOG.is_file():
+        raise HTTPException(404, f"no capture log at {config.FUSION_CAPTURE_LOG}")
+    with open(config.FUSION_CAPTURE_LOG) as fh:
+        return list(metrics.iter_samples(fh))
+
+
+@lru_cache(maxsize=1)
+def _metrics_by_vehicle() -> dict[int, list["metrics.MetricsSample"]]:
+    by_vid: dict[int, list] = {}
+    for s in _metrics_samples():
+        by_vid.setdefault(s.vehicle, []).append(s)
+    for samples in by_vid.values():
+        samples.sort(key=lambda s: s.t)
+    return by_vid
+
+
+@lru_cache(maxsize=1)
+def _fusion_by_vehicle() -> dict[int, list["fusion.FusionEvent"]]:
+    by_vid: dict[int, list] = {}
+    for e in _capture_events():
+        by_vid.setdefault(e.vid, []).append(e)
+    for events in by_vid.values():
+        events.sort(key=lambda e: e.t)
+    return by_vid
+
+
+def _nearest_by_t(sorted_items: list, t: float, key):
+    """Item whose `key(item)` is closest to t, plus the abs time delta. Assumes
+    sorted_items is sorted ascending by key(item); empty input -> (None, inf)."""
+    if not sorted_items:
+        return None, float("inf")
+    keys = [key(x) for x in sorted_items]
+    i = bisect.bisect_left(keys, t)
+    candidates = [j for j in (i - 1, i) if 0 <= j < len(sorted_items)]
+    best = min(candidates, key=lambda j: abs(keys[j] - t))
+    return sorted_items[best], abs(keys[best] - t)
+
+
+@app.get("/api/capture/vehicle/{vid}/neighbours")
+def capture_vehicle_neighbours(vid: int, t: float, radius_m: float = 300.0):
+    """Real positions from [METRICS] lines, not attention weights — this
+    capture's log never re-ran the GAT with attention output requested (that
+    only happens for the replay corpus, see /api/scenarios/.../gat_attention).
+    Distance-only: edges here mean "was this close," not "attended to this
+    much." """
+    by_vehicle = _metrics_by_vehicle()
+    if vid not in by_vehicle:
+        raise HTTPException(404, f"vehicle {vid} has no [METRICS] samples in the capture")
+
+    target, target_dt = _nearest_by_t(by_vehicle[vid], t, key=lambda s: s.t)
+    if target is None or target_dt > _NEIGHBOUR_T_TOLERANCE_S:
+        raise HTTPException(404, f"vehicle {vid} has no [METRICS] sample within {_NEIGHBOUR_T_TOLERANCE_S}s of t={t}")
+
+    fusion_by_vehicle = _fusion_by_vehicle()
+
+    neighbours = []
+    for other_vid, samples in by_vehicle.items():
+        if other_vid == vid:
+            continue
+        sample, dt = _nearest_by_t(samples, target.t, key=lambda s: s.t)
+        if sample is None or dt > _NEIGHBOUR_T_TOLERANCE_S:
+            continue
+        distance = math.hypot(sample.pos_x - target.pos_x, sample.pos_y - target.pos_y)
+        if distance > radius_m:
+            continue
+        gt_pois = False
+        fev, fdt = _nearest_by_t(fusion_by_vehicle.get(other_vid, []), target.t, key=lambda e: e.t)
+        if fev is not None and fdt <= _NEIGHBOUR_T_TOLERANCE_S:
+            gt_pois = fev.gt_pois
+        neighbours.append(
+            {
+                "vehicle_id": other_vid,
+                "pos_x": sample.pos_x,
+                "pos_y": sample.pos_y,
+                "distance_m": distance,
+                "is_poisoned": gt_pois,
+            }
+        )
+    neighbours.sort(key=lambda n: n["distance_m"])
+
+    return {
+        "vehicle_id": vid,
+        "t": target.t,
+        "target_pos": {"x": target.pos_x, "y": target.pos_y},
+        "neighbours": neighbours,
+    }
+
+
+# ── IPFS: real daemon, on-demand — deliberately separate from the simulator
+#    (which only talks to IPFS live during a run, hours away for any full
+#    sim) so the UI can demonstrate a genuine add/pin/fetch round trip against
+#    whatever's actually running right now, using real data already on hand.
+#    Every capture/replay run recorded so far hit connection-refused and fell
+#    back to the deterministic FNV-1a stub (see run_summary.py) — this is not
+#    that: it's a live call to the daemon, and it fails honestly (503) rather
+#    than ever fabricating a CID if the daemon isn't reachable. ─────────────
+
+class IpfsPinRequest(BaseModel):
+    label: str
+    payload: dict
+
+
+@app.get("/api/ipfs/status")
+def ipfs_status():
+    return ipfs_client.status()
+
+
+@app.post("/api/ipfs/pin")
+def ipfs_pin(req: IpfsPinRequest):
+    try:
+        result = ipfs_client.add_json(req.payload, filename=f"{req.label}.json")
+    except ipfs_client.IpfsUnreachable as e:
+        raise HTTPException(503, f"IPFS daemon unreachable: {e}")
+    return {"label": req.label, **result}
 
 
 # ── Run console: launch, track, and stream real simulation runs ────────────
@@ -872,7 +1127,9 @@ def runs_detail(run_id: str):
             fh.seek(max(0, size - _PROGRESS_TAIL_BYTES))
             tail = fh.read().decode(errors="replace")
     progress = run_manager.parse_progress(tail, rec["config"], run_id=run_id)
-    return {**rec, "progress": progress}
+    live_metrics = run_manager.update_live_metrics(run_id, rec["log_path"], sim_time_total=float(rec["config"]["sim_time"]))
+    history = run_manager.get_metrics_history(run_id)
+    return {**rec, "progress": progress, "live_metrics": live_metrics, "metrics_history": history}
 
 
 @app.post("/api/runs/{run_id}/stop")
@@ -883,29 +1140,56 @@ def runs_stop(run_id: str):
     return {"stopped": True}
 
 
-@app.get("/api/runs/{run_id}/stream")
-def runs_stream(run_id: str):
+# Plain polled REST, not SSE — see ledger_blocks_recent's comment above for
+# why: Cloudflare Quick Tunnels don't stream SSE-over-GET in real time, they
+# buffer until the connection closes, which never happens for a live-tailed
+# log. Byte-offset incremental read, same pattern run_manager's own
+# update_live_metrics already uses for the same log file.
+@app.get("/api/runs/{run_id}/log")
+def runs_log(run_id: str, offset: int = 0):
     rec = run_manager.get_run(run_id)
     if rec is None:
         raise HTTPException(404, f"no run with id {run_id}")
     log_path = Path(rec["log_path"])
 
-    def tail_generator():
-        # Start from the beginning — these logs are capped by simTime and
-        # stay small enough (tens of MB) that a fresh client replaying the
-        # whole thing is simpler and more honest than guessing an offset.
-        with open(log_path, "r", errors="replace") as fh:
-            while True:
-                line = fh.readline()
-                if line:
-                    yield f"data: {json.dumps(line.rstrip(chr(10)))}\n\n"
-                else:
-                    if not run_manager._is_alive(rec["pid"]):
-                        yield "event: done\ndata: {}\n\n"
-                        break
-                    time.sleep(0.5)
+    lines: list[str] = []
+    next_offset = offset
+    if log_path.is_file():
+        with open(log_path, "rb") as fh:
+            fh.seek(offset)
+            chunk = fh.read()
+        last_nl = chunk.rfind(b"\n")
+        if last_nl != -1:
+            complete = chunk[: last_nl + 1]
+            next_offset = offset + len(complete)
+            lines = complete.decode(errors="replace").splitlines()
 
-    return StreamingResponse(tail_generator(), media_type="text/event-stream")
+    return {"lines": lines, "next_offset": next_offset, "done": not run_manager._is_alive(rec["pid"])}
+
+
+# ── CSV explorer: generic "pick a CSV, pick two columns, plot it" — see
+#    parsers/csv_explorer.py's docstring for why headerless sources are
+#    labelled "Column N" rather than guessed. ────────────────────────────────
+
+@app.get("/api/csv_sources")
+def csv_sources():
+    return csv_explorer.list_sources()
+
+
+@app.get("/api/csv_sources/{source_id}/columns")
+def csv_source_columns(source_id: str):
+    try:
+        return csv_explorer.read_columns(source_id)
+    except KeyError:
+        raise HTTPException(404, f"unknown CSV source: {source_id}")
+
+
+@app.get("/api/csv_sources/{source_id}/data")
+def csv_source_data(source_id: str, x: str, y: str, max_points: int = 2000):
+    try:
+        return csv_explorer.read_xy(source_id, x, y, max_points=max_points)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
 
 
 # ── Results & ablation (E1/E2 figures as static images, E5 as data,
@@ -948,6 +1232,154 @@ def results_ablation():
             },
         ],
     }
+
+
+@app.get("/api/results/ablation_studies")
+def results_ablation_studies():
+    """The paper's own 11-variant ablation study (report/main.tex, "Attack
+    Modeling"/ablation chapter, \\subsection{AB1..AB11} — NOT the same thing
+    as /api/results/ablation above, which is a separate D1/D4/D6 time-cutoff
+    analysis under one fixed scenario. Every number here was read directly
+    out of main.tex's own results prose (each entry's "citation" gives the
+    line range) — this endpoint transcribes the paper, it does not
+    re-derive or re-verify the underlying sweeps. AB8 has no "results" key:
+    the paper itself discloses (main.tex:8715-8722) that this ablation was
+    never completed experimentally — that gap is real and shown as a gap,
+    not filled in or omitted."""
+    return [
+        {
+            "number": 1,
+            "category": "Detection",
+            "title": "Rule-Based Signatures Removed",
+            "ablates": "The nine rule-based signatures and composite score ψ_i(t) (Eq 3.21)",
+            "swept": "attacker penetration ρ_a ∈ {0.05, 0.10, 0.20, 0.30, 0.40}",
+            "headline": "MCC_full at ρ_a=0.40: full 0.781 vs AB1 0.395",
+            "finding": "Removing the rule signatures costs roughly half the achieved detection quality at every penetration rate in the sweep.",
+            "caveat": "The quoted TTD (12.74–15.44s vs 0.59–6.04s) is from an independent single-seed check, not the 3-seed manifest; PBPO is a mechanism argument, not a measured data column.",
+            "citation": "main.tex:7157-7276",
+            "has_results": True,
+        },
+        {
+            "number": 2,
+            "category": "Detection",
+            "title": "HMAC Removed",
+            "ablates": "HMAC beacon integrity and anti-replay verification (Eq 3.42)",
+            "swept": "MitM penetration ρ_MitM ∈ {0.05, 0.10, 0.20, 0.30, 0.40, 0.8}",
+            "headline": "MCC_full at ρ_MitM=0.80: full 0.942 vs AB2 0.479 — but AB2 is HIGHER than full at ρ≤0.10",
+            "finding": "Below ρ_MitM≈0.3 the ablated arm's MCC is actually higher — a measurement artefact, not a real advantage: HMAC's fail-fast gate discards modified beacons before they can be scored as a caught true positive, so removing the gate inflates AB2's measured MCC while making the system strictly less safe. CDER (which scores control outcomes, not beacon verdicts) is the fair arbiter here. Above ρ≈0.3 the artefact is overwhelmed and AB2 collapses.",
+            "caveat": "The low-penetration inversion (0.718 vs 0.602 at ρ=0.05) is real and explained above, not noise — don't read it as HMAC being harmful.",
+            "citation": "main.tex:7276-7380",
+            "has_results": True,
+        },
+        {
+            "number": 3,
+            "category": "Detection",
+            "title": "GAT Disabled",
+            "ablates": "The GAT spatial anomaly detector",
+            "swept": "coordinated Sybil identities per RSU, n_coord ∈ {1, 2, 5, 10, 20}",
+            "headline": "MCC_full: full 0.332→0.180 vs AB3 at or below zero (−0.007 to −0.115)",
+            "finding": "Without the GAT, coordinated Sybil identities are effectively undetectable — MCC falls to zero or negative across the whole sweep.",
+            "caveat": "Explicitly marked preliminary by the paper itself: only 3 seeds, high seed variance (realized poison rate ranged 6.3–18.8% across seeds at fixed ρ_a=0.20).",
+            "citation": "main.tex:7380-7517",
+            "has_results": True,
+        },
+        {
+            "number": 4,
+            "category": "Detection",
+            "title": "LSTM-AE Disabled",
+            "ablates": "The LSTM temporal autoencoder (reconstruction error ε̂)",
+            "swept": "stealth drift bound ε_max ∈ {0.1, 0.2, 0.3, 0.4, 0.5} m/beacon",
+            "headline": "MCC_full at ε_max=0.5m: full 0.367 vs AB4 flat at 0.025 — identical seed-for-seed across the sweep",
+            "finding": "The ablated system's response to stealth drift magnitude is exactly zero, not just small — the paper calls this \"the cleanest ablation in the study\" because a sub-threshold-per-beacon drift attack is structurally invisible to rule signatures and only the LSTM-AE's cumulative-window view catches it.",
+            "caveat": "TTD handling of the \"never detected\" sentinel value across seeds needs confirmation before the plotted figure is fully trusted (in-file TODO).",
+            "citation": "main.tex:7517-7685",
+            "has_results": True,
+        },
+        {
+            "number": 5,
+            "category": "Detection",
+            "title": "Full AI Layer Removed (Lightweight Mode Only)",
+            "ablates": "Both GAT and LSTM-AE together — detection relies solely on HMAC + rule signatures",
+            "swept": "vehicle speed regime, v ∈ {10, 60, 100, 140} km/h",
+            "headline": "MCC_full: full 0.867 (flat) vs Lightweight-only 0.267–0.367 across speed regimes",
+            "finding": "This is the direct Lightweight-Mode-vs-Full-Mode comparison: with both AI detectors removed, detection quality drops by more than half and stays flat regardless of speed — the AI layer is what recovers the loss, not speed-regime tuning.",
+            "caveat": "TTD is a \"never detected\" sentinel value at every speed and every seed for the ablated arm.",
+            "citation": "main.tex:7685-7857",
+            "has_results": True,
+        },
+        {
+            "number": 6,
+            "category": "Cryptography",
+            "title": "TRS Threshold Signing Gate Removed",
+            "ablates": "t-of-n threshold ring signing, weakened to a single signer with no quorum",
+            "swept": "compromised ring-member fraction f/n ∈ {0, 0.25, 0.5, 0.75, 1.0} (n=4)",
+            "headline": "PARR at f/n=0.5: full t-of-n quorum 0.800 vs AB6 single-signer 0.000",
+            "finding": "A single compromised ring member fully defeats a non-quorum signer — the threshold gate is what makes a poisoned aggregate rejectable at all, not an incremental improvement.",
+            "caveat": None,
+            "citation": "main.tex:7857-7981",
+            "has_results": True,
+        },
+        {
+            "number": 7,
+            "category": "Cryptography",
+            "title": "FHE Pre-Coordination Encryption Removed (PQ vs. classical)",
+            "ablates": "Compares the full post-quantum PQ-FHE-TRS pipeline against a classical ECDSA-class baseline (Shamir-Schnorr-P256)",
+            "swept": "RSU signing-ring size n ∈ {4, 6, 8, 10, 12}",
+            "headline": "TRS signing latency: PQ (ML-DSA-87/Dilithium5) ~22.0ms flat vs classical ~3.48ms — a 6.34× ratio; bandwidth overhead ~10.5× baseline",
+            "finding": "Post-quantum signing costs roughly 6× a classical scheme, and the full crypto pipeline (FHE + TRS) adds about 10.5× bandwidth over plain beacons — the measured price of PQ-safety and FHE-based aggregate privacy.",
+            "caveat": None,
+            "citation": "main.tex:7981-8143",
+            "has_results": True,
+        },
+        {
+            "number": 8,
+            "category": "Trust",
+            "title": "RSU Three-State Trust Lifecycle Removed",
+            "ablates": "The RSU trust-state lifecycle (TRUSTED → PROBATIONARY → DEMOTED)",
+            "swept": None,
+            "headline": None,
+            "finding": None,
+            "caveat": "Not among the completed studies — the paper discloses this itself: \"is not among the completed studies reported in Chapter Results... the RQ6 claim regarding trust-management sub-components is correspondingly supported by AB9 and AB10 alone.\" Shown here as a real gap, not filled in with a number.",
+            "citation": "main.tex:4236, 8715-8722",
+            "has_results": False,
+        },
+        {
+            "number": 9,
+            "category": "Trust",
+            "title": "Multi-Controller Architecture Removed",
+            "ablates": "Multiple controllers with cross-controller conflict detection (CP-DETECT) and revocation, reduced to a single controller with no revocation pathway",
+            "swept": "controller compromise onset t_comp / T_sim ∈ {0, 0.25, 0.5, 0.75, 1.0}",
+            "headline": "CDER decays 0.633 → 0.265 as compromise onset moves later in the run — near-linear",
+            "finding": "Without a revocation pathway, control-decision damage is simply proportional to how long the compromised controller stays exposed — a controller compromised at the start corrupts decisions for the whole run, one compromised at the end corrupts almost none.",
+            "caveat": "An unresolved in-file TODO in the paper's own source flags that the archived sweep may contain only the single-controller (ablated) arm, with no full-mode comparison series in the underlying data — treat the full-system baseline for this ablation with caution.",
+            "citation": "main.tex:8143-8240",
+            "has_results": True,
+        },
+        {
+            "number": 10,
+            "category": "Trust",
+            "title": "Blockchain Trust Layer Removed",
+            "ablates": "SC-Trust / SC-Revoke — the 2f+1 BFT-endorsed on-chain revocation requirement",
+            "swept": "attack penetration ρ_a ∈ {0, 0.2, 0.4, 0.6, 0.8, 1.0}",
+            "headline": "CDER separation reaches 0.021 at ρ_a=1.0 (full 0.679 vs ablated 0.700) — small but consistent in sign above ρ_a=0.6",
+            "finding": "Without the 2f+1 BFT endorsement requirement, revocation depends on one controller's own view and becomes less reliable as more entities misbehave — directionally as predicted, though the effect size is small.",
+            "caveat": "The paper flags this explicitly: \"A 0.02 difference in CDER sits close to the resolution at which the ablated arm's values were logged — several of its rows carry only one decimal place.\" Read this as establishing direction, not a precise magnitude.",
+            "citation": "main.tex:8240-8421",
+            "has_results": True,
+        },
+        {
+            "number": 11,
+            "category": "Key Management",
+            "title": "LKH Replaced with Unicast Key Distribution",
+            "ablates": "Logical Key Hierarchy group rekeying, replaced with per-vehicle unicast rekey messages",
+            "swept": "group size |V_j| ∈ {40, 80, 120, 160, 200}",
+            "headline": "Rekey messages at |V_j|=200: LKH 8 vs unicast 199 — a 24.9× reduction",
+            "finding": "LKH's message count matches its closed-form prediction ⌈log2|V_j|⌉ EXACTLY at every point, not just approximately — the strongest possible confirmation that the deployed mechanism is what the analysis assumes it is.",
+            "caveat": "Run as a standalone micro-benchmark of the rekey mechanism itself, not inside a full network simulation.",
+            "citation": "main.tex:8421-8600",
+            "has_results": True,
+        },
+    ]
 
 
 # ── Serve the built frontend (present after `npm run build`) ───────────────
