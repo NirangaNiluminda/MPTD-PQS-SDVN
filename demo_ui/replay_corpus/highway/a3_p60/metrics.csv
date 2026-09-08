@@ -1,0 +1,2 @@
+attack_number,attacker_class,attack_pct,maxspeed_kmh,ablation_mode,cm_TP,cm_FP,cm_TN,cm_FN,MCC,FPR,cm_full_TP,cm_full_FP,cm_full_TN,cm_full_FN,MCC_full,FPR_full,PARR,CDER,ctrl_decisions_total,ctrl_decisions_wrong,TDEE,TPE,PBPO_LW_ms,PBPO_Full_ms,total_received,total_poisoned,total_stored,trs_verified_count,trs_rejected_count,sc_register_rejects,sc_register_active
+3,2,60,150,1,21468,2549,10441,0,0.847623,0.196228,0,0,0,0,0,0,1.00084,0.0691565,34299,2372,0.57,0.104636,0.0195482,0.0895325,34281,21468,34281,0,0,0,0

@@ -174,8 +174,14 @@ demo_ui/frontend/vite.config.d.ts
 /UlRlcStats.txt
 /UlSinrStats.txt
 
-# Simulation stdout captures for the demo UI (large, regeneratable)
-demo_ui/captures/
+# Simulation stdout captures for the demo UI (large, regeneratable) — except
+# ledger_snapshot.json, vendored deliberately so Blockchain Ledger's
+# point-in-time view works on a fresh clone with no live Fabric network
+# reachable. `captures/*` (not `captures/`) so the negation below can still
+# reach into the directory — git can't re-include a file whose parent
+# directory itself was excluded.
+demo_ui/captures/*
+!demo_ui/captures/ledger_snapshot.json
 
 # graphify knowledge-graph cache (large, regeneratable via `graphify update .`)
 graphify-out/

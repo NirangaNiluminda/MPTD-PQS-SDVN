@@ -8,11 +8,16 @@ from pathlib import Path
 REPO_ROOT = Path(os.environ.get("MPTD_REPO_ROOT", Path(__file__).resolve().parents[2]))
 
 # Pre-recorded replay corpus: 113 scenarios, {urban,rural,highway} x a<N>_p<PCT>.
-# See parsers/catalog.py for the confirmed layout.
+# See parsers/catalog.py for the confirmed layout. Vendored into the repo at
+# demo_ui/replay_corpus/ (302MB, no file >50MB — confirmed safe for a normal
+# git commit, no Git LFS needed) specifically so a fresh clone on another
+# machine works with zero setup — no live simulation or personal Desktop
+# path required. MPTD_CORPUS_ROOT still overrides this for anyone with a
+# larger/different corpus elsewhere (e.g. the original Desktop copy).
 CORPUS_ROOT = Path(
     os.environ.get(
         "MPTD_CORPUS_ROOT",
-        "/home/sdvn_mobility_flooding/Desktop/dataset_G50-mobility",
+        str(REPO_ROOT / "demo_ui" / "replay_corpus"),
     )
 )
 
