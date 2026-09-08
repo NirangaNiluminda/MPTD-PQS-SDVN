@@ -663,6 +663,36 @@ double delta_th = 5.0;      // Dead-reckoning residual threshold (m)
 static bool g_save_restore_context = false;  // unused placeholder
 int    drift_window_k = 10; // Window size k for cumulative drift score
 
+// TP-S5 long-baseline variant (flag-gated, default OFF -- existing results
+// stay byte-identical). The TP-S5 formula above averages ONE-STEP
+// dead-reckoning residuals, each anchored on the immediately preceding
+// (already-poisoned) position -- so a DIRECTIONAL drift attack (TP-S1's
+// SampleBoundedDrift is fixed-direction per-vehicle, not zero-mean noise,
+// 06a_attack_models.h) never accumulates: every step's residual only shows
+// that step's own tiny increment. This variant instead anchors on the
+// position/speed/heading from drift_window_k beacons back and projects
+// forward once over the whole elapsed window, so the vehicle's TOTAL
+// displacement since that anchor is compared against the current position in
+// one shot -- a fixed-direction drift shows up as a growing residual instead
+// of being diluted into k near-invisible per-step values.
+bool   g_drift_longbaseline   = false;
+double delta_th_cumulative    = 5.0; // placeholder -- to calibrate against honest traffic before trusting
+
+// k_hat rule-bit routing for TP-S1 (flag-gated, default OFF -- existing
+// results stay byte-identical). Mirrors the existing MP-S1/MP-S2 rule-bit
+// overrides just above (08_detection_engine.h, "trust the rule bit over the
+// ambiguous ML k_hat"): measured 2026-08-29 on TP-S1 (attack_number=1), only
+// 45/220 (20.5%) of GAT's CONFIDENT (non-fallback) k_hat predictions for
+// genuinely poisoned beacons land on k_hat=0 (TP-S1's own weight set) -- the
+// other 79.5% are misrouted to unrelated attack weight sets (most commonly
+// k_hat=4 -> attack=5's weights, psi=0.1/gat=0.05/ae=0.85, almost pure AE).
+// TP-S1's own kinematic bit (sig_mask bit 0, the position-feasibility check)
+// is a candidate reliable discriminator the same way sig bits 5/6 are for
+// MP-S1/MP-S2 -- NOT yet measured for cross-contamination against the other
+// 6 attacks the way bits 5/6 were, so this is an unverified candidate fix,
+// not a confirmed-safe rule like its precedent.
+bool   g_tp_s1_khat_route     = false;
+
 // ── Mobility Pattern Detection Thresholds (§3.4.4) ────────────────────────
 // MP-S1: Sybil identity density (Eq. 3.7)
 double K_sybil = 5.0;       // Max ghost identities per RSU coverage area

@@ -30,6 +30,10 @@
       "detail": "The OR-path is ON unless you explicitly pass `--gat_det_flag_heads=0`. Reported runs pass 0."
     },
     {
+      "trap": "`routing_algorithm` defaults **0**, but blockchain needs **4**",
+      "detail": "Fabric bring-up sits inside `if (routing_algorithm == 4)` at `12_main.h:2094`, with the `skip_blockchain` check *nested inside* it. At the default 0 NEITHER branch runs -- so you get no blockchain AND no \"skip_blockchain=true -- Fabric init bypassed\" message. The silence is the trap: `--skip_blockchain=false` on its own looks like it worked and does nothing. Pass `--routing_algorithm=4` for any run that needs on-chain state. Also gates the vehicle->controller flow map and a detection path (`08_detection_engine.h:3936`), so it is not routing-only."
+    },
+    {
       "trap": "ns-3 CLI booleans",
       "detail": "Need `=0`/`=1`, not bare flags. A bare `--ring_detect` does not enable it."
     },
@@ -120,7 +124,7 @@
     "skip_blockchain": {
       "status": "used",
       "value": "true",
-      "why": "Detection runs do not need the Fabric round-trip. Turn OFF for the RQ5/RQ6 crypto-latency runs."
+      "why": "Detection runs do not need the Fabric round-trip. Turn OFF for the RQ5/RQ6 crypto-latency runs -- but NOT on its own: the check is nested inside `if (routing_algorithm == 4)` (12_main.h:2094), so `--skip_blockchain=false` with the default routing_algorithm=0 silently does nothing at all, with no message either way. Always pair it with `--routing_algorithm=4`."
     },
     "per_pid_results": {
       "status": "used",
@@ -428,7 +432,7 @@
     "routing_algorithm": {
       "status": "used",
       "value": "0 (DEFAULT)",
-      "why": "Routing protocol selector. Inert for detection runs \u2014 meaningful only when --routing_test=true."
+      "why": "Selects the SDN data-plane mode, and is NOT inert for detection runs (an earlier version of this entry claimed it was \u2014 that was wrong and cost a wasted blockchain run). Value 4 is the full-SDVN mode and gates three separate things: the entire Fabric/blockchain bring-up (12_main.h:2094), the vehicle\u2192controller flow mapping node_controller_ID (02_config_globals.h:902), and a detection-engine path (08_detection_engine.h:3936). Because the default is 0, the reported D1/D4/D6 runs had NO blockchain \u2014 consistent with their --skip_blockchain=true. Any run that needs on-chain state must pass --routing_algorithm=4; --skip_blockchain=false alone does nothing."
     },
     "qf": {
       "status": "used",
@@ -458,6 +462,21 @@
       "status": "used",
       "value": "unset for the canonical run; only E3 (scalability sweep) sets it for N_Vehicles=300/400/500",
       "why": "Default mobility trace (mobility_urban_60.tcl) only has 200 vehicle trajectories. E3 sweeps N_Vehicles up to 500, which the trace does not cover; without this override nodes beyond 199 get no MobilityModel and the simulator aborts inside LteHelper::InstallUeDevice() (12_main.h ~584-600). Points at a separately generated trace (mobility/mobility_urban{300,400,500}_60.tcl, built via sumo/build_sumo_trace.sh with VEH_COUNT_OVERRIDE, same road network, KEEP_IN so vehicles never despawn) instead, without touching the shared default trace used by every other experiment. Also required bumping total_size 256->550 and MAX_NODES 320->600 (02_config_globals.h) since those are fixed compile-time array capacities sized for the old 200-vehicle ceiling."
+    },
+    "drift_longbaseline": {
+      "status": "used",
+      "value": "0",
+      "why": "Experimental candidate fix for TP-S1 underperformance (E5: SENTINEL MCC=0.331 vs baseline B3=0.606). Default TP-S5 averages k ONE-STEP dead-reckoning residuals, each anchored on the immediately preceding (already-poisoned) position -- so it cannot see TP-S1s directional cumulative drift (SampleBoundedDrift is fixed-direction per-vehicle, 06a_attack_models.h), only that steps own tiny increment. This variant anchors on the position drift_window_k beacons back and projects forward ONCE over the whole window instead. Default OFF so every already-completed experiment (E1-E4, E_A1 300s/3-seed reruns) stays byte-identical. Not yet calibrated against honest traffic or measured on TP-S1 -- do not enable for reported results until both are done. MEASURED 2026-08-29 (100V/32R/150s, seed=1, attack_number=1/TP-S1, LW mode): MCC 0.284->0.287, FPR 0.054->0.055 vs baseline -- real but tiny (+0.003), smaller than documented ONNX inference noise (~0.007). Mechanism confirmed working (85/2633 poisoned beacons newly flagged that TP-S5 default missed) but most were apparently already caught by other bits, so net effect on fused decision is marginal. Does NOT meaningfully close the TP-S1 underperformance gap (SENTINEL 0.33-0.52 vs baseline B3 0.606). Left default OFF -- not worth enabling for reported results as-is."
+    },
+    "delta_th_cumulative": {
+      "status": "used",
+      "value": "15.0 (calibrated 2026-08-29 on clean 50V/16R/60s honest traffic: smooth ceiling 8.66m, one isolated single-vehicle outlier cluster 61-74m excluded as a likely SUMO route-restart artifact not organic driving)",
+      "why": "Threshold for --drift_longbaseline only, inert otherwise. Cannot reuse delta_th (tuned for ONE-STEP residuals, ~0 for honest SUMO traffic per the delta_th calibration note above it in 02_config_globals.h) because a multi-step projection has a different natural honest-traffic scale (a full second of real turning/accel is not a straight line). Needs its own calibration run against clean (attack_number=0) traffic before use."
+    },
+    "tp_s1_khat_route": {
+      "status": "unused",
+      "value": "0",
+      "why": "Experimental candidate fix for TP-S1 GAT misrouting (measured 2026-08-29: only 45/220 = 20.5% of GAT confident k_hat predictions for genuinely poisoned TP-S1 beacons land on k_hat=0; 79.5% misroute to unrelated attack weight sets, most commonly k_hat=4 -> attack=5 near-pure-AE weights). Mirrors the existing bit5/bit6 MP-S1/MP-S2 rule-bit overrides (08_detection_engine.h) but UNLIKE those, cross-contamination against the other 6 attacks has not been measured -- bit 0 (kinematic position feasibility) might also fire under other trajectory-altering attacks. Default OFF so every already-completed experiment stays byte-identical. MEASURED 2026-08-30 (100V/32R/150s, seed=1, attack_number=1/TP-S1, enable_gat=1/enable_lstm_ae=1, Full mode): MCC_full 0.453->0.458 (+0.005), FPR_full unchanged at 0.019 -- the fix adds true positives without adding false positives. NOTE (2026-08-30, later same day): the TP-S1 gap to baseline B3 (0.606) this was originally measured against was itself wrong -- results_e5_final/e5_final_table.json's TP-S1 entry had been built from e5_preview.py's single-seed preview dataset, not the real 300s/3-seed archived campaign (SENTINEL_experiments/E5_perattack_300s) the paper's own numbers come from. Corrected: at the real operating point SENTINEL_Full MCC=0.6529 already beats B3's real MCC=0.5085 (freshly computed against that same archived data, since no baseline outputs existed for it) -- there is no gap to close. This flag's own measurement above (100V/32R/150s) stands as real and unaffected by that correction, but is no longer motivated by an underperformance that doesn't exist at the real scale. LW-mode MCC unchanged (0.284 both ways), as expected -- this flag only affects GAT k_hat routing used in the Full/fusion path. Cross-attack contamination (whether bit 0 fires spuriously under other attacks) and the combined effect with --drift_longbaseline are still not tested. Left default OFF -- not worth enabling for reported results as-is."
     }
   }
 }

@@ -513,22 +513,49 @@ uint32_t run_tp_detect(int vid, BsmBeaconTag &tag)
     {
         int avail = (vs.count >= 2) ? (vs.count - 1) : 0;  // pairs available
         int k     = (avail < drift_window_k) ? avail : drift_window_k;
-        double drift_sum = 0.0;
-        for (int step = 0; step < k; step++) {
-            // pair: (head-2-step) → (head-1-step)  in circular buffer
-            int b_cur  = ((vs.head - 1 - step) + BEACON_HISTORY) % BEACON_HISTORY;
-            int b_prev = ((vs.head - 2 - step) + BEACON_HISTORY) % BEACON_HISTORY;
-            double dt_s = vs.timestamp[b_cur] - vs.timestamp[b_prev];
-            if (dt_s <= 0) dt_s = T_b;
-            double px_hat = vs.pos_x[b_prev] + vs.speed[b_prev] * std::cos(vs.heading[b_prev]) * dt_s;
-            double py_hat = vs.pos_y[b_prev] + vs.speed[b_prev] * std::sin(vs.heading[b_prev]) * dt_s;
-            double r = std::sqrt((vs.pos_x[b_cur]-px_hat)*(vs.pos_x[b_cur]-px_hat) +
-                                 (vs.pos_y[b_cur]-py_hat)*(vs.pos_y[b_cur]-py_hat));
-            drift_sum += r;
+
+        if (g_drift_longbaseline) {
+            // Long-baseline variant (--drift_longbaseline=1): anchor on the
+            // position k beacons back and project forward ONCE over the whole
+            // elapsed window, instead of averaging k one-step residuals. A
+            // directional drift (TP-S1's SampleBoundedDrift is fixed-direction
+            // per vehicle) accumulates into one residual here rather than
+            // being diluted into k near-invisible per-step values.
+            if (k > 0) {
+                int b_cur    = curr;
+                int b_anchor = ((vs.head - 1 - k) + BEACON_HISTORY) % BEACON_HISTORY;
+                double dt_win = vs.timestamp[b_cur] - vs.timestamp[b_anchor];
+                if (dt_win <= 0) dt_win = k * T_b;
+                double px_hat = vs.pos_x[b_anchor] + vs.speed[b_anchor] * std::cos(vs.heading[b_anchor]) * dt_win;
+                double py_hat = vs.pos_y[b_anchor] + vs.speed[b_anchor] * std::sin(vs.heading[b_anchor]) * dt_win;
+                vs.drift_score = std::sqrt((vs.pos_x[b_cur]-px_hat)*(vs.pos_x[b_cur]-px_hat) +
+                                           (vs.pos_y[b_cur]-py_hat)*(vs.pos_y[b_cur]-py_hat));
+            } else {
+                vs.drift_score = 0.0;
+            }
+            if (std::getenv("MPTD_DRIFT_CALIB"))
+                std::cout << "[TP-S5-LB-CALIB] vid=" << vid << " is_poisoned=" << tag.GetIsPoisoned()
+                          << " drift=" << vs.drift_score << " k=" << k << std::endl;
+            if (vs.drift_score > delta_th_cumulative)
+                violated |= (1 << 4);
+        } else {
+            double drift_sum = 0.0;
+            for (int step = 0; step < k; step++) {
+                // pair: (head-2-step) → (head-1-step)  in circular buffer
+                int b_cur  = ((vs.head - 1 - step) + BEACON_HISTORY) % BEACON_HISTORY;
+                int b_prev = ((vs.head - 2 - step) + BEACON_HISTORY) % BEACON_HISTORY;
+                double dt_s = vs.timestamp[b_cur] - vs.timestamp[b_prev];
+                if (dt_s <= 0) dt_s = T_b;
+                double px_hat = vs.pos_x[b_prev] + vs.speed[b_prev] * std::cos(vs.heading[b_prev]) * dt_s;
+                double py_hat = vs.pos_y[b_prev] + vs.speed[b_prev] * std::sin(vs.heading[b_prev]) * dt_s;
+                double r = std::sqrt((vs.pos_x[b_cur]-px_hat)*(vs.pos_x[b_cur]-px_hat) +
+                                     (vs.pos_y[b_cur]-py_hat)*(vs.pos_y[b_cur]-py_hat));
+                drift_sum += r;
+            }
+            vs.drift_score = (k > 0) ? (drift_sum / k) : 0.0;
+            if (vs.drift_score > delta_th)
+                violated |= (1 << 4);
         }
-        vs.drift_score = (k > 0) ? (drift_sum / k) : 0.0;
-        if (vs.drift_score > delta_th)
-            violated |= (1 << 4);
     }
 
     return violated;
@@ -2376,6 +2403,14 @@ void run_gat_fusion_for_rsu(uint32_t rsu_id, uint32_t window_epoch_for_log)
                         if (is_ghost_i)                 { k_hat_i = 2; khat_from_ghost_id = true; }
                         else if (sig_mask_i & (1u << 5))  k_hat_i = 2;  // MP-S1 -> attack=3 slot
                         else if (sig_mask_i & (1u << 6))  k_hat_i = 3;  // MP-S2 -> attack=4 slot
+                        // --tp_s1_khat_route (default off): TP-S1's kinematic bit as a
+                        // rule-trusted discriminator, same pattern as bits 5/6 above.
+                        // UNLIKE those, cross-contamination against the other 6 attacks
+                        // has not been measured -- treat as a candidate, not confirmed-safe.
+                        else if (g_tp_s1_khat_route && (sig_mask_i & (1u << 0))) k_hat_i = 0;
+                        if (std::getenv("MPTD_KHAT_CALIB") && rw.is_poisoned[i])
+                            std::cout << "[KHAT-CALIB] vid=" << vid_i << " k_hat=" << k_hat_i
+                                      << " gat_ok=" << gat_ok << std::endl;
                         // sir Change 1: attack-conditioned ψ. Recompute the LW
                         // composite from this vehicle's sig_mask with the weight
                         // vector for k̂ (or the aggregate w when k̂=-1, i.e. GAT

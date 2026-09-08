@@ -1,0 +1,142 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* RGB triplets (space-separated, no commas) so Tailwind's opacity modifier
+ * (bg-surface-panel/95) can compose them via rgb(var(--x) / <alpha-value>).
+ * Hex source of truth + palette validation results: src/design/tokens.ts —
+ * keep these two files in sync by hand; there is no build step that
+ * generates one from the other. Dark is the default (:root, no attribute)
+ * so the app renders correctly before React/the theme store hydrates. */
+:root {
+  color-scheme: dark;
+
+  --c-surface-page: 11 15 20;
+  --c-surface-panel: 15 20 25;
+  --c-surface-raised: 21 28 36;
+  --c-surface-hairline: 31 41 51;
+  --c-surface-hairline2: 43 55 68;
+
+  --c-ink-primary: 242 245 248;
+  --c-ink-secondary: 168 179 191;
+  --c-ink-muted: 107 119 133;
+
+  --c-entity-rsu: 57 135 229;
+  --c-entity-controller: 25 158 112;
+  --c-entity-vehicle: 125 136 148;
+  --c-entity-ghost: 213 81 129;
+
+  --c-status-good: 12 163 12;
+  --c-status-caught: 250 178 25;
+  --c-status-serious: 236 131 90;
+  --c-status-missed: 208 59 59;
+
+  --c-axis-line: 44 55 66; /* recharts axis strokes — not a Tailwind colour, chart-only */
+  --ease: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+[data-theme="light"] {
+  color-scheme: light;
+
+  --c-surface-page: 238 241 245;
+  --c-surface-panel: 255 255 255;
+  --c-surface-raised: 245 247 250;
+  --c-surface-hairline: 221 227 234;
+  --c-surface-hairline2: 199 208 218;
+
+  --c-ink-primary: 14 22 32;
+  --c-ink-secondary: 74 88 102;
+  --c-ink-muted: 120 132 143;
+
+  --c-entity-rsu: 31 102 192;
+  --c-entity-controller: 15 122 85;
+  --c-entity-vehicle: 95 107 120;
+  --c-entity-ghost: 178 53 102;
+
+  --c-status-good: 10 125 10;
+  --c-status-caught: 169 116 0;
+  --c-status-serious: 184 85 42;
+  --c-status-missed: 179 42 42;
+
+  --c-axis-line: 199 208 218;
+}
+
+body {
+  margin: 0;
+  background: rgb(var(--c-surface-page));
+  color: rgb(var(--c-ink-primary));
+  font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Thin, recessive scrollbars — the feed and drawer scroll a lot. */
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--c-surface-hairline));
+  border-radius: 4px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgb(var(--c-surface-hairline2));
+}
+
+/* deck.gl injects its tooltip inline; restyle to match the panel language. */
+.deck-tooltip {
+  background: rgb(var(--c-surface-raised)) !important;
+  border: 1px solid rgb(var(--c-surface-hairline)) !important;
+  border-radius: 6px !important;
+  color: rgb(var(--c-ink-primary)) !important;
+  font-size: 11px !important;
+  line-height: 1.45 !important;
+  padding: 8px 10px !important;
+  white-space: pre-line !important;
+}
+
+/* Shared motion system — one vocabulary for every reveal in the app:
+ * .anim-rise    a panel/row settling into place (accordion bodies, modal
+ *               sections) — staggered with animation-delay where several
+ *               appear together.
+ * .anim-fadein  a backdrop/overlay appearing.
+ * .anim-sweep   a bar/progress fill drawing in from zero width.
+ * .anim-panel-in a drill-down modal growing from where it was opened —
+ *               set the two custom properties (--fx, --fy: the click
+ *               point's offset from viewport centre, in px) inline so the
+ *               panel visibly originates from the tile that opened it.
+ * prefers-reduced-motion collapses every one of these to a no-op, per the
+ * dataviz/accessibility norm — motion communicates state change here, it
+ * never carries information a static frame lacks. */
+@keyframes rise {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes fadein {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes sweep {
+  from { width: 0; }
+}
+@keyframes panel-in {
+  from {
+    opacity: 0.6;
+    transform: translate(calc(var(--fx, 0px) * 0.5), calc(var(--fy, 0px) * 0.5)) scale(0.965);
+  }
+  to { opacity: 1; transform: none; }
+}
+
+.anim-rise { animation: rise 0.34s var(--ease) both; }
+.anim-fadein { animation: fadein 0.26s ease both; }
+.anim-sweep { animation: sweep 0.7s var(--ease) both; }
+.anim-panel-in { animation: panel-in 0.3s var(--ease) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

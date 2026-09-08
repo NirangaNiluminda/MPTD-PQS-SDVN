@@ -151,6 +151,21 @@ mobility/mobility_rural3k_*.tcl
 # Python bytecode (any depth)
 __pycache__/
 
+# Parsed road-network cache written by demo_ui/backend/parsers/roadmap.py.
+# Derived from the .net.xml next to it; regenerated automatically when stale.
+sumo/**/.*.roadmap.json
+sumo/**/.*.signals.json
+
+# ── Demo UI (demo_ui/) — regeneratable build/dependency output ────────────────
+demo_ui/.venv/
+demo_ui/frontend/node_modules/
+demo_ui/frontend/dist/
+demo_ui/frontend/*.tsbuildinfo
+# `tsc -b` on tsconfig.node.json emits these next to vite.config.ts — the
+# .ts source is what's committed, not its compiled output.
+demo_ui/frontend/vite.config.js
+demo_ui/frontend/vite.config.d.ts
+
 # ── ns-3 RLC/PHY trace dumps (regenerated whenever the binary is run from the
 #    repo root instead of $NS3; not source, not results — DlRsrpSinrStats.txt
 #    alone has reached 440MB and blocked a GitHub push once already) ───────────
@@ -158,3 +173,15 @@ __pycache__/
 /DlRlcStats.txt
 /UlRlcStats.txt
 /UlSinrStats.txt
+
+# Simulation stdout captures for the demo UI (large, regeneratable) — except
+# ledger_snapshot.json, vendored deliberately so Blockchain Ledger's
+# point-in-time view works on a fresh clone with no live Fabric network
+# reachable. `captures/*` (not `captures/`) so the negation below can still
+# reach into the directory — git can't re-include a file whose parent
+# directory itself was excluded.
+demo_ui/captures/*
+!demo_ui/captures/ledger_snapshot.json
+
+# graphify knowledge-graph cache (large, regeneratable via `graphify update .`)
+graphify-out/

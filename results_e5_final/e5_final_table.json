@@ -1,31 +1,32 @@
 {
   "TP-S1": {
     "density_metric": "TPE",
+    "_provenance": "Corrected 2026-08-30: previous values here came from e5_preview.py's single-seed preview dataset (analytics/datasets/urban/a1_p40_m0), not the real campaign. Replaced with the actual 300s, 3-seed archived run (SENTINEL_experiments/E5_perattack_300s/urban/a1_p40_s1..s3) that the paper's own cited MCC_full numbers (0.6649/0.6838/0.6099) come from -- verified to match exactly. B1/B2/B3 MCC computed fresh against this same data via mptd_pqs' own detector modules, since no baseline outputs were archived for this run (paper's own TODO note in main.tex admits this gap). TTD/CDER/density_val/PBPO_ms for SENTINEL_Full and SENTINEL_LW recomputed the same way e5_preview.py does. B1/B2/B3 TTD/PBPO_ms left as before (not re-verified; MCC is what determines baseline_wins).",
     "SENTINEL_Full": {
-      "MCC": 0.3305,
-      "MCC_std": 0.05444722215136417,
-      "TTD": 7.072,
-      "CDER": 0.3005,
-      "density_val": 14.855,
-      "PBPO_ms": 2.4625
+      "MCC": 0.6529,
+      "MCC_std": 0.0384,
+      "TTD": 0.479,
+      "CDER": 0.0822,
+      "density_val": 31.127,
+      "PBPO_ms": 0.8327
     },
     "SENTINEL_LW": {
-      "MCC": 0.2825,
-      "MCC_std": 0.020506096654409858,
-      "PBPO_ms": 0.010499999999999999
+      "MCC": 0.7638,
+      "MCC_std": 0.0689,
+      "PBPO_ms": 0.0192
     },
     "B1": {
-      "MCC": 0.2492986908565133,
+      "MCC": 0.2570,
       "TTD": 5.216666666666667,
       "PBPO_ms": 0.12405513919440297
     },
     "B2": {
-      "MCC": -0.16313310601513506,
+      "MCC": 0.2070,
       "TTD": 0.06163888888888872,
       "PBPO_ms": 0.0009826411510807577
     },
     "B3": {
-      "MCC": 0.6055320220818643,
+      "MCC": 0.5085,
       "TTD": 0.0007777777777783336,
       "PBPO_ms": 0.0008655922916541135
     }

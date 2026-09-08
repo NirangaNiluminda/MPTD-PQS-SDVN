@@ -152,6 +152,22 @@ int main(int argc, char *argv[])
                   "Floor the attack-conditioned psi at the global-weight psi so k_hat "
                   "misrouting cannot erase rule evidence (1=on, default 0)",
                   g_psi_cond_floor);
+    cmd.AddValue ("drift_longbaseline",
+                  "TP-S5: anchor the cumulative-drift check on the position drift_window_k "
+                  "beacons back (single long-range dead-reckoning projection) instead of "
+                  "averaging k one-step residuals, so a directional drift attack accumulates "
+                  "instead of being diluted (1=on, default 0)",
+                  g_drift_longbaseline);
+    cmd.AddValue ("delta_th_cumulative",
+                  "Residual threshold (m) for --drift_longbaseline's long-baseline projection "
+                  "check. Unused unless drift_longbaseline=1.",
+                  delta_th_cumulative);
+    cmd.AddValue ("tp_s1_khat_route",
+                  "Route k_hat to TP-S1's own weight set (k_hat=0) when sig_mask bit 0 "
+                  "(kinematic position feasibility) fires, mirroring the existing MP-S1/MP-S2 "
+                  "rule-bit overrides, instead of trusting GAT's often-misrouted k_hat "
+                  "(1=on, default 0)",
+                  g_tp_s1_khat_route);
     cmd.AddValue ("ring_detect",
                   "Deterministic Sybil-ring geometry test: flag identities sitting on a "
                   "consistent-radius ring about a common centroid, excluding the centroid "
