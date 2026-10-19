@@ -62,21 +62,6 @@ does not survive cloning.
 - **If shown wrong, correct it openly** and move on.
 - Deploy or promote nothing without explicit go-ahead.
 
-## Current state (2026-08-07)
-
-300 s combined-attack run, seed 1, rho_a 0.40, urban — simulator-printed:
-
-| arm | MCC_full | FPR_full |
-|---|---|---|
-| D1 (no ML) | 0.763 | 0.064 |
-| D4 (GAT) | 0.758 | 0.090 |
-| D6 (GAT+AE) | 0.766 | 0.095 |
-
-Ordering **D1 < D4 < D6 holds at a 90 s cutoff** (0.8339 / 0.8432 / 0.8477) but
-**not at 300 s** (D4 falls 0.005 below D1). Any reported MCC must state its
-evaluation window. `psi_cond_floor` eliminated D4's true-positive loss entirely
-(158 -> 0); the residual gap is false positives, concentrated in 13 vehicles.
-
 ## Dead ends — do NOT retry
 
 | attempt | why it failed |
