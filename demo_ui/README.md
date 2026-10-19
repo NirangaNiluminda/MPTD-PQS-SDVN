@@ -2,7 +2,7 @@
 
 Browser UI for the MPTD-PQS-SDVN attack/defence demo. Design rationale, data
 inventory, and the full 6-screen plan live in
-`../DEMO_UI_PLAN_2026-08-14.md` — read that first if you're picking this up
+`../docs/DEMO_UI_PLAN_2026-08-14.md` — read that first if you're picking this up
 cold. This file is just "how do I run it."
 
 ## What's built so far (2026-08-14, overnight pass)

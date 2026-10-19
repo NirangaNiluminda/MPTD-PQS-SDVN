@@ -94,8 +94,8 @@ evaluation window. `psi_cond_floor` eliminated D4's true-positive loss entirely
 | file | contents |
 |---|---|
 | [RUN_CONFIG.md](RUN_CONFIG.md) | generated flag reference + traps + canonical run |
-| [CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md](CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md) | code-vs-paper audit of all ~28 modelling items |
-| [HANDOFF_2026-08-07.md](HANDOFF_2026-08-07.md) | session handoff, root-cause narrative |
+| [CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md](https://github.com/NirangaNiluminda/MPTD-PQS-SDVN/blob/research-notes/CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md) | code-vs-paper audit of all ~28 modelling items |
+| [HANDOFF_2026-08-07.md](https://github.com/NirangaNiluminda/MPTD-PQS-SDVN/blob/research-notes/HANDOFF_2026-08-07.md) | session handoff, root-cause narrative |
 | `report/main.tex` | the paper (may lag Overleaf — check before editing) |
 
 ## Known code/paper mismatches

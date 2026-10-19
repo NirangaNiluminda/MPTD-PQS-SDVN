@@ -39,4 +39,4 @@ g=lambda k:r.get(k,'nan'); print(g('MCC'),g('FPR'),g('MCC_full'),g('FPR_full'),g
   done
 done
 echo "[FIX] done -> $CSV"
-cd /home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN && python3 plot_sensitivity.py "$CSV"
+cd /home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN && python3 analysis/plot_sensitivity.py "$CSV"
