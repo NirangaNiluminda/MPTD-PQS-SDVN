@@ -61,29 +61,24 @@ flowchart LR
     B -- CRL / controller revocation --> R
 ```
 
-## Results
+## Evaluation
 
-Evaluated on three real road networks (Shinjuku, Tokyo · Hohenwart, Germany · A9 autobahn),
-200 vehicles, 5 experiments and 11 ablation studies, against three published baselines
-(Ghaleb 2014, Ercan 2022, Sharma & Liu 2021).
+The framework is evaluated end-to-end in simulation:
 
-| Finding | Result |
-|---|---|
-| **Coordinated Sybil attack via compromised RSU** | MCC **0.82–0.99** vs. **≈ 0** for all three baselines |
-| **Malicious-controller attacks** (control plane) | MCC **0.98** — baselines are structurally blind (≈ 0) |
-| **Full vs. lightweight mode** (stealthy attacks, 20 % attackers) | MCC **0.93** vs. 0.36 |
-| **Honest false-positive rate** | **4.3 %** (target ≤ 5 %) |
-| **False revocation of honest vehicles** | **0 %** with blockchain BFT vs. **20 %** with centralised revocation |
-| **Threshold signing gate** (half the ring compromised) | **60 % more** poisoned aggregates rejected than single-signer |
-| **Key management** (200 vehicles per zone) | LKH needs **24.9× fewer** rekey messages than unicast |
-| **Real-time cost** | AI layer uses **1–2 %** of the 100 ms beacon budget; PQ signing a fixed ~18 ms per signer per epoch |
+- **Three real road networks** imported from OpenStreetMap — dense urban (Shinjuku, Tokyo),
+  sparse rural (Hohenwart, Germany) and a motorway corridor (A9 autobahn) — with 200 vehicles
+  and realistic 802.11p channel models.
+- **Seven attack variants** across four attacker classes, on both the data and control planes.
+- **Five experiments** sweeping attacker penetration and intensity, vehicle speed, network size
+  and coordinated threat level.
+- **Eleven ablation studies** that each remove one component (rule signatures, HMAC, GAT,
+  LSTM-AE, threshold signing, FHE, multi-controller revocation, blockchain trust layer, LKH) to
+  measure exactly what it contributes.
+- **Comparison against three published baselines** (Ghaleb 2014, Ercan 2022, Sharma & Liu 2021),
+  re-implemented in [`mptd_pqs/`](mptd_pqs/).
+- **Real-time budget:** the full detection pipeline is checked against the 100 ms beacon interval.
 
-Every component was ablated individually; removing the GAT or the LSTM-AE each drops a whole
-attack class to chance-level detection, showing the layers are complementary, not redundant.
-Full methodology and results: [report](report/main.pdf).
-
-> Some experiments use a small number of random seeds: the ordering of components held on every
-> seed, but exact magnitudes may shift with more runs (see the report's Discussion chapter).
+Detailed results will be linked here once the accompanying paper is published.
 
 ## SENTINEL demo UI
 
@@ -113,7 +108,6 @@ analysis/                Evaluation, ablation, tuning and plotting scripts
 analytics/               ML training code, data and evaluation utilities
 results_e*_final/        Final experiment outputs (read by the demo UI)
 results/                 Other result files and figures
-report/                  Thesis (LaTeX + PDF)
 sumo/ · mobility/        SUMO scenarios for the urban, rural and highway maps
 docs/                    Run guide, evaluation guide, baseline guide, demo-UI plan
 tools/                   Flag-reference generator + pre-commit hook
@@ -130,14 +124,15 @@ Analysis scripts run from the repo root, e.g. `python3 analysis/heldout_eval.py`
 
 ## Team
 
+Final-year undergraduate research project, Department of Electrical & Information Engineering,
+University of Ruhuna.
+
 | | |
 |---|---|
 | **G.W.N. Niluminda** — lead developer & system architect | [GitHub](https://github.com/NirangaNiluminda) · [LinkedIn](https://linkedin.com/in/niranganiluminda) |
 | H.M.S. Muthukumari | |
 | I.J. Niroshan | |
 | C.Y. Samarasinghe | |
-
-**Supervisor:** Dr. Tharindu Gamage · **Co-supervisor:** Dr. P.A.D.S. Nilmantha Wijesekara
 
 **My role:** designed the end-to-end architecture and built the NS-3 simulation, the detection
 pipeline (rule signatures, GAT and LSTM-AE fusion), the post-quantum and Hyperledger Fabric

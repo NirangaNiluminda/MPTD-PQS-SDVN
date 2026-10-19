@@ -6,7 +6,7 @@ Auto-loaded every session. Keep it short; put detail in the linked files.
 
 NS-3 + SUMO simulation of an SDVN mobility/trajectory-poisoning detection
 framework (rule signatures + GAT + LSTM-AE + PQ crypto + Hyperledger Fabric),
-with a LaTeX paper in `report/`. Branch `ml-review-fixes`.
+(the LaTeX paper is kept outside this public repo). Branch `ml-review-fixes`.
 
 ## Paths
 
@@ -96,7 +96,6 @@ evaluation window. `psi_cond_floor` eliminated D4's true-positive loss entirely
 | [RUN_CONFIG.md](RUN_CONFIG.md) | generated flag reference + traps + canonical run |
 | [CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md](https://github.com/NirangaNiluminda/MPTD-PQS-SDVN/blob/research-notes/CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md) | code-vs-paper audit of all ~28 modelling items |
 | [HANDOFF_2026-08-07.md](https://github.com/NirangaNiluminda/MPTD-PQS-SDVN/blob/research-notes/HANDOFF_2026-08-07.md) | session handoff, root-cause narrative |
-| `report/main.tex` | the paper (may lag Overleaf — check before editing) |
 
 ## Known code/paper mismatches
 
