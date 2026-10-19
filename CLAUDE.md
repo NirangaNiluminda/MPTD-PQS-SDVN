@@ -6,7 +6,7 @@ Auto-loaded every session. Keep it short; put detail in the linked files.
 
 NS-3 + SUMO simulation of an SDVN mobility/trajectory-poisoning detection
 framework (rule signatures + GAT + LSTM-AE + PQ crypto + Hyperledger Fabric),
-with a LaTeX paper in `report/`. Branch `ml-review-fixes`.
+(the LaTeX paper is kept outside this public repo). Branch `ml-review-fixes`.
 
 ## Paths
 
@@ -62,21 +62,6 @@ does not survive cloning.
 - **If shown wrong, correct it openly** and move on.
 - Deploy or promote nothing without explicit go-ahead.
 
-## Current state (2026-08-07)
-
-300 s combined-attack run, seed 1, rho_a 0.40, urban — simulator-printed:
-
-| arm | MCC_full | FPR_full |
-|---|---|---|
-| D1 (no ML) | 0.763 | 0.064 |
-| D4 (GAT) | 0.758 | 0.090 |
-| D6 (GAT+AE) | 0.766 | 0.095 |
-
-Ordering **D1 < D4 < D6 holds at a 90 s cutoff** (0.8339 / 0.8432 / 0.8477) but
-**not at 300 s** (D4 falls 0.005 below D1). Any reported MCC must state its
-evaluation window. `psi_cond_floor` eliminated D4's true-positive loss entirely
-(158 -> 0); the residual gap is false positives, concentrated in 13 vehicles.
-
 ## Dead ends — do NOT retry
 
 | attempt | why it failed |
@@ -94,9 +79,8 @@ evaluation window. `psi_cond_floor` eliminated D4's true-positive loss entirely
 | file | contents |
 |---|---|
 | [RUN_CONFIG.md](RUN_CONFIG.md) | generated flag reference + traps + canonical run |
-| [CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md](CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md) | code-vs-paper audit of all ~28 modelling items |
-| [HANDOFF_2026-08-07.md](HANDOFF_2026-08-07.md) | session handoff, root-cause narrative |
-| `report/main.tex` | the paper (may lag Overleaf — check before editing) |
+| [CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md](https://github.com/NirangaNiluminda/MPTD-PQS-SDVN/blob/research-notes/CODE_AUDIT_VS_PAPER_ITEMS_2026-08-07.md) | code-vs-paper audit of all ~28 modelling items |
+| [HANDOFF_2026-08-07.md](https://github.com/NirangaNiluminda/MPTD-PQS-SDVN/blob/research-notes/HANDOFF_2026-08-07.md) | session handoff, root-cause narrative |
 
 ## Known code/paper mismatches
 

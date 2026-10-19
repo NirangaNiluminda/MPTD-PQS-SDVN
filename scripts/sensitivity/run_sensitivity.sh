@@ -5,7 +5,7 @@
 # Sweeps each LW-detector hyper-parameter ONE AT A TIME (all others at default),
 # in FULL mode (GAT + LSTM-AE + PQ crypto), skip_blockchain=true (ledger does
 # not affect MCC/FPR, so we skip Fabric to keep each run ~1 min). >=SEEDS seeds
-# per point; records mean+/-std MCC and FPR to a tidy CSV that plot_sensitivity.py
+# per point; records mean+/-std MCC and FPR to a tidy CSV that analysis/plot_sensitivity.py
 # turns into per-parameter plots + one combined plot + the filled LaTeX tables.
 #
 # Fills: tab:threshold-sensitivity (psi_th), tab:kl-sensitivity (kappa_th),
@@ -96,5 +96,5 @@ done
 
 echo "[SENS] raw results: $CSV"
 echo "[SENS] plotting + LaTeX ..."
-cd /home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN && python3 plot_sensitivity.py "$CSV"
+cd /home/sdvn_mobility_flooding/Niranga/MPTD-PQS-SDVN && python3 analysis/plot_sensitivity.py "$CSV"
 echo "[SENS] DONE. plots + tables next to the CSV in: $OUT"
